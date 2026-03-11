@@ -1128,11 +1128,24 @@ feature_get(struct Client* from, const char* const* fields, int count)
   return 0;
 }
 
+static int features_loading = 0; /**< True while config file is being parsed */
+
+/** Return whether a config file is currently being parsed.
+ * Feature notify callbacks can use this to defer work until
+ * after all features are set.
+ */
+int feature_conf_loading(void)
+{
+  return features_loading;
+}
+
 /** Called before reading the .conf to clear all dirty marks. */
 void
 feature_unmark(void)
 {
   int i;
+
+  features_loading = 1;
 
   for (i = 0; features[i].type; i++) {
     features[i].flags &= ~FEAT_MARK; /* clear the marks... */
@@ -1181,6 +1194,8 @@ feature_mark(void)
     if (change && features[i].notify)
       (*features[i].notify)(); /* call change notify function */
   }
+
+  features_loading = 0;
 }
 
 /** Initialize the features subsystem. */
