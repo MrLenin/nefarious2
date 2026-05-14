@@ -245,10 +245,37 @@ engine_delete(struct Socket *sock)
   assert(0 != sock);
   Debug((DEBUG_ENGINE, "epoll: Deleting socket %d [%p], state %s",
 	 s_fd(sock), sock, state_to_name(s_state(sock))));
+
+  /* Explicitly remove fd from the epoll interest list.
+   *
+   * Without this, the fd stays in the interest list until close() actually
+   * runs.  Combined with the deferred close pattern this branch introduces
+   * (close_connection does shutdown(SHUT_RDWR) and queues ET_DESTROY for
+   * the actual close), there is an interval where level-triggered epoll
+   * keeps firing EPOLLHUP on the half-closed fd.  The event handler can't
+   * make progress (the Client has already been exited), and ET_DESTROY
+   * starves because the loop is consuming events for the same socket.
+   *
+   * Worst case: the Socket struct's memory gets freed and reused for a
+   * new accept'd connection, and stale events from the old registration
+   * dispatch to the new fd's context, closing the new connection within
+   * milliseconds of accept.  Symptom on the wire: server-link reconnects
+   * after a SQUIT see TCP SYN-ACK, then a FIN from the listening peer
+   * within ~1ms, before TLS ClientHello can even be sent.
+   *
+   * Also necessary for dup'd fds: closing the original fd does NOT
+   * remove the epoll registration if a dup'd fd still references the
+   * same underlying open file description.
+   *
+   * Ignore errors — the fd may already be closed or not registered. */
+  if (s_fd(sock) >= 0)
+    epoll_ctl(epoll_fd, EPOLL_CTL_DEL, s_fd(sock), NULL);
+
   /* Drop any unprocessed events citing this socket. */
   for (ii = 0; ii < events_used; ii++) {
     if (events[ii].data.ptr == sock) {
       events[ii] = events[--events_used];
+      ii--; /* re-check the swapped-in event */
     }
   }
 }
