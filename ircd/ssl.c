@@ -285,8 +285,18 @@ int ssl_accept(struct Client *cptr)
 
           Debug((DEBUG_ERROR, "SSL_accept: %s", cli_sslerror(cptr)));
 
+          /* Skip ssl_smart_shutdown on a failed-handshake SSL.  The
+           * handshake is by definition not finished here (SSL_accept
+           * returned <= 0 with SSL_ERROR_SSL), so calling SSL_shutdown
+           * would emit a TLS alert into the listener's CTX in an
+           * unexpected state.  Empirically that leaves the listener
+           * unable to complete future SSL_accept calls — every
+           * subsequent server-link reconnect after a failed handshake
+           * fails with the same "Internal OpenSSL error or protocol
+           * error" until the process is restarted.  SSL_set_shutdown
+           * still marks the state for the upcoming SSL_free; we just
+           * don't try to send an alert. */
           SSL_set_shutdown(cli_socket(cptr).ssl, SSL_RECEIVED_SHUTDOWN);
-          ssl_smart_shutdown(cli_socket(cptr).ssl);
           SSL_free(cli_socket(cptr).ssl);
           cli_socket(cptr).ssl = NULL;
 
