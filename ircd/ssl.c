@@ -43,6 +43,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <sys/socket.h>
 #include <sys/uio.h>
 #include <stdio.h>
 #include <string.h>
@@ -537,8 +538,25 @@ int ssl_murder(void *ssl, int fd, const char *buf)
   } else {
     if (buf)
       SSL_write((SSL *) ssl, buf, strlen(buf));
+    /* Send TLS close_notify before SSL_free so the peer sees a clean
+     * shutdown rather than a truncated record.  Without this, clients
+     * commonly render the disconnect as a transport-error ("No such
+     * device or address" on HexChat, similar elsewhere) and suppress
+     * the trailing rejection message that this path just wrote.  Skip
+     * for a half-handshaked SSL: SSL_shutdown before init_finished
+     * emits alerts in a state the listener's CTX wasn't expecting,
+     * leaving stale state that trips subsequent SSL_accept calls with
+     * "Internal OpenSSL error or protocol error". */
+    if (SSL_is_init_finished((SSL *) ssl))
+      ssl_smart_shutdown((SSL *) ssl);
     SSL_free((SSL *) ssl);
   }
+  /* Graceful TCP close: send FIN via shutdown(SHUT_RDWR) so the buffered
+   * close_notify and rejection message actually reach the peer, rather
+   * than getting discarded by an RST that close() on a socket with
+   * unread data can trigger on Linux.  Mirrors the pattern in
+   * close_connection (s_bsd.c). */
+  shutdown(fd, SHUT_RDWR);
   close(fd);
   return 0;
 }
@@ -547,7 +565,20 @@ void ssl_free(struct Socket *socketh)
 {
   if (!socketh->ssl)
     return;
+  /* Send TLS close_notify before tearing down SSL state.  Pairs with
+   * the TCP graceful close (shutdown(SHUT_RDWR)) in close_connection —
+   * a clean TLS shutdown lets the peer's TLS stack deliver any trailing
+   * application data (ERROR :Closing Link …) to the client instead of
+   * surfacing the close as a transport error.  Skip the SSL_shutdown
+   * if the handshake hasn't finished: alerts emitted on a half-
+   * handshaked SSL can leave stale state that trips subsequent
+   * SSL_accept calls on the listener with "Internal OpenSSL error or
+   * protocol error" — silently breaking server-link reconnects after a
+   * SQUIT cascade tears down a mid-handshake session. */
+  if (SSL_is_init_finished(socketh->ssl))
+    ssl_smart_shutdown(socketh->ssl);
   SSL_free(socketh->ssl);
+  socketh->ssl = NULL;
 }
 
 char *ssl_get_cipher(SSL *ssl)
