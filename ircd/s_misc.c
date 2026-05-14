@@ -405,6 +405,15 @@ int exit_client(struct Client *cptr,
                 NumNick(victim), /* two %s's */
                 cli_name(victim), cli_info(victim));
 
+    /* Always send ERROR to local user clients before closing, even on
+     * voluntary QUIT (where victim == cli_from(killer)).  Modern IRC
+     * clients and test frameworks expect ERROR as the close indicator. */
+    if (IsUser(victim) && !IsConnecting(victim) && !IsDead(victim)) {
+      sendrawto_one(victim, MSG_ERROR " :Closing Link: %s by %s (%s)",
+                    cli_name(victim),
+                    cli_name(IsServer(killer) ? &his : killer),
+                    comment);
+    }
     if (victim != cli_from(killer)  /* The source knows already */
         && IsClient(victim))    /* Not a Ping struct or Log file */
     {
@@ -416,11 +425,6 @@ int exit_client(struct Client *cptr,
 	    sendcmdto_one(killer, CMD_ERROR, victim,
 			  ":Closing Link: %s by %s (%s)", cli_name(victim),
 			  cli_name(killer), comment);
-	  else
-	    sendrawto_one(victim, MSG_ERROR " :Closing Link: %s by %s (%s)",
-			  cli_name(victim),
-                          cli_name(IsServer(killer) ? &his : killer),
-			  comment);
 	}
       }
       if ((IsServer(victim) || IsHandshake(victim) || IsConnecting(victim)) &&

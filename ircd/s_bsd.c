@@ -459,8 +459,15 @@ void close_connection(struct Client *cptr)
   if (-1 < cli_fd(cptr)) {
     flush_connections(cptr);
     LocalClientArray[cli_fd(cptr)] = 0;
-    close(cli_fd(cptr));
-    socket_del(&(cli_socket(cptr))); /* queue a socket delete */
+    /* Use shutdown() instead of close() to send FIN gracefully.
+     * close() on a socket with unread data in the recv buffer sends RST,
+     * which discards pending data at the remote end's recv buffer (on Linux).
+     * shutdown(SHUT_RDWR) sends FIN and silently ACKs any incoming data,
+     * preventing RST.  The actual close(fd) is deferred to the ET_DESTROY
+     * callback via socket_del(), giving remote clients time to read any
+     * queued messages (ERROR, MONITOR 731 notifications, etc.). */
+    shutdown(cli_fd(cptr), SHUT_RDWR);
+    socket_del(&(cli_socket(cptr))); /* queue deferred socket destroy + close */
     cli_fd(cptr) = -1;
   }
   SetFlag(cptr, FLAG_DEADSOCKET);
@@ -997,11 +1004,22 @@ static void client_sock_callback(struct Event* ev)
   case ET_DESTROY:
     con_freeflag(con) &= ~FREEFLAG_SOCKET;
 
-    if (!con_freeflag(con) && !cptr)
-      free_connection(con);
+    /* Deferred close: close_connection() used shutdown() instead of close()
+     * to avoid RST.  Now actually release the file descriptor after the
+     * event engine has drained pending writes to the peer. */
+    if (s_fd(ev_socket(ev)) >= 0) {
+      close(s_fd(ev_socket(ev)));
+      s_fd(ev_socket(ev)) = -1;
+    }
+
 #ifdef USE_SSL
+    /* Free SSL BEFORE potentially freeing the Connection, because the
+     * Socket struct is embedded inside Connection.  Reversing the order
+     * would read/write freed memory (use-after-free). */
     ssl_free(ev_socket(ev));
 #endif /* USE_SSL */
+    if (!con_freeflag(con) && !cptr)
+      free_connection(con);
     break;
 
   case ET_CONNECT: /* socket connection completed */
