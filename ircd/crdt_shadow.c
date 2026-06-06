@@ -107,6 +107,43 @@ void crdt_shadow_topic(struct Channel *chptr)
                   t, (uint32_t)strlen(t) + 1, hlc, g_crdt.my_numeric);
 }
 
+/* Persistent channel-mode bits we mirror — excludes per-member CHANOP/VOICE/
+ * HALFOP, the list-modes BAN/EXCEPT, and internal flags (BURSTADDED, SAVE,
+ * FREE, WASDELJOINS) so transient bits don't cause false divergence. */
+#define CRDT_MODE_MASK (MODE_PRIVATE | MODE_SECRET | MODE_MODERATED |          \
+                        MODE_TOPICLIMIT | MODE_INVITEONLY | MODE_NOPRIVMSGS |  \
+                        MODE_KEY | MODE_LIMIT | MODE_REGONLY | MODE_DELJOINS | \
+                        MODE_REGISTERED | MODE_UPASS | MODE_APASS | MODE_REDIRECT)
+
+/** Compact, comparable snapshot of a channel's persistent mode state. */
+struct ShadowModeSnap {
+  uint32_t mode;
+  uint32_t limit;
+  char     key[KEYLEN + 1];
+};
+
+static void build_mode_snap(struct Channel *chptr, struct ShadowModeSnap *s)
+{
+  memset(s, 0, sizeof *s);
+  s->mode = chptr->mode.mode & CRDT_MODE_MASK;
+  if (s->mode & MODE_LIMIT)
+    s->limit = chptr->mode.limit;
+  if (s->mode & MODE_KEY)
+    strncpy(s->key, chptr->mode.key, sizeof s->key - 1);
+}
+
+void crdt_shadow_modes(struct Channel *chptr)
+{
+  struct ShadowModeSnap snap;
+  struct HLC hlc;
+  if (!shadow_on() || !chptr)
+    return;
+  build_mode_snap(chptr, &snap);
+  hlc = hlc_local_event(&g_crdt.clock);
+  crdt_lwwmap_set(&g_crdt.modes, chptr->chname, strlen(chptr->chname),
+                  &snap, sizeof snap, hlc, g_crdt.my_numeric);
+}
+
 void crdt_shadow_verify(void)
 {
   struct Channel *chptr;
@@ -150,6 +187,22 @@ void crdt_shadow_verify(void)
         log_write(LS_SYSTEM, L_NOTICE, 0,
                   "CRDT shadow topic divergence: %s shadow=\"%s\" real=\"%s\"",
                   chptr->chname, stopic, chptr->topic);
+      }
+    }
+    /* field-level: channel modes (bits + limit + key) must match */
+    {
+      struct ShadowModeSnap cur;
+      const struct CrdtLWWValue *mv =
+        crdt_lwwmap_get(&g_crdt.modes, chptr->chname, strlen(chptr->chname));
+      build_mode_snap(chptr, &cur);
+      /* a channel with no persistent modes matches an absent shadow entry */
+      if ((mv && (mv->data_len != sizeof cur ||
+                  memcmp(mv->data, &cur, sizeof cur) != 0)) ||
+          (!mv && cur.mode != 0)) {
+        mismatches++;
+        log_write(LS_SYSTEM, L_NOTICE, 0,
+                  "CRDT shadow mode divergence: %s real_mode=0x%x",
+                  chptr->chname, cur.mode);
       }
     }
   }

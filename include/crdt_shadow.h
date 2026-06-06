@@ -48,6 +48,10 @@ void crdt_shadow_user_remove(struct Client *cptr);
  *  Records chptr->topic into the shadow topics map. */
 void crdt_shadow_topic(struct Channel *chptr);
 
+/** Mirror a channel's mode state (called from modebuf_flush). Snapshots the
+ *  persistent mode bits + limit + key into the shadow modes map. */
+void crdt_shadow_modes(struct Channel *chptr);
+
 /** Compare the shadow CRDT membership to the real channel state and log any
  *  divergence. No-op unless FEAT_CRDT_ENABLED. */
 void crdt_shadow_verify(void);

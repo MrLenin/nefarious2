@@ -3125,7 +3125,11 @@ modebuf_mode_client(struct ModeBuf *mbuf, unsigned int mode,
 int
 modebuf_flush(struct ModeBuf *mbuf)
 {
-  return modebuf_flush_int(mbuf, 1);
+  int ret = modebuf_flush_int(mbuf, 1);
+  /* Phase 1 CRDT shadow: snapshot the channel's finalized modes
+   * (gated on FEAT_CRDT_ENABLED). */
+  crdt_shadow_modes(mbuf->mb_channel);
+  return ret;
 }
 
 /* This extracts the simple modes contained in mbuf

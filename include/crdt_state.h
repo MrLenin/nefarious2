@@ -126,6 +126,7 @@ struct CrdtNetworkState {
   struct CrdtLWWMap       users;        /**< numeric-str -> CrdtUserRecord */
   struct CrdtLWWMap       nicks;        /**< lc-nick -> CrdtNickClaim */
   struct CrdtLWWMap       topics;       /**< channel-name -> topic string */
+  struct CrdtLWWMap       modes;        /**< channel-name -> opaque mode blob */
   struct CrdtChannel     *chan_buckets[CRDT_CHAN_BUCKETS];
 };
 

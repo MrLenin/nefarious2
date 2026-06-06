@@ -137,6 +137,7 @@ void crdt_state_init(struct CrdtNetworkState *st, uint16_t my_numeric)
   crdt_lwwmap_init(&st->users);
   crdt_lwwmap_init(&st->nicks);
   crdt_lwwmap_init(&st->topics);
+  crdt_lwwmap_init(&st->modes);
 }
 
 void crdt_state_clear(struct CrdtNetworkState *st)
@@ -147,6 +148,7 @@ void crdt_state_clear(struct CrdtNetworkState *st)
   crdt_lwwmap_clear(&st->users);
   crdt_lwwmap_clear(&st->nicks);
   crdt_lwwmap_clear(&st->topics);
+  crdt_lwwmap_clear(&st->modes);
   for (int b = 0; b < CRDT_CHAN_BUCKETS; b++) {
     struct CrdtChannel *c = st->chan_buckets[b];
     while (c) {
