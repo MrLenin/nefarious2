@@ -25,6 +25,7 @@
 
 #include "bouncer_session.h"
 #include "channel.h"
+#include "crdt_shadow.h"
 #include "chathistory_presence.h"
 #include "class.h"
 #include "client.h"
@@ -801,6 +802,10 @@ void add_user_to_channel(struct Channel* chptr, struct Client* who,
      * client's anchor in this channel (no-op if a sibling connection
      * was already a member, or if the feature is disabled). */
     presence_on_channel_add(who, chptr);
+
+    /* Phase 1 CRDT shadow: mirror this membership (skips aliases, gated
+     * on FEAT_CRDT_ENABLED). Behavior-neutral when disabled. */
+    crdt_shadow_join(chptr, who, flags);
   }
 }
 
@@ -907,6 +912,12 @@ void remove_user_from_channel(struct Client* cptr, struct Channel* chptr)
      * BEFORE remove_member_from_channel because the implementation
      * walks chptr->members with @a cptr excluded. */
     presence_on_channel_remove(cptr, chptr);
+
+    /* Phase 1 CRDT shadow: mirror this removal for non-alias members
+     * (gated on FEAT_CRDT_ENABLED). Behavior-neutral when disabled. */
+    if (!IsMemberAlias(member))
+      crdt_shadow_part(chptr, cptr);
+
     if (remove_member_from_channel(member)) {
       if (channel_all_zombies(chptr)) {
         /*

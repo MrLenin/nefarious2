@@ -29,6 +29,7 @@
 #include "client.h"
 #include "handlers.h"
 #include "crdt_hlc.h"
+#include "crdt_shadow.h"
 #include "crule.h"
 #include "destruct_event.h"
 #include "hash.h"
@@ -1199,6 +1200,10 @@ int main(int argc, char **argv) {
   cli_lasttime(&me) = cli_since(&me) = cli_firsttime(&me) = CurrentTime;
 
   hlc_init((uint16_t)base64toint(cli_yxx(&me)));
+
+  /* Phase 1 CRDT shadow: initialise the shadow replica + verify timer.
+   * No-op behavior unless FEAT_CRDT_ENABLED. */
+  crdt_shadow_init((uint16_t)base64toint(cli_yxx(&me)));
 
   /* Seed MsgIdCounter from epoch milliseconds to ensure uniqueness across
    * restarts.  9 base64 chars holds ~1.8e16; epoch ms is ~1.7e12, leaving
