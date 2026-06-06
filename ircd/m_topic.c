@@ -26,6 +26,7 @@
 #include "config.h"
 
 #include "channel.h"
+#include "crdt_shadow.h"
 #include "client.h"
 #include "hash.h"
 #include "ircd.h"
@@ -156,6 +157,9 @@ static void do_settopic(struct Client *sptr, struct Client *cptr,
      ircd_strncpy((char *)&nick, cli_name(from), NICKLEN + 1);
    }
    chptr->topic_time = ts ? ts : TStime();
+
+   /* Phase 1 CRDT shadow: mirror the topic (gated on FEAT_CRDT_ENABLED). */
+   crdt_shadow_topic(chptr);
 
    /* Generate or reuse msgid before S2S relay so all servers use the same one */
    {

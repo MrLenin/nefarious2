@@ -95,6 +95,18 @@ void crdt_shadow_user_remove(struct Client *cptr)
   crdt_user_remove(&g_crdt, user_numeric(cptr, num, sizeof num));
 }
 
+void crdt_shadow_topic(struct Channel *chptr)
+{
+  struct HLC hlc;
+  const char *t;
+  if (!shadow_on())
+    return;
+  t = chptr->topic;
+  hlc = hlc_local_event(&g_crdt.clock);
+  crdt_lwwmap_set(&g_crdt.topics, chptr->chname, strlen(chptr->chname),
+                  t, (uint32_t)strlen(t) + 1, hlc, g_crdt.my_numeric);
+}
+
 void crdt_shadow_verify(void)
 {
   struct Channel *chptr;
@@ -126,6 +138,18 @@ void crdt_shadow_verify(void)
         mismatches++;
         log_write(LS_SYSTEM, L_NOTICE, 0,
                   "CRDT shadow member missing: %s in %s", num, chptr->chname);
+      }
+    }
+    /* field-level: channel topic must match */
+    {
+      const struct CrdtLWWValue *tv =
+        crdt_lwwmap_get(&g_crdt.topics, chptr->chname, strlen(chptr->chname));
+      const char *stopic = tv ? (const char *)tv->data : "";
+      if (strcmp(stopic, chptr->topic) != 0) {
+        mismatches++;
+        log_write(LS_SYSTEM, L_NOTICE, 0,
+                  "CRDT shadow topic divergence: %s shadow=\"%s\" real=\"%s\"",
+                  chptr->chname, stopic, chptr->topic);
       }
     }
   }

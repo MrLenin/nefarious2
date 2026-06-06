@@ -44,6 +44,10 @@ void crdt_shadow_user_add(struct Client *cptr);
 /** Mirror a user removal (called from exit_one_client for IsUser clients). */
 void crdt_shadow_user_remove(struct Client *cptr);
 
+/** Mirror a channel topic (called from do_settopic and the burst topic-clear).
+ *  Records chptr->topic into the shadow topics map. */
+void crdt_shadow_topic(struct Channel *chptr);
+
 /** Compare the shadow CRDT membership to the real channel state and log any
  *  divergence. No-op unless FEAT_CRDT_ENABLED. */
 void crdt_shadow_verify(void);

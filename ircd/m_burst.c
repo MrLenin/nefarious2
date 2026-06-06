@@ -82,6 +82,7 @@
 #include "config.h"
 
 #include "channel.h"
+#include "crdt_shadow.h"
 #include "client.h"
 #include "hash.h"
 #include "ircd.h"
@@ -383,6 +384,8 @@ int ms_burst(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
       chptr->topic_time = 0;
       sendcmdto_channel_butserv_butone(&his, CMD_TOPIC, chptr, NULL, 0,
                                        "%H :%s", chptr, chptr->topic);
+      /* Phase 1 CRDT shadow: mirror the topic clear (gated). */
+      crdt_shadow_topic(chptr);
     }
   } else if (chptr->creationtime == timestamp) {
     modebuf_init(mbuf = &modebuf, &me, cptr, chptr,
