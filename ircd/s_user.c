@@ -1341,6 +1341,11 @@ int set_nick_name(struct Client* cptr, struct Client* sptr,
     hAddClient(sptr);
     return auth_set_nick(cli_auth(sptr), nick);
   }
+
+  /* Phase 1 CRDT shadow: refresh the user's record after a completed nick
+   * change (cli_name now holds the new nick; gated, skips aliases). */
+  crdt_shadow_user_add(sptr);
+
   return 0;
 }
 

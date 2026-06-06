@@ -108,24 +108,53 @@ void crdt_shadow_verify(void)
   for (chptr = GlobalChannelList; chptr; chptr = chptr->next) {
     struct CrdtChannel *cc = crdt_state_channel(&g_crdt, chptr->chname, 0);
     uint32_t crdt_n = cc ? crdt_orset_size(&cc->members) : 0;
+    struct Membership *m;
+    char num[16];
     checked++;
     if (crdt_n != chptr->users) {
       mismatches++;
       log_write(LS_SYSTEM, L_NOTICE, 0,
-                "CRDT shadow divergence: %s real=%u crdt=%u",
+                "CRDT shadow count divergence: %s real=%u crdt=%u",
                 chptr->chname, chptr->users, crdt_n);
+    }
+    /* field-level: every real non-alias member must be present in the shadow */
+    for (m = chptr->members; m; m = m->next_member) {
+      if (m->status & CHFL_ALIAS)
+        continue;
+      user_numeric(m->user, num, sizeof num);
+      if (!cc || !crdt_orset_contains(&cc->members, num, strlen(num))) {
+        mismatches++;
+        log_write(LS_SYSTEM, L_NOTICE, 0,
+                  "CRDT shadow member missing: %s in %s", num, chptr->chname);
+      }
     }
   }
 
-  /* user registry: compare non-alias IsUser clients to the shadow */
-  for (acptr = GlobalClientList; acptr; acptr = cli_next(acptr))
-    if (IsUser(acptr) && !IsBouncerAlias(acptr))
-      real_users++;
+  /* user registry: existence + nick-value check for non-alias IsUser clients */
+  for (acptr = GlobalClientList; acptr; acptr = cli_next(acptr)) {
+    char num[16];
+    const struct CrdtUserRecord *r;
+    if (!IsUser(acptr) || IsBouncerAlias(acptr))
+      continue;
+    real_users++;
+    user_numeric(acptr, num, sizeof num);
+    r = crdt_user_get(&g_crdt, num);
+    if (!r) {
+      mismatches++;
+      log_write(LS_SYSTEM, L_NOTICE, 0,
+                "CRDT shadow user missing: %s (%s)", num, cli_name(acptr));
+    } else if (strcmp(r->nick, cli_name(acptr)) != 0) {
+      mismatches++;
+      log_write(LS_SYSTEM, L_NOTICE, 0,
+                "CRDT shadow nick stale: %s shadow=%s real=%s",
+                num, r->nick, cli_name(acptr));
+    }
+  }
   crdt_users = crdt_lwwmap_size(&g_crdt.users);
   if (real_users != crdt_users) {
     mismatches++;
     log_write(LS_SYSTEM, L_NOTICE, 0,
-              "CRDT shadow user divergence: real=%u crdt=%u",
+              "CRDT shadow user count divergence: real=%u crdt=%u",
               real_users, crdt_users);
   }
 
