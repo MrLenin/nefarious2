@@ -36,6 +36,14 @@ void crdt_shadow_join(struct Channel *chptr, struct Client *who,
  *  remove_user_from_channel, for non-alias members). */
 void crdt_shadow_part(struct Channel *chptr, struct Client *who);
 
+/** Mirror a registered user into the shadow user registry (called from
+ *  register_user on success). Skips bouncer aliases. Idempotent — also safe
+ *  to call on nick change to refresh the record. */
+void crdt_shadow_user_add(struct Client *cptr);
+
+/** Mirror a user removal (called from exit_one_client for IsUser clients). */
+void crdt_shadow_user_remove(struct Client *cptr);
+
 /** Compare the shadow CRDT membership to the real channel state and log any
  *  divergence. No-op unless FEAT_CRDT_ENABLED. */
 void crdt_shadow_verify(void);

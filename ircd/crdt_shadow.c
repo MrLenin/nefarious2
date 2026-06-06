@@ -15,6 +15,7 @@
 #include "channel.h"
 #include "client.h"
 #include "struct.h"          /* struct User (cli_user(c)->server) */
+#include "ircd.h"           /* GlobalClientList */
 #include "ircd_events.h"
 #include "ircd_features.h"
 #include "ircd_log.h"
@@ -68,10 +69,38 @@ void crdt_shadow_part(struct Channel *chptr, struct Client *who)
                    CRDT_PRIORITY_USER);
 }
 
+void crdt_shadow_user_add(struct Client *cptr)
+{
+  char num[16];
+  struct CrdtUserRecord rec;
+  if (!shadow_on())
+    return;
+  if (!cli_user(cptr) || IsBouncerAlias(cptr))   /* non-alias users only */
+    return;
+  memset(&rec, 0, sizeof rec);
+  strncpy(rec.nick, cli_name(cptr), sizeof rec.nick - 1);
+  strncpy(rec.ident, cli_user(cptr)->username, sizeof rec.ident - 1);
+  rec.server = (uint16_t)base64toint(cli_yxx(cli_user(cptr)->server));
+  rec.ip = 0;                                     /* unused in count verify */
+  crdt_user_set(&g_crdt, user_numeric(cptr, num, sizeof num), &rec);
+}
+
+void crdt_shadow_user_remove(struct Client *cptr)
+{
+  char num[16];
+  if (!shadow_on())
+    return;
+  if (!cli_user(cptr) || IsBouncerAlias(cptr))
+    return;
+  crdt_user_remove(&g_crdt, user_numeric(cptr, num, sizeof num));
+}
+
 void crdt_shadow_verify(void)
 {
   struct Channel *chptr;
+  struct Client *acptr;
   unsigned int checked = 0, mismatches = 0;
+  uint32_t real_users = 0, crdt_users;
 
   if (!shadow_on())
     return;
@@ -88,9 +117,21 @@ void crdt_shadow_verify(void)
     }
   }
 
+  /* user registry: compare non-alias IsUser clients to the shadow */
+  for (acptr = GlobalClientList; acptr; acptr = cli_next(acptr))
+    if (IsUser(acptr) && !IsBouncerAlias(acptr))
+      real_users++;
+  crdt_users = crdt_lwwmap_size(&g_crdt.users);
+  if (real_users != crdt_users) {
+    mismatches++;
+    log_write(LS_SYSTEM, L_NOTICE, 0,
+              "CRDT shadow user divergence: real=%u crdt=%u",
+              real_users, crdt_users);
+  }
+
   log_write(LS_SYSTEM, L_NOTICE, 0,
-            "CRDT shadow verify: %u channels checked, %u mismatch(es)",
-            checked, mismatches);
+            "CRDT shadow verify: %u channels, %u/%u users, %u mismatch(es)",
+            checked, crdt_users, real_users, mismatches);
 
   /* Single-node shadow mode has no peers, so everything we have applied is
    * causally stable relative to our own state vector — GC keeps the shadow's

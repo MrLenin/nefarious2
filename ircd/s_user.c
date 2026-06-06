@@ -32,6 +32,7 @@
 #include "capab.h"
 #include "IPcheck.h"
 #include "channel.h"
+#include "crdt_shadow.h"
 #include "class.h"
 #include "client.h"
 #include "hash.h"
@@ -1001,6 +1002,10 @@ int register_user(struct Client *cptr, struct Client *sptr)
    * produce a phantom second "online" notification. */
   if (!IsBouncerAlias(sptr))
     check_status_watch(sptr, RPL_LOGON);
+
+  /* Phase 1 CRDT shadow: mirror the registered user (gated on
+   * FEAT_CRDT_ENABLED; skips bouncer aliases internally). */
+  crdt_shadow_user_add(sptr);
 
   return 0;
 }

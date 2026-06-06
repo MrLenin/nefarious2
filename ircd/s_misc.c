@@ -33,6 +33,7 @@
 #include "channel.h"
 #include "client.h"
 #include "crdt_hlc.h"
+#include "crdt_shadow.h"
 #include "forwarded_label.h"
 #include "hash.h"
 #include "ircd.h"
@@ -328,6 +329,10 @@ static void exit_one_client(struct Client* bcptr, const char* comment)
     chathistory_fed_cleanup_link(bcptr);
   }
   if (IsUser(bcptr)) {
+    /* Phase 1 CRDT shadow: mirror user removal while cli_user + numeric are
+     * still valid (gated on FEAT_CRDT_ENABLED; skips bouncer aliases). */
+    crdt_shadow_user_remove(bcptr);
+
     /* Purge per-Client ephemeral session-scoped state before the rest
      * of the teardown sequence — cli_session_id is still valid here,
      * which lets future subsystems (chathistory PM ring, read-marker
