@@ -495,6 +495,19 @@ enum Feature {
   FEAT_GITSYNC_HOST_FINGERPRINT,
 #endif
 
+  /* CRDT mesh S2S (crdt-mesh branch) — all OFF by default; the custom-C
+   * CRDT engine and its sync/wire layer are gated behind these. The engine
+   * primitives themselves take parameters in and do NOT read these flags;
+   * only the (future) integration layer consults them. */
+  FEAT_CRDT_ENABLED,
+  FEAT_CRDT_SYNC,
+  FEAT_CRDT_MESH,
+  FEAT_CRDT_PRIMARY,
+  FEAT_CRDT_GC_INTERVAL,
+  FEAT_CRDT_BATCH_MS,
+  FEAT_CRDT_STALE_TIMEOUT,
+  FEAT_CRDT_OPLOG_MAX,
+
   FEAT_LAST_F
 };
 

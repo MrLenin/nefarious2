@@ -50,6 +50,21 @@ Configuration options can be viewed with `./configure --help`. Common options:
 - `--prefix=PATH` - Installation prefix (default: $HOME)
 - `--libdir=PATH`, `--bindir=PATH`, `--mandir=PATH` - Specific install directories
 
+## Testing & TDD
+
+Unit tests are CMocka suites under `ircd/test/` (`*_cmocka.c`), registered in
+`ircd/test/Makefile.in` (`CMOCKA_TESTPROGS` + `CMOCKA_SRC` + a per-suite `*_OBJS`/rule).
+Build/run them with `make -C ircd/test cmocka` (the Docker build runs them and gates the
+image). Each suite links `test_stub.o` plus the specific `../*.o` it exercises.
+
+**Test-first (TDD) for new subsystems.** When building a new self-contained component
+(this branch's CRDT engine is the model: `crdt_types.c`, `crdt_state.c`), write the failing
+CMocka suite **first** (encode the success criteria as assertions), watch it fail, then
+implement to green and refactor. Keep engine code free of `feature_int`/`Client`/event-loop
+deps so it links in the harness with only `test_stub.o` — read feature flags in the
+integration layer, not the primitives. Skip TDD only for trivial edits or where a
+behavioral test can't be constructed.
+
 ## Docker Build
 
 The multi-stage `Dockerfile` is at the repo root (GitHub Actions `docker-publish.yml` builds it on push):

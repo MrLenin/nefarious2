@@ -94,6 +94,8 @@ IRCD_SRC = \
 	class.c \
 	client.c \
 	crdt_hlc.c \
+	crdt_types.c \
+	crdt_state.c \
 	crule.c \
 	dbuf.c \
 	db_rocksdb.c \

@@ -1356,6 +1356,19 @@ static struct FeatureDesc {
   F_S(GITSYNC_HOST_FINGERPRINT, 0, "", 0),  /* SSH host key fingerprint (TOFU) */
 #endif
 
+  /* CRDT mesh S2S — all OFF by default (engine gated; see ircd_features.h).
+   * Booleans: master switch + per-phase gates. Ints: GC / batching tuning.
+   * Order here must mirror the enum tail in ircd_features.h (features[] is
+   * indexed by enum ordinal). */
+  F_B(CRDT_ENABLED, 0, 0, 0),
+  F_B(CRDT_SYNC, 0, 0, 0),
+  F_B(CRDT_MESH, 0, 0, 0),
+  F_B(CRDT_PRIMARY, 0, 0, 0),
+  F_I(CRDT_GC_INTERVAL, 0, 60, 0),
+  F_I(CRDT_BATCH_MS, 0, 10, 0),
+  F_I(CRDT_STALE_TIMEOUT, 0, 300, 0),
+  F_I(CRDT_OPLOG_MAX, 0, 100000, 0),
+
 #undef F_S
 #undef F_B
 #undef F_I
