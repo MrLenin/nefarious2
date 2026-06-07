@@ -573,7 +573,7 @@ static int completed_connection(struct Client* cptr)
   /* Flag string: h=hub, 6=ipv6, o=oplevels, v=IRCv3-aware S2S extensions,
    * F=BX F (reconcile-end) handshake supported.
    * Legacy peers ignore unknown flag chars. */
-  sendrawto_one(cptr, MSG_SERVER " %s 1 %Tu %Tu J%s %s%s +%s6%svF :%s",
+  sendrawto_one(cptr, MSG_SERVER " %s 1 %Tu %Tu J%s %s%s +%s6%svFC :%s",
                 cli_name(&me), cli_serv(&me)->timestamp, newts,
 		MAJOR_PROTOCOL, NumServCap(&me),
 		feature_bool(FEAT_HUB) ? "h" : "",

@@ -164,6 +164,12 @@ int  crdt_state_sync(struct CrdtNetworkState *dst,
 int  crdt_state_equal(const struct CrdtNetworkState *a,
                       const struct CrdtNetworkState *b);
 
+/** Order-independent digest of the ENTIRE CRDT document, including OR-Set
+ *  add-tags and tombstones (not just materialized state). Two replicas that
+ *  have exchanged all ops produce the same digest; tag divergence (e.g. before
+ *  delta sync unions per-origin tags) produces different digests. */
+uint64_t crdt_state_digest(const struct CrdtNetworkState *st);
+
 /* ---- causal-stability GC ---- */
 /** GC oplog + all channel member sets against a stable state vector. Returns
  *  total tombstones+ops freed. (Only sound over priority-0 churn — see

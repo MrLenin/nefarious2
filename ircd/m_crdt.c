@@ -93,6 +93,16 @@ void crdt_sync_request(struct Client *peer)
   sendcmdto_one(&me, CMD_CRDT_REPLICATION, peer, "S :%s", b64);
 }
 
+void crdt_sync_broadcast(void)
+{
+  struct Client *acptr;
+  if (!crdt_shadow_active())
+    return;
+  for (acptr = GlobalClientList; acptr; acptr = cli_next(acptr))
+    if (IsServer(acptr) && MyConnect(acptr) && IsCrdtAware(acptr))
+      crdt_sync_request(acptr);
+}
+
 int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
 {
   const char *sub;

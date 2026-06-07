@@ -79,4 +79,7 @@ int crdt_shadow_encode_delta(const uint8_t *remote_sv, size_t sv_len,
 /** Decode + apply a delta into the shadow document. Returns ops applied, or -1. */
 int crdt_shadow_apply_delta(const uint8_t *buf, size_t len);
 
+/** Digest of the shadow CRDT document (for cross-server convergence checks). */
+uint64_t crdt_shadow_digest(void);
+
 #endif /* INCLUDED_crdt_shadow_h */

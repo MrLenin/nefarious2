@@ -21,6 +21,7 @@
 #include "ircd_features.h"
 #include "ircd_log.h"
 #include "numnicks.h"
+#include "handlers.h"        /* crdt_sync_broadcast */
 
 #include <stdio.h>
 #include <string.h>
@@ -309,8 +310,10 @@ void crdt_shadow_verify(void)
   }
 
   log_write(LS_SYSTEM, L_NOTICE, 0,
-            "CRDT shadow verify: %u channels, %u/%u users, %u mismatch(es)",
-            checked, crdt_users, real_users, mismatches);
+            "CRDT shadow verify: %u channels, %u/%u users, %u mismatch(es) "
+            "digest=%016llx",
+            checked, crdt_users, real_users, mismatches,
+            (unsigned long long)crdt_state_digest(&g_crdt));
 
   /* NOTE: the oplog is intentionally NOT GC'd against our own state vector
    * here — Phase 2 delta sync needs ops retained until peers have caught up.
@@ -350,12 +353,18 @@ int crdt_shadow_apply_delta(const uint8_t *buf, size_t len)
   return crdt_delta_apply(&g_crdt, buf, len);
 }
 
+uint64_t crdt_shadow_digest(void)
+{
+  return g_inited ? crdt_state_digest(&g_crdt) : 0;
+}
+
 /** Periodic timer callback. */
 static void crdt_shadow_verify_cb(struct Event *ev)
 {
   if (ev_type(ev) != ET_EXPIRE)
     return;
   crdt_shadow_verify();
+  crdt_sync_broadcast();   /* periodic anti-entropy: pull deltas from peers */
 }
 
 void crdt_shadow_init(uint16_t my_numeric)

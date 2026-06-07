@@ -413,6 +413,108 @@ int crdt_state_equal(const struct CrdtNetworkState *a,
 }
 
 /* ------------------------------------------------------------------ */
+/* digest (order-independent; includes tags + tombstones)             */
+/* ------------------------------------------------------------------ */
+
+#define FNV64_OFFSET 14695981039346656037ULL
+
+static uint64_t fnv64(uint64_t h, const void *d, size_t n)
+{
+  const unsigned char *p = d;
+  size_t i;
+  for (i = 0; i < n; i++) { h ^= p[i]; h *= 1099511628211ULL; }
+  return h;
+}
+
+/* Hash HLC / CrdtTag field-by-field — never the raw struct, whose padding
+ * bytes are unspecified and would make the digest nondeterministic. */
+static uint64_t hash_hlc(uint64_t h, const struct HLC *t)
+{
+  h = fnv64(h, &t->physical_ms, sizeof t->physical_ms);
+  h = fnv64(h, &t->logical, sizeof t->logical);
+  h = fnv64(h, &t->node_id, sizeof t->node_id);
+  return h;
+}
+static uint64_t hash_tag(uint64_t h, const struct CrdtTag *tg)
+{
+  h = fnv64(h, &tg->origin, sizeof tg->origin);
+  h = fnv64(h, &tg->seq, sizeof tg->seq);
+  return h;
+}
+
+static uint64_t digest_lww(uint64_t acc, const struct CrdtLWWMap *m, uint8_t ns)
+{
+  uint32_t b;
+  for (b = 0; b < m->nbuckets; b++) {
+    struct CrdtLWWEntry *e;
+    for (e = m->buckets[b]; e; e = e->ht_next) {
+      uint64_t h = FNV64_OFFSET;
+      h = fnv64(h, &ns, 1);
+      h = fnv64(h, e->key, e->key_len);
+      h = fnv64(h, &e->deleted, sizeof e->deleted);
+      if (!e->deleted) {
+        h = fnv64(h, e->val.data, e->val.data_len);
+        h = hash_hlc(h, &e->val.ts);
+        h = fnv64(h, &e->val.writer, sizeof e->val.writer);
+      }
+      acc ^= h;
+    }
+  }
+  return acc;
+}
+
+static uint64_t digest_orset(uint64_t acc, const struct CrdtORSet *s,
+                             const char *cname, uint32_t cnlen, uint8_t ns)
+{
+  uint32_t b;
+  uint16_t i;
+  for (b = 0; b < s->nbuckets; b++) {
+    struct CrdtORSetEntry *e;
+    for (e = s->buckets[b]; e; e = e->ht_next)
+      for (i = 0; i < e->add_count; i++) {
+        uint64_t h = FNV64_OFFSET;
+        h = fnv64(h, &ns, 1);
+        h = fnv64(h, cname, cnlen);
+        h = fnv64(h, e->key, e->key_len);
+        h = hash_tag(h, &e->add_tags[i]);
+        acc ^= h;
+      }
+  }
+  for (b = 0; b < s->tomb_nbuckets; b++) {
+    struct CrdtTombstone *t;
+    for (t = s->tomb[b]; t; t = t->ht_next) {
+      uint64_t h = FNV64_OFFSET;
+      h = fnv64(h, &ns, 1);
+      h = fnv64(h, cname, cnlen);
+      h = hash_tag(h, &t->tag);
+      h = fnv64(h, &t->priority, 1);
+      acc ^= h;
+    }
+  }
+  return acc;
+}
+
+uint64_t crdt_state_digest(const struct CrdtNetworkState *st)
+{
+  uint64_t acc = 0;
+  int bk;
+  acc = digest_lww(acc, &st->servers, 1);
+  acc = digest_lww(acc, &st->users, 2);
+  acc = digest_lww(acc, &st->nicks, 3);
+  acc = digest_lww(acc, &st->topics, 4);
+  acc = digest_lww(acc, &st->modes, 5);
+  for (bk = 0; bk < CRDT_CHAN_BUCKETS; bk++) {
+    struct CrdtChannel *c;
+    for (c = st->chan_buckets[bk]; c; c = c->next) {
+      acc = digest_orset(acc, &c->members, c->name, c->name_len, 10);
+      acc = digest_orset(acc, &c->bans, c->name, c->name_len, 11);
+      acc = digest_orset(acc, &c->excepts, c->name, c->name_len, 12);
+    }
+  }
+  return acc;
+}
+
+/* ------------------------------------------------------------------ */
 /* causal-stability GC                                                */
 /* ------------------------------------------------------------------ */
 
