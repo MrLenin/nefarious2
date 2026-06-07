@@ -31,6 +31,16 @@ static struct CrdtNetworkState g_crdt;
 static int                     g_inited = 0;
 static struct Timer            g_verify_timer;
 
+/** Recorded peer state vectors, for causal-stability GC (one slot per peer). */
+#define CRDT_MAX_PEERS 8
+struct crdt_peer_sv {
+  int                    used;
+  uint16_t               origin;
+  time_t                 when;
+  struct CrdtStateVector sv;
+};
+static struct crdt_peer_sv g_peers[CRDT_MAX_PEERS];
+
 /** How often the shadow is reconciled against real state (seconds). */
 #define CRDT_VERIFY_INTERVAL 30
 
@@ -354,6 +364,50 @@ uint64_t crdt_shadow_digest(void)
   return g_inited ? crdt_state_digest(&g_crdt) : 0;
 }
 
+void crdt_shadow_record_peer_sv(uint16_t origin, const uint8_t *sv, size_t len)
+{
+  int i, slot = -1;
+  if (!g_inited)
+    return;
+  for (i = 0; i < CRDT_MAX_PEERS; i++) {
+    if (g_peers[i].used && g_peers[i].origin == origin) { slot = i; break; }
+    if (slot < 0 && !g_peers[i].used) slot = i;
+  }
+  if (slot < 0)
+    return;                                  /* table full */
+  if (crdt_sv_decode(&g_peers[slot].sv, sv, len) < 0)
+    return;
+  g_peers[slot].used = 1;
+  g_peers[slot].origin = origin;
+  g_peers[slot].when = CurrentTime;
+}
+
+/* Causal-stability GC: reclaim ops/tombstones every fresh peer has seen, i.e.
+ * everything below the component-wise min of (our SV, each fresh peer's SV).
+ * Stale peers (no SV within FEAT_CRDT_STALE_TIMEOUT) are excluded so an offline
+ * peer can't freeze GC network-wide. */
+static void crdt_shadow_gc(void)
+{
+  static struct CrdtStateVector gmin;        /* static: avoid a 32KB stack frame */
+  const struct CrdtStateVector *vecs[CRDT_MAX_PEERS + 1];
+  int i, n = 0, freed;
+  time_t cutoff;
+  if (!shadow_on())
+    return;
+  vecs[n++] = &g_crdt.local_sv;
+  cutoff = CurrentTime - feature_int(FEAT_CRDT_STALE_TIMEOUT);
+  for (i = 0; i < CRDT_MAX_PEERS; i++)
+    if (g_peers[i].used && g_peers[i].when >= cutoff)
+      vecs[n++] = &g_peers[i].sv;
+  if (n < 2)
+    return;                                  /* no fresh peer -> nothing safe to GC */
+  crdt_sv_global_min(&gmin, vecs, n);
+  freed = crdt_state_gc(&g_crdt, &gmin);
+  if (freed > 0)
+    log_write(LS_SYSTEM, L_NOTICE, 0,
+              "CRDT GC: reclaimed %d op/tombstone(s) (causally stable)", freed);
+}
+
 /** Periodic timer callback. */
 static void crdt_shadow_verify_cb(struct Event *ev)
 {
@@ -361,6 +415,7 @@ static void crdt_shadow_verify_cb(struct Event *ev)
     return;
   crdt_shadow_verify();
   crdt_sync_broadcast();   /* periodic anti-entropy: pull deltas from peers */
+  crdt_shadow_gc();        /* reclaim causally-stable ops/tombstones */
 }
 
 void crdt_shadow_init(uint16_t my_numeric)

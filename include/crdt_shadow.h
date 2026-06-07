@@ -82,4 +82,8 @@ int crdt_shadow_apply_delta(const uint8_t *buf, size_t len);
 /** Digest of the shadow CRDT document (for cross-server convergence checks). */
 uint64_t crdt_shadow_digest(void);
 
+/** Record a peer's encoded state vector (from CR S / CR V), keyed by the peer's
+ *  server numeric, for causal-stability GC. */
+void crdt_shadow_record_peer_sv(uint16_t origin, const uint8_t *sv, size_t len);
+
 #endif /* INCLUDED_crdt_shadow_h */

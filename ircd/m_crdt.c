@@ -112,11 +112,14 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
   sub = parv[1];
 
   if (sub[0] == 'S' && !sub[1]) {
-    /* peer's state vector -> reply with the delta it is missing */
+    /* peer's state vector -> record it (for GC) + reply with the delta it lacks */
     uint8_t svbytes[8192];
     int svn = crdt_b64_decode(parv[parc - 1], svbytes, sizeof svbytes);
-    if (svn >= 0)
+    if (svn >= 0) {
+      crdt_shadow_record_peer_sv((uint16_t)base64toint(cli_yxx(cptr)),
+                                 svbytes, (size_t)svn);
       send_crdt_delta(cptr, svbytes, svn);
+    }
   } else if ((sub[0] == 'D' || sub[0] == 'U') && !sub[1]) {
     /* delta / incremental chunk: <id> <+|.> :<b64> */
     char *full = NULL;
@@ -140,8 +143,12 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
       MyFree(bin);
     }
   } else if (sub[0] == 'V' && !sub[1]) {
-    /* version broadcast for causal-stability GC — recorded in a later
-     * increment; ignore for now. */
+    /* version broadcast: record the peer's SV for causal-stability GC */
+    uint8_t svbytes[8192];
+    int svn = crdt_b64_decode(parv[parc - 1], svbytes, sizeof svbytes);
+    if (svn >= 0)
+      crdt_shadow_record_peer_sv((uint16_t)base64toint(cli_yxx(cptr)),
+                                 svbytes, (size_t)svn);
   }
   return 0;
 }
