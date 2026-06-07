@@ -400,6 +400,59 @@ static void test_wire_digest_converges(void **state)
   crdt_state_clear(&s2);
 }
 
+/* Two replicas make CONCURRENT, CONFLICTING changes to the same entities with
+ * no coordination, then sync. They must still converge to the same digest --
+ * the core CRDT guarantee under contention (concurrent LWW conflict on a key,
+ * concurrent part-vs-keep on a member, conflicting topic + modes). */
+static void test_wire_concurrent_converges(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s1, s2;
+  uint8_t buf[8192];
+  int n, r;
+  struct CrdtUserRecord ua = mkuser("alice", 1, "a", 0x0A);
+  struct CrdtUserRecord ub = mkuser("bob", 1, "b", 0x0B);
+  struct CrdtUserRecord aX = mkuser("aliceX", 1, "a", 0x0A);
+  struct CrdtUserRecord aY = mkuser("aliceY", 1, "a", 0x0A);
+  uint8_t m1[2] = { 0x10, 0 }, m2[2] = { 0x20, 0 };
+  crdt_state_init(&s1, 1);
+  crdt_state_init(&s2, 2);
+
+  /* shared baseline, mirrored independently on each side (own origin tags) */
+  crdt_user_set(&s1, "AAAAA", &ua); crdt_chan_join(&s1, "#x", "AAAAA");
+  crdt_user_set(&s2, "AAAAA", &ua); crdt_chan_join(&s2, "#x", "AAAAA");
+  crdt_user_set(&s1, "BBBBB", &ub); crdt_chan_join(&s1, "#x", "BBBBB");
+  crdt_user_set(&s2, "BBBBB", &ub); crdt_chan_join(&s2, "#x", "BBBBB");
+
+  /* --- concurrent, conflicting ops (no sync between them) --- */
+  crdt_user_set(&s1, "AAAAA", &aX);                 /* A's record two ways  */
+  crdt_user_set(&s2, "AAAAA", &aY);
+  crdt_chan_remove(&s1, "#x", "BBBBB", CRDT_PRIORITY_USER); /* s1 parts B    */
+  crdt_user_set(&s2, "CCCCC", &ub); crdt_chan_join(&s2, "#x", "CCCCC"); /* s2 adds C */
+  crdt_topic_set(&s1, "#x", "topic-one");           /* conflicting topic    */
+  crdt_topic_set(&s2, "#x", "topic-two");
+  crdt_modes_set(&s1, "#x", m1, sizeof m1);         /* conflicting modes    */
+  crdt_modes_set(&s2, "#x", m2, sizeof m2);
+
+  assert_true(crdt_state_digest(&s1) != crdt_state_digest(&s2));  /* diverged */
+
+  /* exchange deltas both ways (two rounds to flush relayed ops) */
+  for (r = 0; r < 2; r++) {
+    n = crdt_delta_encode(&s1.oplog, &s2.local_sv, buf, sizeof buf);
+    crdt_delta_apply(&s2, buf, (size_t)n);
+    n = crdt_delta_encode(&s2.oplog, &s1.local_sv, buf, sizeof buf);
+    crdt_delta_apply(&s1, buf, (size_t)n);
+  }
+
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));  /* converged */
+  /* idempotent: nothing left to apply either way */
+  n = crdt_delta_encode(&s1.oplog, &s2.local_sv, buf, sizeof buf);
+  assert_int_equal(0, crdt_delta_apply(&s2, buf, (size_t)n));
+
+  crdt_state_clear(&s1);
+  crdt_state_clear(&s2);
+}
+
 static void test_wire_b64_roundtrip(void **state)
 {
   (void)state;
@@ -478,6 +531,7 @@ int main(void)
     cmocka_unit_test(test_wire_sv_roundtrip),
     cmocka_unit_test(test_wire_delta_converges),
     cmocka_unit_test(test_wire_digest_converges),
+    cmocka_unit_test(test_wire_concurrent_converges),
     cmocka_unit_test(test_wire_b64_roundtrip),
     cmocka_unit_test(test_chunk_reassembles),
     cmocka_unit_test(test_chunk_isolation),
