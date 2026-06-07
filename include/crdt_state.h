@@ -186,6 +186,12 @@ int  crdt_state_equal(const struct CrdtNetworkState *a,
  *  delta sync unions per-origin tags) produces different digests. */
 uint64_t crdt_state_digest(const struct CrdtNetworkState *st);
 
+/** Materialized-state digest: PRESENT OR-Set elements + LWW maps only, with no
+ *  GC-reclaimable add-tags/tombstones. Invariant under independent GC — the
+ *  true convergence metric (two replicas with equal observable state agree even
+ *  if they have GC'd different tombstone subsets). */
+uint64_t crdt_state_digest_materialized(const struct CrdtNetworkState *st);
+
 /* ---- causal-stability GC ---- */
 /** GC oplog + all channel member sets against a stable state vector. Returns
  *  total tombstones+ops freed. (Only sound over priority-0 churn — see

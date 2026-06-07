@@ -531,6 +531,29 @@ static void test_snapshot_recovers_gc_gap(void **state)
   crdt_state_clear(&s2);
 }
 
+/* The materialized digest is invariant under GC (it hashes only present
+ * elements), while the full digest is not (it hashes reclaimable tombstones).
+ * This is why two replicas with identical live state but different GC progress
+ * agree on mdigest but not digest -- mdigest is the real convergence metric. */
+static void test_materialized_digest_gc_invariant(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s;
+  uint64_t m_before, m_after, full_before, full_after;
+  crdt_state_init(&s, 1);
+  crdt_chan_join(&s, "#g", "AAAAA");
+  crdt_chan_join(&s, "#g", "BBBBB");
+  crdt_chan_remove(&s, "#g", "BBBBB", CRDT_PRIORITY_USER);  /* leaves a tombstone */
+  m_before = crdt_state_digest_materialized(&s);
+  full_before = crdt_state_digest(&s);
+  crdt_state_gc(&s, &s.local_sv);             /* reclaim the stable tombstone */
+  m_after = crdt_state_digest_materialized(&s);
+  full_after = crdt_state_digest(&s);
+  assert_int_equal(m_before, m_after);        /* materialized: unchanged by GC */
+  assert_int_not_equal(full_before, full_after); /* full: tombstone reclaimed */
+  crdt_state_clear(&s);
+}
+
 static void test_wire_b64_roundtrip(void **state)
 {
   (void)state;
@@ -613,6 +636,7 @@ int main(void)
     cmocka_unit_test(test_snapshot_roundtrip),
     cmocka_unit_test(test_gc_advances_floor),
     cmocka_unit_test(test_snapshot_recovers_gc_gap),
+    cmocka_unit_test(test_materialized_digest_gc_invariant),
     cmocka_unit_test(test_wire_b64_roundtrip),
     cmocka_unit_test(test_chunk_reassembles),
     cmocka_unit_test(test_chunk_isolation),

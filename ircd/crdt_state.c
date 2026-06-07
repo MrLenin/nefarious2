@@ -562,6 +562,50 @@ uint64_t crdt_state_digest(const struct CrdtNetworkState *st)
   return acc;
 }
 
+/* Materialized-state digest: hash only PRESENT OR-Set elements (no add-tags,
+ * no tombstones), plus the LWW maps (which carry no GC-reclaimable bookkeeping).
+ * Unlike crdt_state_digest this is invariant under independent/asymmetric GC —
+ * two replicas with the same observable state agree even if they have reclaimed
+ * different tombstone subsets. This is the true convergence metric. */
+static uint64_t digest_orset_present(uint64_t acc, const struct CrdtORSet *s,
+                                     const char *cname, uint32_t cnlen,
+                                     uint8_t ns)
+{
+  uint32_t b;
+  for (b = 0; b < s->nbuckets; b++) {
+    struct CrdtORSetEntry *e;
+    for (e = s->buckets[b]; e; e = e->ht_next)
+      if (crdt_orset_contains(s, e->key, e->key_len)) {
+        uint64_t h = FNV64_OFFSET;
+        h = fnv64(h, &ns, 1);
+        h = fnv64(h, cname, cnlen);
+        h = fnv64(h, e->key, e->key_len);
+        acc ^= h;
+      }
+  }
+  return acc;
+}
+
+uint64_t crdt_state_digest_materialized(const struct CrdtNetworkState *st)
+{
+  uint64_t acc = 0;
+  int bk;
+  acc = digest_lww(acc, &st->servers, 1);
+  acc = digest_lww(acc, &st->users, 2);
+  acc = digest_lww(acc, &st->nicks, 3);
+  acc = digest_lww(acc, &st->topics, 4);
+  acc = digest_lww(acc, &st->modes, 5);
+  for (bk = 0; bk < CRDT_CHAN_BUCKETS; bk++) {
+    struct CrdtChannel *c;
+    for (c = st->chan_buckets[bk]; c; c = c->next) {
+      acc = digest_orset_present(acc, &c->members, c->name, c->name_len, 10);
+      acc = digest_orset_present(acc, &c->bans, c->name, c->name_len, 11);
+      acc = digest_orset_present(acc, &c->excepts, c->name, c->name_len, 12);
+    }
+  }
+  return acc;
+}
+
 
 /* ------------------------------------------------------------------ */
 /* causal-stability GC                                                */

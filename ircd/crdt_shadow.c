@@ -317,9 +317,10 @@ void crdt_shadow_verify(void)
 
   log_write(LS_SYSTEM, L_NOTICE, 0,
             "CRDT shadow verify: %u channels, %u/%u users, %u mismatch(es) "
-            "digest=%016llx",
+            "digest=%016llx mdigest=%016llx",
             checked, crdt_users, real_users, mismatches,
-            (unsigned long long)crdt_state_digest(&g_crdt));
+            (unsigned long long)crdt_state_digest(&g_crdt),
+            (unsigned long long)crdt_state_digest_materialized(&g_crdt));
 
   /* NOTE: the oplog is intentionally NOT GC'd against our own state vector
    * here — Phase 2 delta sync needs ops retained until peers have caught up.
@@ -406,25 +407,48 @@ void crdt_shadow_record_peer_sv(uint16_t origin, const uint8_t *sv, size_t len)
   g_peers[slot].when = CurrentTime;
 }
 
-/* Causal-stability GC: reclaim ops/tombstones every fresh peer has seen, i.e.
- * everything below the component-wise min of (our SV, each fresh peer's SV).
- * Stale peers (no SV within FEAT_CRDT_STALE_TIMEOUT) are excluded so an offline
- * peer can't freeze GC network-wide. */
+/* SV cached for a peer numeric (from CR S / CR V), or NULL if not yet reported. */
+static const struct CrdtStateVector *peer_sv_lookup(uint16_t origin)
+{
+  int i;
+  for (i = 0; i < CRDT_MAX_PEERS; i++)
+    if (g_peers[i].used && g_peers[i].origin == origin)
+      return &g_peers[i].sv;
+  return NULL;
+}
+
+/* Causal-stability GC: reclaim everything below the component-wise min of (our
+ * SV, each CONNECTED CRDT peer's SV). Inclusion is by live connection state, not
+ * by last-CR-S timestamp: a peer that is currently linked is always counted
+ * (with its best-known SV, or all-zero if it hasn't reported yet -> conservative,
+ * blocks GC of its component until it does). A peer that has SQUIT simply isn't
+ * in the list, so GC advances past it and a CR F snapshot catches it up on
+ * rejoin. (The old timestamp-staleness flapped whenever stale_timeout fell below
+ * the CR S broadcast interval, risking reclaiming ops a live-but-quiet peer
+ * still needed.) NOTE: correct while every CRDT server is a DIRECT peer (star);
+ * a multi-hop CRDT mesh needs transitive SV propagation (CR V flooding). */
 static void crdt_shadow_gc(void)
 {
   static struct CrdtStateVector gmin;        /* static: avoid a 32KB stack frame */
+  static struct CrdtStateVector zero;        /* all-zero, for an unreported peer */
   const struct CrdtStateVector *vecs[CRDT_MAX_PEERS + 1];
-  int i, n = 0, freed;
-  time_t cutoff;
+  int n = 0, npeers = 0, freed;
+  struct Client *acptr;
   if (!shadow_on())
     return;
   vecs[n++] = &g_crdt.local_sv;
-  cutoff = CurrentTime - feature_int(FEAT_CRDT_STALE_TIMEOUT);
-  for (i = 0; i < CRDT_MAX_PEERS; i++)
-    if (g_peers[i].used && g_peers[i].when >= cutoff)
-      vecs[n++] = &g_peers[i].sv;
-  if (n < 2)
-    return;                                  /* no fresh peer -> nothing safe to GC */
+  for (acptr = GlobalClientList; acptr; acptr = cli_next(acptr)) {
+    if (IsServer(acptr) && MyConnect(acptr) && IsCrdtAware(acptr)) {
+      const struct CrdtStateVector *sv =
+        peer_sv_lookup((uint16_t)base64toint(cli_yxx(acptr)));
+      vecs[n++] = sv ? sv : &zero;
+      npeers++;
+      if (n > CRDT_MAX_PEERS)
+        break;
+    }
+  }
+  if (npeers < 1)
+    return;                                  /* no connected CRDT peer */
   crdt_sv_global_min(&gmin, vecs, n);
   freed = crdt_state_gc(&g_crdt, &gmin);
   if (freed > 0)
