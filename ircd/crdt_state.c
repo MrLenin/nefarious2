@@ -135,6 +135,7 @@ void crdt_state_init(struct CrdtNetworkState *st, uint16_t my_numeric)
   st->clock.logical = 0;
   st->clock.node_id = my_numeric;
   crdt_sv_init(&st->local_sv);
+  crdt_sv_init(&st->gc_floor);
   crdt_lwwmap_init(&st->servers);
   crdt_lwwmap_init(&st->users);
   crdt_lwwmap_init(&st->nicks);
@@ -352,6 +353,12 @@ static struct CrdtLWWMap *lww_for(struct CrdtNetworkState *st,
   case CRDT_COLL_MODES:   return &st->modes;
   default:                return NULL;
   }
+}
+
+struct CrdtLWWMap *crdt_state_lww_for(struct CrdtNetworkState *st,
+                                      enum CrdtCollection coll)
+{
+  return lww_for(st, coll);
 }
 
 void crdt_state_apply_op(struct CrdtNetworkState *st, const struct CrdtOp *op)
@@ -592,6 +599,11 @@ int crdt_state_gc(struct CrdtNetworkState *st,
       freed += crdt_orset_gc(&c->bans, stable);
       freed += crdt_orset_gc(&c->excepts, stable);
     }
+
+  /* record the reclaimed cut: anything <= gc_floor is gone from the oplog, so a
+   * peer whose SV is below it must be sent a full snapshot, not a delta. */
+  for (int i = 0; i < CRDT_MAX_SERVERS; i++)
+    crdt_sv_update(&st->gc_floor, (uint16_t)i, stable->seq[i]);
 
   return freed;
 }

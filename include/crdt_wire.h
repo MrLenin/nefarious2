@@ -50,6 +50,27 @@ int crdt_delta_encode(const struct CrdtOpLog *log,
 int crdt_delta_apply(struct CrdtNetworkState *st,
                      const uint8_t *buf, size_t len);
 
+/* ---- full-state snapshot (CR F) ----
+ * Serializes the ENTIRE materialized document — all five LWW maps and every
+ * channel's member/ban/except OR-Sets (add-tags AND tombstones) — plus the
+ * sender's state vector. This is the fallback for when a peer has fallen behind
+ * the GC floor: the ops it needs are gone from the oplog, so a delta can't
+ * reconstruct them. Layout:
+ *   [sv_len:2][sv]
+ *   [lww_total:4] then each [coll:1][key_len:2][key][deleted:1]
+ *                          [ts.physical:8][ts.logical:2][ts.node:2][writer:2]
+ *                          [val_len:4][val]
+ *   [chan_count:4] then each [name_len:2][name] x3 OR-Sets, each:
+ *        [add_count:4]  add*[key_len:2][key][tag.origin:2][tag.seq:8]
+ *        [tomb_count:4] tomb*[tag.origin:2][tag.seq:8][priority:1]
+ * apply merges it in (LWW adopt-if-newer, OR-Set union — so the receiver's own
+ * newer/unsent state survives) and raises local_sv to the snapshot's SV.
+ * encode returns bytes written or -1; apply returns 0 on success, -1 on error. */
+int crdt_snapshot_encode(const struct CrdtNetworkState *st,
+                         uint8_t *buf, size_t cap);
+int crdt_snapshot_apply(struct CrdtNetworkState *st,
+                        const uint8_t *buf, size_t len);
+
 /* ---- base64 (RFC 4648, standard alphabet) for putting binary on the P10
  * wire. encode: out gets a NUL-terminated string, returns its length or -1 if
  * cap too small. decode: returns decoded byte count, or -1 if cap too small;

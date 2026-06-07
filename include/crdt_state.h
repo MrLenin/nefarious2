@@ -125,6 +125,10 @@ struct CrdtNetworkState {
                                          *   NOT the crdt_hlc global — lets
                                          *   multiple states coexist in-proc) */
   struct CrdtStateVector  local_sv;     /**< what this server has seen */
+  struct CrdtStateVector  gc_floor;     /**< highest seq/origin reclaimed from
+                                         *   the oplog; a peer whose SV is below
+                                         *   this can't be served a delta and
+                                         *   needs a full snapshot (CR F) */
   struct CrdtOpLog        oplog;        /**< ops for delta computation */
 
   struct CrdtLWWMap       servers;      /**< numeric-str -> CrdtServerRecord */
@@ -162,6 +166,10 @@ void crdt_modes_set(struct CrdtNetworkState *st, const char *chan,
                     const void *snap, uint32_t snaplen);
 
 /* ---- sync / merge ---- */
+/** The LWW-Map backing a given collection (SERVERS/USERS/NICKS/TOPICS/MODES),
+ *  or NULL for OR-Set collections. Exposed for snapshot apply (crdt_wire.c). */
+struct CrdtLWWMap *crdt_state_lww_for(struct CrdtNetworkState *st,
+                                      enum CrdtCollection coll);
 /** Apply a single remote op (idempotent via state-vector check). */
 void crdt_state_apply_op(struct CrdtNetworkState *st, const struct CrdtOp *op);
 /** Delta sync: replay every op in src's oplog that dst hasn't seen, into dst.

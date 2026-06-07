@@ -453,6 +453,84 @@ static void test_wire_concurrent_converges(void **state)
   crdt_state_clear(&s2);
 }
 
+/* A full-state snapshot reconstructs a byte-identical document on a fresh peer
+ * (CR F: the fallback when delta sync can't, because the ops were GC'd). */
+static void test_snapshot_roundtrip(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s1, s2;
+  uint8_t buf[16384];
+  int n;
+  struct CrdtUserRecord u = mkuser("alice", 1, "a", 0x01020304);
+  uint8_t modesnap[3] = { 0x10, 0x20, 0x30 };
+  crdt_state_init(&s1, 1);
+  crdt_state_init(&s2, 2);
+  crdt_user_set(&s1, "AAAAA", &u);
+  crdt_chan_join(&s1, "#r", "AAAAA");
+  crdt_chan_join(&s1, "#r", "BBBBB");
+  crdt_chan_remove(&s1, "#r", "BBBBB", CRDT_PRIORITY_USER);  /* leaves a tombstone */
+  crdt_topic_set(&s1, "#r", "hello world");
+  crdt_modes_set(&s1, "#r", modesnap, sizeof modesnap);
+
+  n = crdt_snapshot_encode(&s1, buf, sizeof buf);
+  assert_true(n > 0);
+  assert_true(crdt_snapshot_apply(&s2, buf, (size_t)n) >= 0);
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+
+  crdt_state_clear(&s1);
+  crdt_state_clear(&s2);
+}
+
+/* crdt_state_gc advances gc_floor to the stable cut it reclaimed against. */
+static void test_gc_advances_floor(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s1;
+  struct CrdtUserRecord u = mkuser("alice", 1, "a", 1);
+  crdt_state_init(&s1, 1);
+  crdt_user_set(&s1, "AAAAA", &u);
+  crdt_chan_join(&s1, "#g", "AAAAA");
+  crdt_topic_set(&s1, "#g", "t");
+  assert_int_equal(0, (int)s1.gc_floor.seq[1]);
+  crdt_state_gc(&s1, &s1.local_sv);
+  assert_int_equal((int)s1.local_sv.seq[1], (int)s1.gc_floor.seq[1]);
+  assert_true(s1.gc_floor.seq[1] > 0);
+  crdt_state_clear(&s1);
+}
+
+/* The real CR F scenario: a peer falls so far behind that the ops it needs have
+ * been GC'd from the oplog -> a delta can't catch it up, but a snapshot can. */
+static void test_snapshot_recovers_gc_gap(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s1, s2;
+  uint8_t buf[16384];
+  int n;
+  struct CrdtUserRecord u = mkuser("alice", 1, "a", 1);
+  crdt_state_init(&s1, 1);
+  crdt_state_init(&s2, 2);
+  crdt_user_set(&s1, "AAAAA", &u);
+  crdt_chan_join(&s1, "#g", "AAAAA");
+  crdt_topic_set(&s1, "#g", "t");
+
+  /* s1 GCs against its own SV (every other peer caught up; s2 was split) ->
+   * oplog emptied, gc_floor now past s2's (empty) SV. */
+  crdt_state_gc(&s1, &s1.local_sv);
+
+  /* a delta for the far-behind s2 is empty (the ops are gone) -> still diverged */
+  n = crdt_delta_encode(&s1.oplog, &s2.local_sv, buf, sizeof buf);
+  crdt_delta_apply(&s2, buf, (size_t)n);
+  assert_true(crdt_state_digest(&s1) != crdt_state_digest(&s2));
+
+  /* a snapshot catches it up regardless of the GC gap */
+  n = crdt_snapshot_encode(&s1, buf, sizeof buf);
+  assert_true(crdt_snapshot_apply(&s2, buf, (size_t)n) >= 0);
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+
+  crdt_state_clear(&s1);
+  crdt_state_clear(&s2);
+}
+
 static void test_wire_b64_roundtrip(void **state)
 {
   (void)state;
@@ -532,6 +610,9 @@ int main(void)
     cmocka_unit_test(test_wire_delta_converges),
     cmocka_unit_test(test_wire_digest_converges),
     cmocka_unit_test(test_wire_concurrent_converges),
+    cmocka_unit_test(test_snapshot_roundtrip),
+    cmocka_unit_test(test_gc_advances_floor),
+    cmocka_unit_test(test_snapshot_recovers_gc_gap),
     cmocka_unit_test(test_wire_b64_roundtrip),
     cmocka_unit_test(test_chunk_reassembles),
     cmocka_unit_test(test_chunk_isolation),

@@ -364,6 +364,30 @@ uint64_t crdt_shadow_digest(void)
   return g_inited ? crdt_state_digest(&g_crdt) : 0;
 }
 
+int crdt_shadow_encode_snapshot(uint8_t *buf, size_t cap)
+{
+  return g_inited ? crdt_snapshot_encode(&g_crdt, buf, cap) : -1;
+}
+
+int crdt_shadow_apply_snapshot(const uint8_t *buf, size_t len)
+{
+  return g_inited ? crdt_snapshot_apply(&g_crdt, buf, len) : -1;
+}
+
+int crdt_shadow_peer_behind_floor(const uint8_t *sv, size_t len)
+{
+  static struct CrdtStateVector peer;   /* static: avoid a 32KB stack frame */
+  int i;
+  if (!g_inited)
+    return 0;
+  if (crdt_sv_decode(&peer, sv, len) < 0)
+    return 0;
+  for (i = 0; i < CRDT_MAX_SERVERS; i++)
+    if (peer.seq[i] < g_crdt.gc_floor.seq[i])
+      return 1;
+  return 0;
+}
+
 void crdt_shadow_record_peer_sv(uint16_t origin, const uint8_t *sv, size_t len)
 {
   int i, slot = -1;

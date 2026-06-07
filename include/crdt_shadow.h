@@ -86,4 +86,15 @@ uint64_t crdt_shadow_digest(void);
  *  server numeric, for causal-stability GC. */
 void crdt_shadow_record_peer_sv(uint16_t origin, const uint8_t *sv, size_t len);
 
+/** Encode the full document as a snapshot (CR F payload). Returns bytes, or -1. */
+int crdt_shadow_encode_snapshot(uint8_t *buf, size_t cap);
+
+/** Decode + apply a full snapshot into the shadow document. Returns 0, or -1. */
+int crdt_shadow_apply_snapshot(const uint8_t *buf, size_t len);
+
+/** Non-zero if a peer with encoded state vector @a sv has fallen behind the GC
+ *  floor — the ops it lacks are gone from the oplog, so it needs a snapshot
+ *  (CR F) rather than a delta (CR D). */
+int crdt_shadow_peer_behind_floor(const uint8_t *sv, size_t len);
+
 #endif /* INCLUDED_crdt_shadow_h */
