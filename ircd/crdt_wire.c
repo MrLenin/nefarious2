@@ -49,8 +49,15 @@ static uint32_t rget_u32(struct rbuf *r)
 { uint8_t b[4] = {0}; rget(r, b, 4);
   return ((uint32_t)b[0]<<24)|((uint32_t)b[1]<<16)|((uint32_t)b[2]<<8)|b[3]; }
 static uint64_t rget_u64(struct rbuf *r)
-{ uint8_t b[8] = {0}; uint64_t v = 0; int i; rget(r, b, 8);
-  for (i = 0; i < 8; i++) v = (v << 8) | b[i]; return v; }
+{
+  uint8_t b[8] = {0};
+  uint64_t v = 0;
+  int i;
+  rget(r, b, 8);
+  for (i = 0; i < 8; i++)
+    v = (v << 8) | b[i];
+  return v;
+}
 
 /* Read a length-prefixed blob into a freshly malloc'd buffer (NULL if n==0). */
 static void rget_blob(struct rbuf *r, void **out, size_t n)

@@ -19,6 +19,7 @@
 #include <stddef.h>
 #include <setjmp.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <cmocka.h>
 
@@ -26,6 +27,7 @@
 #include "crdt_types.h"
 #include "crdt_state.h"
 #include "crdt_wire.h"
+#include "s2s_chunk.h"
 
 /* ------------------------------------------------------------------ */
 /* helpers                                                            */
@@ -369,6 +371,48 @@ static void test_wire_delta_converges(void **state)
 }
 
 /* ================================================================== */
+/* Phase 2 — shared S2S chunk reassembly                              */
+/* ================================================================== */
+
+static void test_chunk_reassembles(void **state)
+{
+  (void)state;
+  char *out = NULL; size_t len = 0;
+  assert_int_equal(0, s2s_chunk_feed((void *)1, "id1", "AAAA", 1, &out, &len));
+  assert_int_equal(0, s2s_chunk_feed((void *)1, "id1", "BBBB", 1, &out, &len));
+  assert_int_equal(1, s2s_chunk_feed((void *)1, "id1", "CC", 0, &out, &len));
+  assert_non_null(out);
+  assert_int_equal(10, (int)len);
+  assert_string_equal("AAAABBBBCC", out);
+  free(out);
+}
+
+static void test_chunk_isolation(void **state)
+{
+  (void)state;
+  char *out = NULL; size_t len = 0;
+  /* same id over two different links must not collide */
+  s2s_chunk_feed((void *)1, "x", "L1", 1, &out, &len);
+  s2s_chunk_feed((void *)2, "x", "L2", 1, &out, &len);
+  assert_int_equal(1, s2s_chunk_feed((void *)1, "x", "a", 0, &out, &len));
+  assert_string_equal("L1a", out); free(out);
+  assert_int_equal(1, s2s_chunk_feed((void *)2, "x", "b", 0, &out, &len));
+  assert_string_equal("L2b", out); free(out);
+}
+
+static void test_chunk_cleanup_link(void **state)
+{
+  (void)state;
+  char *out = NULL; size_t len = 0;
+  s2s_chunk_feed((void *)1, "id", "XYZ", 1, &out, &len);  /* buffered */
+  s2s_chunk_cleanup_link((void *)1);                       /* peer SQUIT */
+  /* a fresh feed for the same (link,id) starts clean, not "XYZ..." */
+  assert_int_equal(1, s2s_chunk_feed((void *)1, "id", "Q", 0, &out, &len));
+  assert_string_equal("Q", out);
+  free(out);
+}
+
+/* ================================================================== */
 
 int main(void)
 {
@@ -384,6 +428,9 @@ int main(void)
     cmocka_unit_test(test_E_squit_creates_no_membership_tombstones),
     cmocka_unit_test(test_wire_sv_roundtrip),
     cmocka_unit_test(test_wire_delta_converges),
+    cmocka_unit_test(test_chunk_reassembles),
+    cmocka_unit_test(test_chunk_isolation),
+    cmocka_unit_test(test_chunk_cleanup_link),
   };
   return cmocka_run_group_tests(tests, NULL, NULL);
 }

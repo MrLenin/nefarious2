@@ -495,6 +495,7 @@ void set_server_flags(struct Client *cptr, const char *flags)
     case 'o': SetOpLevels(cptr); break;
     case 'v': SetIRCv3Aware(cptr); break;
     case 'F': SetBxfAware(cptr); break;
+    case 'C': SetCrdtAware(cptr); break;
     }
 }
 
@@ -788,13 +789,14 @@ int ms_server(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
       continue;
     if (0 == match(cli_name(&me), cli_name(acptr)))
       continue;
-    sendcmdto_one(sptr, CMD_SERVER, bcptr, "%s %d 0 %s %s %s%s +%s%s%s%s%s%s :%s",
+    sendcmdto_one(sptr, CMD_SERVER, bcptr, "%s %d 0 %s %s %s%s +%s%s%s%s%s%s%s :%s",
                   cli_name(acptr), hop + 1, parv[4], parv[5],
                   NumServCap(acptr), IsHub(acptr) ? "h" : "",
                   IsService(acptr) ? "s" : "", IsIPv6(acptr) ? "6" : "",
                   IsOpLevels(acptr) ? "o" : "",
                   IsIRCv3Aware(acptr) ? "v" : "",
-                  IsBxfAware(acptr) ? "F" : "", cli_info(acptr));
+                  IsBxfAware(acptr) ? "F" : "", IsCrdtAware(acptr) ? "C" : "",
+                  cli_info(acptr));
   }
   return 0;
 }

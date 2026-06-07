@@ -201,6 +201,10 @@ enum Flag
                                          emit BX F, so we must NOT gate on
                                          it (gate would hang the burst).
                                          Advertised via 'F' in SERVER flags. */
+    FLAG_CRDT_AWARE,                /**< server speaks the CR (CRDT sync) token.
+                                         Advertised via 'C' in SERVER flags.
+                                         Capability only; actual sync is gated
+                                         on FEAT_CRDT_ENABLED at sync time. */
     FLAG_GOTID,                     /**< successful ident lookup achieved */
     FLAG_DOID,                      /**< I-lines say must use ident return */
     FLAG_NONL,                      /**< No \n in buffer */
@@ -1177,6 +1181,8 @@ struct Client {
 #define IsIRCv3Aware(x)         HasFlag(x, FLAG_IRCV3AWARE)
 /** Return non-zero if the server emits BX F (reconcile-end) markers. */
 #define IsBxfAware(x)           HasFlag(x, FLAG_BXF_AWARE)
+/** Test if the client speaks the CR (CRDT sync) token. */
+#define IsCrdtAware(x)          HasFlag(x, FLAG_CRDT_AWARE)
 /** Return non-zero if the client has an account stamp. */
 #define IsAccount(x)            HasFlag(x, FLAG_ACCOUNT)
 /** Return non-zero if the client has set mode +x (hidden host). */
@@ -1325,6 +1331,8 @@ struct Client {
 #define SetIRCv3Aware(x)        SetFlag(x, FLAG_IRCV3AWARE)
 /** Mark a server as supporting the BX F handshake. */
 #define SetBxfAware(x)          SetFlag(x, FLAG_BXF_AWARE)
+/** Mark the client as CR (CRDT sync) capable. */
+#define SetCrdtAware(x)         SetFlag(x, FLAG_CRDT_AWARE)
 /** Mark a client as having an account stamp. */
 #define SetAccount(x)           SetFlag(x, FLAG_ACCOUNT)
 /** Mark a client as having mode +x (hidden host). */

@@ -1217,6 +1217,7 @@ int main(int argc, char **argv) {
    * flag will set FLAG_IRCV3AWARE on us and gate fork-only emissions
    * accordingly. Legacy peers ignore the unknown flag char. */
   SetIRCv3Aware(&me);
+  SetCrdtAware(&me);   /* this binary speaks the CR (CRDT sync) token */
 
   write_pidfile();
   init_counters();

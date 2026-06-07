@@ -98,6 +98,7 @@ IRCD_SRC = \
 	crdt_state.c \
 	crdt_wire.c \
 	crdt_shadow.c \
+	s2s_chunk.c \
 	crule.c \
 	dbuf.c \
 	db_rocksdb.c \
