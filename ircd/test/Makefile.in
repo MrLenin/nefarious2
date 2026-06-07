@@ -159,7 +159,7 @@ recv_classify_cmocka: $(RECV_CLASSIFY_CMOCKA_OBJS)
 
 # CRDT engine tests - custom-C CRDT primitives + state machine (Phase 0).
 # The engine is dependency-light, so only crdt_*.o + test_stub.o are linked.
-CRDT_CMOCKA_OBJS = crdt_cmocka.o test_stub.o ../crdt_types.o ../crdt_state.o ../crdt_hlc.o
+CRDT_CMOCKA_OBJS = crdt_cmocka.o test_stub.o ../crdt_types.o ../crdt_state.o ../crdt_hlc.o ../crdt_wire.o
 crdt_cmocka: $(CRDT_CMOCKA_OBJS)
 	${CC} -o $@ $(LDFLAGS) $(CRDT_CMOCKA_OBJS) $(CMOCKA_LIBS)
 

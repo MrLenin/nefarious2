@@ -96,6 +96,7 @@ IRCD_SRC = \
 	crdt_hlc.c \
 	crdt_types.c \
 	crdt_state.c \
+	crdt_wire.c \
 	crdt_shadow.c \
 	crule.c \
 	dbuf.c \

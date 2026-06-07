@@ -25,6 +25,7 @@
 #include "crdt_hlc.h"
 #include "crdt_types.h"
 #include "crdt_state.h"
+#include "crdt_wire.h"
 
 /* ------------------------------------------------------------------ */
 /* helpers                                                            */
@@ -309,6 +310,65 @@ static void test_E_squit_creates_no_membership_tombstones(void **state)
 }
 
 /* ================================================================== */
+/* Phase 2 — wire serialization round-trip                            */
+/* ================================================================== */
+
+static void test_wire_sv_roundtrip(void **state)
+{
+  (void)state;
+  struct CrdtStateVector a, b;
+  uint8_t buf[512];
+  int n;
+  crdt_sv_init(&a);
+  crdt_sv_init(&b);
+  crdt_sv_update(&a, 1, 100);
+  crdt_sv_update(&a, 5, 42);
+  crdt_sv_update(&a, 4000, 7);
+  n = crdt_sv_encode(&a, buf, sizeof buf);
+  assert_true(n > 0);
+  assert_true(crdt_sv_decode(&b, buf, (size_t)n) >= 0);
+  assert_int_equal(100, b.seq[1]);
+  assert_int_equal(42, b.seq[5]);
+  assert_int_equal(7, b.seq[4000]);
+  assert_int_equal(0, b.seq[2]);   /* unset stays zero */
+}
+
+/* The payoff: encode a server's oplog as a delta vs an empty peer SV, apply it
+ * to a fresh replica, and the two converge — the wire form of crdt_state_sync. */
+static void test_wire_delta_converges(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s1, s2;
+  uint8_t buf[8192];
+  int n, applied;
+  crdt_state_init(&s1, 1);
+  crdt_state_init(&s2, 2);
+
+  struct CrdtUserRecord u = mkuser("alice", 1, "alice", 0x01010101);
+  crdt_user_set(&s1, "AAAAA", &u);
+  crdt_chan_join(&s1, "#wire", "AAAAA");
+  crdt_chan_join(&s1, "#wire", "BBBBB");
+  crdt_chan_remove(&s1, "#wire", "BBBBB", CRDT_PRIORITY_CHANOP); /* KICK */
+  struct CrdtNickClaim c = mkclaim("AAAAA", mkhlc(100, 0, 1), "alice",
+                                   0x01010101, NULL);
+  crdt_nick_claim(&s1, "alice", &c);
+
+  n = crdt_delta_encode(&s1.oplog, &s2.local_sv, buf, sizeof buf);
+  assert_true(n > 0);
+  applied = crdt_delta_apply(&s2, buf, (size_t)n);
+  assert_true(applied > 0);
+  assert_true(crdt_state_equal(&s1, &s2));
+
+  /* idempotent: re-applying the same delta changes nothing */
+  applied = crdt_delta_apply(&s2, buf, (size_t)n);
+  assert_int_equal(0, applied);
+  assert_true(crdt_state_equal(&s1, &s2));
+
+  crdt_state_clear(&s1);
+  crdt_state_clear(&s2);
+}
+
+/* ================================================================== */
 
 int main(void)
 {
@@ -322,6 +382,8 @@ int main(void)
     cmocka_unit_test(test_C_kick_beats_concurrent_join),
     cmocka_unit_test(test_C_part_yields_to_concurrent_join),
     cmocka_unit_test(test_E_squit_creates_no_membership_tombstones),
+    cmocka_unit_test(test_wire_sv_roundtrip),
+    cmocka_unit_test(test_wire_delta_converges),
   };
   return cmocka_run_group_tests(tests, NULL, NULL);
 }
