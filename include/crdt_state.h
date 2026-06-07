@@ -99,12 +99,15 @@ struct CrdtOpLog {
 };
 
 /*
- * Channel table — name -> members OR-Set (PoC keeps bans/modes out of scope).
+ * Channel table — name -> members/bans/excepts OR-Sets. (Channel modes/topic
+ * live in the CrdtNetworkState LWW-Maps, keyed by channel name.)
  */
 struct CrdtChannel {
   char               *name;
   uint32_t            name_len;
   struct CrdtORSet    members;    /**< set of user numerics */
+  struct CrdtORSet    bans;       /**< set of +b ban masks */
+  struct CrdtORSet    excepts;    /**< set of +e except masks */
   struct CrdtChannel *next;       /**< bucket chain */
 };
 

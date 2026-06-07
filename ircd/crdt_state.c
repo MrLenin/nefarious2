@@ -109,6 +109,8 @@ static struct CrdtChannel *chan_get(struct CrdtNetworkState *st,
   c->name = memdup(name, len);
   c->name_len = len;
   crdt_orset_init(&c->members);
+  crdt_orset_init(&c->bans);
+  crdt_orset_init(&c->excepts);
   c->next = st->chan_buckets[b];
   st->chan_buckets[b] = c;
   return c;
@@ -154,6 +156,8 @@ void crdt_state_clear(struct CrdtNetworkState *st)
     while (c) {
       struct CrdtChannel *n = c->next;
       crdt_orset_clear(&c->members);
+      crdt_orset_clear(&c->bans);
+      crdt_orset_clear(&c->excepts);
       free(c->name);
       free(c);
       c = n;
@@ -439,8 +443,11 @@ int crdt_state_gc(struct CrdtNetworkState *st,
 
   /* channel member sets: reclaim stable tombstones */
   for (int b = 0; b < CRDT_CHAN_BUCKETS; b++)
-    for (struct CrdtChannel *c = st->chan_buckets[b]; c; c = c->next)
+    for (struct CrdtChannel *c = st->chan_buckets[b]; c; c = c->next) {
       freed += crdt_orset_gc(&c->members, stable);
+      freed += crdt_orset_gc(&c->bans, stable);
+      freed += crdt_orset_gc(&c->excepts, stable);
+    }
 
   return freed;
 }

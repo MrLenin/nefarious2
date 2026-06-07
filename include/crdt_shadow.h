@@ -52,6 +52,10 @@ void crdt_shadow_topic(struct Channel *chptr);
  *  persistent mode bits + limit + key into the shadow modes map. */
 void crdt_shadow_modes(struct Channel *chptr);
 
+/** Reconcile the shadow ban/except OR-Sets to the channel's banlist/exceptlist
+ *  (called from modebuf_flush). */
+void crdt_shadow_lists(struct Channel *chptr);
+
 /** Compare the shadow CRDT membership to the real channel state and log any
  *  divergence. No-op unless FEAT_CRDT_ENABLED. */
 void crdt_shadow_verify(void);

@@ -144,6 +144,62 @@ void crdt_shadow_modes(struct Channel *chptr)
                   &snap, sizeof snap, hlc, g_crdt.my_numeric);
 }
 
+/* ---- ban/except list-modes: OR-Sets reconciled to the real Ban lists ---- */
+
+#define CRDT_MASKLEN (NICKLEN + USERLEN + HOSTLEN + 3)
+
+static int mask_in_banlist(struct Ban *list, const char *mask)
+{
+  for (; list; list = list->next)
+    if (strcmp(list->banstr, mask) == 0)
+      return 1;
+  return 0;
+}
+
+struct crdt_collect_ctx { char masks[64][CRDT_MASKLEN]; int n; };
+static void crdt_collect_cb(const char *key, uint32_t key_len, void *ctx)
+{
+  struct crdt_collect_ctx *c = ctx;
+  if (c->n < 64) {
+    uint32_t l = key_len < CRDT_MASKLEN - 1 ? key_len : CRDT_MASKLEN - 1;
+    memcpy(c->masks[c->n], key, l);
+    c->masks[c->n][l] = '\0';
+    c->n++;
+  }
+}
+
+/** Bring an OR-Set into line with a channel's real Ban list (add new masks,
+ *  remove masks no longer present). */
+static void reconcile_list(struct CrdtORSet *set, struct Ban *list)
+{
+  struct Ban *b;
+  struct crdt_collect_ctx cc;
+  int i;
+  for (b = list; b; b = b->next) {
+    uint32_t len = (uint32_t)strlen(b->banstr);
+    if (!crdt_orset_contains(set, b->banstr, len)) {
+      struct CrdtTag tag = { g_crdt.my_numeric, ++g_crdt.next_seq };
+      crdt_orset_add(set, b->banstr, len, tag);
+    }
+  }
+  cc.n = 0;
+  crdt_orset_foreach(set, crdt_collect_cb, &cc);
+  for (i = 0; i < cc.n; i++)
+    if (!mask_in_banlist(list, cc.masks[i]))
+      crdt_orset_remove(set, cc.masks[i], (uint32_t)strlen(cc.masks[i]),
+                        CRDT_PRIORITY_USER, NULL, 0);
+}
+
+void crdt_shadow_lists(struct Channel *chptr)
+{
+  struct CrdtChannel *cc;
+  if (!shadow_on() || !chptr)
+    return;
+  cc = crdt_state_channel(&g_crdt, chptr->chname, 1);
+  reconcile_list(&cc->bans, chptr->banlist);
+  reconcile_list(&cc->excepts, chptr->exceptlist);
+}
+
 void crdt_shadow_verify(void)
 {
   struct Channel *chptr;
@@ -204,6 +260,22 @@ void crdt_shadow_verify(void)
                   "CRDT shadow mode divergence: %s real_mode=0x%x",
                   chptr->chname, cur.mode);
       }
+    }
+    /* field-level: every real ban/except must be present in the shadow set */
+    if (cc) {
+      struct Ban *b;
+      for (b = chptr->banlist; b; b = b->next)
+        if (!crdt_orset_contains(&cc->bans, b->banstr, strlen(b->banstr))) {
+          mismatches++;
+          log_write(LS_SYSTEM, L_NOTICE, 0,
+                    "CRDT shadow ban missing: %s in %s", b->banstr, chptr->chname);
+        }
+      for (b = chptr->exceptlist; b; b = b->next)
+        if (!crdt_orset_contains(&cc->excepts, b->banstr, strlen(b->banstr))) {
+          mismatches++;
+          log_write(LS_SYSTEM, L_NOTICE, 0,
+                    "CRDT shadow except missing: %s in %s", b->banstr, chptr->chname);
+        }
     }
   }
 
