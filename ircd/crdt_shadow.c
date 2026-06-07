@@ -11,6 +11,7 @@
 #include "crdt_shadow.h"
 #include "crdt_state.h"
 #include "crdt_types.h"
+#include "crdt_wire.h"
 
 #include "channel.h"
 #include "client.h"
@@ -311,11 +312,42 @@ void crdt_shadow_verify(void)
             "CRDT shadow verify: %u channels, %u/%u users, %u mismatch(es)",
             checked, crdt_users, real_users, mismatches);
 
-  /* Single-node shadow mode has no peers, so everything we have applied is
-   * causally stable relative to our own state vector — GC keeps the shadow's
-   * oplog/tombstones bounded. (Multi-node delta sync replaces this in a
-   * later phase.) */
-  crdt_state_gc(&g_crdt, &g_crdt.local_sv);
+  /* NOTE: the oplog is intentionally NOT GC'd against our own state vector
+   * here — Phase 2 delta sync needs ops retained until peers have caught up.
+   * Causal-stability GC against the min of peer SVs (via CR V) is a later
+   * increment; until then the shadow oplog grows (bounded enough for testing). */
+}
+
+/* ---- Phase 2 wire-sync accessors ---- */
+
+int crdt_shadow_active(void)
+{
+  return shadow_on();
+}
+
+int crdt_shadow_encode_sv(uint8_t *buf, size_t cap)
+{
+  if (!g_inited)
+    return -1;
+  return crdt_sv_encode(&g_crdt.local_sv, buf, cap);
+}
+
+int crdt_shadow_encode_delta(const uint8_t *remote_sv, size_t sv_len,
+                             uint8_t *buf, size_t cap)
+{
+  struct CrdtStateVector rsv;
+  if (!g_inited)
+    return -1;
+  if (crdt_sv_decode(&rsv, remote_sv, sv_len) < 0)
+    return -1;
+  return crdt_delta_encode(&g_crdt.oplog, &rsv, buf, cap);
+}
+
+int crdt_shadow_apply_delta(const uint8_t *buf, size_t len)
+{
+  if (!g_inited)
+    return -1;
+  return crdt_delta_apply(&g_crdt, buf, len);
 }
 
 /** Periodic timer callback. */

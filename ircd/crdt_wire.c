@@ -206,3 +206,65 @@ int crdt_delta_apply(struct CrdtNetworkState *st,
   }
   return applied;
 }
+
+/* ================================================================== */
+/* base64 (RFC 4648)                                                  */
+/* ================================================================== */
+
+static const char B64[] =
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+int crdt_b64_encode(const uint8_t *in, size_t inlen, char *out, size_t cap)
+{
+  size_t need = ((inlen + 2) / 3) * 4 + 1;
+  size_t i = 0, o = 0, rem;
+  if (cap < need) return -1;
+  while (i + 3 <= inlen) {
+    uint32_t v = ((uint32_t)in[i] << 16) | ((uint32_t)in[i+1] << 8) | in[i+2];
+    out[o++] = B64[(v >> 18) & 63];
+    out[o++] = B64[(v >> 12) & 63];
+    out[o++] = B64[(v >> 6) & 63];
+    out[o++] = B64[v & 63];
+    i += 3;
+  }
+  rem = inlen - i;
+  if (rem == 1) {
+    uint32_t v = (uint32_t)in[i] << 16;
+    out[o++] = B64[(v >> 18) & 63];
+    out[o++] = B64[(v >> 12) & 63];
+    out[o++] = '='; out[o++] = '=';
+  } else if (rem == 2) {
+    uint32_t v = ((uint32_t)in[i] << 16) | ((uint32_t)in[i+1] << 8);
+    out[o++] = B64[(v >> 18) & 63];
+    out[o++] = B64[(v >> 12) & 63];
+    out[o++] = B64[(v >> 6) & 63];
+    out[o++] = '=';
+  }
+  out[o] = '\0';
+  return (int)o;
+}
+
+int crdt_b64_decode(const char *in, uint8_t *out, size_t cap)
+{
+  int8_t rev[256];
+  size_t o = 0;
+  uint32_t acc = 0;
+  int bits = 0, i;
+  const char *p;
+  for (i = 0; i < 256; i++) rev[i] = -1;
+  for (i = 0; i < 64; i++) rev[(unsigned char)B64[i]] = (int8_t)i;
+  for (p = in; *p; p++) {
+    int8_t d;
+    if (*p == '=') break;
+    d = rev[(unsigned char)*p];
+    if (d < 0) continue;                 /* skip whitespace/newlines */
+    acc = (acc << 6) | (uint32_t)d;
+    bits += 6;
+    if (bits >= 8) {
+      bits -= 8;
+      if (o >= cap) return -1;
+      out[o++] = (uint8_t)((acc >> bits) & 0xff);
+    }
+  }
+  return (int)o;
+}

@@ -324,6 +324,9 @@ extern int m_webpush(struct Client*, struct Client*, int, char*[]);
 extern int ms_webpush(struct Client*, struct Client*, int, char*[]);
 extern int m_bouncer(struct Client*, struct Client*, int, char*[]);
 extern int ms_bouncer_session(struct Client*, struct Client*, int, char*[]);
+extern int ms_crdt(struct Client*, struct Client*, int, char*[]);
+/** Send our CRDT state vector to a CRDT-aware peer to kick off delta sync. */
+extern void crdt_sync_request(struct Client* peer);
 extern int ms_bouncer_transfer(struct Client*, struct Client*, int, char*[]);
 extern int m_persistence(struct Client*, struct Client*, int, char*[]);
 extern void persistence_send_status(struct Client *to);

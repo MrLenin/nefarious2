@@ -50,4 +50,11 @@ int crdt_delta_encode(const struct CrdtOpLog *log,
 int crdt_delta_apply(struct CrdtNetworkState *st,
                      const uint8_t *buf, size_t len);
 
+/* ---- base64 (RFC 4648, standard alphabet) for putting binary on the P10
+ * wire. encode: out gets a NUL-terminated string, returns its length or -1 if
+ * cap too small. decode: returns decoded byte count, or -1 if cap too small;
+ * non-alphabet chars are skipped, '=' ends input. */
+int crdt_b64_encode(const uint8_t *in, size_t inlen, char *out, size_t cap);
+int crdt_b64_decode(const char *in, uint8_t *out, size_t cap);
+
 #endif /* INCLUDED_crdt_wire_h */

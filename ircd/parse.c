@@ -1087,6 +1087,14 @@ struct Message msgtab[] = {
     "C|X|P|N|U <args> - Bouncer alias/transfer management"
   },
   {
+    MSG_CRDT_REPLICATION,
+    TOK_CRDT_REPLICATION,
+    0, MAXPARA, 0, 0, NULL,
+    /* UNREG, CLIENT, SERVER, OPER, SERVICE */
+    { m_ignore, m_ignore, ms_crdt, m_ignore, m_ignore },
+    "S|D|U|V <args> - CRDT mesh state sync"
+  },
+  {
     MSG_FINGERPRINT,
     TOK_FINGERPRINT,
     0, MAXPARA,         0, 0, NULL,

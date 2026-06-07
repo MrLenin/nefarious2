@@ -170,6 +170,10 @@ int ms_end_of_burst(struct Client* cptr, struct Client* sptr, int parc, char* pa
   if (MyConnect(sptr)) {
     sendcmdto_one(&me, CMD_END_OF_BURST_ACK, sptr, "");
 
+    /* Phase 2 CRDT: kick off delta sync with this directly-connected
+     * neighbour (no-op unless it is CRDT-aware and FEAT_CRDT_ENABLED). */
+    crdt_sync_request(cptr);
+
     /* (BX R reconcile moved to pre-burst — see server_estab.  Post-
      * EOB is too late: by then peer's N for hold ghosts has already
      * been processed and any colliding ghosts have already been

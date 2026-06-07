@@ -150,6 +150,7 @@ IRCD_SRC = \
 	m_close.c \
 	m_connect.c \
 	m_cprivmsg.c \
+	m_crdt.c \
 	m_create.c \
 	m_defaults.c \
 	m_destruct.c \

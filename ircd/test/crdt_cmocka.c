@@ -370,6 +370,25 @@ static void test_wire_delta_converges(void **state)
   crdt_state_clear(&s2);
 }
 
+static void test_wire_b64_roundtrip(void **state)
+{
+  (void)state;
+  const uint8_t in[] = { 0, 1, 2, 253, 254, 255, 0x10, 0x20, 'h', 'i' };
+  char enc[64];
+  uint8_t dec[64];
+  size_t L;
+  int n = crdt_b64_encode(in, sizeof in, enc, sizeof enc);
+  assert_true(n > 0);
+  assert_int_equal((int)sizeof in, crdt_b64_decode(enc, dec, sizeof dec));
+  assert_memory_equal(in, dec, sizeof in);
+  /* exercise all three padding cases */
+  for (L = 1; L <= 3; L++) {
+    assert_true(crdt_b64_encode(in, L, enc, sizeof enc) > 0);
+    assert_int_equal((int)L, crdt_b64_decode(enc, dec, sizeof dec));
+    assert_memory_equal(in, dec, L);
+  }
+}
+
 /* ================================================================== */
 /* Phase 2 — shared S2S chunk reassembly                              */
 /* ================================================================== */
@@ -428,6 +447,7 @@ int main(void)
     cmocka_unit_test(test_E_squit_creates_no_membership_tombstones),
     cmocka_unit_test(test_wire_sv_roundtrip),
     cmocka_unit_test(test_wire_delta_converges),
+    cmocka_unit_test(test_wire_b64_roundtrip),
     cmocka_unit_test(test_chunk_reassembles),
     cmocka_unit_test(test_chunk_isolation),
     cmocka_unit_test(test_chunk_cleanup_link),

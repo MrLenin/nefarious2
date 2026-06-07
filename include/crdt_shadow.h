@@ -19,6 +19,7 @@
 #define INCLUDED_crdt_shadow_h
 
 #include <stdint.h>
+#include <stddef.h>
 
 struct Channel;
 struct Client;
@@ -59,5 +60,23 @@ void crdt_shadow_lists(struct Channel *chptr);
 /** Compare the shadow CRDT membership to the real channel state and log any
  *  divergence. No-op unless FEAT_CRDT_ENABLED. */
 void crdt_shadow_verify(void);
+
+/* ---- Phase 2 wire-sync accessors (used by m_crdt.c) ----
+ * These expose the shadow document to the CR token handlers while keeping the
+ * CrdtNetworkState itself private to this module. */
+
+/** Non-zero if CRDT sync is active (initialised AND FEAT_CRDT_ENABLED). */
+int crdt_shadow_active(void);
+
+/** Encode this server's state vector. Returns bytes written, or -1. */
+int crdt_shadow_encode_sv(uint8_t *buf, size_t cap);
+
+/** Encode the delta of ops the peer lacks, given the peer's encoded state
+ *  vector. Returns bytes written, or -1. */
+int crdt_shadow_encode_delta(const uint8_t *remote_sv, size_t sv_len,
+                             uint8_t *buf, size_t cap);
+
+/** Decode + apply a delta into the shadow document. Returns ops applied, or -1. */
+int crdt_shadow_apply_delta(const uint8_t *buf, size_t len);
 
 #endif /* INCLUDED_crdt_shadow_h */
