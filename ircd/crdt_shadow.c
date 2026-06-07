@@ -99,14 +99,12 @@ void crdt_shadow_user_remove(struct Client *cptr)
 
 void crdt_shadow_topic(struct Channel *chptr)
 {
-  struct HLC hlc;
-  const char *t;
   if (!shadow_on())
     return;
-  t = chptr->topic;
-  hlc = hlc_local_event(&g_crdt.clock);
-  crdt_lwwmap_set(&g_crdt.topics, chptr->chname, strlen(chptr->chname),
-                  t, (uint32_t)strlen(t) + 1, hlc, g_crdt.my_numeric);
+  /* op-recording setter so the topic replicates (a direct crdt_lwwmap_set
+   * would never enter the oplog and never sync — that was the modes/topic
+   * convergence bug). */
+  crdt_topic_set(&g_crdt, chptr->chname, chptr->topic);
 }
 
 /* Persistent channel-mode bits we mirror — excludes per-member CHANOP/VOICE/
@@ -137,13 +135,11 @@ static void build_mode_snap(struct Channel *chptr, struct ShadowModeSnap *s)
 void crdt_shadow_modes(struct Channel *chptr)
 {
   struct ShadowModeSnap snap;
-  struct HLC hlc;
   if (!shadow_on() || !chptr)
     return;
   build_mode_snap(chptr, &snap);
-  hlc = hlc_local_event(&g_crdt.clock);
-  crdt_lwwmap_set(&g_crdt.modes, chptr->chname, strlen(chptr->chname),
-                  &snap, sizeof snap, hlc, g_crdt.my_numeric);
+  /* op-recording setter so modes replicate (see crdt_shadow_topic). */
+  crdt_modes_set(&g_crdt, chptr->chname, &snap, sizeof snap);
 }
 
 /* ---- ban/except list-modes: OR-Sets reconciled to the real Ban lists ---- */

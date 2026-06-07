@@ -69,7 +69,9 @@ enum CrdtCollection {
   CRDT_COLL_SERVERS,
   CRDT_COLL_USERS,
   CRDT_COLL_NICKS,
-  CRDT_COLL_CHAN_MEMBERS
+  CRDT_COLL_CHAN_MEMBERS,
+  CRDT_COLL_TOPICS,     /**< channel-name -> topic string (LWW) */
+  CRDT_COLL_MODES       /**< channel-name -> mode snapshot blob (LWW) */
 };
 
 struct CrdtOp {
@@ -152,6 +154,12 @@ void crdt_server_set(struct CrdtNetworkState *st, uint16_t numeric,
 /** SQUIT — one LWW write, zero membership tombstones (proposal §17.3.2). */
 void crdt_server_squit(struct CrdtNetworkState *st, uint16_t numeric);
 void crdt_server_relink(struct CrdtNetworkState *st, uint16_t numeric);
+/** Set a channel topic (LWW). Records a SET op so it replicates. */
+void crdt_topic_set(struct CrdtNetworkState *st, const char *chan,
+                    const char *topic);
+/** Set a channel mode snapshot (opaque blob, LWW). Records a SET op. */
+void crdt_modes_set(struct CrdtNetworkState *st, const char *chan,
+                    const void *snap, uint32_t snaplen);
 
 /* ---- sync / merge ---- */
 /** Apply a single remote op (idempotent via state-vector check). */

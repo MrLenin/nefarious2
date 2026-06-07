@@ -298,6 +298,45 @@ void crdt_server_relink(struct CrdtNetworkState *st, uint16_t numeric)
   crdt_server_set(st, numeric, CRDT_SRV_ACTIVE);
 }
 
+void crdt_topic_set(struct CrdtNetworkState *st, const char *chan,
+                    const char *topic)
+{
+  struct HLC ts = hlc_local_event(&st->clock);
+  uint32_t klen = (uint32_t)strlen(chan);
+  uint32_t vlen = (uint32_t)strlen(topic) + 1;   /* include the NUL */
+  uint64_t seq;
+  struct CrdtOp *op;
+  crdt_lwwmap_set(&st->topics, chan, klen, topic, vlen, ts, st->my_numeric);
+  seq = st->next_seq++;
+  op = op_new(st->my_numeric, seq, CRDT_OP_SET, CRDT_COLL_TOPICS);
+  op->key = memdup(chan, klen);
+  op->key_len = klen;
+  op->val = memdup(topic, vlen);
+  op->val_len = vlen;
+  op->ts = ts;
+  op->writer = st->my_numeric;
+  record(st, op);
+}
+
+void crdt_modes_set(struct CrdtNetworkState *st, const char *chan,
+                    const void *snap, uint32_t snaplen)
+{
+  struct HLC ts = hlc_local_event(&st->clock);
+  uint32_t klen = (uint32_t)strlen(chan);
+  uint64_t seq;
+  struct CrdtOp *op;
+  crdt_lwwmap_set(&st->modes, chan, klen, snap, snaplen, ts, st->my_numeric);
+  seq = st->next_seq++;
+  op = op_new(st->my_numeric, seq, CRDT_OP_SET, CRDT_COLL_MODES);
+  op->key = memdup(chan, klen);
+  op->key_len = klen;
+  op->val = memdup(snap, snaplen);
+  op->val_len = snaplen;
+  op->ts = ts;
+  op->writer = st->my_numeric;
+  record(st, op);
+}
+
 /* ------------------------------------------------------------------ */
 /* sync / merge                                                       */
 /* ------------------------------------------------------------------ */
@@ -309,6 +348,8 @@ static struct CrdtLWWMap *lww_for(struct CrdtNetworkState *st,
   case CRDT_COLL_SERVERS: return &st->servers;
   case CRDT_COLL_USERS:   return &st->users;
   case CRDT_COLL_NICKS:   return &st->nicks;
+  case CRDT_COLL_TOPICS:  return &st->topics;
+  case CRDT_COLL_MODES:   return &st->modes;
   default:                return NULL;
   }
 }
@@ -513,6 +554,7 @@ uint64_t crdt_state_digest(const struct CrdtNetworkState *st)
   }
   return acc;
 }
+
 
 /* ------------------------------------------------------------------ */
 /* causal-stability GC                                                */

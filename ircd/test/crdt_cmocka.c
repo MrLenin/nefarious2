@@ -379,11 +379,16 @@ static void test_wire_digest_converges(void **state)
   uint8_t buf[8192];
   int n;
   struct CrdtUserRecord u = mkuser("a", 1, "a", 0x01010101);
+  uint8_t msnap[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
   crdt_state_init(&s1, 1);
   crdt_state_init(&s2, 2);
-  /* same logical content, but each server tags it with its own origin */
+  /* same logical content, but each server tags it with its own origin. Topic
+   * and modes are included on purpose: they must be op-backed to converge
+   * (regression guard for the bug where they bypassed the oplog). */
   crdt_user_set(&s1, "AAAAA", &u);  crdt_chan_join(&s1, "#d", "AAAAA");
+  crdt_topic_set(&s1, "#d", "hello");  crdt_modes_set(&s1, "#d", msnap, sizeof msnap);
   crdt_user_set(&s2, "AAAAA", &u);  crdt_chan_join(&s2, "#d", "AAAAA");
+  crdt_topic_set(&s2, "#d", "hello");  crdt_modes_set(&s2, "#d", msnap, sizeof msnap);
   assert_true(crdt_state_digest(&s1) != crdt_state_digest(&s2));  /* tags differ */
   /* exchange deltas both ways -> tag union -> converge */
   n = crdt_delta_encode(&s1.oplog, &s2.local_sv, buf, sizeof buf);
