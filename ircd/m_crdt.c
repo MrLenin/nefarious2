@@ -191,10 +191,14 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
       MyFree(full);
       if (bn > 0) {
         int applied = crdt_shadow_apply_delta(bin, (size_t)bn);
-        if (applied > 0)
+        if (applied > 0) {
           log_write(LS_SYSTEM, L_NOTICE, 0,
                     "CRDT sync: applied %d op(s) from %s", applied,
                     cli_name(cptr));
+          /* Phase 3d: drive live topics that just arrived via CRDT (+ gateway to
+           * legacy). Idempotent; no-op unless FEAT_CRDT_PRIMARY. */
+          crdt_shadow_reconcile_topics();
+        }
       }
       MyFree(bin);
     }

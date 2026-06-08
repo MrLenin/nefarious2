@@ -23,9 +23,11 @@
 #include "ircd_features.h"
 #include "ircd_log.h"
 #include "ircd_string.h"     /* ircd_strncpy (3c materialize) */
+#include "msg.h"             /* CMD_TOPIC (Phase 3d gateway) */
 #include "numnicks.h"
 #include "querycmds.h"       /* UserStats, Count_newremoteclient (3c materialize) */
 #include "s_user.h"          /* umode_str, make_user, user_apply_umode_str */
+#include "send.h"            /* sendcmdto_* (Phase 3d topic gateway) */
 #include "handlers.h"        /* crdt_sync_broadcast */
 
 #include <stdio.h>
@@ -861,6 +863,65 @@ void crdt_shadow_materialize_live(void)
               created, chans);
 }
 
+/* ---- Phase 3d: TOPIC via CRDT + §17.7 hybrid gateway ----
+ * Drive a live channel topic FROM the doc (a topic that propagated over CRDT,
+ * not P10) and bridge it to the legacy P10 tree. The send-side suppression of
+ * the P10 TOPIC to CRDT peers lives in m_topic.c. */
+
+struct reconcile_topic_ctx { unsigned int *changed; };
+
+static void reconcile_topic_cb(const char *key, uint32_t key_len,
+                               const struct CrdtLWWValue *val, void *ctx)
+{
+  struct reconcile_topic_ctx *c = ctx;
+  char chname[CHANNELLEN + 1];
+  struct Channel *chptr;
+  const char *doc_topic;
+  const struct CrdtLWWValue *cm;
+  if (key_len >= sizeof chname || !val->data)
+    return;
+  memcpy(chname, key, key_len); chname[key_len] = '\0';
+  chptr = FindChannel(chname);
+  if (!chptr)
+    return;                              /* channel not live yet (materialize/BURST) */
+  doc_topic = (const char *)val->data;
+  if (strcmp(doc_topic, chptr->topic) == 0)
+    return;                              /* already in sync — also the echo guard:
+                                            a P10 topic sets live+doc together, so
+                                            reconcile never bounces it back */
+  /* Drive the live topic DIRECTLY — never via do_settopic, so crdt_shadow_topic
+   * is not re-invoked and no new op is minted (loop prevention). */
+  ircd_strncpy(chptr->topic, doc_topic, TOPICLEN + 1);
+  cm = crdt_lwwmap_get(&g_crdt.chanmeta, chname, key_len);
+  if (cm && cm->data_len == sizeof(struct CrdtChanMeta)) {
+    const struct CrdtChanMeta *meta = (const struct CrdtChanMeta *)cm->data;
+    chptr->topic_time = (time_t)meta->topic_time;
+    ircd_strncpy(chptr->topic_nick, meta->topic_nick, sizeof chptr->topic_nick - 1);
+  }
+  /* notify LOCAL clients on this server */
+  sendcmdto_channel_butserv_butone(&me, CMD_TOPIC, chptr, NULL, 0, "%H :%s",
+                                   chptr, chptr->topic);
+  /* §17.7 GATEWAY: bridge to legacy P10 servers only (forbid CRDT-aware — they
+   * already have it via CRDT). A no-op on a leaf with no legacy peers. The real
+   * setter rides as the %s param so legacy records it. */
+  sendcmdto_flag_serv_butone(&me, CMD_TOPIC, NULL, FLAG_LAST_FLAG, FLAG_CRDT_AWARE,
+                             "%H %s %Tu %Tu :%s", chptr, chptr->topic_nick,
+                             chptr->creationtime, chptr->topic_time, chptr->topic);
+  (*c->changed)++;
+}
+
+void crdt_shadow_reconcile_topics(void)
+{
+  unsigned int changed = 0;
+  struct reconcile_topic_ctx ctx = { &changed };
+  if (!shadow_on() || !feature_bool(FEAT_CRDT_PRIMARY))
+    return;
+  crdt_lwwmap_foreach(&g_crdt.topics, reconcile_topic_cb, &ctx);
+  if (changed)
+    log_write(LS_SYSTEM, L_NOTICE, 0,
+              "CRDT topic-reconcile: drove %u channel topic(s) from doc", changed);
+}
+
 /* ---- Phase 2 wire-sync accessors ---- */
 
 int crdt_shadow_active(void)
@@ -1051,6 +1112,8 @@ static void crdt_shadow_verify_cb(struct Event *ev)
     if (!bursting)
       crdt_shadow_materialize_live();
   }
+  crdt_shadow_reconcile_topics();  /* Phase 3d: drive live topics from CRDT (+gateway) —
+                                      catches 2-hop foreign-origin topics via anti-entropy */
   crdt_sync_broadcast();   /* periodic anti-entropy: pull deltas from peers */
   crdt_shadow_gc();        /* reclaim causally-stable ops/tombstones */
 }

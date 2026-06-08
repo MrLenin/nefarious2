@@ -186,7 +186,22 @@ static void do_settopic(struct Client *sptr, struct Client *cptr,
        sendcmdto_set_s2s_tags(topic_time_ms, topic_msgid);
      }
      sendcmdto_want_s2s_tags(1);
-     if (setter != NULL)
+     if (feature_bool(FEAT_CRDT_PRIMARY)) {
+       /* Phase 3d: CRDT-primary peers receive this topic via CRDT (the doc op +
+        * crdt_shadow_reconcile_topics on the far side); relay the P10 TOPIC to
+        * LEGACY (non-CRDT-aware) servers only. forbid=FLAG_CRDT_AWARE skips CRDT
+        * peers; FLAG_LAST_FLAG = no require. */
+       if (setter != NULL)
+         sendcmdto_flag_serv_butone(sptr, CMD_TOPIC, cptr, FLAG_LAST_FLAG,
+                                    FLAG_CRDT_AWARE, "%H %s %Tu %Tu :%s", chptr,
+                                    chptr->topic_nick, chptr->creationtime,
+                                    chptr->topic_time, chptr->topic);
+       else
+         sendcmdto_flag_serv_butone(sptr, CMD_TOPIC, cptr, FLAG_LAST_FLAG,
+                                    FLAG_CRDT_AWARE, "%H %Tu %Tu :%s", chptr,
+                                    chptr->creationtime, chptr->topic_time,
+                                    chptr->topic);
+     } else if (setter != NULL)
        sendcmdto_serv_butone(sptr, CMD_TOPIC, cptr, "%H %s %Tu %Tu :%s", chptr,
                              chptr->topic_nick, chptr->creationtime,
                              chptr->topic_time, chptr->topic);

@@ -76,6 +76,11 @@ void crdt_shadow_materialize_check(void);
  *  replacement for P10 BURST on a CRDT-primary leaf. */
 void crdt_shadow_materialize_live(void);
 
+/** Phase 3d: drive live channel topics from the doc (topics that propagated via
+ *  CRDT, not P10) and bridge them to the legacy P10 tree (§17.7 gateway).
+ *  Idempotent (acts only when doc topic != live). No-op unless FEAT_CRDT_PRIMARY. */
+void crdt_shadow_reconcile_topics(void);
+
 /* ---- Phase 2 wire-sync accessors (used by m_crdt.c) ----
  * These expose the shadow document to the CR token handlers while keeping the
  * CrdtNetworkState itself private to this module. */
