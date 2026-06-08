@@ -554,6 +554,53 @@ static void test_materialized_digest_gc_invariant(void **state)
   crdt_state_clear(&s);
 }
 
+/* Reproduces the live 3-peer scenario that left a fresh peer mdigest-divergent:
+ * a peer (leaf) independently re-mirrors the SAME logical state with its OWN
+ * origin/HLC (as P10-burst mirroring does), the other peer (hub) has already
+ * GC'd its own ops (so it can only serve a CR F snapshot, not a delta), leaf
+ * applies the snapshot, then bidirectional anti-entropy runs. The materialized
+ * state MUST converge -- both must agree on the LWW winner (value, ts, writer)
+ * for every key, not just the value. */
+static void test_fresh_mirror_snapshot_converges(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState hub, leaf;
+  uint8_t buf[16384];
+  int n, r;
+  struct CrdtUserRecord u = mkuser("alice", 1, "a", 0x01020304);
+  crdt_state_init(&hub, 1);
+  crdt_state_init(&leaf, 2);
+
+  /* hub's original writes, then GC -> its own ops leave the oplog (only the
+   * materialized state survives, reachable solely via a snapshot) */
+  crdt_user_set(&hub, "AAAAA", &u);
+  crdt_chan_join(&hub, "#c", "AAAAA");
+  crdt_topic_set(&hub, "#c", "hi");
+  crdt_state_gc(&hub, &hub.local_sv);
+
+  /* leaf independently re-mirrors the same logical state (its own origin/HLC) */
+  crdt_user_set(&leaf, "AAAAA", &u);
+  crdt_chan_join(&leaf, "#c", "AAAAA");
+  crdt_topic_set(&leaf, "#c", "hi");
+
+  /* leaf is behind hub's GC floor -> CR F snapshot */
+  n = crdt_snapshot_encode(&hub, buf, sizeof buf);
+  assert_true(crdt_snapshot_apply(&leaf, buf, (size_t)n) >= 0);
+
+  /* bidirectional anti-entropy */
+  for (r = 0; r < 3; r++) {
+    n = crdt_delta_encode(&hub.oplog, &leaf.local_sv, buf, sizeof buf);
+    crdt_delta_apply(&leaf, buf, (size_t)n);
+    n = crdt_delta_encode(&leaf.oplog, &hub.local_sv, buf, sizeof buf);
+    crdt_delta_apply(&hub, buf, (size_t)n);
+  }
+
+  assert_true(crdt_state_digest_materialized(&hub) ==
+              crdt_state_digest_materialized(&leaf));
+  crdt_state_clear(&hub);
+  crdt_state_clear(&leaf);
+}
+
 static void test_wire_b64_roundtrip(void **state)
 {
   (void)state;
@@ -637,6 +684,7 @@ int main(void)
     cmocka_unit_test(test_gc_advances_floor),
     cmocka_unit_test(test_snapshot_recovers_gc_gap),
     cmocka_unit_test(test_materialized_digest_gc_invariant),
+    cmocka_unit_test(test_fresh_mirror_snapshot_converges),
     cmocka_unit_test(test_wire_b64_roundtrip),
     cmocka_unit_test(test_chunk_reassembles),
     cmocka_unit_test(test_chunk_isolation),
