@@ -601,6 +601,65 @@ static void test_fresh_mirror_snapshot_converges(void **state)
   crdt_state_clear(&leaf);
 }
 
+/* Multi-hop topology A -- B -- C (B relays; A and C are NOT direct peers). Each
+ * node runs anti-entropy with ONLY its direct peers and GCs against ONLY its
+ * direct peers' SVs -- exactly what crdt_shadow_gc does live. With ongoing churn
+ * on A and C, all three must still converge: the claim is that "retain an op
+ * until every direct peer has it" + hop-by-hop relay is sufficient for GC safety
+ * in any connected topology, so no transitive (CR V) SV propagation is needed. */
+static void test_multihop_relay_gc_converges(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState A, B, C;
+  struct CrdtStateVector st;
+  uint8_t buf[16384];
+  int n, r;
+  char key[8];
+  crdt_state_init(&A, 1);
+  crdt_state_init(&B, 2);
+  crdt_state_init(&C, 3);
+
+  for (r = 0; r < 6; r++) {
+    struct CrdtUserRecord ua = mkuser("a", 1, "a", (uint32_t)(0x100 + r));
+    struct CrdtUserRecord uc = mkuser("c", 3, "c", (uint32_t)(0x300 + r));
+    snprintf(key, sizeof key, "A%04d", r);
+    crdt_user_set(&A, key, &ua);  crdt_chan_join(&A, "#x", key);
+    snprintf(key, sizeof key, "C%04d", r);
+    crdt_user_set(&C, key, &uc);  crdt_chan_join(&C, "#x", key);
+
+    /* direct-peer anti-entropy only: A<->B, then B<->C */
+    n = crdt_delta_encode(&A.oplog, &B.local_sv, buf, sizeof buf); crdt_delta_apply(&B, buf, (size_t)n);
+    n = crdt_delta_encode(&B.oplog, &A.local_sv, buf, sizeof buf); crdt_delta_apply(&A, buf, (size_t)n);
+    n = crdt_delta_encode(&B.oplog, &C.local_sv, buf, sizeof buf); crdt_delta_apply(&C, buf, (size_t)n);
+    n = crdt_delta_encode(&C.oplog, &B.local_sv, buf, sizeof buf); crdt_delta_apply(&B, buf, (size_t)n);
+
+    /* per-node GC against DIRECT peers only (the crux of the claim) */
+    { const struct CrdtStateVector *v[2] = { &A.local_sv, &B.local_sv };
+      crdt_sv_global_min(&st, v, 2); crdt_state_gc(&A, &st); }
+    { const struct CrdtStateVector *v[3] = { &B.local_sv, &A.local_sv, &C.local_sv };
+      crdt_sv_global_min(&st, v, 3); crdt_state_gc(&B, &st); }
+    { const struct CrdtStateVector *v[2] = { &C.local_sv, &B.local_sv };
+      crdt_sv_global_min(&st, v, 2); crdt_state_gc(&C, &st); }
+  }
+
+  /* flush: keep relaying (no new ops) until everything propagates end to end */
+  for (r = 0; r < 5; r++) {
+    n = crdt_delta_encode(&A.oplog, &B.local_sv, buf, sizeof buf); crdt_delta_apply(&B, buf, (size_t)n);
+    n = crdt_delta_encode(&B.oplog, &A.local_sv, buf, sizeof buf); crdt_delta_apply(&A, buf, (size_t)n);
+    n = crdt_delta_encode(&B.oplog, &C.local_sv, buf, sizeof buf); crdt_delta_apply(&C, buf, (size_t)n);
+    n = crdt_delta_encode(&C.oplog, &B.local_sv, buf, sizeof buf); crdt_delta_apply(&B, buf, (size_t)n);
+  }
+
+  /* A and C never exchanged directly, B GC'd against only its direct peers --
+   * yet all three converge materially */
+  assert_true(crdt_state_digest_materialized(&A) == crdt_state_digest_materialized(&B));
+  assert_true(crdt_state_digest_materialized(&B) == crdt_state_digest_materialized(&C));
+
+  crdt_state_clear(&A);
+  crdt_state_clear(&B);
+  crdt_state_clear(&C);
+}
+
 static void test_wire_b64_roundtrip(void **state)
 {
   (void)state;
@@ -685,6 +744,7 @@ int main(void)
     cmocka_unit_test(test_snapshot_recovers_gc_gap),
     cmocka_unit_test(test_materialized_digest_gc_invariant),
     cmocka_unit_test(test_fresh_mirror_snapshot_converges),
+    cmocka_unit_test(test_multihop_relay_gc_converges),
     cmocka_unit_test(test_wire_b64_roundtrip),
     cmocka_unit_test(test_chunk_reassembles),
     cmocka_unit_test(test_chunk_isolation),

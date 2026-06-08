@@ -425,8 +425,12 @@ static const struct CrdtStateVector *peer_sv_lookup(uint16_t origin)
  * in the list, so GC advances past it and a CR F snapshot catches it up on
  * rejoin. (The old timestamp-staleness flapped whenever stale_timeout fell below
  * the CR S broadcast interval, risking reclaiming ops a live-but-quiet peer
- * still needed.) NOTE: correct while every CRDT server is a DIRECT peer (star);
- * a multi-hop CRDT mesh needs transitive SV propagation (CR V flooding). */
+ * still needed.) This is correct for ANY connected topology, not just a star:
+ * a server only ever sends deltas to its direct peers and retains each op until
+ * ALL of them have it, and received ops relay hop-by-hop (crdt_state_apply_op
+ * re-appends to the oplog). So an op always survives on the frontier between the
+ * has-it and lacks-it regions until it finishes propagating -- no transitive
+ * (CR V) SV flooding is needed. Proven by test_multihop_relay_gc_converges. */
 static void crdt_shadow_gc(void)
 {
   static struct CrdtStateVector gmin;        /* static: avoid a 32KB stack frame */
