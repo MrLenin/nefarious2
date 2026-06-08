@@ -94,6 +94,13 @@ void crdt_shadow_reconcile_modes(void);
  *  guard). No-op unless FEAT_CRDT_PRIMARY. */
 void crdt_shadow_reconcile_members(void);
 
+/** Phase 3g: drive live channel membership REMOVE (PART / delete-on-leave) from
+ *  the doc + §17.7 gateway. Removes a live member ONLY when the doc OR-Set has
+ *  explicitly tombstoned it (crdt_orset_is_explicitly_removed) — never on mere
+ *  absence (the sync-lag guard). KICK/QUIT stay P10 (backstop). No-op unless
+ *  FEAT_CRDT_PRIMARY. */
+void crdt_shadow_reconcile_removes(void);
+
 /* ---- Phase 2 wire-sync accessors (used by m_crdt.c) ----
  * These expose the shadow document to the CR token handlers while keeping the
  * CrdtNetworkState itself private to this module. */

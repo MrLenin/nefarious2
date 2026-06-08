@@ -1067,6 +1067,65 @@ void crdt_shadow_reconcile_members(void)
               "CRDT member-reconcile: added %u member(s) from doc", changed);
 }
 
+/* ---- Phase 3g: channel MEMBERSHIP remove (PART / delete-on-leave) ---- */
+/* Drive a live membership REMOVE from the doc + §17.7 gateway. Send-side
+ * suppression of the P10 PART to CRDT peers lives in channel.c joinbuf_flush.
+ * SAFETY: removes a live member ONLY when the doc has EXPLICITLY tombstoned it
+ * (crdt_orset_is_explicitly_removed) — NEVER on mere absence (sync lag / a
+ * not-yet-seen JOIN / a P10-only member). KICK/QUIT still ride P10; their
+ * mirrored tombstones make this a harmless backstop (member already gone → the
+ * walk finds nothing to remove). PART comment is not carried by the tombstone. */
+void crdt_shadow_reconcile_removes(void)
+{
+  unsigned int changed = 0;
+  int bk;
+  if (!shadow_on() || !feature_bool(FEAT_CRDT_PRIMARY))
+    return;
+  for (bk = 0; bk < CRDT_CHAN_BUCKETS; bk++) {
+    struct CrdtChannel *dc;
+    for (dc = g_crdt.chan_buckets[bk]; dc; dc = dc->next) {
+      char nbuf[CHANNELLEN + 1];
+      if (dc->name_len >= sizeof nbuf)
+        continue;
+      memcpy(nbuf, dc->name, dc->name_len); nbuf[dc->name_len] = '\0';
+      /* Re-FindChannel each pass: remove_user_from_channel can SYNCHRONOUSLY
+       * destruct chptr when the last member leaves (channel.c:413/424), so we
+       * never hold chptr across a removal. */
+      for (;;) {
+        struct Channel *chptr = FindChannel(nbuf);
+        struct Membership *m;
+        struct Client *victim = NULL;
+        char num[16];
+        if (!chptr)
+          break;                           /* not live, or destructed by a prior removal */
+        for (m = chptr->members; m; m = m->next_member) {
+          if (IsMemberAlias(m))            /* aliases aren't real members (handled elsewhere) */
+            continue;
+          user_numeric(m->user, num, sizeof num);
+          if (crdt_orset_is_explicitly_removed(&dc->members, num, strlen(num))) {
+            victim = m->user;
+            break;
+          }
+        }
+        if (!victim)
+          break;                           /* no tombstoned-but-live members remain */
+        /* victim is still a member: notify locals + §17.7 gateway to legacy, THEN
+         * remove. remove_user_from_channel mirrors via crdt_shadow_part, but its
+         * from_crdt_peer self-gate (victim's cli_from is a CRDT peer) suppresses
+         * the re-mint — no loop, no nomirror needed. */
+        sendcmdto_channel_butserv_butone(victim, CMD_PART, chptr, NULL, 0, "%H", chptr);
+        sendcmdto_flag_serv_butone(victim, CMD_PART, NULL, FLAG_LAST_FLAG, FLAG_CRDT_AWARE,
+                                   "%H", chptr);
+        remove_user_from_channel(victim, chptr);   /* chptr may be freed here */
+        changed++;
+      }
+    }
+  }
+  if (changed)
+    log_write(LS_SYSTEM, L_NOTICE, 0,
+              "CRDT member-reconcile: removed %u member(s) from doc", changed);
+}
+
 /* ---- Phase 2 wire-sync accessors ---- */
 
 int crdt_shadow_active(void)
@@ -1261,6 +1320,7 @@ static void crdt_shadow_verify_cb(struct Event *ev)
                                       catches 2-hop foreign-origin topics via anti-entropy */
   crdt_shadow_reconcile_modes();   /* Phase 3e: same for persistent channel modes */
   crdt_shadow_reconcile_members(); /* Phase 3f: same for channel membership (JOIN-add) */
+  crdt_shadow_reconcile_removes(); /* Phase 3g: membership remove (PART / delete-on-leave) */
   crdt_sync_broadcast();   /* periodic anti-entropy: pull deltas from peers */
   crdt_shadow_gc();        /* reclaim causally-stable ops/tombstones */
 }

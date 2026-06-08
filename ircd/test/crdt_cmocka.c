@@ -269,6 +269,49 @@ static void test_C_part_yields_to_concurrent_join(void **state)
   crdt_state_clear(&s2);
 }
 
+/* Phase 3g gate: crdt_orset_is_explicitly_removed distinguishes a tombstoned
+ * member (a real remove happened → safe to reconcile-remove live) from a merely
+ * absent one (never added / sync lag → must NOT remove a live member). */
+static void test_orset_explicit_removal_gate(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s1, s2;
+  struct CrdtORSet *m;
+  crdt_state_init(&s1, 1);
+  crdt_state_init(&s2, 2);
+
+  /* present (joined, not removed): contained, NOT explicitly removed */
+  crdt_chan_join(&s1, "#c", "PPPPP");
+  m = &crdt_state_channel(&s1, "#c", 0)->members;
+  assert_int_equal(1, crdt_orset_contains(m, "PPPPP", 5));
+  assert_int_equal(0, crdt_orset_is_explicitly_removed(m, "PPPPP", 5));
+
+  /* absent (never added): neither contained nor explicitly removed (the guard) */
+  assert_int_equal(0, crdt_orset_contains(m, "ABSEN", 5));
+  assert_int_equal(0, crdt_orset_is_explicitly_removed(m, "ABSEN", 5));
+
+  /* fully tombstoned (joined then PART): NOT contained, IS explicitly removed */
+  crdt_chan_join(&s1, "#c", "RRRRR");
+  crdt_chan_remove(&s1, "#c", "RRRRR", CRDT_PRIORITY_USER);
+  m = &crdt_state_channel(&s1, "#c", 0)->members;
+  assert_int_equal(0, crdt_orset_contains(m, "RRRRR", 5));
+  assert_int_equal(1, crdt_orset_is_explicitly_removed(m, "RRRRR", 5));
+
+  /* partial tombstone (PART vs concurrent re-JOIN → one tag tombstoned, one live):
+   * contained, NOT explicitly removed (the live add-tag keeps the member present) */
+  crdt_chan_join(&s1, "#c", "QQQQQ");
+  crdt_state_sync(&s2, &s1);                                 /* s2 learns tag1 */
+  crdt_chan_remove(&s1, "#c", "QQQQQ", CRDT_PRIORITY_USER);  /* s1 tombstones tag1 */
+  crdt_chan_join(&s2, "#c", "QQQQQ");                        /* s2 re-joins → tag2 */
+  crdt_state_sync(&s1, &s2);                                 /* s1: tag1(tomb) + tag2(live) */
+  m = &crdt_state_channel(&s1, "#c", 0)->members;
+  assert_int_equal(1, crdt_orset_contains(m, "QQQQQ", 5));
+  assert_int_equal(0, crdt_orset_is_explicitly_removed(m, "QQQQQ", 5));
+
+  crdt_state_clear(&s1);
+  crdt_state_clear(&s2);
+}
+
 /* ================================================================== */
 /* Scenario E — SQUIT as server-state transition (no tombstone storm) */
 /* ================================================================== */
@@ -901,6 +944,7 @@ int main(void)
     cmocka_unit_test(test_B_force_rename_preserves_both),
     cmocka_unit_test(test_C_kick_beats_concurrent_join),
     cmocka_unit_test(test_C_part_yields_to_concurrent_join),
+    cmocka_unit_test(test_orset_explicit_removal_gate),
     cmocka_unit_test(test_E_squit_creates_no_membership_tombstones),
     cmocka_unit_test(test_wire_sv_roundtrip),
     cmocka_unit_test(test_wire_delta_converges),

@@ -168,6 +168,18 @@ int crdt_orset_contains(const struct CrdtORSet *set,
   return live && !prio_remove;
 }
 
+int crdt_orset_is_explicitly_removed(const struct CrdtORSet *set,
+                                     const char *key, uint32_t key_len)
+{
+  /* Distinguish "tombstoned" (entry exists but all add-tags covered → a real
+   * remove happened) from "absent" (never added / GC'd). The linchpin for a safe
+   * doc→live reconcile-remove: fire ONLY on an explicit tombstone, NEVER on mere
+   * absence (which could be sync lag or a P10-only member we haven't seen added). */
+  if (!orset_find(set, key, key_len))
+    return 0;                                 /* absent → NOT explicitly removed */
+  return !crdt_orset_contains(set, key, key_len);  /* exists but not contained → removed */
+}
+
 void crdt_orset_add(struct CrdtORSet *set, const char *key, uint32_t key_len,
                     struct CrdtTag tag)
 {

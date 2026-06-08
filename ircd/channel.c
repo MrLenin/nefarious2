@@ -5604,9 +5604,21 @@ joinbuf_flush(struct JoinBuf *jbuf)
     if (jbuf->jb_alias_source)
       sendcmdto_set_alias_source(jbuf->jb_alias_source);
     sendcmdto_want_s2s_tags(1);
-    sendcmdto_serv_butone(jbuf->jb_source, CMD_PART, jbuf->jb_connect,
-			  jbuf->jb_comment ? "%s :%s" : "%s", chanlist,
-			  jbuf->jb_comment);
+    /* Phase 3g: membership PART rides CRDT between CRDT-primary peers. Suppress
+     * the P10 PART to CRDT-aware servers (they learn it via the member tombstone
+     * op + reconcile-remove, which also gateways back to legacy); still relay to
+     * legacy peers. Putting PART on the SAME transport as JOIN (3f) removes the
+     * P10-fast/CRDT-slow skew that otherwise lets reconcile-add resurrect a
+     * just-parted member. KICK/QUIT are separate (CMD_KICK/CMD_QUIT, not joinbuf). */
+    if (feature_bool(FEAT_CRDT_PRIMARY))
+      sendcmdto_flag_serv_butone(jbuf->jb_source, CMD_PART, jbuf->jb_connect,
+				 FLAG_LAST_FLAG, FLAG_CRDT_AWARE,
+				 jbuf->jb_comment ? "%s :%s" : "%s", chanlist,
+				 jbuf->jb_comment);
+    else
+      sendcmdto_serv_butone(jbuf->jb_source, CMD_PART, jbuf->jb_connect,
+			    jbuf->jb_comment ? "%s :%s" : "%s", chanlist,
+			    jbuf->jb_comment);
     break;
   }
 

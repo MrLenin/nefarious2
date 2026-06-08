@@ -118,6 +118,14 @@ void crdt_orset_clear(struct CrdtORSet *set);   /**< free all storage */
 int crdt_orset_contains(const struct CrdtORSet *set,
                         const char *key, uint32_t key_len);
 
+/** Returns 1 iff the entry EXISTS in the set but is no longer contained (all
+ *  add-tags tombstoned / priority-removed) — i.e. an explicit remove happened.
+ *  Returns 0 if the entry is ABSENT (never added / GC'd). The safe gate for a
+ *  doc→live reconcile-remove: removes only the explicitly-tombstoned, never the
+ *  merely-absent (sync-lag / not-yet-seen-add guard). */
+int crdt_orset_is_explicitly_removed(const struct CrdtORSet *set,
+                                     const char *key, uint32_t key_len);
+
 /** Local add: register an add-tag (caller supplies a fresh tag). Idempotent. */
 void crdt_orset_add(struct CrdtORSet *set, const char *key, uint32_t key_len,
                     struct CrdtTag tag);
