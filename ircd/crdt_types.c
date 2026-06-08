@@ -398,6 +398,15 @@ uint32_t crdt_lwwmap_size(const struct CrdtLWWMap *map)
   return n;
 }
 
+void crdt_lwwmap_foreach(const struct CrdtLWWMap *map,
+                         crdt_lwwmap_iter_fn fn, void *ctx)
+{
+  for (uint32_t b = 0; b < map->nbuckets; b++)
+    for (struct CrdtLWWEntry *e = map->buckets[b]; e; e = e->ht_next)
+      if (!e->deleted)
+        fn(e->key, e->key_len, &e->val, ctx);
+}
+
 /* ================================================================== */
 /* CrdtStateVector                                                    */
 /* ================================================================== */

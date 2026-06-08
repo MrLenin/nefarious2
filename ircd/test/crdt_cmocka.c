@@ -50,7 +50,8 @@ static struct CrdtUserRecord mkuser(const char *nick, uint16_t srv,
   strncpy(u.nick, nick, sizeof u.nick - 1);
   strncpy(u.ident, ident, sizeof u.ident - 1);
   u.server = srv;
-  u.ip = ip;
+  memcpy(u.ip6, &ip, sizeof ip);   /* Phase 3b: ip is now ip6[16]; stash the
+                                      test's u32 in the first 4 bytes */
   return u;
 }
 
@@ -457,6 +458,115 @@ static void test_single_writer_full_digest_converges(void **state)
   crdt_state_clear(&B);
 }
 
+/* Phase 3b: the EXPANDED user record (host/realname/account/umodes/ip6/TS/...)
+ * round-trips byte-for-byte through delta encode+apply. assert_memory_equal over
+ * the whole record catches any wire field that wasn't serialized. The record is
+ * memset to 0 first so padding bytes are deterministic. */
+static void test_user_record_full_roundtrip(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s1, s2;
+  uint8_t buf[8192];
+  int n;
+  struct CrdtUserRecord u;
+  const struct CrdtUserRecord *r;
+  unsigned char ip[16] = { 0,0,0,0,0,0,0,0,0,0,0xff,0xff,1,2,3,4 };
+  memset(&u, 0, sizeof u);
+  strcpy(u.nick, "alice"); strcpy(u.ident, "al");
+  strcpy(u.host, "host.example.net"); strcpy(u.realname, "Alice Roberts");
+  strcpy(u.account, "alice_acct"); strcpy(u.umodes, "+rix");
+  memcpy(u.ip6, ip, 16);
+  u.nick_ts = 1780000000ULL; u.acc_create = 1779000000ULL;
+  u.server = 4;
+  crdt_state_init(&s1, 4);
+  crdt_state_init(&s2, 3);
+  crdt_user_set(&s1, "DAAAB", &u);
+  n = crdt_delta_encode(&s1.oplog, &s2.local_sv, buf, sizeof buf);
+  assert_true(n > 0);
+  assert_true(crdt_delta_apply(&s2, buf, (size_t)n) > 0);
+  r = crdt_user_get(&s2, "DAAAB");
+  assert_non_null(r);
+  assert_memory_equal(r, &u, sizeof u);   /* whole-record byte fidelity */
+  crdt_state_clear(&s1);
+  crdt_state_clear(&s2);
+}
+
+/* Phase 3b: per-member status LWW (keyed chan\0numeric) round-trips through
+ * delta, and a later deop (higher HLC) wins after a one-way exchange — the LWW
+ * conflict semantics that make op/deop a value change, not a membership churn. */
+static void test_member_status_roundtrip_and_converges(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s1, s2;
+  uint8_t buf[8192];
+  int n;
+  char key[64];
+  uint32_t klen;
+  struct CrdtMemberRecord op_rec, deop_rec;
+  const struct CrdtLWWValue *v;
+  memset(&op_rec, 0, sizeof op_rec);
+  op_rec.status = CRDT_MEMBER_OP | CRDT_MEMBER_VOICE; op_rec.oplevel = 5;
+  memset(&deop_rec, 0, sizeof deop_rec);
+  deop_rec.status = CRDT_MEMBER_VOICE; deop_rec.oplevel = 0;
+  /* composite key "#c\0DAAAB" */
+  memcpy(key, "#c", 2); key[2] = '\0'; memcpy(key + 3, "DAAAB", 5);
+  klen = 2 + 1 + 5;
+  crdt_state_init(&s1, 4);
+  crdt_state_init(&s2, 3);
+  crdt_member_status_set(&s1, "#c", "DAAAB", &op_rec);
+  n = crdt_delta_encode(&s1.oplog, &s2.local_sv, buf, sizeof buf);
+  assert_true(n > 0);
+  assert_true(crdt_delta_apply(&s2, buf, (size_t)n) > 0);
+  v = crdt_lwwmap_get(&s2.members_status, key, klen);
+  assert_non_null(v);
+  assert_int_equal((int)v->data_len, (int)sizeof op_rec);
+  assert_memory_equal(v->data, &op_rec, sizeof op_rec);
+  /* s2 deops later (higher HLC) -> wins; sync back to s1 -> both converge */
+  crdt_member_status_set(&s2, "#c", "DAAAB", &deop_rec);
+  n = crdt_delta_encode(&s2.oplog, &s1.local_sv, buf, sizeof buf);
+  assert_true(n > 0);
+  assert_true(crdt_delta_apply(&s1, buf, (size_t)n) > 0);
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+  v = crdt_lwwmap_get(&s1.members_status, key, klen);
+  assert_non_null(v);
+  assert_memory_equal(v->data, &deop_rec, sizeof deop_rec);
+  crdt_state_clear(&s1);
+  crdt_state_clear(&s2);
+}
+
+/* Phase 3b: a full snapshot carries the new chanmeta + members_status maps
+ * (guards the snapshot-encoder wiring — a forgotten snap_put_lww would diverge
+ * the digest). */
+static void test_snapshot_chanmeta_members_roundtrip(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s1, s2;
+  uint8_t buf[16384];
+  int n;
+  struct CrdtChanMeta meta;
+  struct CrdtMemberRecord mr;
+  const struct CrdtLWWValue *v;
+  memset(&meta, 0, sizeof meta);
+  meta.creationtime = 1780000123ULL; meta.topic_time = 1780000200ULL;
+  strcpy(meta.topic_nick, "alice!al@host.example.net");
+  memset(&mr, 0, sizeof mr);
+  mr.status = CRDT_MEMBER_OP; mr.oplevel = 1;
+  crdt_state_init(&s1, 4);
+  crdt_state_init(&s2, 3);
+  crdt_chan_join(&s1, "#c", "DAAAB");
+  crdt_chanmeta_set(&s1, "#c", &meta);
+  crdt_member_status_set(&s1, "#c", "DAAAB", &mr);
+  n = crdt_snapshot_encode(&s1, buf, sizeof buf);
+  assert_true(n > 0);
+  assert_int_equal(0, crdt_snapshot_apply(&s2, buf, (size_t)n));
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+  v = crdt_lwwmap_get(&s2.chanmeta, "#c", 2);
+  assert_non_null(v);
+  assert_memory_equal(v->data, &meta, sizeof meta);
+  crdt_state_clear(&s1);
+  crdt_state_clear(&s2);
+}
+
 /* Two replicas make CONCURRENT, CONFLICTING changes to the same entities with
  * no coordination, then sync. They must still converge to the same digest --
  * the core CRDT guarantee under contention (concurrent LWW conflict on a key,
@@ -796,6 +906,9 @@ int main(void)
     cmocka_unit_test(test_wire_delta_converges),
     cmocka_unit_test(test_wire_digest_converges),
     cmocka_unit_test(test_single_writer_full_digest_converges),
+    cmocka_unit_test(test_user_record_full_roundtrip),
+    cmocka_unit_test(test_member_status_roundtrip_and_converges),
+    cmocka_unit_test(test_snapshot_chanmeta_members_roundtrip),
     cmocka_unit_test(test_wire_concurrent_converges),
     cmocka_unit_test(test_snapshot_roundtrip),
     cmocka_unit_test(test_gc_advances_floor),

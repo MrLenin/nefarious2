@@ -2611,6 +2611,11 @@ int set_user_mode(struct Client *cptr, struct Client *sptr, int parc,
    * Must be after mode application so aliases reflect the new state. */
   bounce_sync_session_umodes(acptr);
 
+  /* Phase 3b CRDT shadow: refresh the user record so post-registration umode
+   * changes (local /mode, S2S MODE, oper-up) stay reflected in the doc.
+   * Gated + idempotent; single-writer gate skips CRDT-peer-originated changes. */
+  crdt_shadow_user_add(acptr);
+
   return 0;
 }
 

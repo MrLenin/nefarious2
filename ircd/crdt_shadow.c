@@ -15,12 +15,14 @@
 
 #include "channel.h"
 #include "client.h"
+#include "hash.h"            /* FindChannel (Phase 3b dry-run lookup) */
 #include "struct.h"          /* struct User (cli_user(c)->server) */
 #include "ircd.h"           /* GlobalClientList */
 #include "ircd_events.h"
 #include "ircd_features.h"
 #include "ircd_log.h"
 #include "numnicks.h"
+#include "s_user.h"          /* umode_str (Phase 3b reconstruction payload) */
 #include "handlers.h"        /* crdt_sync_broadcast */
 
 #include <stdio.h>
@@ -82,6 +84,56 @@ static const char *user_numeric(struct Client *who, char *buf, size_t n)
   return buf;
 }
 
+/* ---- Phase 3b reconstruction payload helpers ---- */
+
+/** Copy just the mode-LETTERS of a umode_str() result into @a dst (the first
+ *  whitespace-delimited token). Parameters (sethost, account, the volatile
+ *  IP-list field) are deliberately dropped: sethost lives in rec.host, account
+ *  in rec.account, and param fields can be observer-relative. The bare flags are
+ *  S2S-propagated and observer-consistent, so they converge. */
+static void umode_letters(char *dst, size_t dstsz, const char *um)
+{
+  size_t i = 0;
+  if (um)
+    while (um[i] && um[i] != ' ' && i + 1 < dstsz) { dst[i] = um[i]; i++; }
+  dst[i] = '\0';
+}
+
+/** Map live Membership status bits to the compact CRDT status byte. */
+static uint8_t compact_status(unsigned int st)
+{
+  uint8_t s = 0;
+  if (st & CHFL_CHANOP) s |= CRDT_MEMBER_OP;
+  if (st & CHFL_VOICE)  s |= CRDT_MEMBER_VOICE;
+  if (st & CHFL_HALFOP) s |= CRDT_MEMBER_HALFOP;
+  return s;
+}
+
+/** Mirror one member's status+oplevel into the members_status LWW map. */
+static void write_member_status(struct Channel *chptr, struct Membership *m)
+{
+  char num[16];
+  struct CrdtMemberRecord rec;
+  if (!m || (m->status & CHFL_ALIAS) || !cli_user(m->user))
+    return;
+  memset(&rec, 0, sizeof rec);
+  rec.status = compact_status(m->status);
+  rec.oplevel = (uint16_t)m->oplevel;
+  crdt_member_status_set(&g_crdt, chptr->chname,
+                         user_numeric(m->user, num, sizeof num), &rec);
+}
+
+/** Mirror a channel's metadata (creationtime + topic provenance) into chanmeta. */
+static void write_chanmeta(struct Channel *chptr)
+{
+  struct CrdtChanMeta meta;
+  memset(&meta, 0, sizeof meta);
+  meta.creationtime = (uint64_t)chptr->creationtime;
+  meta.topic_time = (uint64_t)chptr->topic_time;
+  strncpy(meta.topic_nick, chptr->topic_nick, sizeof meta.topic_nick - 1);
+  crdt_chanmeta_set(&g_crdt, chptr->chname, &meta);
+}
+
 void crdt_shadow_join(struct Channel *chptr, struct Client *who,
                       unsigned int flags)
 {
@@ -95,6 +147,11 @@ void crdt_shadow_join(struct Channel *chptr, struct Client *who,
   if (from_crdt_peer(cli_from(who)))  /* single-writer: peer owns this op */
     return;
   crdt_chan_join(&g_crdt, chptr->chname, user_numeric(who, num, sizeof num));
+  /* opped/voiced-on-join (burst @, founder) never hits modebuf_flush, so capture
+   * initial member status here; and seed the channel meta (creationtime). */
+  if (flags & (CHFL_CHANOP | CHFL_HALFOP | CHFL_VOICE))
+    write_member_status(chptr, find_member_link(chptr, who));
+  write_chanmeta(chptr);
   crdt_sync_push();                   /* eager-propagate to CRDT peers */
 }
 
@@ -118,15 +175,25 @@ void crdt_shadow_user_add(struct Client *cptr)
   struct CrdtUserRecord rec;
   if (!shadow_on())
     return;
-  if (!cli_user(cptr) || IsBouncerAlias(cptr))   /* non-alias users only */
+  /* non-alias users that are fully numbered (own + server numeric set) — guards
+   * against the set_user_mode hook firing mid-registration before the local
+   * numeric is assigned (which would mint a malformed server-only key). */
+  if (!cli_user(cptr) || !cli_user(cptr)->server || !cli_yxx(cptr)[0] ||
+      IsBouncerAlias(cptr))
     return;
   if (from_crdt_peer(cli_from(cptr)))  /* single-writer: peer owns this op */
     return;
   memset(&rec, 0, sizeof rec);
   strncpy(rec.nick, cli_name(cptr), sizeof rec.nick - 1);
   strncpy(rec.ident, cli_user(cptr)->username, sizeof rec.ident - 1);
+  strncpy(rec.host, cli_user(cptr)->host, sizeof rec.host - 1);
+  strncpy(rec.realname, cli_info(cptr), sizeof rec.realname - 1);
+  strncpy(rec.account, cli_user(cptr)->account, sizeof rec.account - 1);
+  umode_letters(rec.umodes, sizeof rec.umodes, umode_str(cptr));
+  memcpy(rec.ip6, &cli_ip(cptr), sizeof rec.ip6);   /* struct irc_in_addr, 16B */
+  rec.nick_ts = (uint64_t)cli_lastnick(cptr);
+  rec.acc_create = (uint64_t)cli_user(cptr)->acc_create;
   rec.server = (uint16_t)base64toint(cli_yxx(cli_user(cptr)->server));
-  rec.ip = 0;                                     /* unused in count verify */
   crdt_user_set(&g_crdt, user_numeric(cptr, num, sizeof num), &rec);
   crdt_sync_push();                    /* eager-propagate to CRDT peers */
 }
@@ -154,6 +221,7 @@ void crdt_shadow_topic(struct Channel *chptr, struct Client *from)
    * would never enter the oplog and never sync — that was the modes/topic
    * convergence bug). */
   crdt_topic_set(&g_crdt, chptr->chname, chptr->topic);
+  write_chanmeta(chptr);               /* topic_time/topic_nick + creationtime */
   crdt_sync_push();                    /* eager-propagate to CRDT peers */
 }
 
@@ -192,6 +260,13 @@ void crdt_shadow_modes(struct Channel *chptr, struct Client *from)
   build_mode_snap(chptr, &snap);
   /* op-recording setter so modes replicate (see crdt_shadow_topic). */
   crdt_modes_set(&g_crdt, chptr->chname, &snap, sizeof snap);
+  /* modebuf_flush fires on every op/deop/voice — re-assert each present member's
+   * status (the single choke for per-member status changes). */
+  {
+    struct Membership *m;
+    for (m = chptr->members; m; m = m->next_member)
+      write_member_status(chptr, m);
+  }
   crdt_sync_push();                    /* eager-propagate to CRDT peers */
 }
 
@@ -374,6 +449,196 @@ void crdt_shadow_verify(void)
    * increment; until then the shadow oplog grows (bounded enough for testing). */
 }
 
+/* ---- Phase 3b dry-run materialization check (doc -> live fidelity) ----
+ * The inverse of crdt_shadow_verify (which walks live -> doc). For every entity
+ * in the DOC, confirm a live entity exists with field-for-field fidelity over the
+ * reconstruction set 3c would rebuild from. Logs "reconstruction gap"s; MUTATES
+ * NOTHING. A clean run means the doc is a faithful, complete source of truth. */
+
+#define MAT_LOG_CAP 20      /* cap logged gaps per pass to avoid log spam */
+
+struct mat_user_ctx { unsigned int *gaps; unsigned int *logged; unsigned int *users; };
+
+static void mat_user_cb(const char *key, uint32_t key_len,
+                        const struct CrdtLWWValue *val, void *ctx)
+{
+  struct mat_user_ctx *c = ctx;
+  char numbuf[16], miss[256];
+  const struct CrdtUserRecord *rec;
+  struct Client *live;
+  if (key_len >= sizeof numbuf ||
+      val->data_len != sizeof(struct CrdtUserRecord)) { (*c->gaps)++; return; }
+  memcpy(numbuf, key, key_len); numbuf[key_len] = '\0';
+  rec = (const struct CrdtUserRecord *)val->data;
+  (*c->users)++;
+  live = findNUser(numbuf);
+  if (!live || !cli_user(live)) {
+    (*c->gaps)++;
+    if ((*c->logged)++ < MAT_LOG_CAP)
+      log_write(LS_SYSTEM, L_NOTICE, 0,
+                "CRDT mat-check gap: user %s (%s) in doc, not live", numbuf,
+                rec->nick);
+    return;
+  }
+  miss[0] = '\0';
+#define MCK(cond, name) do { if (cond) \
+    strncat(miss, name " ", sizeof miss - strlen(miss) - 1); } while (0)
+  MCK(strcmp(rec->nick, cli_name(live)), "nick");
+  MCK(strcmp(rec->ident, cli_user(live)->username), "ident");
+  MCK(strcmp(rec->host, cli_user(live)->host), "host");
+  MCK(strcmp(rec->realname, cli_info(live)), "realname");
+  MCK(strcmp(rec->account, cli_user(live)->account), "account");
+  MCK(memcmp(rec->ip6, &cli_ip(live), sizeof rec->ip6), "ip");
+  MCK(rec->nick_ts != (uint64_t)cli_lastnick(live), "ts");
+  { char letters[CRDT_UMODELEN];
+    umode_letters(letters, sizeof letters, umode_str(live));
+    MCK(strcmp(rec->umodes, letters), "umode"); }
+#undef MCK
+  if (miss[0]) {
+    (*c->gaps)++;
+    if ((*c->logged)++ < MAT_LOG_CAP)
+      log_write(LS_SYSTEM, L_NOTICE, 0,
+                "CRDT mat-check gap: user %s (%s) fields: %s", numbuf, rec->nick,
+                miss);
+  }
+}
+
+struct mat_chan_ctx {
+  struct Channel *live;
+  const char     *chname;
+  unsigned int   *gaps;
+  unsigned int   *logged;
+};
+
+/* present doc member -> live membership + status fidelity */
+static void mat_member_cb(const char *key, uint32_t key_len, void *ctx)
+{
+  struct mat_chan_ctx *c = ctx;
+  char numbuf[16], mkey[512];
+  struct Client *live_u;
+  struct Membership *m;
+  const struct CrdtLWWValue *sv;
+  const struct CrdtMemberRecord *mr;
+  uint8_t live_status;
+  uint32_t clen, mklen;
+  if (key_len >= sizeof numbuf)
+    return;
+  memcpy(numbuf, key, key_len); numbuf[key_len] = '\0';
+  live_u = findNUser(numbuf);
+  m = live_u ? find_member_link(c->live, live_u) : NULL;
+  if (!m) {
+    (*c->gaps)++;
+    if ((*c->logged)++ < MAT_LOG_CAP)
+      log_write(LS_SYSTEM, L_NOTICE, 0,
+                "CRDT mat-check gap: %s member %s in doc, not live", c->chname,
+                numbuf);
+    return;
+  }
+  clen = (uint32_t)strlen(c->chname);
+  if (clen + 1 + key_len > sizeof mkey)
+    return;
+  memcpy(mkey, c->chname, clen); mkey[clen] = '\0';
+  memcpy(mkey + clen + 1, key, key_len);
+  mklen = clen + 1 + key_len;
+  sv = crdt_lwwmap_get(&g_crdt.members_status, mkey, mklen);
+  mr = (sv && sv->data_len == sizeof(struct CrdtMemberRecord))
+         ? (const struct CrdtMemberRecord *)sv->data : NULL;
+  live_status = compact_status(m->status);
+  /* a plain member with no status entry is fine; otherwise must match */
+  if ((!mr && live_status != 0) ||
+      (mr && (mr->status != live_status ||
+              mr->oplevel != (uint16_t)m->oplevel))) {
+    (*c->gaps)++;
+    if ((*c->logged)++ < MAT_LOG_CAP)
+      log_write(LS_SYSTEM, L_NOTICE, 0,
+                "CRDT mat-check gap: %s member %s status doc=%u live=%u",
+                c->chname, numbuf, mr ? mr->status : 0, live_status);
+  }
+}
+
+void crdt_shadow_materialize_check(void)
+{
+  unsigned int gaps = 0, logged = 0, users = 0, chans = 0;
+  int bk;
+  if (!shadow_on())
+    return;
+
+  { struct mat_user_ctx uc = { &gaps, &logged, &users };
+    crdt_lwwmap_foreach(&g_crdt.users, mat_user_cb, &uc); }
+
+  for (bk = 0; bk < CRDT_CHAN_BUCKETS; bk++) {
+    struct CrdtChannel *dc;
+    for (dc = g_crdt.chan_buckets[bk]; dc; dc = dc->next) {
+      char nbuf[CHANNELLEN + 1];
+      struct Channel *live;
+      struct mat_chan_ctx cc;
+      const struct CrdtLWWValue *mv, *tv;
+      struct ShadowModeSnap cur;
+      if (crdt_orset_size(&dc->members) == 0)   /* empty doc channel */
+        continue;
+      if (dc->name_len >= sizeof nbuf)
+        continue;
+      memcpy(nbuf, dc->name, dc->name_len); nbuf[dc->name_len] = '\0';
+      chans++;
+      live = FindChannel(nbuf);
+      if (!live) {
+        gaps++;
+        if (logged++ < MAT_LOG_CAP)
+          log_write(LS_SYSTEM, L_NOTICE, 0,
+                    "CRDT mat-check gap: channel %s in doc, not live", nbuf);
+        continue;
+      }
+      /* chanmeta: creationtime + topic provenance */
+      mv = crdt_lwwmap_get(&g_crdt.chanmeta, nbuf, dc->name_len);
+      if (mv && mv->data_len == sizeof(struct CrdtChanMeta)) {
+        const struct CrdtChanMeta *meta = (const struct CrdtChanMeta *)mv->data;
+        if (meta->creationtime != (uint64_t)live->creationtime ||
+            meta->topic_time != (uint64_t)live->topic_time ||
+            strcmp(meta->topic_nick, live->topic_nick) != 0) {
+          gaps++;
+          if (logged++ < MAT_LOG_CAP)
+            log_write(LS_SYSTEM, L_NOTICE, 0,
+                      "CRDT mat-check gap: %s chanmeta doc_ts=%lu live_ts=%lu",
+                      nbuf, (unsigned long)meta->creationtime,
+                      (unsigned long)live->creationtime);
+        }
+      } else {
+        gaps++;
+        if (logged++ < MAT_LOG_CAP)
+          log_write(LS_SYSTEM, L_NOTICE, 0,
+                    "CRDT mat-check gap: %s chanmeta missing", nbuf);
+      }
+      /* topic string */
+      tv = crdt_lwwmap_get(&g_crdt.topics, nbuf, dc->name_len);
+      if (strcmp(tv ? (const char *)tv->data : "", live->topic) != 0) {
+        gaps++;
+        if (logged++ < MAT_LOG_CAP)
+          log_write(LS_SYSTEM, L_NOTICE, 0,
+                    "CRDT mat-check gap: %s topic mismatch", nbuf);
+      }
+      /* persistent modes */
+      build_mode_snap(live, &cur);
+      mv = crdt_lwwmap_get(&g_crdt.modes, nbuf, dc->name_len);
+      if ((mv && (mv->data_len != sizeof cur ||
+                  memcmp(mv->data, &cur, sizeof cur) != 0)) ||
+          (!mv && cur.mode != 0)) {
+        gaps++;
+        if (logged++ < MAT_LOG_CAP)
+          log_write(LS_SYSTEM, L_NOTICE, 0,
+                    "CRDT mat-check gap: %s modes mismatch (mode=0x%x)", nbuf,
+                    cur.mode);
+      }
+      /* members + per-member status (present doc members only) */
+      cc.live = live; cc.chname = nbuf; cc.gaps = &gaps; cc.logged = &logged;
+      crdt_orset_foreach(&dc->members, mat_member_cb, &cc);
+    }
+  }
+
+  log_write(LS_SYSTEM, L_NOTICE, 0,
+            "CRDT mat-check: %u users, %u channels, %u reconstruction gap(s)",
+            users, chans, gaps);
+}
+
 /* ---- Phase 2 wire-sync accessors ---- */
 
 int crdt_shadow_active(void)
@@ -529,6 +794,7 @@ static void crdt_shadow_verify_cb(struct Event *ev)
   if (ev_type(ev) != ET_EXPIRE)
     return;
   crdt_shadow_verify();
+  crdt_shadow_materialize_check();  /* Phase 3b dry-run: doc -> live fidelity */
   crdt_sync_broadcast();   /* periodic anti-entropy: pull deltas from peers */
   crdt_shadow_gc();        /* reclaim causally-stable ops/tombstones */
 }

@@ -18,11 +18,21 @@
 #include "crdt_hlc.h"
 #include "crdt_types.h"
 
-/* Fixed field sizes (PoC; generous vs IRC limits). */
+/* Fixed field sizes (PoC; generous vs IRC limits — buffer sizes incl. NUL). */
 #define CRDT_NICKLEN     32
 #define CRDT_IDENTLEN    16
 #define CRDT_ACCOUNTLEN  32
 #define CRDT_NUMERICLEN   6   /* 5-char P10 client numeric + NUL */
+#define CRDT_HOSTLEN     80   /* >= HOSTLEN(75)+1 */
+#define CRDT_REALLEN     56   /* >= REALLEN(50)+1 */
+#define CRDT_UMODELEN    32   /* umode_str() form, e.g. "+rix" */
+#define CRDT_TOPICNICKLEN 120 /* >= NICKLEN+USERLEN+HOSTLEN+3 +1 */
+
+/* Compact per-member channel status bits (mapped from CHFL_* at the shadow
+ * boundary; raw CHFL_HALFOP=0x800000 won't fit a byte). */
+#define CRDT_MEMBER_OP     0x01
+#define CRDT_MEMBER_VOICE  0x02
+#define CRDT_MEMBER_HALFOP 0x04
 
 /*
  * Records stored as LWW-Map values (memcpy'd blobs).
@@ -38,11 +48,39 @@ struct CrdtServerRecord {
   uint8_t state;          /**< enum CrdtServerState */
 };
 
+/* Full reconstruction payload for a user (Phase 3b): everything the BURST/NICK
+ * path needs to rebuild a live Client. Populated with memset-then-fill so the
+ * blob (incl. padding) is byte-deterministic across replicas. */
 struct CrdtUserRecord {
   char     nick[CRDT_NICKLEN];
   char     ident[CRDT_IDENTLEN];
-  uint32_t ip;
+  char     host[CRDT_HOSTLEN];        /**< displayed host (cli_user->host) */
+  char     realname[CRDT_REALLEN];    /**< cli_info */
+  char     account[CRDT_ACCOUNTLEN];  /**< "" if not logged in */
+  char     umodes[CRDT_UMODELEN];     /**< umode_str() form, e.g. "+rix" */
+  unsigned char ip6[16];              /**< struct irc_in_addr bytes (host order) */
+  uint64_t nick_ts;                   /**< cli_lastnick (TS) */
+  uint64_t acc_create;                /**< account timestamp */
   uint16_t server;        /**< owning server numeric (for SQUIT visibility) */
+  /* NB: hopcount is deliberately NOT stored — it is observer-relative (distance
+   * from each server), so it can't be a shared CRDT value; 3c recomputes it
+   * locally at materialize time. (The dry-run surfaced this.) */
+};
+
+/* Per-member channel status (Phase 3b): an LWW register keyed by chan\0numeric,
+ * parallel to the members OR-Set (presence is set-like; status is last-write). */
+struct CrdtMemberRecord {
+  uint8_t  status;        /**< CRDT_MEMBER_OP|VOICE|HALFOP */
+  uint16_t oplevel;
+};
+
+/* Per-channel metadata (Phase 3b): creationtime (TS-war) + topic provenance.
+ * Stored separately from the topic string so a topic-less channel still carries
+ * its creationtime. Timestamps are fixed uint64 (not time_t) for wire stability. */
+struct CrdtChanMeta {
+  uint64_t creationtime;
+  uint64_t topic_time;
+  char     topic_nick[CRDT_TOPICNICKLEN];
 };
 
 /** Nick claim (proposal §17.5.1). */
@@ -70,8 +108,10 @@ enum CrdtCollection {
   CRDT_COLL_USERS,
   CRDT_COLL_NICKS,
   CRDT_COLL_CHAN_MEMBERS,
-  CRDT_COLL_TOPICS,     /**< channel-name -> topic string (LWW) */
-  CRDT_COLL_MODES       /**< channel-name -> mode snapshot blob (LWW) */
+  CRDT_COLL_TOPICS,        /**< channel-name -> topic string (LWW) */
+  CRDT_COLL_MODES,         /**< channel-name -> mode snapshot blob (LWW) */
+  CRDT_COLL_MEMBER_STATUS, /**< chan\0numeric -> CrdtMemberRecord (LWW) */
+  CRDT_COLL_CHANMETA       /**< channel-name -> CrdtChanMeta (LWW) */
 };
 
 struct CrdtOp {
@@ -136,6 +176,8 @@ struct CrdtNetworkState {
   struct CrdtLWWMap       nicks;        /**< lc-nick -> CrdtNickClaim */
   struct CrdtLWWMap       topics;       /**< channel-name -> topic string */
   struct CrdtLWWMap       modes;        /**< channel-name -> opaque mode blob */
+  struct CrdtLWWMap       members_status; /**< chan\0numeric -> CrdtMemberRecord */
+  struct CrdtLWWMap       chanmeta;     /**< channel-name -> CrdtChanMeta */
   struct CrdtChannel     *chan_buckets[CRDT_CHAN_BUCKETS];
 };
 
@@ -164,6 +206,13 @@ void crdt_topic_set(struct CrdtNetworkState *st, const char *chan,
 /** Set a channel mode snapshot (opaque blob, LWW). Records a SET op. */
 void crdt_modes_set(struct CrdtNetworkState *st, const char *chan,
                     const void *snap, uint32_t snaplen);
+/** Set a member's channel status (LWW, keyed chan\0numeric). Records a SET op. */
+void crdt_member_status_set(struct CrdtNetworkState *st, const char *chan,
+                            const char *numeric,
+                            const struct CrdtMemberRecord *rec);
+/** Set per-channel metadata (creationtime/topic provenance, LWW). Records a SET. */
+void crdt_chanmeta_set(struct CrdtNetworkState *st, const char *chan,
+                       const struct CrdtChanMeta *meta);
 
 /* ---- sync / merge ---- */
 /** The LWW-Map backing a given collection (SERVERS/USERS/NICKS/TOPICS/MODES),

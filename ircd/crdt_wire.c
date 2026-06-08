@@ -298,13 +298,16 @@ int crdt_snapshot_encode(const struct CrdtNetworkState *st,
   w.p[sv_off]     = (uint8_t)((unsigned)svn >> 8);
   w.p[sv_off + 1] = (uint8_t)svn;
 
-  /* five LWW maps */
+  /* LWW maps (count is dynamic; the decoder routes each entry by its coll byte
+   * via crdt_state_lww_for, so adding maps here needs no decoder change) */
   lww_off = w.off; wput_u32(&w, 0);
   snap_put_lww(&w, &st->servers, (uint8_t)CRDT_COLL_SERVERS, &lww_total);
   snap_put_lww(&w, &st->users,   (uint8_t)CRDT_COLL_USERS,   &lww_total);
   snap_put_lww(&w, &st->nicks,   (uint8_t)CRDT_COLL_NICKS,   &lww_total);
   snap_put_lww(&w, &st->topics,  (uint8_t)CRDT_COLL_TOPICS,  &lww_total);
   snap_put_lww(&w, &st->modes,   (uint8_t)CRDT_COLL_MODES,   &lww_total);
+  snap_put_lww(&w, &st->members_status, (uint8_t)CRDT_COLL_MEMBER_STATUS, &lww_total);
+  snap_put_lww(&w, &st->chanmeta, (uint8_t)CRDT_COLL_CHANMETA, &lww_total);
   wpatch_u32(&w, lww_off, lww_total);
 
   /* channels: members / bans / excepts */

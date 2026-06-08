@@ -65,6 +65,11 @@ void crdt_shadow_lists(struct Channel *chptr, struct Client *from);
  *  divergence. No-op unless FEAT_CRDT_ENABLED. */
 void crdt_shadow_verify(void);
 
+/** Phase 3b dry-run: walk the doc and confirm every entity could be rebuilt
+ *  from it with field-for-field fidelity against live state. Logs reconstruction
+ *  gaps; mutates nothing. No-op unless FEAT_CRDT_ENABLED. */
+void crdt_shadow_materialize_check(void);
+
 /* ---- Phase 2 wire-sync accessors (used by m_crdt.c) ----
  * These expose the shadow document to the CR token handlers while keeping the
  * CrdtNetworkState itself private to this module. */

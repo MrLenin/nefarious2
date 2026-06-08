@@ -141,6 +141,8 @@ void crdt_state_init(struct CrdtNetworkState *st, uint16_t my_numeric)
   crdt_lwwmap_init(&st->nicks);
   crdt_lwwmap_init(&st->topics);
   crdt_lwwmap_init(&st->modes);
+  crdt_lwwmap_init(&st->members_status);
+  crdt_lwwmap_init(&st->chanmeta);
 }
 
 void crdt_state_clear(struct CrdtNetworkState *st)
@@ -152,6 +154,8 @@ void crdt_state_clear(struct CrdtNetworkState *st)
   crdt_lwwmap_clear(&st->nicks);
   crdt_lwwmap_clear(&st->topics);
   crdt_lwwmap_clear(&st->modes);
+  crdt_lwwmap_clear(&st->members_status);
+  crdt_lwwmap_clear(&st->chanmeta);
   for (int b = 0; b < CRDT_CHAN_BUCKETS; b++) {
     struct CrdtChannel *c = st->chan_buckets[b];
     while (c) {
@@ -338,6 +342,56 @@ void crdt_modes_set(struct CrdtNetworkState *st, const char *chan,
   record(st, op);
 }
 
+void crdt_member_status_set(struct CrdtNetworkState *st, const char *chan,
+                            const char *numeric,
+                            const struct CrdtMemberRecord *rec)
+{
+  struct HLC ts = hlc_local_event(&st->clock);
+  uint32_t clen = (uint32_t)strlen(chan);
+  uint32_t nlen = (uint32_t)strlen(numeric);
+  char key[512];                 /* chan \0 numeric (chan<=CHANNELLEN, num<=5) */
+  uint32_t klen;
+  uint64_t seq;
+  struct CrdtOp *op;
+  if (clen + 1 + nlen > sizeof key)
+    return;                      /* defensive: oversized key, skip */
+  memcpy(key, chan, clen);
+  key[clen] = '\0';
+  memcpy(key + clen + 1, numeric, nlen);
+  klen = clen + 1 + nlen;
+  crdt_lwwmap_set(&st->members_status, key, klen, rec, sizeof(*rec),
+                  ts, st->my_numeric);
+  seq = st->next_seq++;
+  op = op_new(st->my_numeric, seq, CRDT_OP_SET, CRDT_COLL_MEMBER_STATUS);
+  op->key = memdup(key, klen);
+  op->key_len = klen;
+  op->val = memdup(rec, sizeof(*rec));
+  op->val_len = sizeof(*rec);
+  op->ts = ts;
+  op->writer = st->my_numeric;
+  record(st, op);
+}
+
+void crdt_chanmeta_set(struct CrdtNetworkState *st, const char *chan,
+                       const struct CrdtChanMeta *meta)
+{
+  struct HLC ts = hlc_local_event(&st->clock);
+  uint32_t klen = (uint32_t)strlen(chan);
+  uint64_t seq;
+  struct CrdtOp *op;
+  crdt_lwwmap_set(&st->chanmeta, chan, klen, meta, sizeof(*meta),
+                  ts, st->my_numeric);
+  seq = st->next_seq++;
+  op = op_new(st->my_numeric, seq, CRDT_OP_SET, CRDT_COLL_CHANMETA);
+  op->key = memdup(chan, klen);
+  op->key_len = klen;
+  op->val = memdup(meta, sizeof(*meta));
+  op->val_len = sizeof(*meta);
+  op->ts = ts;
+  op->writer = st->my_numeric;
+  record(st, op);
+}
+
 /* ------------------------------------------------------------------ */
 /* sync / merge                                                       */
 /* ------------------------------------------------------------------ */
@@ -351,6 +405,8 @@ static struct CrdtLWWMap *lww_for(struct CrdtNetworkState *st,
   case CRDT_COLL_NICKS:   return &st->nicks;
   case CRDT_COLL_TOPICS:  return &st->topics;
   case CRDT_COLL_MODES:   return &st->modes;
+  case CRDT_COLL_MEMBER_STATUS: return &st->members_status;
+  case CRDT_COLL_CHANMETA:      return &st->chanmeta;
   default:                return NULL;
   }
 }
@@ -551,6 +607,8 @@ uint64_t crdt_state_digest(const struct CrdtNetworkState *st)
   acc = digest_lww(acc, &st->nicks, 3);
   acc = digest_lww(acc, &st->topics, 4);
   acc = digest_lww(acc, &st->modes, 5);
+  acc = digest_lww(acc, &st->members_status, 6);
+  acc = digest_lww(acc, &st->chanmeta, 7);
   for (bk = 0; bk < CRDT_CHAN_BUCKETS; bk++) {
     struct CrdtChannel *c;
     for (c = st->chan_buckets[bk]; c; c = c->next) {
@@ -595,6 +653,8 @@ uint64_t crdt_state_digest_materialized(const struct CrdtNetworkState *st)
   acc = digest_lww(acc, &st->nicks, 3);
   acc = digest_lww(acc, &st->topics, 4);
   acc = digest_lww(acc, &st->modes, 5);
+  acc = digest_lww(acc, &st->members_status, 6);
+  acc = digest_lww(acc, &st->chanmeta, 7);
   for (bk = 0; bk < CRDT_CHAN_BUCKETS; bk++) {
     struct CrdtChannel *c;
     for (c = st->chan_buckets[bk]; c; c = c->next) {

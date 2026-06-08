@@ -210,6 +210,12 @@ int crdt_lwwmap_delete(struct CrdtLWWMap *map, const char *key,
 /** Number of live (non-deleted) keys. */
 uint32_t crdt_lwwmap_size(const struct CrdtLWWMap *map);
 
+typedef void (*crdt_lwwmap_iter_fn)(const char *key, uint32_t key_len,
+                                    const struct CrdtLWWValue *val, void *ctx);
+/** Visit every PRESENT (non-deleted) key with its current value. */
+void crdt_lwwmap_foreach(const struct CrdtLWWMap *map,
+                         crdt_lwwmap_iter_fn fn, void *ctx);
+
 /*
  * ============================================================
  * CrdtStateVector — per-server highest-seq tracking
