@@ -156,6 +156,17 @@ struct MetadataEntry;
  */
 #define MODE_WPARAS     (MODE_CHANOP|MODE_HALFOP|MODE_VOICE|MODE_BAN|MODE_KEY|MODE_LIMIT|MODE_APASS|MODE_UPASS)
 
+/** CRDT-mesh: persistent channel-mode bits mirrored into / driven from the CRDT
+ *  doc (Phase 3b/3c/3e). Excludes per-member CHANOP/VOICE/HALFOP, the list-modes
+ *  BAN/EXCEPT, extended modes (exmode), and internal flags (BURSTADDED/SAVE/etc.).
+ *  NB: +L/+U/+A (REDIRECT/UPASS/APASS) are deliberately EXCLUDED — their string
+ *  args aren't carried in ShadowModeSnap, so they ride P10 only (3e scope-out;
+ *  full support needs a snap-blob extension). */
+#define CRDT_MODE_MASK (MODE_PRIVATE | MODE_SECRET | MODE_MODERATED |          \
+                        MODE_TOPICLIMIT | MODE_INVITEONLY | MODE_NOPRIVMSGS |  \
+                        MODE_KEY | MODE_LIMIT | MODE_REGONLY | MODE_DELJOINS | \
+                        MODE_REGISTERED)
+
 /** Available Channel modes */
 #define infochanmodes feature_bool(FEAT_OPLEVELS) ? "AabCcDdhHikLlMmNnOopPQRrSsTtUvZz" : "abCcDdhHikLlMmNnOopPQRrSsTtvZz"
 /** Available Channel modes that take parameters */
@@ -563,6 +574,7 @@ extern void modebuf_mode_string(struct ModeBuf *mbuf, unsigned int mode,
 extern void modebuf_mode_client(struct ModeBuf *mbuf, unsigned int mode,
 				struct Client *client, int oplevel);
 extern int modebuf_flush(struct ModeBuf *mbuf);
+extern int modebuf_flush_nomirror(struct ModeBuf *mbuf);
 extern void modebuf_extract(struct ModeBuf *mbuf, char *buf, int oplevels);
 
 extern void mode_ban_invalidate(struct Channel *chan);

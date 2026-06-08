@@ -2394,6 +2394,29 @@ show_delayed_joins(const struct Channel *chan)
  *
  * @returns 0
  */
+/** CRDT-mesh (Phase 3e): true iff this mode flush contains ONLY persistent
+ *  channel modes (the CRDT_MODE_MASK set, incl. KEY/LIMIT args) — no per-member
+ *  ops, no bans/excepts, no extended modes, no +A/+U. Such a flush can be routed
+ *  to CRDT-primary peers over CRDT instead of P10 (they apply it via
+ *  crdt_shadow_reconcile_modes); only the legacy P10 side needs the wire MODE. */
+static int modebuf_is_crdt_channel_only(const struct ModeBuf *mbuf)
+{
+  unsigned int dir = MODE_ADD | MODE_DEL | MODE_SAVE;
+  unsigned int chg = (mbuf->mb_add | mbuf->mb_rem) & ~dir;  /* mb_add/rem carry the
+                                          direction flag (e.g. MODE_ADD) — strip it */
+  int i;
+  if (chg & ~CRDT_MODE_MASK)
+    return 0;                          /* a mode bit outside the CRDT mask */
+  if (mbuf->mb_exadd || mbuf->mb_exrem)
+    return 0;                          /* extended modes ride P10 */
+  for (i = 0; i < mbuf->mb_count; i++) {
+    unsigned int t = MB_TYPE(mbuf, i) & ~dir;
+    if (!(t & (MODE_KEY | MODE_LIMIT)))
+      return 0;                        /* member-op / ban / +A / +U present */
+  }
+  return (chg & CRDT_MODE_MASK) || mbuf->mb_count;  /* and something is changing */
+}
+
 static int
 modebuf_flush_int(struct ModeBuf *mbuf, int all)
 {
@@ -2882,11 +2905,26 @@ modebuf_flush_int(struct ModeBuf *mbuf, int all)
        * We're propagating a normal (or HACK3 or HACK4) MODE command
        * to the rest of the network.  We send the actual channel TS.
        */
-      /* Send oplevels to servers with oplevels support. */
+      /* Phase 3e: a channel-modes-only flush reaches CRDT-primary peers over
+       * CRDT (crdt_shadow_reconcile_modes), so relay P10 to LEGACY (non-CRDT)
+       * peers only. addstr==addstro for channel-only (no member-op args), so a
+       * single legacy-forbid call covers both oplevel classes.
+       */
+      int crdt_only = feature_bool(FEAT_CRDT_PRIMARY) &&
+                      modebuf_is_crdt_channel_only(mbuf);
       if (mode_msgid[0] && mode_time_ms) {
         sendcmdto_set_s2s_tags(mode_time_ms, mode_msgid);
         sendcmdto_want_s2s_tags(1);
       }
+      if (crdt_only) {
+        sendcmdto_flag_serv_butone(mbuf->mb_source, CMD_MODE, mbuf->mb_connect,
+                                   FLAG_LAST_FLAG, FLAG_CRDT_AWARE,
+                                   "%H %s%s%s%s%s%s %Tu", mbuf->mb_channel,
+                                   rembuf_i ? "-" : "", rembuf, addbuf_i ? "+" : "",
+                                   addbuf, remstr, addstr,
+                                   mbuf->mb_channel->creationtime);
+      } else {
+      /* Send oplevels to servers with oplevels support. */
       sendcmdto_flag_serv_butone(mbuf->mb_source, CMD_MODE, mbuf->mb_connect,
                                  FLAG_OPLEVELS, FLAG_LAST_FLAG,
                                  "%H %s%s%s%s%s%s %Tu", mbuf->mb_channel,
@@ -2904,6 +2942,7 @@ modebuf_flush_int(struct ModeBuf *mbuf, int all)
                                  rembuf_i ? "-" : "", rembuf, addbuf_i ? "+" : "",
                                  addbuf, remstr, addstro,
                                  mbuf->mb_channel->creationtime);
+      }
     }
   }
 
@@ -3131,6 +3170,16 @@ modebuf_flush(struct ModeBuf *mbuf)
   crdt_shadow_modes(mbuf->mb_channel, mbuf->mb_connect);
   crdt_shadow_lists(mbuf->mb_channel, mbuf->mb_connect);
   return ret;
+}
+
+/** Like modebuf_flush() but WITHOUT the crdt_shadow mirror (Phase 3e). Used by
+ *  crdt_shadow_reconcile_modes to emit a CRDT-driven mode delta to local clients
+ *  + the legacy gateway, reusing the correct MODE formatting without re-minting a
+ *  CRDT op (which crdt_shadow_modes would do — an apply loop). */
+int
+modebuf_flush_nomirror(struct ModeBuf *mbuf)
+{
+  return modebuf_flush_int(mbuf, 1);
 }
 
 /* This extracts the simple modes contained in mbuf

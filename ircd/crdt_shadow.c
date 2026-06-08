@@ -230,13 +230,8 @@ void crdt_shadow_topic(struct Channel *chptr, struct Client *from)
   crdt_sync_push();                    /* eager-propagate to CRDT peers */
 }
 
-/* Persistent channel-mode bits we mirror — excludes per-member CHANOP/VOICE/
- * HALFOP, the list-modes BAN/EXCEPT, and internal flags (BURSTADDED, SAVE,
- * FREE, WASDELJOINS) so transient bits don't cause false divergence. */
-#define CRDT_MODE_MASK (MODE_PRIVATE | MODE_SECRET | MODE_MODERATED |          \
-                        MODE_TOPICLIMIT | MODE_INVITEONLY | MODE_NOPRIVMSGS |  \
-                        MODE_KEY | MODE_LIMIT | MODE_REGONLY | MODE_DELJOINS | \
-                        MODE_REGISTERED | MODE_UPASS | MODE_APASS | MODE_REDIRECT)
+/* CRDT_MODE_MASK now lives in channel.h (shared with the modebuf suppression
+ * predicate); +L/+U/+A excluded there — see the note at its definition. */
 
 /** Compact, comparable snapshot of a channel's persistent mode state. */
 struct ShadowModeSnap {
@@ -253,6 +248,22 @@ static void build_mode_snap(struct Channel *chptr, struct ShadowModeSnap *s)
     s->limit = chptr->mode.limit;
   if (s->mode & MODE_KEY)
     strncpy(s->key, chptr->mode.key, sizeof s->key - 1);
+}
+
+/** Inverse of build_mode_snap (Phase 3e): drive the live channel's persistent
+ *  modes from a snapshot, touching ONLY the CRDT_MODE_MASK bits + limit + key.
+ *  Per-member status, bans, exmode, and internal flags are preserved. */
+static void apply_mode_snap(struct Channel *chptr, const struct ShadowModeSnap *s)
+{
+  chptr->mode.mode = (chptr->mode.mode & ~CRDT_MODE_MASK) | (s->mode & CRDT_MODE_MASK);
+  if (s->mode & MODE_LIMIT)
+    chptr->mode.limit = s->limit;
+  else
+    chptr->mode.limit = 0;
+  if (s->mode & MODE_KEY)
+    ircd_strncpy(chptr->mode.key, s->key, KEYLEN + 1);
+  else
+    chptr->mode.key[0] = '\0';
 }
 
 void crdt_shadow_modes(struct Channel *chptr, struct Client *from)
@@ -922,6 +933,69 @@ void crdt_shadow_reconcile_topics(void)
               "CRDT topic-reconcile: drove %u channel topic(s) from doc", changed);
 }
 
+/* ---- Phase 3e: channel MODES via CRDT + §17.7 gateway ---- */
+
+struct reconcile_mode_ctx { unsigned int *changed; };
+
+static void reconcile_mode_cb(const char *key, uint32_t key_len,
+                              const struct CrdtLWWValue *val, void *ctx)
+{
+  struct reconcile_mode_ctx *c = ctx;
+  char chname[CHANNELLEN + 1];
+  struct Channel *chptr;
+  struct ShadowModeSnap doc, before;
+  struct ModeBuf mbuf;
+  unsigned int added, removed;
+  if (key_len >= sizeof chname || !val->data ||
+      val->data_len != sizeof(struct ShadowModeSnap))
+    return;
+  memcpy(chname, key, key_len); chname[key_len] = '\0';
+  chptr = FindChannel(chname);
+  if (!chptr)
+    return;                              /* channel not live yet */
+  memcpy(&doc, val->data, sizeof doc);
+  doc.mode &= CRDT_MODE_MASK;            /* defensive: ignore any stale +L/U/A bits */
+  build_mode_snap(chptr, &before);
+  if (memcmp(&doc, &before, sizeof doc) == 0)
+    return;                              /* in sync — echo guard */
+  /* drive live DIRECTLY (no set_mode/modebuf -> no crdt_shadow_modes re-mirror) */
+  apply_mode_snap(chptr, &doc);
+  /* render the +/- delta for local clients + the legacy gateway via modebuf
+   * (correct formatting); modebuf_flush_nomirror avoids the re-mirror, and the
+   * channel-only suppression routes it to legacy peers only. */
+  modebuf_init(&mbuf, &me, NULL, chptr, MODEBUF_DEST_CHANNEL | MODEBUF_DEST_SERVER);
+  added   = (doc.mode & ~before.mode) & CRDT_MODE_MASK & ~(MODE_KEY | MODE_LIMIT);
+  removed = (before.mode & ~doc.mode) & CRDT_MODE_MASK & ~(MODE_KEY | MODE_LIMIT);
+  if (added)
+    modebuf_mode(&mbuf, MODE_ADD | added);
+  if (removed)
+    modebuf_mode(&mbuf, MODE_DEL | removed);
+  if (doc.mode & MODE_LIMIT) {
+    if (!(before.mode & MODE_LIMIT) || before.limit != doc.limit)
+      modebuf_mode_uint(&mbuf, MODE_ADD | MODE_LIMIT, doc.limit);
+  } else if (before.mode & MODE_LIMIT)
+    modebuf_mode_uint(&mbuf, MODE_DEL | MODE_LIMIT, before.limit);
+  if (doc.mode & MODE_KEY) {
+    if (!(before.mode & MODE_KEY) || strcmp(before.key, doc.key) != 0)
+      modebuf_mode_string(&mbuf, MODE_ADD | MODE_KEY, doc.key, 0);
+  } else if (before.mode & MODE_KEY)
+    modebuf_mode_string(&mbuf, MODE_DEL | MODE_KEY, before.key, 0);
+  modebuf_flush_nomirror(&mbuf);
+  (*c->changed)++;
+}
+
+void crdt_shadow_reconcile_modes(void)
+{
+  unsigned int changed = 0;
+  struct reconcile_mode_ctx ctx = { &changed };
+  if (!shadow_on() || !feature_bool(FEAT_CRDT_PRIMARY))
+    return;
+  crdt_lwwmap_foreach(&g_crdt.modes, reconcile_mode_cb, &ctx);
+  if (changed)
+    log_write(LS_SYSTEM, L_NOTICE, 0,
+              "CRDT mode-reconcile: drove %u channel(s) from doc", changed);
+}
+
 /* ---- Phase 2 wire-sync accessors ---- */
 
 int crdt_shadow_active(void)
@@ -1114,6 +1188,7 @@ static void crdt_shadow_verify_cb(struct Event *ev)
   }
   crdt_shadow_reconcile_topics();  /* Phase 3d: drive live topics from CRDT (+gateway) —
                                       catches 2-hop foreign-origin topics via anti-entropy */
+  crdt_shadow_reconcile_modes();   /* Phase 3e: same for persistent channel modes */
   crdt_sync_broadcast();   /* periodic anti-entropy: pull deltas from peers */
   crdt_shadow_gc();        /* reclaim causally-stable ops/tombstones */
 }

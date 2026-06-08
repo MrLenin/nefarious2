@@ -81,6 +81,12 @@ void crdt_shadow_materialize_live(void);
  *  Idempotent (acts only when doc topic != live). No-op unless FEAT_CRDT_PRIMARY. */
 void crdt_shadow_reconcile_topics(void);
 
+/** Phase 3e: same as reconcile_topics but for persistent channel modes (the
+ *  CRDT_MODE_MASK set). Drives live modes from the doc + §17.7 gateway to legacy.
+ *  Idempotent (acts only when the doc mode-snapshot != live). No-op unless
+ *  FEAT_CRDT_PRIMARY. */
+void crdt_shadow_reconcile_modes(void);
+
 /* ---- Phase 2 wire-sync accessors (used by m_crdt.c) ----
  * These expose the shadow document to the CR token handlers while keeping the
  * CrdtNetworkState itself private to this module. */
