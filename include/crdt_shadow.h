@@ -70,6 +70,12 @@ void crdt_shadow_verify(void);
  *  gaps; mutates nothing. No-op unless FEAT_CRDT_ENABLED. */
 void crdt_shadow_materialize_check(void);
 
+/** Phase 3c: materialize live state (struct Client/Channel + memberships) FROM
+ *  the doc — the create-analog of the dry-run. Idempotent (skips anything already
+ *  live). No-op unless FEAT_CRDT_ENABLED. Used as the CRDT-authoritative
+ *  replacement for P10 BURST on a CRDT-primary leaf. */
+void crdt_shadow_materialize_live(void);
+
 /* ---- Phase 2 wire-sync accessors (used by m_crdt.c) ----
  * These expose the shadow document to the CR token handlers while keeping the
  * CrdtNetworkState itself private to this module. */

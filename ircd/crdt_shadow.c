@@ -16,13 +16,16 @@
 #include "channel.h"
 #include "client.h"
 #include "hash.h"            /* FindChannel (Phase 3b dry-run lookup) */
+#include "list.h"            /* make_client / add_client_to_list (3c materialize) */
 #include "struct.h"          /* struct User (cli_user(c)->server) */
-#include "ircd.h"           /* GlobalClientList */
+#include "ircd.h"           /* GlobalClientList, me, TStime */
 #include "ircd_events.h"
 #include "ircd_features.h"
 #include "ircd_log.h"
+#include "ircd_string.h"     /* ircd_strncpy (3c materialize) */
 #include "numnicks.h"
-#include "s_user.h"          /* umode_str (Phase 3b reconstruction payload) */
+#include "querycmds.h"       /* UserStats, Count_newremoteclient (3c materialize) */
+#include "s_user.h"          /* umode_str, make_user, user_apply_umode_str */
 #include "handlers.h"        /* crdt_sync_broadcast */
 
 #include <stdio.h>
@@ -556,6 +559,29 @@ static void mat_member_cb(const char *key, uint32_t key_len, void *ctx)
   }
 }
 
+/* present doc ban/except mask -> must exist in the live ban/except list */
+struct mat_ban_ctx {
+  struct Ban   *live;
+  const char   *chname;
+  const char   *kind;
+  unsigned int *gaps;
+  unsigned int *logged;
+};
+static void mat_bancheck_cb(const char *key, uint32_t key_len, void *ctx)
+{
+  struct mat_ban_ctx *c = ctx;
+  char mask[CRDT_MASKLEN];
+  uint32_t l = key_len < CRDT_MASKLEN - 1 ? key_len : CRDT_MASKLEN - 1;
+  memcpy(mask, key, l); mask[l] = '\0';
+  if (!mask_in_banlist(c->live, mask)) {
+    (*c->gaps)++;
+    if ((*c->logged)++ < MAT_LOG_CAP)
+      log_write(LS_SYSTEM, L_NOTICE, 0,
+                "CRDT mat-check gap: %s %s %s in doc, not live", c->chname,
+                c->kind, mask);
+  }
+}
+
 void crdt_shadow_materialize_check(void)
 {
   unsigned int gaps = 0, logged = 0, users = 0, chans = 0;
@@ -631,12 +657,208 @@ void crdt_shadow_materialize_check(void)
       /* members + per-member status (present doc members only) */
       cc.live = live; cc.chname = nbuf; cc.gaps = &gaps; cc.logged = &logged;
       crdt_orset_foreach(&dc->members, mat_member_cb, &cc);
+      /* bans + excepts (present doc masks must be live) — required because a
+       * BURST-skip cutover (3c) won't send send_channel_modes, so the doc is
+       * the only source of list-modes. */
+      { struct mat_ban_ctx bc;
+        bc.chname = nbuf; bc.gaps = &gaps; bc.logged = &logged;
+        bc.live = live->banlist;    bc.kind = "ban";
+        crdt_orset_foreach(&dc->bans, mat_bancheck_cb, &bc);
+        bc.live = live->exceptlist; bc.kind = "except";
+        crdt_orset_foreach(&dc->excepts, mat_bancheck_cb, &bc); }
     }
   }
 
   log_write(LS_SYSTEM, L_NOTICE, 0,
             "CRDT mat-check: %u users, %u channels, %u reconstruction gap(s)",
             users, chans, gaps);
+}
+
+/* ---- Phase 3c: materialize live state FROM the doc (create path) ----
+ * The create-analog of the dry-run: build real struct Client/struct Channel from
+ * the doc instead of from P10 BURST. Idempotent + re-runnable (skips anything
+ * already live). Modeled on the set_nick_name IsServer remote-create branch
+ * (s_user.c:1078) — NOT register_user (which re-broadcasts NICK to the network).
+ * Gated by the caller (FEAT_CRDT_PRIMARY); see crdt_shadow_materialize_live. */
+
+/** Expand the compact member-status byte to live CHFL_* membership flags. */
+static unsigned int expand_status(uint8_t s)
+{
+  unsigned int f = 0;
+  if (s & CRDT_MEMBER_OP)     f |= CHFL_CHANOP;
+  if (s & CRDT_MEMBER_VOICE)  f |= CHFL_VOICE;
+  if (s & CRDT_MEMBER_HALFOP) f |= CHFL_HALFOP;
+  return f;
+}
+
+struct mat_create_ctx { unsigned int *created; };
+
+static void mat_create_user_cb(const char *key, uint32_t key_len,
+                               const struct CrdtLWWValue *val, void *ctx)
+{
+  struct mat_create_ctx *c = ctx;
+  char numbuf[16], srvnum[4];
+  const struct CrdtUserRecord *rec;
+  struct Client *srv, *nc;
+  if (key_len < 3 || key_len >= sizeof numbuf ||
+      val->data_len != sizeof(struct CrdtUserRecord))
+    return;
+  memcpy(numbuf, key, key_len); numbuf[key_len] = '\0';
+  if (findNUser(numbuf))                  /* already live — idempotent + mandatory
+                                             guard (SetRemoteNumNick kills on clash) */
+    return;
+  rec = (const struct CrdtUserRecord *)val->data;
+  srvnum[0] = numbuf[0]; srvnum[1] = numbuf[1]; srvnum[2] = '\0';
+  srv = FindNServer(srvnum);
+  if (!srv || !IsServer(srv))             /* owning server not in tree yet:
+                                             skip-and-retry on the next pass */
+    return;
+  nc = make_client(cli_from(srv), STAT_UNKNOWN);
+  if (!nc)
+    return;
+  cli_hopcount(nc) = cli_hopcount(srv) + 1;     /* recomputed locally */
+  cli_lastnick(nc) = (time_t)rec->nick_ts;
+  ircd_strncpy(cli_name(nc), rec->nick, NICKLEN + 1);
+  cli_user(nc) = make_user(nc);
+  cli_user(nc)->server = srv;                    /* before SetRemoteNumNick */
+  SetRemoteNumNick(nc, numbuf);
+  memcpy(&cli_ip(nc), rec->ip6, sizeof cli_ip(nc));
+  add_client_to_list(nc);
+  hAddClient(nc);
+  ircd_strncpy(cli_username(nc), rec->ident, USERLEN + 1);
+  ircd_strncpy(cli_user(nc)->username, rec->ident, USERLEN + 1);
+  ircd_strncpy(cli_user(nc)->host, rec->host, HOSTLEN + 1);
+  ircd_strncpy(cli_user(nc)->realhost, rec->host, HOSTLEN + 1);  /* doc has one host */
+  ircd_strncpy(cli_info(nc), rec->realname, REALLEN + 1);
+  if (rec->account[0]) {
+    ircd_strncpy(cli_user(nc)->account, rec->account, ACCOUNTLEN + 1);
+    cli_user(nc)->acc_create = (time_t)rec->acc_create;
+    SetAccount(nc);
+  }
+  user_apply_umode_str(nc, rec->umodes);         /* sets umode FLAGS only */
+  SetUser(nc);
+  Count_newremoteclient(UserStats, srv);
+  if (IsInvisible(nc))                            /* user_apply_umode_str doesn't */
+    ++UserStats.inv_clients;                      /* bump these — exit asserts >0  */
+  if (IsOper(nc) && !IsHideOper(nc) && !IsChannelService(nc) && !IsBot(nc))
+    ++UserStats.opers;
+  (*c->created)++;
+}
+
+struct mat_join_ctx { struct Channel *chptr; const char *chname; };
+
+static void mat_join_cb(const char *key, uint32_t key_len, void *ctx)
+{
+  struct mat_join_ctx *c = ctx;
+  char numbuf[16], mkey[512];
+  struct Client *u;
+  const struct CrdtLWWValue *sv;
+  unsigned int flags = 0;
+  int oplevel = 0;
+  uint32_t clen;
+  if (key_len >= sizeof numbuf)
+    return;
+  memcpy(numbuf, key, key_len); numbuf[key_len] = '\0';
+  u = findNUser(numbuf);
+  if (!u)                                  /* user not materialized yet — retry */
+    return;
+  if (find_member_link(c->chptr, u))       /* already a member — idempotent */
+    return;
+  clen = (uint32_t)strlen(c->chname);
+  if (clen + 1 + key_len <= sizeof mkey) {
+    memcpy(mkey, c->chname, clen); mkey[clen] = '\0';
+    memcpy(mkey + clen + 1, key, key_len);
+    sv = crdt_lwwmap_get(&g_crdt.members_status, mkey, clen + 1 + key_len);
+    if (sv && sv->data_len == sizeof(struct CrdtMemberRecord)) {
+      const struct CrdtMemberRecord *mr = (const struct CrdtMemberRecord *)sv->data;
+      flags = expand_status(mr->status);
+      oplevel = mr->oplevel;
+    }
+  }
+  add_user_to_channel(c->chptr, u, flags, oplevel);
+}
+
+static void mat_banbuild_cb(const char *key, uint32_t key_len, void *ctx)
+{
+  struct Ban **list = ctx;
+  char mask[CRDT_MASKLEN];
+  uint32_t l = key_len < CRDT_MASKLEN - 1 ? key_len : CRDT_MASKLEN - 1;
+  struct Ban *nb;
+  memcpy(mask, key, l); mask[l] = '\0';
+  nb = make_ban(mask);
+  if (!nb)
+    return;
+  ircd_strncpy(nb->who, "*", sizeof nb->who);
+  nb->when = TStime();
+  nb->flags |= BAN_BURSTED;
+  nb->next = *list;
+  *list = nb;
+}
+
+void crdt_shadow_materialize_live(void)
+{
+  unsigned int created = 0, chans = 0;
+  int bk;
+  if (!shadow_on())
+    return;
+
+  /* users first — channels reference them by numeric */
+  { struct mat_create_ctx uc = { &created };
+    crdt_lwwmap_foreach(&g_crdt.users, mat_create_user_cb, &uc); }
+
+  for (bk = 0; bk < CRDT_CHAN_BUCKETS; bk++) {
+    struct CrdtChannel *dc;
+    for (dc = g_crdt.chan_buckets[bk]; dc; dc = dc->next) {
+      char nbuf[CHANNELLEN + 1];
+      struct Channel *chptr;
+      int existed;
+      const struct CrdtLWWValue *v;
+      struct mat_join_ctx jc;
+      if (crdt_orset_size(&dc->members) == 0)
+        continue;
+      if (dc->name_len >= sizeof nbuf)
+        continue;
+      memcpy(nbuf, dc->name, dc->name_len); nbuf[dc->name_len] = '\0';
+      existed = (FindChannel(nbuf) != NULL);
+      chptr = get_channel(&me, nbuf, CGT_CREATE);
+      if (!chptr)
+        continue;
+      if (!existed) {
+        /* fresh channel: rebuild creationtime/topic/modes/bans from the doc
+         * (only when WE created it — never clobber a BURST-built channel). */
+        v = crdt_lwwmap_get(&g_crdt.chanmeta, nbuf, dc->name_len);
+        if (v && v->data_len == sizeof(struct CrdtChanMeta)) {
+          const struct CrdtChanMeta *meta = (const struct CrdtChanMeta *)v->data;
+          chptr->creationtime = (time_t)meta->creationtime;
+          chptr->topic_time = (time_t)meta->topic_time;
+          ircd_strncpy(chptr->topic_nick, meta->topic_nick,
+                       sizeof chptr->topic_nick - 1);
+        }
+        v = crdt_lwwmap_get(&g_crdt.topics, nbuf, dc->name_len);
+        if (v && v->data)
+          ircd_strncpy(chptr->topic, (const char *)v->data, TOPICLEN + 1);
+        v = crdt_lwwmap_get(&g_crdt.modes, nbuf, dc->name_len);
+        if (v && v->data_len == sizeof(struct ShadowModeSnap)) {
+          const struct ShadowModeSnap *s = (const struct ShadowModeSnap *)v->data;
+          chptr->mode.mode |= s->mode;
+          if (s->mode & MODE_LIMIT) chptr->mode.limit = s->limit;
+          if (s->mode & MODE_KEY)
+            ircd_strncpy(chptr->mode.key, s->key, sizeof chptr->mode.key);
+        }
+        crdt_orset_foreach(&dc->bans, mat_banbuild_cb, &chptr->banlist);
+        crdt_orset_foreach(&dc->excepts, mat_banbuild_cb, &chptr->exceptlist);
+        chans++;
+      }
+      /* members — always (find_member_link guards against doubles) */
+      jc.chptr = chptr; jc.chname = nbuf;
+      crdt_orset_foreach(&dc->members, mat_join_cb, &jc);
+    }
+  }
+
+  if (created || chans)
+    log_write(LS_SYSTEM, L_NOTICE, 0,
+              "CRDT materialize: created %u user(s), %u channel(s) from doc",
+              created, chans);
 }
 
 /* ---- Phase 2 wire-sync accessors ---- */
@@ -795,6 +1017,20 @@ static void crdt_shadow_verify_cb(struct Event *ev)
     return;
   crdt_shadow_verify();
   crdt_shadow_materialize_check();  /* Phase 3b dry-run: doc -> live fidelity */
+  /* Phase 3c: idempotent create-from-doc. Run it only when NO inbound burst is
+   * in progress, so we never pre-create a user that a P10 BURST is still about
+   * to deliver (which would collide). In steady state every entity is already
+   * live so this creates nothing (Stage-1 crash-free proof); it is also the
+   * post-burst retry that heals SERVER-tree-race skips once the cutover is on.
+   * The during-burst create path (when BURST was skipped) is the CR F trigger. */
+  {
+    struct Client *acptr;
+    int bursting = 0;
+    for (acptr = GlobalClientList; acptr; acptr = cli_next(acptr))
+      if (IsServer(acptr) && IsBurstOrBurstAck(acptr)) { bursting = 1; break; }
+    if (!bursting)
+      crdt_shadow_materialize_live();
+  }
   crdt_sync_broadcast();   /* periodic anti-entropy: pull deltas from peers */
   crdt_shadow_gc();        /* reclaim causally-stable ops/tombstones */
 }
