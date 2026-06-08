@@ -64,6 +64,8 @@
 #include "bouncer_session.h"
 #include "webpush.h"
 #include "ircd_features.h"
+#include "handlers.h"          /* crdt_send_snapshot (Phase 3c BURST cutover) */
+#include "crdt_shadow.h"       /* crdt_shadow_doc_ready (Phase 3c) */
 
 /* #include <assert.h> -- Now using assert in ircd_log.h */
 #include <stdlib.h>
@@ -330,6 +332,22 @@ int server_finish_burst(struct Client *cptr)
 {
   struct Client *acptr;
   struct SLink *lp;
+
+  /* Phase 3c cutover: a CRDT-aware peer with CRDT-primary mode gets the full
+   * CRDT document (CR F snapshot) INSTEAD of the P10 user/session/channel BURST
+   * — it materializes live state from the doc. The SERVER tree + glines/jupes
+   * were already sent (server_estab, before this), so routing + bans hold. EOB
+   * still closes the burst. (Mirrors the IsIRCv3Aware burst-content gates.)
+   * crdt_shadow_doc_ready() guards against skipping BURST when our doc is not yet
+   * a complete source (e.g. at cold boot) — then we fall back to a normal BURST
+   * so the peer is never left missing users. */
+  if (IsCrdtAware(cptr) && feature_bool(FEAT_CRDT_PRIMARY) &&
+      crdt_shadow_doc_ready()) {
+    crdt_send_snapshot(cptr);
+    sendcmdto_one(&me, CMD_END_OF_BURST, cptr, "");
+    sendcmdto_one(&me, CMD_END_OF_BURST_ACK, cptr, "");
+    return 0;
+  }
 
   for (acptr = &me; acptr; acptr = cli_prev(acptr))
   {

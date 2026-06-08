@@ -20,6 +20,7 @@
 #include "client.h"
 #include "ircd.h"
 #include "ircd_alloc.h"
+#include "ircd_features.h"
 #include "ircd_log.h"
 #include "handlers.h"
 #include "msg.h"
@@ -148,6 +149,11 @@ void crdt_sync_push(void)
   MyFree(delta);
 }
 
+void crdt_send_snapshot(struct Client *to)
+{
+  send_crdt_snapshot(to);              /* Phase 3c: CRDT-authoritative BURST */
+}
+
 int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
 {
   const char *sub;
@@ -205,10 +211,19 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
       uint8_t *bin = MyMalloc(flen ? flen : 1);
       int bn = crdt_b64_decode(full, bin, flen ? flen : 1);
       MyFree(full);
-      if (bn > 0 && crdt_shadow_apply_snapshot(bin, (size_t)bn) == 0)
+      if (bn > 0 && crdt_shadow_apply_snapshot(bin, (size_t)bn) == 0) {
         log_write(LS_SYSTEM, L_NOTICE, 0,
                   "CRDT sync: applied full snapshot (%d bytes) from %s", bn,
                   cli_name(cptr));
+        /* Phase 3c cutover: if WE are CRDT-primary and this peer skipped its P10
+         * BURST in favor of the snapshot (we're still mid-burst from it), build
+         * live state from the doc NOW — the authoritative replacement for BURST.
+         * Idempotent; the verify timer re-runs post-burst to heal SERVER-tree
+         * race skips. No-op when the peer sent a normal BURST (this never fires
+         * because no CR F is received in that case). */
+        if (feature_bool(FEAT_CRDT_PRIMARY) && IsBurstOrBurstAck(cptr))
+          crdt_shadow_materialize_live();
+      }
       MyFree(bin);
     }
   } else if (sub[0] == 'V' && !sub[1]) {

@@ -83,6 +83,13 @@ void crdt_shadow_materialize_live(void);
 /** Non-zero if CRDT sync is active (initialised AND FEAT_CRDT_ENABLED). */
 int crdt_shadow_active(void);
 
+/** Phase 3c: non-zero only if the doc is a COMPLETE source of live state (doc
+ *  user count > 0 and >= live user count). The burst-skip cutover gates on this
+ *  so a not-yet-converged doc (e.g. at cold boot) falls back to a normal P10
+ *  BURST instead of sending an empty snapshot that would leave the peer missing
+ *  users. */
+int crdt_shadow_doc_ready(void);
+
 /** Encode this server's state vector. Returns bytes written, or -1. */
 int crdt_shadow_encode_sv(uint8_t *buf, size_t cap);
 

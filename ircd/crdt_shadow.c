@@ -868,6 +868,26 @@ int crdt_shadow_active(void)
   return shadow_on();
 }
 
+int crdt_shadow_doc_ready(void)
+{
+  struct Client *acptr;
+  uint32_t live = 0, doc;
+  if (!shadow_on())
+    return 0;
+  /* The doc may serve as the authoritative BURST replacement only if it is a
+   * COMPLETE picture of live state: non-empty AND at least as many users as we
+   * have live. At cold boot the doc lags live (mirrored as P10 arrives), so this
+   * is false -> the burst-skip falls back to a normal P10 BURST (no regression).
+   * Once converged it is true -> peers get a full CR F snapshot to materialize. */
+  doc = crdt_lwwmap_size(&g_crdt.users);
+  if (doc == 0)
+    return 0;
+  for (acptr = GlobalClientList; acptr; acptr = cli_next(acptr))
+    if (IsUser(acptr) && !IsBouncerAlias(acptr))
+      live++;
+  return doc >= live;
+}
+
 int crdt_shadow_encode_sv(uint8_t *buf, size_t cap)
 {
   if (!g_inited)

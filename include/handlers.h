@@ -333,6 +333,9 @@ extern void crdt_sync_broadcast(void);
  *  CRDT peer the ops it lacks, using its last-reported state vector. Peers with
  *  no cached SV yet are skipped (the periodic anti-entropy catches them up). */
 extern void crdt_sync_push(void);
+/** Phase 3c: send the full CRDT document as a CR F snapshot to @a to — the
+ *  CRDT-authoritative replacement for P10 BURST on a CRDT-primary link. */
+extern void crdt_send_snapshot(struct Client* to);
 extern int ms_bouncer_transfer(struct Client*, struct Client*, int, char*[]);
 extern int m_persistence(struct Client*, struct Client*, int, char*[]);
 extern void persistence_send_status(struct Client *to);
