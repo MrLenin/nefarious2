@@ -60,6 +60,18 @@ static void send_crdt_chunks(struct Client *to, char sub,
   } while (off < b64len);
 }
 
+/** Base64-encode a raw CRDT op blob and send it to @a to as CR <sub> chunks. */
+static void send_crdt_blob(struct Client *to, char sub, const uint8_t *bin,
+                           int n)
+{
+  size_t bcap = (size_t)n * 4 / 3 + 8;
+  char *b64 = MyMalloc(bcap);
+  int bn = crdt_b64_encode(bin, (size_t)n, b64, bcap);
+  if (bn > 0)
+    send_crdt_chunks(to, sub, b64, bn);
+  MyFree(b64);
+}
+
 /** Compute the delta of ops @a to lacks (given its encoded state vector) and
  *  send it as CR D chunks. */
 static void send_crdt_delta(struct Client *to, const uint8_t *remote_sv,
@@ -68,14 +80,8 @@ static void send_crdt_delta(struct Client *to, const uint8_t *remote_sv,
   uint8_t *delta = MyMalloc(CR_DELTA_MAX);
   int dn = crdt_shadow_encode_delta(remote_sv, (size_t)sv_len, delta,
                                     CR_DELTA_MAX);
-  if (dn > 4) {                 /* 4 bytes = empty op count; nothing to send */
-    size_t bcap = (size_t)dn * 4 / 3 + 8;
-    char *b64 = MyMalloc(bcap);
-    int bn = crdt_b64_encode(delta, (size_t)dn, b64, bcap);
-    if (bn > 0)
-      send_crdt_chunks(to, 'D', b64, bn);
-    MyFree(b64);
-  }
+  if (dn > 4)                   /* 4 bytes = empty op count; nothing to send */
+    send_crdt_blob(to, 'D', delta, dn);
   MyFree(delta);
 }
 
@@ -120,6 +126,26 @@ void crdt_sync_broadcast(void)
   for (acptr = GlobalClientList; acptr; acptr = cli_next(acptr))
     if (IsServer(acptr) && MyConnect(acptr) && IsCrdtAware(acptr))
       crdt_sync_request(acptr);
+}
+
+void crdt_sync_push(void)
+{
+  struct Client *acptr;
+  uint8_t *delta;
+  int dn;
+  if (!crdt_shadow_active())
+    return;
+  /* Encode our own-origin ops created since the last push ONCE, then fan the
+   * same CR U out to every directly-connected CRDT peer. Foreign-origin ops we
+   * received are NOT eager-pushed here — they reach 2-hop peers via the periodic
+   * anti-entropy pull (crdt_sync_broadcast), which is proven mesh-safe. */
+  delta = MyMalloc(CR_DELTA_MAX);
+  dn = crdt_shadow_encode_local_unpushed(delta, CR_DELTA_MAX);
+  if (dn > 4)
+    for (acptr = GlobalClientList; acptr; acptr = cli_next(acptr))
+      if (IsServer(acptr) && MyConnect(acptr) && IsCrdtAware(acptr))
+        send_crdt_blob(acptr, 'U', delta, dn);
+  MyFree(delta);
 }
 
 int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])

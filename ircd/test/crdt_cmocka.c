@@ -400,6 +400,63 @@ static void test_wire_digest_converges(void **state)
   crdt_state_clear(&s2);
 }
 
+/* Phase 3a single-writer invariant: when exactly ONE replica writes an entity
+ * and the other only RECEIVES it (the gated, non-re-mirroring case), the FULL
+ * digest (OR-Set add-tags + tombstones included) converges after a single
+ * ONE-WAY sync -- there is one origin tag per entity, so no bidirectional tag
+ * union is needed. The control half then re-introduces the re-mirror artifact
+ * (B also writes the same entity with its own origin) and shows the full digest
+ * diverging while the materialized digest still agrees -- exactly the cosmetic
+ * divergence Phase 3a's gating removes. Contrast test_wire_digest_converges,
+ * where BOTH sides write and full convergence needs a round-trip. */
+static void test_single_writer_full_digest_converges(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState A, B;
+  uint8_t buf[8192];
+  int n, applied;
+  struct CrdtUserRecord u = mkuser("alice", 4, "a", 0x04040404);
+  uint8_t msnap[8] = { 9, 8, 7, 6, 5, 4, 3, 2 };
+  crdt_state_init(&A, 4);   /* A (numeric 4) is the SOLE writer */
+  crdt_state_init(&B, 3);   /* B (numeric 3) only receives -- writes nothing */
+
+  crdt_user_set(&A, "AAAAA", &u);
+  crdt_chan_join(&A, "#c", "AAAAA");
+  crdt_topic_set(&A, "#c", "hi");
+  crdt_modes_set(&A, "#c", msnap, sizeof msnap);
+
+  /* one-way sync B<-A (B is the single-writer-gated peer: it mirrors nothing) */
+  n = crdt_delta_encode(&A.oplog, &B.local_sv, buf, sizeof buf);
+  assert_true(n > 0);
+  applied = crdt_delta_apply(&B, buf, (size_t)n);
+  assert_true(applied > 0);
+
+  /* FULL digest matches after ONE one-way sync (single origin tag per entity);
+   * materialized matches too. No bidirectional round-trip was needed. */
+  assert_true(crdt_state_digest(&A) == crdt_state_digest(&B));
+  assert_true(crdt_state_digest_materialized(&A) ==
+              crdt_state_digest_materialized(&B));
+
+  /* control: if B ALSO writes the same entities (the re-mirror artifact), the
+   * single one-way sync above is no longer sufficient -- A has never seen B's
+   * origin-3 ops, so the full digest diverges (and so does materialized: each
+   * side's winning user-LWW is its own origin's write, same value bytes but a
+   * different ts/writer). Convergence now requires a round-trip. This is the
+   * cost single-writer gating removes. */
+  crdt_user_set(&B, "AAAAA", &u);
+  crdt_chan_join(&B, "#c", "AAAAA");
+  assert_true(crdt_state_digest(&A) != crdt_state_digest(&B));   /* one-way insufficient */
+  n = crdt_delta_encode(&B.oplog, &A.local_sv, buf, sizeof buf);
+  assert_true(n > 0);
+  crdt_delta_apply(&A, buf, (size_t)n);                          /* the round-trip */
+  assert_true(crdt_state_digest(&A) == crdt_state_digest(&B));   /* now converged */
+  assert_true(crdt_state_digest_materialized(&A) ==
+              crdt_state_digest_materialized(&B));
+
+  crdt_state_clear(&A);
+  crdt_state_clear(&B);
+}
+
 /* Two replicas make CONCURRENT, CONFLICTING changes to the same entities with
  * no coordination, then sync. They must still converge to the same digest --
  * the core CRDT guarantee under contention (concurrent LWW conflict on a key,
@@ -738,6 +795,7 @@ int main(void)
     cmocka_unit_test(test_wire_sv_roundtrip),
     cmocka_unit_test(test_wire_delta_converges),
     cmocka_unit_test(test_wire_digest_converges),
+    cmocka_unit_test(test_single_writer_full_digest_converges),
     cmocka_unit_test(test_wire_concurrent_converges),
     cmocka_unit_test(test_snapshot_roundtrip),
     cmocka_unit_test(test_gc_advances_floor),

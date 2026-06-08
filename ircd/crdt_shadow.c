@@ -31,6 +31,12 @@ static struct CrdtNetworkState g_crdt;
 static int                     g_inited = 0;
 static struct Timer            g_verify_timer;
 
+/** Eager-push high-water mark: the highest own-origin op seq we have already
+ *  pushed to peers via CR U. Bounds eager push to ops WE created since last time
+ *  (relay of foreign-origin ops stays on the anti-entropy path), keeping it
+ *  O(new ops) instead of re-sending a growing cumulative delta each write. */
+static uint64_t                g_last_pushed_seq = 0;
+
 /** Recorded peer state vectors, for causal-stability GC (one slot per peer). */
 #define CRDT_MAX_PEERS 8
 struct crdt_peer_sv {
@@ -50,6 +56,25 @@ static int shadow_on(void)
   return g_inited && feature_bool(FEAT_CRDT_ENABLED);
 }
 
+/** Single-writer gate (Phase 3a). Returns true if a state event reached us via
+ *  a CRDT-aware peer — in which case that peer is the single writer for it and
+ *  we must NOT re-mirror it locally; we receive its op via CR sync. We DO mirror
+ *  (we are the writer / CRDT-mesh entry point) when the event is local
+ *  (cli_from == self, not a server) or arrived over a non-CRDT P10 link (the
+ *  gateway case). `from != &me` matters because &me is itself CrdtAware
+ *  (SetCrdtAware(&me) in ircd.c) and IsServer(&me) is true, so a local-origin
+ *  change carrying &me as its source must not be mistaken for a peer relay.
+ *
+ *  Caveat: full-digest convergence holds only within a contiguous CRDT-aware
+ *  region. A non-CRDT server bridging two CRDT islands makes each island's entry
+ *  server a second writer for cross-bridge users (gateway case at both ends), so
+ *  the re-mirror redundancy persists across that bridge. Phase 3d (hybrid
+ *  gateway) formalizes the boundary. */
+static int from_crdt_peer(struct Client *from)
+{
+  return from && from != &me && IsServer(from) && IsCrdtAware(from);
+}
+
 /** Build the full P10 numeric ("YYXXX") for a user into @a buf. */
 static const char *user_numeric(struct Client *who, char *buf, size_t n)
 {
@@ -67,7 +92,10 @@ void crdt_shadow_join(struct Channel *chptr, struct Client *who,
     return;
   if (!cli_user(who))
     return;
+  if (from_crdt_peer(cli_from(who)))  /* single-writer: peer owns this op */
+    return;
   crdt_chan_join(&g_crdt, chptr->chname, user_numeric(who, num, sizeof num));
+  crdt_sync_push();                   /* eager-propagate to CRDT peers */
 }
 
 void crdt_shadow_part(struct Channel *chptr, struct Client *who)
@@ -77,8 +105,11 @@ void crdt_shadow_part(struct Channel *chptr, struct Client *who)
     return;
   if (!cli_user(who))
     return;
+  if (from_crdt_peer(cli_from(who)))  /* single-writer: peer owns this op */
+    return;
   crdt_chan_remove(&g_crdt, chptr->chname, user_numeric(who, num, sizeof num),
                    CRDT_PRIORITY_USER);
+  crdt_sync_push();                   /* eager-propagate to CRDT peers */
 }
 
 void crdt_shadow_user_add(struct Client *cptr)
@@ -89,12 +120,15 @@ void crdt_shadow_user_add(struct Client *cptr)
     return;
   if (!cli_user(cptr) || IsBouncerAlias(cptr))   /* non-alias users only */
     return;
+  if (from_crdt_peer(cli_from(cptr)))  /* single-writer: peer owns this op */
+    return;
   memset(&rec, 0, sizeof rec);
   strncpy(rec.nick, cli_name(cptr), sizeof rec.nick - 1);
   strncpy(rec.ident, cli_user(cptr)->username, sizeof rec.ident - 1);
   rec.server = (uint16_t)base64toint(cli_yxx(cli_user(cptr)->server));
   rec.ip = 0;                                     /* unused in count verify */
   crdt_user_set(&g_crdt, user_numeric(cptr, num, sizeof num), &rec);
+  crdt_sync_push();                    /* eager-propagate to CRDT peers */
 }
 
 void crdt_shadow_user_remove(struct Client *cptr)
@@ -104,17 +138,23 @@ void crdt_shadow_user_remove(struct Client *cptr)
     return;
   if (!cli_user(cptr) || IsBouncerAlias(cptr))
     return;
+  if (from_crdt_peer(cli_from(cptr)))  /* single-writer: peer owns this op */
+    return;
   crdt_user_remove(&g_crdt, user_numeric(cptr, num, sizeof num));
+  crdt_sync_push();                    /* eager-propagate to CRDT peers */
 }
 
-void crdt_shadow_topic(struct Channel *chptr)
+void crdt_shadow_topic(struct Channel *chptr, struct Client *from)
 {
   if (!shadow_on())
+    return;
+  if (from_crdt_peer(from))            /* single-writer: peer owns this op */
     return;
   /* op-recording setter so the topic replicates (a direct crdt_lwwmap_set
    * would never enter the oplog and never sync — that was the modes/topic
    * convergence bug). */
   crdt_topic_set(&g_crdt, chptr->chname, chptr->topic);
+  crdt_sync_push();                    /* eager-propagate to CRDT peers */
 }
 
 /* Persistent channel-mode bits we mirror — excludes per-member CHANOP/VOICE/
@@ -142,14 +182,17 @@ static void build_mode_snap(struct Channel *chptr, struct ShadowModeSnap *s)
     strncpy(s->key, chptr->mode.key, sizeof s->key - 1);
 }
 
-void crdt_shadow_modes(struct Channel *chptr)
+void crdt_shadow_modes(struct Channel *chptr, struct Client *from)
 {
   struct ShadowModeSnap snap;
   if (!shadow_on() || !chptr)
     return;
+  if (from_crdt_peer(from))            /* single-writer: peer owns this op */
+    return;
   build_mode_snap(chptr, &snap);
   /* op-recording setter so modes replicate (see crdt_shadow_topic). */
   crdt_modes_set(&g_crdt, chptr->chname, &snap, sizeof snap);
+  crdt_sync_push();                    /* eager-propagate to CRDT peers */
 }
 
 /* ---- ban/except list-modes: OR-Sets reconciled to the real Ban lists ---- */
@@ -198,14 +241,17 @@ static void reconcile_list(struct CrdtORSet *set, struct Ban *list)
                         CRDT_PRIORITY_USER, NULL, 0);
 }
 
-void crdt_shadow_lists(struct Channel *chptr)
+void crdt_shadow_lists(struct Channel *chptr, struct Client *from)
 {
   struct CrdtChannel *cc;
   if (!shadow_on() || !chptr)
     return;
+  if (from_crdt_peer(from))            /* single-writer: peer owns this op */
+    return;
   cc = crdt_state_channel(&g_crdt, chptr->chname, 1);
   reconcile_list(&cc->bans, chptr->banlist);
   reconcile_list(&cc->excepts, chptr->exceptlist);
+  crdt_sync_push();                    /* eager-propagate to CRDT peers */
 }
 
 void crdt_shadow_verify(void)
@@ -317,8 +363,8 @@ void crdt_shadow_verify(void)
 
   log_write(LS_SYSTEM, L_NOTICE, 0,
             "CRDT shadow verify: %u channels, %u/%u users, %u mismatch(es) "
-            "digest=%016llx mdigest=%016llx",
-            checked, crdt_users, real_users, mismatches,
+            "oplog=%u digest=%016llx mdigest=%016llx",
+            checked, crdt_users, real_users, mismatches, g_crdt.oplog.count,
             (unsigned long long)crdt_state_digest(&g_crdt),
             (unsigned long long)crdt_state_digest_materialized(&g_crdt));
 
@@ -358,6 +404,23 @@ int crdt_shadow_apply_delta(const uint8_t *buf, size_t len)
   if (!g_inited)
     return -1;
   return crdt_delta_apply(&g_crdt, buf, len);
+}
+
+int crdt_shadow_encode_local_unpushed(uint8_t *buf, size_t cap)
+{
+  static struct CrdtStateVector synth;   /* static: avoid a 32KB stack frame */
+  int i, n;
+  if (!g_inited)
+    return -1;
+  /* synthetic SV: "peer" has everything EXCEPT our own ops above the high-water
+   * mark -> crdt_delta_encode emits exactly our unpushed own-origin ops. */
+  for (i = 0; i < CRDT_MAX_SERVERS; i++)
+    synth.seq[i] = (uint64_t)-1;
+  synth.seq[g_crdt.my_numeric] = g_last_pushed_seq;
+  n = crdt_delta_encode(&g_crdt.oplog, &synth, buf, cap);
+  if (n > 4)                             /* ops emitted -> consume them */
+    g_last_pushed_seq = g_crdt.local_sv.seq[g_crdt.my_numeric];
+  return n;
 }
 
 uint64_t crdt_shadow_digest(void)

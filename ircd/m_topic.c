@@ -158,8 +158,9 @@ static void do_settopic(struct Client *sptr, struct Client *cptr,
    }
    chptr->topic_time = ts ? ts : TStime();
 
-   /* Phase 1 CRDT shadow: mirror the topic (gated on FEAT_CRDT_ENABLED). */
-   crdt_shadow_topic(chptr);
+   /* Phase 1 CRDT shadow: mirror the topic (gated on FEAT_CRDT_ENABLED).
+    * cptr = incoming link, for the Phase 3a single-writer gate. */
+   crdt_shadow_topic(chptr, cptr);
 
    /* Generate or reuse msgid before S2S relay so all servers use the same one */
    {

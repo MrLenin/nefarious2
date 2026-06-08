@@ -329,6 +329,10 @@ extern int ms_crdt(struct Client*, struct Client*, int, char*[]);
 extern void crdt_sync_request(struct Client* peer);
 /** Periodic anti-entropy: send CR S to every directly-connected CRDT peer. */
 extern void crdt_sync_broadcast(void);
+/** Eager push (CR U): after a local CRDT write, send each directly-connected
+ *  CRDT peer the ops it lacks, using its last-reported state vector. Peers with
+ *  no cached SV yet are skipped (the periodic anti-entropy catches them up). */
+extern void crdt_sync_push(void);
 extern int ms_bouncer_transfer(struct Client*, struct Client*, int, char*[]);
 extern int m_persistence(struct Client*, struct Client*, int, char*[]);
 extern void persistence_send_status(struct Client *to);

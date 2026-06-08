@@ -384,8 +384,10 @@ int ms_burst(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
       chptr->topic_time = 0;
       sendcmdto_channel_butserv_butone(&his, CMD_TOPIC, chptr, NULL, 0,
                                        "%H :%s", chptr, chptr->topic);
-      /* Phase 1 CRDT shadow: mirror the topic clear (gated). */
-      crdt_shadow_topic(chptr);
+      /* Phase 1 CRDT shadow: mirror the topic clear (gated). cptr = the
+       * bursting peer, for the Phase 3a single-writer gate (a CRDT peer's
+       * burst is skipped — its CR F snapshot carries the topic). */
+      crdt_shadow_topic(chptr, cptr);
     }
   } else if (chptr->creationtime == timestamp) {
     modebuf_init(mbuf = &modebuf, &me, cptr, chptr,

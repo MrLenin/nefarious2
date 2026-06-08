@@ -46,16 +46,20 @@ void crdt_shadow_user_add(struct Client *cptr);
 void crdt_shadow_user_remove(struct Client *cptr);
 
 /** Mirror a channel topic (called from do_settopic and the burst topic-clear).
- *  Records chptr->topic into the shadow topics map. */
-void crdt_shadow_topic(struct Channel *chptr);
+ *  Records chptr->topic into the shadow topics map. @a from is the incoming
+ *  link the change arrived on (cptr), or the local source; the single-writer
+ *  gate skips mirroring when @a from is a CRDT-aware peer. */
+void crdt_shadow_topic(struct Channel *chptr, struct Client *from);
 
 /** Mirror a channel's mode state (called from modebuf_flush). Snapshots the
- *  persistent mode bits + limit + key into the shadow modes map. */
-void crdt_shadow_modes(struct Channel *chptr);
+ *  persistent mode bits + limit + key into the shadow modes map. @a from is the
+ *  mode change's incoming link (mbuf->mb_connect) for the single-writer gate. */
+void crdt_shadow_modes(struct Channel *chptr, struct Client *from);
 
 /** Reconcile the shadow ban/except OR-Sets to the channel's banlist/exceptlist
- *  (called from modebuf_flush). */
-void crdt_shadow_lists(struct Channel *chptr);
+ *  (called from modebuf_flush). @a from is the change's incoming link for the
+ *  single-writer gate. */
+void crdt_shadow_lists(struct Channel *chptr, struct Client *from);
 
 /** Compare the shadow CRDT membership to the real channel state and log any
  *  divergence. No-op unless FEAT_CRDT_ENABLED. */
@@ -78,6 +82,11 @@ int crdt_shadow_encode_delta(const uint8_t *remote_sv, size_t sv_len,
 
 /** Decode + apply a delta into the shadow document. Returns ops applied, or -1. */
 int crdt_shadow_apply_delta(const uint8_t *buf, size_t len);
+
+/** Encode the ops WE created (origin == my_numeric) that have not yet been
+ *  eager-pushed, advancing the high-water mark. Returns bytes (>4 if any ops
+ *  were emitted), or <=0. Used by crdt_sync_push for CR U. */
+int crdt_shadow_encode_local_unpushed(uint8_t *buf, size_t cap);
 
 /** Digest of the shadow CRDT document (for cross-server convergence checks). */
 uint64_t crdt_shadow_digest(void);

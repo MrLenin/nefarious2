@@ -3128,8 +3128,8 @@ modebuf_flush(struct ModeBuf *mbuf)
   int ret = modebuf_flush_int(mbuf, 1);
   /* Phase 1 CRDT shadow: snapshot the channel's finalized modes + reconcile
    * the ban/except lists (gated on FEAT_CRDT_ENABLED). */
-  crdt_shadow_modes(mbuf->mb_channel);
-  crdt_shadow_lists(mbuf->mb_channel);
+  crdt_shadow_modes(mbuf->mb_channel, mbuf->mb_connect);
+  crdt_shadow_lists(mbuf->mb_channel, mbuf->mb_connect);
   return ret;
 }
 
