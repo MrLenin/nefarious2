@@ -87,6 +87,13 @@ void crdt_shadow_reconcile_topics(void);
  *  FEAT_CRDT_PRIMARY. */
 void crdt_shadow_reconcile_modes(void);
 
+/** Phase 3f: drive live channel membership (the JOIN/add direction) from the doc
+ *  members OR-Set + §17.7 gateway to legacy. Adds present-in-doc-not-live members
+ *  into already-live channels only (never creates a channel); op/voice + the
+ *  remove direction (PART/KICK/QUIT) stay on P10. Idempotent (find_member_link
+ *  guard). No-op unless FEAT_CRDT_PRIMARY. */
+void crdt_shadow_reconcile_members(void);
+
 /* ---- Phase 2 wire-sync accessors (used by m_crdt.c) ----
  * These expose the shadow document to the CR token handlers while keeping the
  * CrdtNetworkState itself private to this module. */

@@ -195,10 +195,12 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
           log_write(LS_SYSTEM, L_NOTICE, 0,
                     "CRDT sync: applied %d op(s) from %s", applied,
                     cli_name(cptr));
-          /* Phase 3d/3e: drive live topics + channel modes that just arrived via
-           * CRDT (+ gateway to legacy). Idempotent; no-op unless FEAT_CRDT_PRIMARY. */
+          /* Phase 3d/3e/3f: drive live topics + channel modes + membership that just
+           * arrived via CRDT (+ gateway to legacy). Idempotent; no-op unless
+           * FEAT_CRDT_PRIMARY. */
           crdt_shadow_reconcile_topics();
           crdt_shadow_reconcile_modes();
+          crdt_shadow_reconcile_members();
         }
       }
       MyFree(bin);

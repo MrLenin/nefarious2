@@ -996,6 +996,77 @@ void crdt_shadow_reconcile_modes(void)
               "CRDT mode-reconcile: drove %u channel(s) from doc", changed);
 }
 
+/* ---- Phase 3f: channel MEMBERSHIP (JOIN-add) via CRDT + §17.7 gateway ----
+ * Drive live channel membership FROM the doc (a JOIN that propagated over CRDT,
+ * not P10) and bridge it to the legacy P10 tree. Send-side suppression of the
+ * P10 JOIN to CRDT peers lives in channel.c joinbuf_join. ADD direction ONLY —
+ * delete-on-leave (PART/KICK/QUIT) stays on P10 (deferred to 3g). The doc OR-Set
+ * yields only present (non-tombstoned) members, so a parted member is never
+ * re-added; find_member_link is the per-member echo/idempotency guard. */
+
+struct reconcile_member_ctx { struct Channel *chptr; const char *chname; unsigned int *changed; };
+
+static void reconcile_member_cb(const char *key, uint32_t key_len, void *ctx)
+{
+  struct reconcile_member_ctx *c = ctx;
+  char numbuf[16];
+  struct Client *u;
+  if (key_len >= sizeof numbuf)
+    return;
+  memcpy(numbuf, key, key_len); numbuf[key_len] = '\0';
+  u = findNUser(numbuf);
+  if (!u)                                  /* user not materialized yet — retry */
+    return;
+  if (find_member_link(c->chptr, u))       /* already a member — echo guard / idempotent */
+    return;
+  /* Plain member: ops/voice ride P10 (CREATE/MODE), not CRDT, so a plain JOIN
+   * always carries no status. Drive live DIRECTLY — add_user_to_channel's
+   * crdt_shadow_join hook self-gates on from_crdt_peer(cli_from(u)) (true here),
+   * so no op is re-minted (loop prevention; no nomirror variant needed). */
+  add_user_to_channel(c->chptr, u, 0, 0);
+  /* notify LOCAL clients (same EXTJOIN-aware pair as joinbuf_join) */
+  sendcmdto_channel_capab_butserv_butone(u, CMD_JOIN, c->chptr, NULL, 0,
+                                         CAP_NONE, CAP_EXTJOIN, "%H", c->chptr);
+  sendcmdto_channel_capab_butserv_butone(u, CMD_JOIN, c->chptr, NULL, 0,
+                                         CAP_EXTJOIN, CAP_NONE, "%H %s :%s", c->chptr,
+                                         IsAccount(u) ? cli_account(u) : "*", cli_info(u));
+  /* §17.7 GATEWAY: re-emit JOIN onto legacy P10 servers only (forbid CRDT-aware —
+   * they already have it via CRDT). A no-op on a leaf with no legacy peers. */
+  sendcmdto_flag_serv_butone(u, CMD_JOIN, NULL, FLAG_LAST_FLAG, FLAG_CRDT_AWARE,
+                             "%H %Tu", c->chptr, c->chptr->creationtime);
+  (*c->changed)++;
+}
+
+void crdt_shadow_reconcile_members(void)
+{
+  unsigned int changed = 0;
+  int bk;
+  if (!shadow_on() || !feature_bool(FEAT_CRDT_PRIMARY))
+    return;
+  for (bk = 0; bk < CRDT_CHAN_BUCKETS; bk++) {
+    struct CrdtChannel *dc;
+    for (dc = g_crdt.chan_buckets[bk]; dc; dc = dc->next) {
+      char nbuf[CHANNELLEN + 1];
+      struct Channel *chptr;
+      struct reconcile_member_ctx mc;
+      if (crdt_orset_size(&dc->members) == 0)
+        continue;
+      if (dc->name_len >= sizeof nbuf)
+        continue;
+      memcpy(nbuf, dc->name, dc->name_len); nbuf[dc->name_len] = '\0';
+      chptr = FindChannel(nbuf);
+      if (!chptr)
+        continue;                          /* 3f: never create a channel here — channel
+                                              birth/death stays on P10 (CREATE/PART) */
+      mc.chptr = chptr; mc.chname = nbuf; mc.changed = &changed;
+      crdt_orset_foreach(&dc->members, reconcile_member_cb, &mc);
+    }
+  }
+  if (changed)
+    log_write(LS_SYSTEM, L_NOTICE, 0,
+              "CRDT member-reconcile: added %u member(s) from doc", changed);
+}
+
 /* ---- Phase 2 wire-sync accessors ---- */
 
 int crdt_shadow_active(void)
@@ -1189,6 +1260,7 @@ static void crdt_shadow_verify_cb(struct Event *ev)
   crdt_shadow_reconcile_topics();  /* Phase 3d: drive live topics from CRDT (+gateway) —
                                       catches 2-hop foreign-origin topics via anti-entropy */
   crdt_shadow_reconcile_modes();   /* Phase 3e: same for persistent channel modes */
+  crdt_shadow_reconcile_members(); /* Phase 3f: same for channel membership (JOIN-add) */
   crdt_sync_broadcast();   /* periodic anti-entropy: pull deltas from peers */
   crdt_shadow_gc();        /* reclaim causally-stable ops/tombstones */
 }

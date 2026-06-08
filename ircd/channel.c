@@ -5419,8 +5419,17 @@ joinbuf_join(struct JoinBuf *jbuf, struct Channel *chan, unsigned int flags)
           join_msgid);
         sendcmdto_want_s2s_tags(1);
       }
-      sendcmdto_serv_butone(jbuf->jb_source, CMD_JOIN, jbuf->jb_connect,
-			    "%H %Tu", chan, chan->creationtime);
+      /* Phase 3f: membership JOIN-add rides CRDT between CRDT-primary peers.
+       * Suppress the P10 JOIN to CRDT-aware servers (they learn it via the CRDT
+       * member-add op + reconcile, which also gateways back to legacy); still
+       * relay to legacy peers. CREATE/PART (joinbuf_flush) stay full P10. */
+      if (feature_bool(FEAT_CRDT_PRIMARY))
+        sendcmdto_flag_serv_butone(jbuf->jb_source, CMD_JOIN, jbuf->jb_connect,
+                                   FLAG_LAST_FLAG, FLAG_CRDT_AWARE,
+                                   "%H %Tu", chan, chan->creationtime);
+      else
+        sendcmdto_serv_butone(jbuf->jb_source, CMD_JOIN, jbuf->jb_connect,
+                              "%H %Tu", chan, chan->creationtime);
     }
 
     if (!((chan->mode.mode & MODE_DELJOINS) && !(flags & CHFL_VOICED_OR_OPPED))) {
