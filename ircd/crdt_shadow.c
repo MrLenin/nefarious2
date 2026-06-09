@@ -23,6 +23,7 @@
 #include "ircd_events.h"
 #include "ircd_features.h"
 #include "ircd_log.h"
+#include "ircd_snprintf.h"   /* ircd_snprintf %Tu for the 3n reconcile-rename TS */
 #include "ircd_string.h"     /* ircd_strncpy (3c materialize) */
 #include "msg.h"             /* CMD_TOPIC (Phase 3d gateway) */
 #include "numnicks.h"
@@ -1005,13 +1006,47 @@ static void crdt_gateway_user_intro(struct Client *nc)
                              NumNick(nc), cli_info(nc));
 }
 
-struct recon_user_ctx { unsigned int created; };
+struct recon_user_ctx { unsigned int created; unsigned int renamed; };
+
+/* Phase 3n: reconcile an already-live remote user's NICK to the doc.  Driven
+ * through set_nick_name with cptr = the CRDT uplink so the proven rename path runs
+ * (common-channel NICK notify, nick hash, WATCH, lastnick, WHOWAS) and its own P10
+ * relay — now legacy-only under FEAT_CRDT_PRIMARY (s_user.c:1254) — becomes the
+ * §17.7 gateway.  The crdt_shadow_user_add hook inside set_nick_name self-skips
+ * (from_crdt_peer of the CRDT uplink), so no op is re-minted and g_crdt.users is
+ * NOT mutated mid-walk.  Local users (nick authoritative here) and bouncer aliases
+ * (follow their primary) are left alone. */
+static void crdt_reconcile_user_update(struct Client *live,
+                                       const struct CrdtUserRecord *rec,
+                                       struct recon_user_ctx *c)
+{
+  if (!IsUser(live) || MyUser(live) || IsBouncerAlias(live))
+    return;
+  if (ircd_strcmp(cli_name(live), rec->nick) != 0) {
+    char newn[NICKLEN + 1], oldn[NICKLEN + 1], tsbuf[24];
+    char *pv[4];
+    ircd_strncpy(newn, rec->nick, NICKLEN + 1);
+    ircd_strncpy(oldn, cli_name(live), NICKLEN + 1);
+    ircd_snprintf(0, tsbuf, sizeof tsbuf, "%Tu", (time_t)rec->nick_ts);
+    pv[0] = oldn; pv[1] = newn; pv[2] = tsbuf; pv[3] = NULL;
+    set_nick_name(cli_from(live), live, newn, 3, pv, 0);
+    c->renamed++;
+  }
+}
 
 static void recon_user_cb(const char *key, uint32_t key_len,
                           const struct CrdtLWWValue *val, void *ctx)
 {
   struct recon_user_ctx *c = ctx;
-  struct Client *nc;
+  char nb[16], sn[4];
+  const struct CrdtUserRecord *rec;
+  struct Client *srv, *via, *live, *nc;
+  if (key_len < 3 || key_len >= sizeof nb ||
+      val->data_len != sizeof(struct CrdtUserRecord))
+    return;                       /* not a full user record (deleted / tombstoned) */
+  memcpy(nb, key, key_len); nb[key_len] = '\0';
+  sn[0] = nb[0]; sn[1] = nb[1]; sn[2] = '\0';
+  srv = FindNServer(sn);
   /* Inbound-burst collision guard, scoped to the UPLINK we'd receive the P10 intro
    * from — NOT a global "any server in burst" gate (that wedges forever on a
    * services pseudo-server like x3.services, which sits perpetually flagged
@@ -1019,22 +1054,21 @@ static void recon_user_cb(const char *key, uint32_t key_len,
    * NICK could still arrive via P10 on THIS server, i.e. we reach its owning server
    * through a LEGACY (non-CRDT) uplink that is currently bursting.  If we reach the
    * owning server via a CRDT peer (every user on a leaf; CRDT-origin users on the
-   * gateway), the user comes via the doc only → always safe to materialize.  This is
-   * also why x3's perpetual burst is harmless: on a leaf we reach x3 through nef3
-   * (CRDT), and on the gateway x3's users arrive via P10 so findNUser skips them. */
-  if (key_len >= 3 && key_len < CRDT_NUMERICLEN + 10) {
-    char nb[16], sn[4];
-    struct Client *srv, *via;
-    memcpy(nb, key, key_len); nb[key_len] = '\0';
-    sn[0] = nb[0]; sn[1] = nb[1]; sn[2] = '\0';
-    srv = FindNServer(sn);
-    via = (srv && IsServer(srv)) ? cli_from(srv) : NULL;
-    if (via && IsServer(via) && !IsCrdtAware(via) && IsBurstOrBurstAck(via))
-      return;                  /* P10 intro may still be in flight on this legacy burst */
+   * gateway), the user comes via the doc only → always safe.  This is also why x3's
+   * perpetual burst is harmless: on a leaf we reach x3 through nef3 (CRDT), and on
+   * the gateway x3's users arrive via P10 so findNUser skips them. */
+  via = (srv && IsServer(srv)) ? cli_from(srv) : NULL;
+  if (via && IsServer(via) && !IsCrdtAware(via) && IsBurstOrBurstAck(via))
+    return;                       /* P10 intro may still be in flight on this legacy burst */
+  rec = (const struct CrdtUserRecord *)val->data;
+  live = findNUser(nb);
+  if (live) {                     /* 3n: already live — reconcile drift (nick; umode TODO) */
+    crdt_reconcile_user_update(live, rec, c);
+    return;
   }
-  nc = crdt_materialize_one_user(key, key_len, val);
+  nc = crdt_materialize_one_user(key, key_len, val);   /* 3l: create not-yet-live */
   if (nc) {
-    crdt_gateway_user_intro(nc);   /* §17.7: re-introduce to the legacy P10 tree */
+    crdt_gateway_user_intro(nc);  /* §17.7: re-introduce to the legacy P10 tree */
     c->created++;
   }
 }
@@ -1057,9 +1091,10 @@ void crdt_shadow_reconcile_users(void)
    * there (x3.services sits perpetually in burst; a global gate would wedge all
    * materialization). */
   crdt_lwwmap_foreach(&g_crdt.users, recon_user_cb, &c);
-  if (c.created)
+  if (c.created || c.renamed)
     log_write(LS_SYSTEM, L_NOTICE, 0,
-              "CRDT user-reconcile: created+gatewayed %u user(s) from doc", c.created);
+              "CRDT user-reconcile: created+gatewayed %u, renamed %u user(s) from doc",
+              c.created, c.renamed);
 }
 
 /* ---- Phase 3j: channel CREATE (channel birth) via CRDT ----

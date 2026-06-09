@@ -1260,8 +1260,18 @@ int set_nick_name(struct Client* cptr, struct Client* sptr,
       }
       }
       add_history(sptr, 1);
-      sendcmdto_serv_butone(sptr, CMD_NICK, cptr, "%s %Tu", nick,
-                            cli_lastnick(sptr));
+      /* Phase 3n (CRDT-mesh): suppress the P10 NICK rename to CRDT-aware peers —
+       * the change rides the doc (crdt_shadow_reconcile_users renames the remote
+       * copy on CRDT peers).  This same relay, now legacy-only, IS the §17.7
+       * gateway: when reconcile drives the rename via set_nick_name(cptr=CRDT
+       * uplink), it re-emits the NICK to legacy here. */
+      if (feature_bool(FEAT_CRDT_PRIMARY))
+        sendcmdto_flag_serv_butone(sptr, CMD_NICK, cptr, FLAG_LAST_FLAG,
+                                   FLAG_CRDT_AWARE, "%s %Tu", nick,
+                                   cli_lastnick(sptr));
+      else
+        sendcmdto_serv_butone(sptr, CMD_NICK, cptr, "%s %Tu", nick,
+                              cli_lastnick(sptr));
 
       /* BX N: sync nick change to aliases if user has any */
       if (MyUser(sptr) && IsAccount(sptr)) {
