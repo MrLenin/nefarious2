@@ -1064,11 +1064,49 @@ static void test_chunk_cleanup_link(void **state)
   free(out);
 }
 
+/* Phase 3m: user delete-tombstone gate (the doc->live delete-on-leave guard).
+ * absent->0, present->0, deleted->1, reconnect(newer set)->0; and it replicates. */
+static void test_user_explicit_removal_gate(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s1, s2;
+  struct CrdtUserRecord u;
+  unsigned char ip[16] = { 0,0,0,0,0,0,0,0,0,0,0xff,0xff,1,2,3,4 };
+  memset(&u, 0, sizeof u);
+  strcpy(u.nick, "bob"); strcpy(u.ident, "bo"); strcpy(u.host, "h.example");
+  strcpy(u.realname, "Bob"); strcpy(u.umodes, "+i");
+  memcpy(u.ip6, ip, 16); u.nick_ts = 1780000000ULL; u.server = 4;
+  crdt_state_init(&s1, 4);
+  crdt_state_init(&s2, 3);
+
+  /* absent: NOT explicitly removed (the sync-lag guard) */
+  assert_int_equal(0, crdt_user_is_explicitly_removed(&s1, "DAAAB"));
+  /* present: NOT explicitly removed */
+  crdt_user_set(&s1, "DAAAB", &u);
+  assert_int_equal(0, crdt_user_is_explicitly_removed(&s1, "DAAAB"));
+  assert_non_null(crdt_user_get(&s1, "DAAAB"));
+  /* deleted: IS explicitly removed; get() now NULL (deleted == absent for get) */
+  crdt_user_remove(&s1, "DAAAB");
+  assert_int_equal(1, crdt_user_is_explicitly_removed(&s1, "DAAAB"));
+  assert_null(crdt_user_get(&s1, "DAAAB"));
+  /* the tombstone replicates: s2 learns the delete via the oplog and sees it */
+  assert_true(crdt_state_sync(&s2, &s1) >= 0);
+  assert_int_equal(1, crdt_user_is_explicitly_removed(&s2, "DAAAB"));
+  /* reconnect on the same numeric (newer-HLC set) clears the tombstone */
+  crdt_user_set(&s1, "DAAAB", &u);
+  assert_int_equal(0, crdt_user_is_explicitly_removed(&s1, "DAAAB"));
+  assert_non_null(crdt_user_get(&s1, "DAAAB"));
+
+  crdt_state_clear(&s1);
+  crdt_state_clear(&s2);
+}
+
 /* ================================================================== */
 
 int main(void)
 {
   const struct CMUnitTest tests[] = {
+    cmocka_unit_test(test_user_explicit_removal_gate),
     cmocka_unit_test(test_A_convergence),
     cmocka_unit_test(test_B_collision_different_user_oldest_wins),
     cmocka_unit_test(test_B_collision_same_user_newest_wins),

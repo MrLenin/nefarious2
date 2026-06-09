@@ -28,6 +28,7 @@
 #include "msg.h"             /* CMD_TOPIC (Phase 3d gateway) */
 #include "numnicks.h"
 #include "querycmds.h"       /* UserStats, Count_newremoteclient (3c materialize) */
+#include "s_misc.h"          /* exit_client (Phase 3m user delete-on-leave) */
 #include "s_user.h"          /* umode_str, make_user, user_apply_umode_str */
 #include "send.h"            /* sendcmdto_* (Phase 3d topic gateway) */
 #include "handlers.h"        /* crdt_sync_broadcast */
@@ -1138,6 +1139,51 @@ void crdt_shadow_reconcile_users(void)
               c.created, c.renamed, c.umoded);
 }
 
+/* ---- Phase 3m: USER delete-on-leave (QUIT) via CRDT + §17.7 gateway ----
+ * The remove half of the USERS cutover (after 3l create / 3n nick / 3o umode) — the
+ * genuinely risky one.  Walk LIVE remote users; exit any the doc has EXPLICITLY
+ * tombstoned (crdt_user_is_explicitly_removed) — NEVER on mere absence (the 3g
+ * sync-lag safety: a not-yet-materialized or lagging user is absent, not deleted).
+ * Drive the exit through exit_client(cptr=CRDT uplink, victim, victim) so the real
+ * teardown runs (common-channel QUIT to locals, channel/list cleanup) AND its P10
+ * QUIT relay — now legacy-only under FEAT_CRDT_PRIMARY (s_misc.c) — becomes the §17.7
+ * gateway; the crdt_shadow_user_remove hook inside self-skips (from_crdt_peer of the
+ * uplink) so no op is re-minted.  Local users (authoritative here) and bouncer aliases
+ * are left alone.  SQUIT stays on P10 (§17.3 server-SPLIT, deferred — its cascade
+ * tears down materialized users, and the owning-server-absent guard in
+ * crdt_materialize_one_user stops a split server's users from re-materializing).
+ * No-op unless FEAT_CRDT_PRIMARY. */
+#define CRDT_REMOVE_MAX 256
+void crdt_shadow_reconcile_user_removes(void)
+{
+  struct Client *acptr;
+  char victims[CRDT_REMOVE_MAX][CRDT_NUMERICLEN];
+  int nv = 0, i, capped = 0;
+  if (!shadow_on() || !feature_bool(FEAT_CRDT_PRIMARY))
+    return;
+  /* collect FIRST — exit_client frees clients; never exit mid-walk */
+  for (acptr = GlobalClientList; acptr; acptr = cli_next(acptr)) {
+    char num[CRDT_NUMERICLEN];
+    if (!IsUser(acptr) || MyUser(acptr) || IsBouncerAlias(acptr))
+      continue;
+    user_numeric(acptr, num, sizeof num);
+    if (!crdt_user_is_explicitly_removed(&g_crdt, num))
+      continue;                       /* present / absent / lagging — leave it (safety) */
+    if (nv >= CRDT_REMOVE_MAX) { capped = 1; break; }
+    ircd_strncpy(victims[nv], num, CRDT_NUMERICLEN);
+    nv++;
+  }
+  for (i = 0; i < nv; i++) {
+    struct Client *v = findNUser(victims[i]);   /* re-find: a prior exit may have freed it */
+    if (v && IsUser(v) && !MyUser(v) && !IsBouncerAlias(v))
+      exit_client(cli_from(v), v, v, "Quit");   /* gateway via the now-legacy-only QUIT relay */
+  }
+  if (nv)
+    log_write(LS_SYSTEM, L_NOTICE, 0,
+              "CRDT user-reconcile: removed %u user(s)%s from doc", nv,
+              capped ? " (capped; more next tick)" : "");
+}
+
 /* ---- Phase 3j: channel CREATE (channel birth) via CRDT ----
  * Steady-state create-from-doc for a SINGLE not-yet-live channel (the create-half
  * of materialize, lifted to run on every CR D/U + verify tick). Births a channel
@@ -1838,6 +1884,7 @@ static void crdt_shadow_verify_cb(struct Event *ev)
   crdt_shadow_reconcile_removes(); /* Phase 3g: membership remove (PART / delete-on-leave) */
   crdt_shadow_reconcile_member_status(); /* Phase 3h: per-member status (+o/+v/+h) */
   crdt_shadow_reconcile_bans();    /* Phase 3i: channel bans/excepts (+b/+e) */
+  crdt_shadow_reconcile_user_removes(); /* Phase 3m: QUIT / delete-on-leave (after channel cleanup) */
   crdt_sync_broadcast();   /* periodic anti-entropy: pull deltas from peers */
   crdt_shadow_gc();        /* reclaim causally-stable ops/tombstones */
 }

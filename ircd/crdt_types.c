@@ -371,6 +371,20 @@ const struct CrdtLWWValue *crdt_lwwmap_get(const struct CrdtLWWMap *map,
   return &e->val;
 }
 
+/* Phase 3m: distinguish an explicit delete-tombstone from mere absence.  Returns 1
+ * iff an entry exists AND its last write was a delete.  The doc->live reconcile-remove
+ * (delete-on-leave) gates on THIS, never on get()==NULL (which is also absence) — the
+ * user-level analog of crdt_orset_is_explicitly_removed, so a not-yet-seen user (sync
+ * lag) is never wrongly removed.  Delete-tombstones persist in the LWW map
+ * (crdt_state_gc never reclaims LWW entries), so the tombstone always covers the
+ * reconcile; a reconnect on the same numeric overwrites it (newer-HLC set). */
+int crdt_lwwmap_is_deleted(const struct CrdtLWWMap *map,
+                           const char *key, uint32_t key_len)
+{
+  struct CrdtLWWEntry *e = lww_find(map, key, key_len);
+  return (e && e->deleted) ? 1 : 0;
+}
+
 int crdt_lwwmap_delete(struct CrdtLWWMap *map, const char *key,
                        uint32_t key_len, struct HLC ts, uint16_t writer)
 {

@@ -206,6 +206,7 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
           crdt_shadow_reconcile_removes();
           crdt_shadow_reconcile_member_status();
           crdt_shadow_reconcile_bans();
+          crdt_shadow_reconcile_user_removes(); /* Phase 3m: QUIT / delete-on-leave (after channel cleanup) */
         }
       }
       MyFree(bin);

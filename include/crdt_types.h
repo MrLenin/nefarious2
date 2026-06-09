@@ -211,6 +211,12 @@ int crdt_lwwmap_set(struct CrdtLWWMap *map, const char *key, uint32_t key_len,
 const struct CrdtLWWValue *crdt_lwwmap_get(const struct CrdtLWWMap *map,
                                            const char *key, uint32_t key_len);
 
+/** Phase 3m: 1 iff an entry exists AND its last write was a delete (an explicit
+ *  tombstone), 0 if absent or present. The delete-on-leave reconcile gates on this
+ *  (never on get()==NULL) so sync-lag absence never triggers a wrongful remove. */
+int crdt_lwwmap_is_deleted(const struct CrdtLWWMap *map,
+                           const char *key, uint32_t key_len);
+
 /** Delete key (LWW write of a tombstone). Returns 1 if applied, 0 if stale. */
 int crdt_lwwmap_delete(struct CrdtLWWMap *map, const char *key,
                        uint32_t key_len, struct HLC ts, uint16_t writer);

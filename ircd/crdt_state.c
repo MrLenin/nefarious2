@@ -215,6 +215,14 @@ void crdt_user_remove(struct CrdtNetworkState *st, const char *numeric)
   record(st, op);
 }
 
+/* Phase 3m: 1 iff this numeric has an explicit user delete-tombstone in the doc
+ * (the gate for doc->live delete-on-leave; never fires on mere absence). */
+int crdt_user_is_explicitly_removed(const struct CrdtNetworkState *st,
+                                    const char *numeric)
+{
+  return crdt_lwwmap_is_deleted(&st->users, numeric, (uint32_t)strlen(numeric));
+}
+
 void crdt_nick_claim(struct CrdtNetworkState *st, const char *nick_lc,
                      const struct CrdtNickClaim *claim)
 {

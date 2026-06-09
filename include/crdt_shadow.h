@@ -111,6 +111,12 @@ void crdt_shadow_reconcile_modes(void);
  *  reference users by numeric). No-op unless FEAT_CRDT_PRIMARY. */
 void crdt_shadow_reconcile_users(void);
 
+/** Phase 3m: exit live remote users the doc has EXPLICITLY tombstoned (QUIT /
+ *  delete-on-leave) + §17.7-gateway a QUIT to legacy. Gated on
+ *  crdt_user_is_explicitly_removed (never on mere absence — the sync-lag safety).
+ *  SQUIT stays on P10. No-op unless FEAT_CRDT_PRIMARY. */
+void crdt_shadow_reconcile_user_removes(void);
+
 /** Phase 3f: drive live channel membership (the JOIN/add direction) from the doc
  *  members OR-Set + §17.7 gateway to legacy. Adds present-in-doc-not-live members
  *  into already-live channels only (never creates a channel); op/voice + the

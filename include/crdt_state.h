@@ -212,6 +212,10 @@ void crdt_state_clear(struct CrdtNetworkState *st);
 void crdt_user_set(struct CrdtNetworkState *st, const char *numeric,
                    const struct CrdtUserRecord *rec);
 void crdt_user_remove(struct CrdtNetworkState *st, const char *numeric);
+/** Phase 3m: 1 iff @a numeric has an explicit user delete-tombstone in the doc
+ *  (gate for doc->live delete-on-leave; never true for a merely-absent user). */
+int crdt_user_is_explicitly_removed(const struct CrdtNetworkState *st,
+                                    const char *numeric);
 void crdt_nick_claim(struct CrdtNetworkState *st, const char *nick_lc,
                      const struct CrdtNickClaim *claim);
 void crdt_chan_join(struct CrdtNetworkState *st, const char *chan,

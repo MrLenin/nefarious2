@@ -1011,7 +1011,14 @@ int exit_client(struct Client *cptr,
       else if (IsUser(victim) && !HasFlag(victim, FLAG_KILLED)
                && !IsBouncerInternalDestroy(victim)
                && !IsBouncerAlias(victim)
-               && !(IsBouncerHold(victim) && IsIRCv3Aware(dlp->value.cptr))) {
+               && !(IsBouncerHold(victim) && IsIRCv3Aware(dlp->value.cptr))
+               /* Phase 3m (CRDT-mesh): suppress the P10 QUIT to CRDT-aware peers —
+                * the leave rides the doc (the crdt_shadow_user_remove tombstone;
+                * crdt_shadow_reconcile_user_removes exits the remote copy on CRDT
+                * peers + §17.7-gateways a QUIT to legacy via THIS loop). SQUIT-
+                * cascade (victim is a server) takes the SQUIT branch above, so it
+                * still tears down materialized users on CRDT peers normally. */
+               && !(feature_bool(FEAT_CRDT_PRIMARY) && IsCrdtAware(dlp->value.cptr))) {
 	/* Held ghosts: BX X already handled the silent destroy on
 	 * IRCv3-aware peers; non-IRCv3-aware peers don't process BX X
 	 * and need a regular Q to clean up the phantom Client struct
