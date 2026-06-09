@@ -101,6 +101,12 @@ void crdt_shadow_reconcile_members(void);
  *  FEAT_CRDT_PRIMARY. */
 void crdt_shadow_reconcile_removes(void);
 
+/** Phase 3h: drive live per-member status (+o/+v/+h) from the doc members_status
+ *  LWW + §17.7 gateway to legacy. Diffs each live member's status vs the doc and
+ *  emits the delta via modebuf_flush_nomirror (local clients + legacy only).
+ *  Echo-guarded; skips not-yet-materialized members. No-op unless FEAT_CRDT_PRIMARY. */
+void crdt_shadow_reconcile_member_status(void);
+
 /* ---- Phase 2 wire-sync accessors (used by m_crdt.c) ----
  * These expose the shadow document to the CR token handlers while keeping the
  * CrdtNetworkState itself private to this module. */

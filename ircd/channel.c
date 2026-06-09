@@ -2394,12 +2394,13 @@ show_delayed_joins(const struct Channel *chan)
  *
  * @returns 0
  */
-/** CRDT-mesh (Phase 3e): true iff this mode flush contains ONLY persistent
- *  channel modes (the CRDT_MODE_MASK set, incl. KEY/LIMIT args) — no per-member
- *  ops, no bans/excepts, no extended modes, no +A/+U. Such a flush can be routed
- *  to CRDT-primary peers over CRDT instead of P10 (they apply it via
- *  crdt_shadow_reconcile_modes); only the legacy P10 side needs the wire MODE. */
-static int modebuf_is_crdt_channel_only(const struct ModeBuf *mbuf)
+/** CRDT-mesh (Phase 3e/3h): true iff this mode flush contains ONLY state that
+ *  rides the CRDT mesh — persistent channel modes (the CRDT_MODE_MASK set, incl.
+ *  KEY/LIMIT args) AND per-member ops (+o/+v/+h). NO bans/excepts (+b/+e), no
+ *  extended modes, no +A/+U. Such a flush is routed to CRDT-primary peers over
+ *  CRDT instead of P10 (they apply it via crdt_shadow_reconcile_modes /
+ *  crdt_shadow_reconcile_member_status); only the legacy P10 side needs the wire MODE. */
+static int modebuf_is_crdt_only(const struct ModeBuf *mbuf)
 {
   unsigned int dir = MODE_ADD | MODE_DEL | MODE_SAVE;
   unsigned int chg = (mbuf->mb_add | mbuf->mb_rem) & ~dir;  /* mb_add/rem carry the
@@ -2411,8 +2412,10 @@ static int modebuf_is_crdt_channel_only(const struct ModeBuf *mbuf)
     return 0;                          /* extended modes ride P10 */
   for (i = 0; i < mbuf->mb_count; i++) {
     unsigned int t = MB_TYPE(mbuf, i) & ~dir;
-    if (!(t & (MODE_KEY | MODE_LIMIT)))
-      return 0;                        /* member-op / ban / +A / +U present */
+    /* permit channel param-modes (KEY/LIMIT) and member-ops (CHANOP/HALFOP/VOICE);
+     * bans/excepts (MODE_BAN/EXCEPT) and +A/+U (MODE_APASS/UPASS) ride P10. */
+    if (!(t & (MODE_KEY | MODE_LIMIT | MODE_CHANOP | MODE_HALFOP | MODE_VOICE)))
+      return 0;                        /* ban / except / +A / +U present */
   }
   return (chg & CRDT_MODE_MASK) || mbuf->mb_count;  /* and something is changing */
 }
@@ -2905,18 +2908,24 @@ modebuf_flush_int(struct ModeBuf *mbuf, int all)
        * We're propagating a normal (or HACK3 or HACK4) MODE command
        * to the rest of the network.  We send the actual channel TS.
        */
-      /* Phase 3e: a channel-modes-only flush reaches CRDT-primary peers over
-       * CRDT (crdt_shadow_reconcile_modes), so relay P10 to LEGACY (non-CRDT)
-       * peers only. addstr==addstro for channel-only (no member-op args), so a
-       * single legacy-forbid call covers both oplevel classes.
+      /* Phase 3e/3h: a flush of only CRDT-borne state (channel modes + member-ops)
+       * reaches CRDT-primary peers over CRDT (crdt_shadow_reconcile_modes /
+       * _member_status), so relay P10 to LEGACY (non-CRDT) peers only.
        */
       int crdt_only = feature_bool(FEAT_CRDT_PRIMARY) &&
-                      modebuf_is_crdt_channel_only(mbuf);
+                      modebuf_is_crdt_only(mbuf);
       if (mode_msgid[0] && mode_time_ms) {
         sendcmdto_set_s2s_tags(mode_time_ms, mode_msgid);
         sendcmdto_want_s2s_tags(1);
       }
       if (crdt_only) {
+        /* Relay to LEGACY (non-CRDT) peers ONLY — CRDT-primary peers apply via
+         * crdt_shadow_reconcile_modes / _member_status. A single forbid-CRDT call
+         * with addstr is correct for member-ops too: oplevel is network-uniform, so
+         * either every legacy peer is oplevel-aware (and parses nick:level) or none
+         * is (and addstr==addstro plain nick). Do NOT split on FLAG_OPLEVELS here:
+         * the forbid-OPLEVELS call would reach CRDT peers when oplevels are off,
+         * defeating the suppression (the member-op MODE would leak + relay via P10). */
         sendcmdto_flag_serv_butone(mbuf->mb_source, CMD_MODE, mbuf->mb_connect,
                                    FLAG_LAST_FLAG, FLAG_CRDT_AWARE,
                                    "%H %s%s%s%s%s%s %Tu", mbuf->mb_channel,

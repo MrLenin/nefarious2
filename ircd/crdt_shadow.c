@@ -152,10 +152,12 @@ void crdt_shadow_join(struct Channel *chptr, struct Client *who,
   if (from_crdt_peer(cli_from(who)))  /* single-writer: peer owns this op */
     return;
   crdt_chan_join(&g_crdt, chptr->chname, user_numeric(who, num, sizeof num));
-  /* opped/voiced-on-join (burst @, founder) never hits modebuf_flush, so capture
-   * initial member status here; and seed the channel meta (creationtime). */
-  if (flags & (CHFL_CHANOP | CHFL_HALFOP | CHFL_VOICE))
-    write_member_status(chptr, find_member_link(chptr, who));
+  /* Always stamp member status on join (not just op-on-join): members_status is
+   * LWW and is NOT cleared on PART (delete-on-leave deferred), so a member who was
+   * op'd, parted, and now rejoins PLAIN must overwrite the stale op record with a
+   * fresh status=0 (newer HLC) — otherwise Phase-3h reconcile would re-op them.
+   * write_member_status reads the member's current flags (0 for a plain join). */
+  write_member_status(chptr, find_member_link(chptr, who));
   write_chanmeta(chptr);
   crdt_sync_push();                   /* eager-propagate to CRDT peers */
 }
@@ -996,6 +998,86 @@ void crdt_shadow_reconcile_modes(void)
               "CRDT mode-reconcile: drove %u channel(s) from doc", changed);
 }
 
+/* ---- Phase 3h: channel MEMBER-OPS (+o/+v/+h) via CRDT + §17.7 gateway ----
+ * Drive live per-member status (op/voice/halfop) FROM the doc members_status LWW
+ * + bridge to legacy. Send-side suppression of the P10 member-op MODE to CRDT
+ * peers lives in channel.c modebuf_flush_int (the crdt_only branch). NB:
+ * modebuf_mode_client only QUEUES the wire emit — it does NOT change
+ * member->status (the caller does, cf. mode_process_clients) — so set it directly
+ * here, then modebuf_flush_nomirror for the local-notify + legacy gateway (no
+ * crdt_shadow_modes re-mirror loop). */
+
+struct reconcile_mstatus_ctx { unsigned int *changed; };
+
+static void reconcile_mstatus_cb(const char *key, uint32_t key_len,
+                                 const struct CrdtLWWValue *val, void *ctx)
+{
+  struct reconcile_mstatus_ctx *c = ctx;
+  char chname[CHANNELLEN + 1], numbuf[16];
+  const char *nul;
+  struct Channel *chptr;
+  struct Client *u;
+  struct Membership *m;
+  const struct CrdtMemberRecord *mr;
+  unsigned int chlen, numlen, doc_st, live_st, added, removed;
+  struct ModeBuf mbuf;
+  if (!val->data || val->data_len != sizeof(struct CrdtMemberRecord))
+    return;
+  /* key = chan '\0' numeric */
+  nul = memchr(key, '\0', key_len);
+  if (!nul)
+    return;
+  chlen = (unsigned int)(nul - key);
+  numlen = key_len - chlen - 1;
+  if (chlen == 0 || chlen >= sizeof chname || numlen == 0 || numlen >= sizeof numbuf)
+    return;
+  memcpy(chname, key, chlen); chname[chlen] = '\0';
+  memcpy(numbuf, nul + 1, numlen); numbuf[numlen] = '\0';
+  chptr = FindChannel(chname);
+  if (!chptr)
+    return;                              /* channel not live */
+  u = findNUser(numbuf);
+  if (!u)
+    return;                              /* user not materialized yet — retry */
+  m = find_member_link(chptr, u);
+  if (!m)
+    return;                              /* not a live member (3f pending / parted) */
+  mr = (const struct CrdtMemberRecord *)val->data;
+  doc_st  = expand_status(mr->status) & CHFL_VOICED_OR_OPPED;
+  live_st = m->status & CHFL_VOICED_OR_OPPED;
+  if (doc_st == live_st)
+    return;                              /* in sync — echo guard */
+  added   = doc_st  & ~live_st;
+  removed = live_st & ~doc_st;
+  /* drive live DIRECTLY (modebuf_mode_client does not set member->status) */
+  m->status  = (m->status & ~CHFL_VOICED_OR_OPPED) | doc_st;
+  m->oplevel = mr->oplevel;
+  /* emit the +/- delta: local clients (DEST_CHANNEL) + §17.7 legacy gateway
+   * (DEST_SERVER, routed legacy-only by the crdt_only branch); nomirror avoids
+   * re-minting a CRDT op. */
+  modebuf_init(&mbuf, &me, NULL, chptr, MODEBUF_DEST_CHANNEL | MODEBUF_DEST_SERVER);
+  if (added & CHFL_CHANOP) modebuf_mode_client(&mbuf, MODE_ADD | MODE_CHANOP, u, m->oplevel);
+  if (added & CHFL_HALFOP) modebuf_mode_client(&mbuf, MODE_ADD | MODE_HALFOP, u, m->oplevel);
+  if (added & CHFL_VOICE)  modebuf_mode_client(&mbuf, MODE_ADD | MODE_VOICE,  u, m->oplevel);
+  if (removed & CHFL_CHANOP) modebuf_mode_client(&mbuf, MODE_DEL | MODE_CHANOP, u, m->oplevel);
+  if (removed & CHFL_HALFOP) modebuf_mode_client(&mbuf, MODE_DEL | MODE_HALFOP, u, m->oplevel);
+  if (removed & CHFL_VOICE)  modebuf_mode_client(&mbuf, MODE_DEL | MODE_VOICE,  u, m->oplevel);
+  modebuf_flush_nomirror(&mbuf);
+  (*c->changed)++;
+}
+
+void crdt_shadow_reconcile_member_status(void)
+{
+  unsigned int changed = 0;
+  struct reconcile_mstatus_ctx ctx = { &changed };
+  if (!shadow_on() || !feature_bool(FEAT_CRDT_PRIMARY))
+    return;
+  crdt_lwwmap_foreach(&g_crdt.members_status, reconcile_mstatus_cb, &ctx);
+  if (changed)
+    log_write(LS_SYSTEM, L_NOTICE, 0,
+              "CRDT member-status-reconcile: drove %u member(s) from doc", changed);
+}
+
 /* ---- Phase 3f: channel MEMBERSHIP (JOIN-add) via CRDT + §17.7 gateway ----
  * Drive live channel membership FROM the doc (a JOIN that propagated over CRDT,
  * not P10) and bridge it to the legacy P10 tree. Send-side suppression of the
@@ -1321,6 +1403,7 @@ static void crdt_shadow_verify_cb(struct Event *ev)
   crdt_shadow_reconcile_modes();   /* Phase 3e: same for persistent channel modes */
   crdt_shadow_reconcile_members(); /* Phase 3f: same for channel membership (JOIN-add) */
   crdt_shadow_reconcile_removes(); /* Phase 3g: membership remove (PART / delete-on-leave) */
+  crdt_shadow_reconcile_member_status(); /* Phase 3h: per-member status (+o/+v/+h) */
   crdt_sync_broadcast();   /* periodic anti-entropy: pull deltas from peers */
   crdt_shadow_gc();        /* reclaim causally-stable ops/tombstones */
 }

@@ -202,6 +202,7 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
           crdt_shadow_reconcile_modes();
           crdt_shadow_reconcile_members();
           crdt_shadow_reconcile_removes();
+          crdt_shadow_reconcile_member_status();
         }
       }
       MyFree(bin);
