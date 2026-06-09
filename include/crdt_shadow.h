@@ -103,6 +103,14 @@ void crdt_shadow_reconcile_topics(void);
  *  FEAT_CRDT_PRIMARY. */
 void crdt_shadow_reconcile_modes(void);
 
+/** Phase 3l: create not-yet-live users from the doc users map + §17.7-gateway each
+ *  onward to the legacy P10 tree (a P10 NICK introduce, sourced from the owning
+ *  server). The user-level analog of reconcile_members (JOIN-add): introduce rides
+ *  CRDT, removal/nick-change/umode stay on P10 (deferred 3m/3n). Self-guards against
+ *  a concurrent inbound BURST. Must run BEFORE the channel reconcilers (channels
+ *  reference users by numeric). No-op unless FEAT_CRDT_PRIMARY. */
+void crdt_shadow_reconcile_users(void);
+
 /** Phase 3f: drive live channel membership (the JOIN/add direction) from the doc
  *  members OR-Set + §17.7 gateway to legacy. Adds present-in-doc-not-live members
  *  into already-live channels only (never creates a channel); op/voice + the

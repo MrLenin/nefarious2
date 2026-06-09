@@ -847,9 +847,19 @@ int register_user(struct Client *cptr, struct Client *sptr)
    * (D.2 at-N-time dispatch on the receive side handles the multi-
    * server convergence cases without needing to defer the introduction). */
   bounce_set_n_sessid_hint(sptr);
-  /* Send full IP address to IPv6-grokking servers. */
+  /* Send full IP address to IPv6-grokking servers.
+   *
+   * Phase 3l (CRDT-mesh): on a CRDT primary the user introduction rides the
+   * CRDT doc to CRDT-aware peers (crdt_shadow_reconcile_users materializes them
+   * there and §17.7-gateways a NICK onward to legacy), so forbid CRDT-aware
+   * peers on this emit.  Every link advertises the literal '6' (s_serv.c:144),
+   * so this require-IPV6 call carries all real traffic; the forbid-IPV6 call
+   * below is unchanged (vacuous here — no pre-v6 peers exist — so a hypothetical
+   * pre-v6 CRDT peer is the one documented leak, not reachable in this fleet). */
   sendcmdto_flag_serv_butone(user->server, CMD_NICK, cptr,
-                             FLAG_IPV6, FLAG_LAST_FLAG,
+                             FLAG_IPV6,
+                             feature_bool(FEAT_CRDT_PRIMARY) ? FLAG_CRDT_AWARE
+                                                             : FLAG_LAST_FLAG,
                              "%s %d %Tu %s %s %s%s%s%s %s%s :%s",
                              cli_name(sptr), cli_hopcount(sptr) + 1,
                              cli_lastnick(sptr),

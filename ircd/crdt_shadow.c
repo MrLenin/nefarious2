@@ -765,29 +765,34 @@ static unsigned int expand_status(uint8_t s)
 
 struct mat_create_ctx { unsigned int *created; };
 
-static void mat_create_user_cb(const char *key, uint32_t key_len,
-                               const struct CrdtLWWValue *val, void *ctx)
+/* Materialize ONE doc user into a live remote Client.  Factored out of the bulk
+ * mat_create_user_cb so the steady-state reconcile (crdt_shadow_reconcile_users,
+ * Phase 3l) can both create the Client AND learn the resulting Client* in order
+ * to §17.7-gateway a P10 NICK to legacy.  Returns the new Client, or NULL if
+ * skipped (already live / bad record / owning server not in the tree yet).
+ * Modeled on the set_nick_name IsServer remote-create branch (s_user.c:1078). */
+static struct Client *crdt_materialize_one_user(const char *key, uint32_t key_len,
+                                                const struct CrdtLWWValue *val)
 {
-  struct mat_create_ctx *c = ctx;
   char numbuf[16], srvnum[4];
   const struct CrdtUserRecord *rec;
   struct Client *srv, *nc;
   if (key_len < 3 || key_len >= sizeof numbuf ||
       val->data_len != sizeof(struct CrdtUserRecord))
-    return;
+    return NULL;
   memcpy(numbuf, key, key_len); numbuf[key_len] = '\0';
   if (findNUser(numbuf))                  /* already live — idempotent + mandatory
                                              guard (SetRemoteNumNick kills on clash) */
-    return;
+    return NULL;
   rec = (const struct CrdtUserRecord *)val->data;
   srvnum[0] = numbuf[0]; srvnum[1] = numbuf[1]; srvnum[2] = '\0';
   srv = FindNServer(srvnum);
   if (!srv || !IsServer(srv))             /* owning server not in tree yet:
                                              skip-and-retry on the next pass */
-    return;
+    return NULL;
   nc = make_client(cli_from(srv), STAT_UNKNOWN);
   if (!nc)
-    return;
+    return NULL;
   cli_hopcount(nc) = cli_hopcount(srv) + 1;     /* recomputed locally */
   cli_lastnick(nc) = (time_t)rec->nick_ts;
   ircd_strncpy(cli_name(nc), rec->nick, NICKLEN + 1);
@@ -814,7 +819,16 @@ static void mat_create_user_cb(const char *key, uint32_t key_len,
     ++UserStats.inv_clients;                      /* bump these — exit asserts >0  */
   if (IsOper(nc) && !IsHideOper(nc) && !IsChannelService(nc) && !IsBot(nc))
     ++UserStats.opers;
-  (*c->created)++;
+  return nc;
+}
+
+static void mat_create_user_cb(const char *key, uint32_t key_len,
+                               const struct CrdtLWWValue *val, void *ctx)
+{
+  struct mat_create_ctx *c = ctx;
+  if (crdt_materialize_one_user(key, key_len, val))   /* local-only (no gateway —
+                                              the bulk burst-replacement path) */
+    (*c->created)++;
 }
 
 struct mat_join_ctx { struct Channel *chptr; const char *chname; };
@@ -947,6 +961,105 @@ void crdt_shadow_materialize_live(void)
     log_write(LS_SYSTEM, L_NOTICE, 0,
               "CRDT materialize: created %u user(s), %u channel(s) from doc",
               created, chans);
+}
+
+/* ---- Phase 3l: USER introduce + steady-state CREATE via CRDT (+ §17.7 gateway) ----
+ * The user-level analog of 3f (channel JOIN-add): the P10 NICK introduce is
+ * suppressed to CRDT peers (s_user.c register_user) so a new user rides the doc;
+ * on the far side we materialize the Client AND, on a gateway node, re-introduce it
+ * to the legacy P10 tree with a P10 NICK.  Removal stays on P10 (deferred 3m);
+ * nick-change + umode stay on P10 (deferred 3n) — exactly as 3f's JOIN-add coexisted
+ * with P10 PART until 3g. */
+
+/* §17.7 gateway: re-introduce a freshly doc-materialized user to LEGACY peers via a
+ * P10 NICK token, forbidding CRDT-aware peers (they learn it from the doc).  Mirrors
+ * register_user's FLAG_IPV6 two-call split — require-IPV6 carries the real IP to v6
+ * peers, forbid-IPV6 a fake IP to pre-v6 peers; every CRDT peer is v6 (literal '6',
+ * s_serv.c:144) so the forbid-IPV6 call never reaches a CRDT peer (no double).
+ * Sourced from the user's owning server (a server-sourced NICK is the normal remote
+ * introduce form); one=NULL since the forbid mask already excludes every CRDT peer
+ * (NULL one is the proven 3f gateway idiom). */
+static void crdt_gateway_user_intro(struct Client *nc)
+{
+  char ip_base64[25];
+  const char *um;
+  struct Client *srv = cli_user(nc)->server;
+  if (!srv)
+    return;
+  um = umode_str(nc);
+  sendcmdto_flag_serv_butone(srv, CMD_NICK, NULL,
+                             FLAG_IPV6, FLAG_CRDT_AWARE,
+                             "%s %d %Tu %s %s %s%s%s%s %s%s :%s",
+                             cli_name(nc), cli_hopcount(nc) + 1, cli_lastnick(nc),
+                             cli_user(nc)->username, cli_user(nc)->realhost,
+                             *um ? "+" : "", um, *um ? " " : "",
+                             iptobase64(ip_base64, &cli_ip(nc), sizeof(ip_base64), 1),
+                             NumNick(nc), cli_info(nc));
+  sendcmdto_flag_serv_butone(srv, CMD_NICK, NULL,
+                             FLAG_LAST_FLAG, FLAG_IPV6,
+                             "%s %d %Tu %s %s %s%s%s%s %s%s :%s",
+                             cli_name(nc), cli_hopcount(nc) + 1, cli_lastnick(nc),
+                             cli_user(nc)->username, cli_user(nc)->realhost,
+                             *um ? "+" : "", um, *um ? " " : "",
+                             iptobase64(ip_base64, &cli_ip(nc), sizeof(ip_base64), 0),
+                             NumNick(nc), cli_info(nc));
+}
+
+struct recon_user_ctx { unsigned int created; };
+
+static void recon_user_cb(const char *key, uint32_t key_len,
+                          const struct CrdtLWWValue *val, void *ctx)
+{
+  struct recon_user_ctx *c = ctx;
+  struct Client *nc;
+  /* Inbound-burst collision guard, scoped to the UPLINK we'd receive the P10 intro
+   * from — NOT a global "any server in burst" gate (that wedges forever on a
+   * services pseudo-server like x3.services, which sits perpetually flagged
+   * BurstOrBurstAck).  A SetRemoteNumNick collision is possible ONLY if this user's
+   * NICK could still arrive via P10 on THIS server, i.e. we reach its owning server
+   * through a LEGACY (non-CRDT) uplink that is currently bursting.  If we reach the
+   * owning server via a CRDT peer (every user on a leaf; CRDT-origin users on the
+   * gateway), the user comes via the doc only → always safe to materialize.  This is
+   * also why x3's perpetual burst is harmless: on a leaf we reach x3 through nef3
+   * (CRDT), and on the gateway x3's users arrive via P10 so findNUser skips them. */
+  if (key_len >= 3 && key_len < CRDT_NUMERICLEN + 10) {
+    char nb[16], sn[4];
+    struct Client *srv, *via;
+    memcpy(nb, key, key_len); nb[key_len] = '\0';
+    sn[0] = nb[0]; sn[1] = nb[1]; sn[2] = '\0';
+    srv = FindNServer(sn);
+    via = (srv && IsServer(srv)) ? cli_from(srv) : NULL;
+    if (via && IsServer(via) && !IsCrdtAware(via) && IsBurstOrBurstAck(via))
+      return;                  /* P10 intro may still be in flight on this legacy burst */
+  }
+  nc = crdt_materialize_one_user(key, key_len, val);
+  if (nc) {
+    crdt_gateway_user_intro(nc);   /* §17.7: re-introduce to the legacy P10 tree */
+    c->created++;
+  }
+}
+
+/* Phase 3l: create not-yet-live doc users locally + §17.7-gateway each onward to
+ * legacy.  Runs on the CR D/U eager-push path (where the gateway actually fires on
+ * the gateway node, sub-second) and on the verify timer (the 2-hop anti-entropy
+ * fallback).  Idempotent (findNUser inside crdt_materialize_one_user); a
+ * tombstoned/deleted user is skipped (data_len mismatch) so a quit user is never
+ * re-created.  The inbound-burst collision guard is PER-USER (recon_user_cb, scoped
+ * to the legacy uplink toward each user's owning server) — a global gate would wedge
+ * forever on a perpetually in-burst services pseudo-server (x3.services). */
+void crdt_shadow_reconcile_users(void)
+{
+  struct recon_user_ctx c = { 0 };
+  if (!shadow_on() || !feature_bool(FEAT_CRDT_PRIMARY))
+    return;
+  /* The burst guard is PER-USER (in recon_user_cb, scoped to the legacy uplink
+   * toward each user's owning server), not a global gate here — see the rationale
+   * there (x3.services sits perpetually in burst; a global gate would wedge all
+   * materialization). */
+  crdt_lwwmap_foreach(&g_crdt.users, recon_user_cb, &c);
+  if (c.created)
+    log_write(LS_SYSTEM, L_NOTICE, 0,
+              "CRDT user-reconcile: created+gatewayed %u user(s) from doc", c.created);
 }
 
 /* ---- Phase 3j: channel CREATE (channel birth) via CRDT ----
@@ -1622,6 +1735,11 @@ static void crdt_shadow_verify_cb(struct Event *ev)
     return;
   crdt_shadow_verify();
   crdt_shadow_materialize_check();  /* Phase 3b dry-run: doc -> live fidelity */
+  /* Phase 3l: create+gateway users BEFORE materialize_live (the bulk path creates
+   * users locally but never gateways; running reconcile_users first lets it §17.7-
+   * introduce a not-yet-live user to legacy, after which materialize_live no-ops it).
+   * Self-guards against a concurrent burst. */
+  crdt_shadow_reconcile_users();
   /* Phase 3c: idempotent create-from-doc. Run it only when NO inbound burst is
    * in progress, so we never pre-create a user that a P10 BURST is still about
    * to deliver (which would collide). In steady state every entity is already
