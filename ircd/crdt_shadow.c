@@ -769,6 +769,82 @@ static unsigned int expand_status(uint8_t s)
 
 struct mat_create_ctx { unsigned int *created; };
 
+/* ---- live nick-collision resolution (§17.5) ----
+ * Since 3l/3n suppress the P10 NICK to CRDT peers, P10's collision-kill no longer
+ * backstops two CRDT-leaf users racing the same nick. We resolve it the §17.5 way —
+ * deterministic resolver (so every server picks the SAME winner) + force-rename the
+ * LOSER to its numeric (keeps the connection + channels; NOT a kill). Claims are
+ * built ad-hoc from the user records/Clients (no nicks-map needed). */
+static uint32_t crdt_ip_fold(const unsigned char ip6[16])
+{
+  uint32_t f = 2166136261u; int i;
+  for (i = 0; i < 16; i++) { f ^= ip6[i]; f *= 16777619u; }
+  return f;
+}
+static void crdt_claim_from_rec(struct CrdtNickClaim *c, const char *num,
+                                const struct CrdtUserRecord *r)
+{
+  memset(c, 0, sizeof *c);
+  ircd_strncpy(c->numeric, num, sizeof c->numeric);
+  ircd_strncpy(c->ident, r->ident, sizeof c->ident);
+  ircd_strncpy(c->account, r->account, sizeof c->account);
+  c->ip = crdt_ip_fold(r->ip6);
+  c->claimed_at.physical_ms = (uint64_t)r->nick_ts * 1000ULL;  /* nick TS = claim order */
+  c->claimed_at.logical = 0;
+  c->claimed_at.node_id = r->server;
+}
+static void crdt_claim_from_live(struct CrdtNickClaim *c, struct Client *cl)
+{
+  unsigned char ip6[16];
+  memset(c, 0, sizeof *c);
+  user_numeric(cl, c->numeric, sizeof c->numeric);
+  ircd_strncpy(c->ident, cli_user(cl)->username, sizeof c->ident);
+  ircd_strncpy(c->account, cli_user(cl)->account, sizeof c->account);
+  memcpy(ip6, &cli_ip(cl), sizeof ip6);
+  c->ip = crdt_ip_fold(ip6);
+  c->claimed_at.physical_ms = (uint64_t)cli_lastnick(cl) * 1000ULL;
+  c->claimed_at.logical = 0;
+  c->claimed_at.node_id = (uint16_t)base64toint(cli_yxx(cli_user(cl)->server));
+}
+
+/* §17.5: may user U (numeric @a unum, record @a urec) take nick @a want?  Returns 1 if
+ * yes — @a want was free, OR U won the collision and a LOSING LOCAL holder was
+ * force-renamed to its numeric (freeing @a want).  Returns 0 if U must defer: U lost,
+ * or the winning holder is REMOTE (its home server force-renames it and the doc then
+ * converges — non-home servers never rename a remote user into a collision, so no
+ * oscillation).  registered_owner=NULL: account-aware step deferred (needs X3 data).
+ * NB: a force-rename's crdt_shadow_user_add hook does an in-place crdt_user_set on the
+ * (already-present) holder entry — no bucket insert/delete — so a g_crdt.users foreach
+ * in progress is not invalidated. */
+static int crdt_nick_take(const char *want, const char *unum,
+                          const struct CrdtUserRecord *urec)
+{
+  struct Client *holder = FindUser(want);
+  struct CrdtNickClaim cu, cv;
+  if (!holder || ircd_strcmp(cli_name(holder), want) != 0)
+    return 1;                                  /* nobody holds this exact nick */
+  crdt_claim_from_rec(&cu, unum, urec);
+  crdt_claim_from_live(&cv, holder);
+  if (crdt_resolve_nick_collision(&cu, &cv, NULL) == &cv)
+    return 0;                                  /* U lost -> defer */
+  if (!MyConnect(holder))
+    return 0;                                  /* remote winner-holder: its home renames it */
+  {
+    char hnum[CRDT_NUMERICLEN], oldn[NICKLEN + 1], *pv[4];
+    user_numeric(holder, hnum, sizeof hnum);
+    if (ircd_strcmp(hnum, want) == 0)          /* holder already at its numeric */
+      return 0;
+    ircd_strncpy(oldn, cli_name(holder), sizeof oldn);
+    cli_nextnick(holder) = 0;                  /* bypass NICKDELAY for the forced rename */
+    pv[0] = oldn; pv[1] = hnum; pv[2] = (char *)"0"; pv[3] = NULL;
+    set_nick_name(holder, holder, hnum, 3, pv, 1 /* svsnick: bypass ban checks */);
+    log_write(LS_SYSTEM, L_NOTICE, 0,
+              "CRDT nick-collision: force-renamed local %s -> %s (lost '%s')",
+              oldn, hnum, want);
+  }
+  return 1;
+}
+
 /* Materialize ONE doc user into a live remote Client.  Factored out of the bulk
  * mat_create_user_cb so the steady-state reconcile (crdt_shadow_reconcile_users,
  * Phase 3l) can both create the Client AND learn the resulting Client* in order
@@ -799,7 +875,11 @@ static struct Client *crdt_materialize_one_user(const char *key, uint32_t key_le
     return NULL;
   cli_hopcount(nc) = cli_hopcount(srv) + 1;     /* recomputed locally */
   cli_lastnick(nc) = (time_t)rec->nick_ts;
-  ircd_strncpy(cli_name(nc), rec->nick, NICKLEN + 1);
+  /* §17.5: if rec->nick collides with a live user, resolve — take it (force-renaming
+   * a losing local holder) or fall back to our numeric (a valid, unique nick). */
+  ircd_strncpy(cli_name(nc),
+               crdt_nick_take(rec->nick, numbuf, rec) ? rec->nick : numbuf,
+               NICKLEN + 1);
   cli_user(nc) = make_user(nc);
   cli_user(nc)->server = srv;                    /* before SetRemoteNumNick */
   SetRemoteNumNick(nc, numbuf);
@@ -1048,7 +1128,12 @@ static void crdt_reconcile_user_update(struct Client *live,
 {
   if (!IsUser(live) || MyUser(live) || IsBouncerAlias(live))
     return;
-  if (ircd_strcmp(cli_name(live), rec->nick) != 0) {
+  /* §17.5: only rename into rec->nick if it isn't contested (or we won + force-renamed
+   * a losing local holder). If we must defer (lost, or a remote winner holds it), SKIP
+   * — keep the current nick; the loser's home server renames it and the doc converges,
+   * then this rename succeeds next tick (no oscillation: a skip is a no-op). */
+  if (ircd_strcmp(cli_name(live), rec->nick) != 0
+      && crdt_nick_take(rec->nick, numbuf, rec)) {
     char newn[NICKLEN + 1], oldn[NICKLEN + 1], tsbuf[24];
     char *pv[4];
     ircd_strncpy(newn, rec->nick, NICKLEN + 1);
