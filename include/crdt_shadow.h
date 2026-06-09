@@ -42,6 +42,17 @@ void crdt_shadow_part(struct Channel *chptr, struct Client *who);
  *  is not resurrected to the stale value. No-op unless FEAT_CRDT_ENABLED. */
 void crdt_shadow_channel_destroy(struct Channel *chptr);
 
+/** Phase 3k: mirror a channel KICK into the doc (called from m_kick/ms_kick). Mints
+ *  a PRIORITY_USER member tombstone (a kicked user must be able to rejoin, so NOT a
+ *  priority>0 tombstone, which would suppress the element permanently) + kick
+ *  metadata (kicker + reason) so reconcile-remove emits a KICK not a PART (the
+ *  distinction is the metadata, not the priority). @a from is the kick's incoming
+ *  link; the single-writer gate skips when it's a CRDT-aware peer (they already
+ *  minted it). No-op unless FEAT_CRDT_ENABLED. */
+void crdt_shadow_kick(struct Channel *chptr, struct Client *who,
+                      struct Client *kicker, const char *reason,
+                      struct Client *from);
+
 /** Mirror a registered user into the shadow user registry (called from
  *  register_user on success). Skips bouncer aliases. Idempotent — also safe
  *  to call on nick change to refresh the record. */

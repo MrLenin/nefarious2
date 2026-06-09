@@ -403,6 +403,49 @@ static void test_chan_ctime_min_incarnation(void **state)
 }
 
 /* ================================================================== */
+/* Phase 3k: kick_info LWW replicates via DELTA, and its HLC gates KICK-vs-PART.
+ * A member kicked (kick_info written AFTER the join's members_status) -> kick_info
+ * is the newer write -> reconcile emits KICK. After a rejoin (members_status
+ * rewritten, newer than the stale kick_info) -> reconcile emits PART. */
+static void test_kick_info_replicates_and_hlc_gates(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s1, s2;
+  struct CrdtKickInfo ki;
+  struct CrdtMemberRecord mr;
+  const struct CrdtLWWValue *kv, *mv;
+  char key[16]; uint32_t klen;
+  crdt_state_init(&s1, 1);
+  crdt_state_init(&s2, 2);
+  memset(&mr, 0, sizeof mr);
+  memset(&ki, 0, sizeof ki);
+  strcpy(ki.kicker, "AAAAA"); strcpy(ki.reason, "spam");
+  memcpy(key, "#c", 2); key[2]='\0'; memcpy(key+3, "BBBBB", 5); klen = 2+1+5;
+
+  crdt_member_status_set(&s1, "#c", "BBBBB", &mr);   /* join  (HLC j1) */
+  crdt_kick_info_set(&s1, "#c", "BBBBB", &ki);       /* kick  (HLC k1 > j1) */
+  crdt_state_sync(&s2, &s1);
+
+  kv = crdt_kick_info_get(&s2, "#c", "BBBBB");       /* replicated via delta */
+  assert_non_null(kv);
+  assert_int_equal(0, strcmp(((const struct CrdtKickInfo*)kv->data)->kicker, "AAAAA"));
+  assert_int_equal(0, strcmp(((const struct CrdtKickInfo*)kv->data)->reason, "spam"));
+  mv = crdt_lwwmap_get(&s2.members_status, key, klen);
+  assert_non_null(mv);
+  assert_true(hlc_compare(&kv->ts, &mv->ts) > 0);    /* kick fresh -> KICK */
+
+  /* rejoin: members_status rewritten (HLC j2 > k1) -> stale kick -> PART */
+  crdt_member_status_set(&s1, "#c", "BBBBB", &mr);
+  crdt_state_sync(&s2, &s1);
+  kv = crdt_kick_info_get(&s2, "#c", "BBBBB");
+  mv = crdt_lwwmap_get(&s2.members_status, key, klen);
+  assert_true(hlc_compare(&mv->ts, &kv->ts) > 0);    /* join newer -> kick stale */
+
+  crdt_state_clear(&s1);
+  crdt_state_clear(&s2);
+}
+
+/* ================================================================== */
 /* Scenario E — SQUIT as server-state transition (no tombstone storm) */
 /* ================================================================== */
 
@@ -1037,6 +1080,7 @@ int main(void)
     cmocka_unit_test(test_orset_explicit_removal_gate),
     cmocka_unit_test(test_chan_ban_op_replicates),
     cmocka_unit_test(test_chan_ctime_min_incarnation),
+    cmocka_unit_test(test_kick_info_replicates_and_hlc_gates),
     cmocka_unit_test(test_E_squit_creates_no_membership_tombstones),
     cmocka_unit_test(test_wire_sv_roundtrip),
     cmocka_unit_test(test_wire_delta_converges),

@@ -74,6 +74,16 @@ struct CrdtMemberRecord {
   uint16_t oplevel;
 };
 
+#define CRDT_KICKREASONLEN 160
+/* Per-kick metadata (Phase 3k): an LWW register keyed chan\0numeric, parallel to
+ * the kick's member tombstone. Lets reconcile-remove emit a KICK (with attribution)
+ * instead of a PART. KICK-vs-PART is gated by comparing this entry's HLC against the
+ * member's last-join HLC (members_status, rewritten on every join). */
+struct CrdtKickInfo {
+  char kicker[CRDT_NUMERICLEN];      /**< kicker's P10 numeric */
+  char reason[CRDT_KICKREASONLEN];   /**< kick comment (truncated) */
+};
+
 /* Per-channel metadata (Phase 3b): creationtime (TS-war) + topic provenance.
  * Stored separately from the topic string so a topic-less channel still carries
  * its creationtime. Timestamps are fixed uint64 (not time_t) for wire stability. */
@@ -114,7 +124,8 @@ enum CrdtCollection {
   CRDT_COLL_CHANMETA,      /**< channel-name -> CrdtChanMeta (LWW) */
   CRDT_COLL_CHAN_BANS,     /**< per-channel +b ban masks (OR-Set) — Phase 3i */
   CRDT_COLL_CHAN_EXCEPTS,  /**< per-channel +e except masks (OR-Set) — Phase 3i */
-  CRDT_COLL_CHAN_CTIME     /**< per-channel creationtime (incarnation min-register) — Phase 3j */
+  CRDT_COLL_CHAN_CTIME,    /**< per-channel creationtime (incarnation min-register) — Phase 3j */
+  CRDT_COLL_KICK_INFO      /**< chan\0numeric -> CrdtKickInfo (LWW) — Phase 3k */
 };
 
 struct CrdtOp {
@@ -188,6 +199,7 @@ struct CrdtNetworkState {
   struct CrdtLWWMap       topics;       /**< channel-name -> topic string */
   struct CrdtLWWMap       modes;        /**< channel-name -> opaque mode blob */
   struct CrdtLWWMap       members_status; /**< chan\0numeric -> CrdtMemberRecord */
+  struct CrdtLWWMap       kick_info;    /**< chan\0numeric -> CrdtKickInfo (Phase 3k) */
   struct CrdtLWWMap       chanmeta;     /**< channel-name -> CrdtChanMeta */
   struct CrdtChannel     *chan_buckets[CRDT_CHAN_BUCKETS];
 };
@@ -241,6 +253,17 @@ void crdt_member_status_set(struct CrdtNetworkState *st, const char *chan,
 /** Set per-channel metadata (creationtime/topic provenance, LWW). Records a SET. */
 void crdt_chanmeta_set(struct CrdtNetworkState *st, const char *chan,
                        const struct CrdtChanMeta *meta);
+/** Phase 3k: set/get per-kick metadata (LWW, keyed chan\0numeric). set() records a
+ *  SET op so it replicates via delta; get() returns the LWW value (NULL if absent)
+ *  so callers can read both the CrdtKickInfo payload and its HLC (.ts) for the
+ *  KICK-vs-PART staleness gate. */
+void crdt_kick_info_set(struct CrdtNetworkState *st, const char *chan,
+                        const char *numeric, const struct CrdtKickInfo *ki);
+const struct CrdtLWWValue *crdt_kick_info_get(struct CrdtNetworkState *st,
+                                              const char *chan, const char *numeric);
+/** Get a member's status LWW value (NULL if absent), for the KICK-vs-PART HLC gate. */
+const struct CrdtLWWValue *crdt_member_status_get(struct CrdtNetworkState *st,
+                                                  const char *chan, const char *numeric);
 
 /* ---- sync / merge ---- */
 /** The LWW-Map backing a given collection (SERVERS/USERS/NICKS/TOPICS/MODES),

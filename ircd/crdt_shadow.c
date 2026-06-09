@@ -191,6 +191,38 @@ void crdt_shadow_part(struct Channel *chptr, struct Client *who)
   crdt_sync_push();                   /* eager-propagate to CRDT peers */
 }
 
+void crdt_shadow_kick(struct Channel *chptr, struct Client *who,
+                      struct Client *kicker, const char *reason,
+                      struct Client *from)
+{
+  char whonum[16], kicknum[16];
+  struct CrdtKickInfo ki;
+  if (!shadow_on() || !cli_user(who))
+    return;
+  if (from_crdt_peer(from))            /* kick already minted by the CRDT-aware origin */
+    return;
+  /* Phase 3k: remove the member with PRIORITY_USER (a standard OR-Set remove that
+   * tombstones the OBSERVED add-tags). KICK is NOT a ban — a kicked user must be
+   * able to rejoin; a priority>0 (CHANOP) tombstone would suppress the element
+   * permanently (crdt_orset_contains rejects an element if ANY add-tag is covered
+   * by a priority>0 tombstone, and the old tag lingers until GC), blocking rejoin.
+   * KICK-vs-PART is distinguished by kick_info below, NOT by priority. Mint BEFORE
+   * the live removal so it covers the current add-tags (the subsequent
+   * crdt_shadow_part remove then finds nothing uncovered → no double-mint). */
+  user_numeric(who, whonum, sizeof whonum);
+  crdt_chan_remove(&g_crdt, chptr->chname, whonum, CRDT_PRIORITY_USER);
+  /* kick metadata so reconcile-remove emits a KICK (with attribution) not a PART;
+   * the HLC gate (kick_info.ts vs the member's last-join members_status.ts) keeps a
+   * stale kick from re-tagging a later plain PART after a rejoin. */
+  memset(&ki, 0, sizeof ki);
+  if (kicker && !IsServer(kicker) && cli_user(kicker))
+    ircd_strncpy(ki.kicker, user_numeric(kicker, kicknum, sizeof kicknum),
+                 sizeof ki.kicker);
+  ircd_strncpy(ki.reason, reason ? reason : "", sizeof ki.reason);
+  crdt_kick_info_set(&g_crdt, chptr->chname, whonum, &ki);
+  crdt_sync_push();
+}
+
 void crdt_shadow_channel_destroy(struct Channel *chptr)
 {
   if (!shadow_on())
@@ -794,7 +826,7 @@ static void mat_join_cb(const char *key, uint32_t key_len, void *ctx)
   struct Client *u;
   const struct CrdtLWWValue *sv;
   unsigned int flags = 0;
-  int oplevel = 0;
+  int oplevel = MAXOPLEVEL + 1;     /* "no oplevel" sentinel; NOT 0 (= founder level) */
   uint32_t clen;
   if (key_len >= sizeof numbuf)
     return;
@@ -1281,11 +1313,14 @@ static void reconcile_member_cb(const char *key, uint32_t key_len, void *ctx)
     return;
   if (find_member_link(c->chptr, u))       /* already a member — echo guard / idempotent */
     return;
-  /* Plain member: ops/voice ride P10 (CREATE/MODE), not CRDT, so a plain JOIN
-   * always carries no status. Drive live DIRECTLY — add_user_to_channel's
+  /* Plain member: ops/voice/oplevel ride 3h members_status (reconcile_member_status),
+   * so a 3f JOIN-add carries no status. Drive live DIRECTLY — add_user_to_channel's
    * crdt_shadow_join hook self-gates on from_crdt_peer(cli_from(u)) (true here),
-   * so no op is re-minted (loop prevention; no nomirror variant needed). */
-  add_user_to_channel(c->chptr, u, 0, 0);
+   * so no op is re-minted (loop prevention; no nomirror variant needed).
+   * oplevel = MAXOPLEVEL+1 ("no oplevel"); passing 0 here (the old bug) made every
+   * reconciled member founder-oplevel → unkickable by ops + outranks them in apass
+   * channels. An actual op's oplevel is corrected by 3h when its status reconciles. */
+  add_user_to_channel(c->chptr, u, 0, MAXOPLEVEL + 1);
   /* notify LOCAL clients (same EXTJOIN-aware pair as joinbuf_join) */
   sendcmdto_channel_capab_butserv_butone(u, CMD_JOIN, c->chptr, NULL, 0,
                                          CAP_NONE, CAP_EXTJOIN, "%H", c->chptr);
@@ -1374,10 +1409,33 @@ void crdt_shadow_reconcile_removes(void)
         /* victim is still a member: notify locals + §17.7 gateway to legacy, THEN
          * remove. remove_user_from_channel mirrors via crdt_shadow_part, but its
          * from_crdt_peer self-gate (victim's cli_from is a CRDT peer) suppresses
-         * the re-mint — no loop, no nomirror needed. */
-        sendcmdto_channel_butserv_butone(victim, CMD_PART, chptr, NULL, 0, "%H", chptr);
-        sendcmdto_flag_serv_butone(victim, CMD_PART, NULL, FLAG_LAST_FLAG, FLAG_CRDT_AWARE,
-                                   "%H", chptr);
+         * the re-mint — no loop, no nomirror needed.
+         *
+         * Phase 3k: KICK-vs-PART. If there is fresh kick metadata for this victim
+         * (kick_info written AFTER the member's last join — the members_status HLC
+         * gate keeps a stale kick from re-tagging a later plain PART), emit a KICK
+         * with attribution; otherwise a PART (3g). `num` holds the victim numeric. */
+        {
+          const struct CrdtLWWValue *kv = crdt_kick_info_get(&g_crdt, nbuf, num);
+          const struct CrdtLWWValue *mv = crdt_member_status_get(&g_crdt, nbuf, num);
+          int is_kick = kv && kv->data &&
+                        kv->data_len == sizeof(struct CrdtKickInfo) &&
+                        (!mv || hlc_compare(&kv->ts, &mv->ts) > 0);
+          if (is_kick) {
+            const struct CrdtKickInfo *ki = (const struct CrdtKickInfo *)kv->data;
+            struct Client *kicker = ki->kicker[0] ? findNUser(ki->kicker) : NULL;
+            struct Client *from = kicker ? kicker : &me;   /* fall back to server-kick */
+            sendcmdto_channel_butserv_butone(from, CMD_KICK, chptr, NULL, 0,
+                                             "%H %C :%s", chptr, victim, ki->reason);
+            sendcmdto_flag_serv_butone(from, CMD_KICK, NULL, FLAG_LAST_FLAG,
+                                       FLAG_CRDT_AWARE, "%H %C :%s", chptr, victim,
+                                       ki->reason);
+          } else {
+            sendcmdto_channel_butserv_butone(victim, CMD_PART, chptr, NULL, 0, "%H", chptr);
+            sendcmdto_flag_serv_butone(victim, CMD_PART, NULL, FLAG_LAST_FLAG,
+                                       FLAG_CRDT_AWARE, "%H", chptr);
+          }
+        }
         remove_user_from_channel(victim, chptr);   /* chptr may be freed here */
         changed++;
       }
