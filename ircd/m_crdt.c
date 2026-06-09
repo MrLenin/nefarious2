@@ -138,8 +138,8 @@ void crdt_sync_push(void)
     return;
   /* Encode our own-origin ops created since the last push ONCE, then fan the
    * same CR U out to every directly-connected CRDT peer. Foreign-origin ops we
-   * received are NOT eager-pushed here — they reach 2-hop peers via the periodic
-   * anti-entropy pull (crdt_sync_broadcast), which is proven mesh-safe. */
+   * received are eager-RELAYED separately (crdt_relay_delta from the apply path),
+   * so 2-hop peers no longer wait for the periodic anti-entropy pull. */
   delta = MyMalloc(CR_DELTA_MAX);
   dn = crdt_shadow_encode_local_unpushed(delta, CR_DELTA_MAX);
   if (dn > 4)
@@ -147,6 +147,25 @@ void crdt_sync_push(void)
       if (IsServer(acptr) && MyConnect(acptr) && IsCrdtAware(acptr))
         send_crdt_blob(acptr, 'U', delta, dn);
   MyFree(delta);
+}
+
+/* Phase 4 foundation — eager multi-hop relay.  Forward a just-applied delta blob to
+ * every directly-connected CRDT-aware peer EXCEPT the source, so foreign-origin ops
+ * propagate sub-second across hops instead of waiting for the 30s anti-entropy pull.
+ * Gossip flood with state-vector dedup for termination: a peer that already has the
+ * ops applies 0 and so does NOT re-relay (the applied>0 guard at the call site), so
+ * the cascade dies out.  This is the gossip substrate Phase 4's redundant (mesh)
+ * paths need — under multiple paths the same dedup makes duplicate arrivals harmless.
+ * Relaying the whole received blob (not just new ops) is intentional: SV dedup skips
+ * any the target already has; correctness over a few redundant bytes at PoC scale. */
+static void crdt_relay_delta(struct Client *from, const uint8_t *bin, int bn)
+{
+  struct Client *acptr;
+  if (!crdt_shadow_active() || bn <= 0)
+    return;
+  for (acptr = GlobalClientList; acptr; acptr = cli_next(acptr))
+    if (acptr != from && IsServer(acptr) && MyConnect(acptr) && IsCrdtAware(acptr))
+      send_crdt_blob(acptr, 'D', bin, bn);
 }
 
 void crdt_send_snapshot(struct Client *to)
@@ -195,6 +214,10 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
           log_write(LS_SYSTEM, L_NOTICE, 0,
                     "CRDT sync: applied %d op(s) from %s", applied,
                     cli_name(cptr));
+          /* Phase 4 foundation: eager multi-hop relay — forward the just-applied
+           * ops onward to our OTHER CRDT peers (gossip flood; the applied>0 guard +
+           * SV dedup terminate the cascade) so 2-hop peers converge sub-second. */
+          crdt_relay_delta(cptr, bin, bn);
           /* Phase 3d/3e/3f: drive live topics + channel modes + membership that just
            * arrived via CRDT (+ gateway to legacy). Idempotent; no-op unless
            * FEAT_CRDT_PRIMARY. */
