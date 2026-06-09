@@ -84,6 +84,7 @@
 #include "channel.h"
 #include "class.h"
 #include "client.h"
+#include "crdt_shadow.h"   /* Phase 3o: mirror oper umodes to the CRDT doc */
 #include "handlers.h"
 #include "hash.h"
 #include "ircd.h"
@@ -235,7 +236,11 @@ void do_oper(struct Client* cptr, struct Client* sptr, struct ConfItem* aconf, i
       MyFree(cli_user(sptr)->opername);
     DupString(cli_user(sptr)->opername, aconf->name);
 
-    send_umode_out(sptr, sptr, &old_mode, HasPriv(sptr, PRIV_PROPAGATE));
+    send_umode_out(sptr, sptr, &old_mode, HasPriv(sptr, PRIV_PROPAGATE),
+                   1 /* 3o: CRDT-gate the oper +o (cuts over to the doc/reconcile) */);
+    /* Phase 3o (CRDT-mesh): oper-up bypasses set_user_mode's doc hook, so mirror
+     * the umodes here — else the suppressed +o would never reach CRDT peers. */
+    crdt_shadow_user_add(sptr);
   } else {
     client_send_privs(&me, sptr, sptr);
 

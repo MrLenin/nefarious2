@@ -1006,18 +1006,41 @@ static void crdt_gateway_user_intro(struct Client *nc)
                              NumNick(nc), cli_info(nc));
 }
 
-struct recon_user_ctx { unsigned int created; unsigned int renamed; };
+struct recon_user_ctx { unsigned int created; unsigned int renamed; unsigned int umoded; };
 
-/* Phase 3n: reconcile an already-live remote user's NICK to the doc.  Driven
- * through set_nick_name with cptr = the CRDT uplink so the proven rename path runs
- * (common-channel NICK notify, nick hash, WATCH, lastnick, WHOWAS) and its own P10
- * relay — now legacy-only under FEAT_CRDT_PRIMARY (s_user.c:1254) — becomes the
- * §17.7 gateway.  The crdt_shadow_user_add hook inside set_nick_name self-skips
- * (from_crdt_peer of the CRDT uplink), so no op is re-minted and g_crdt.users is
- * NOT mutated mid-walk.  Local users (nick authoritative here) and bouncer aliases
- * (follow their primary) are left alone. */
+/* Build the +/- umode delta that transforms umode-letter set @from into @to.  Both
+ * are umode_letters() forms (no leading sign), e.g. from="iw" to="ix" -> "+x-w". */
+static void build_umode_delta(char *out, size_t outlen, const char *from, const char *to)
+{
+  size_t n = 0; const char *p; int pfx;
+  pfx = 0;
+  for (p = to; *p; p++)
+    if (!strchr(from, *p)) {
+      if (!pfx && n + 1 < outlen) { out[n++] = '+'; pfx = 1; }
+      if (n + 1 < outlen) out[n++] = *p;
+    }
+  pfx = 0;
+  for (p = from; *p; p++)
+    if (!strchr(to, *p)) {
+      if (!pfx && n + 1 < outlen) { out[n++] = '-'; pfx = 1; }
+      if (n + 1 < outlen) out[n++] = *p;
+    }
+  out[n < outlen ? n : outlen - 1] = '\0';
+}
+
+/* Phase 3n/3o: reconcile an already-live remote user's NICK and umodes to the doc.
+ * Both are driven through the real handler (set_nick_name / set_user_mode) with
+ * cptr = the CRDT uplink, so the proven apply path runs (nick: common-channel NICK
+ * notify, nick hash, WATCH, lastnick, WHOWAS; umode: flag-apply, UserStats,
+ * host-hiding) AND its own P10 relay — now legacy-only under FEAT_CRDT_PRIMARY
+ * (s_user.c:1254 / send_umode_out crdt_gate) — becomes the §17.7 gateway.  The
+ * crdt_shadow_user_add hook inside both self-skips (from_crdt_peer of the CRDT
+ * uplink), so no op is re-minted and g_crdt.users is NOT mutated mid-walk.  Local
+ * users (state authoritative here) and bouncer aliases (follow their primary) are
+ * left alone.  @a numbuf is the user's P10 numeric (for set_user_mode's findNUser). */
 static void crdt_reconcile_user_update(struct Client *live,
                                        const struct CrdtUserRecord *rec,
+                                       const char *numbuf,
                                        struct recon_user_ctx *c)
 {
   if (!IsUser(live) || MyUser(live) || IsBouncerAlias(live))
@@ -1031,6 +1054,24 @@ static void crdt_reconcile_user_update(struct Client *live,
     pv[0] = oldn; pv[1] = newn; pv[2] = tsbuf; pv[3] = NULL;
     set_nick_name(cli_from(live), live, newn, 3, pv, 0);
     c->renamed++;
+  }
+  /* umode drift -> apply the +/- delta via set_user_mode (full umode_letters set;
+   * suppression is all-or-nothing per MODE). set_user_mode runs the real apply and
+   * re-emits to legacy via the now-gated send_umode_out (the gateway). sethost's host
+   * param is NOT in umode_letters, so it is untouched here (sethost stays on P10). */
+  {
+    char livel[CRDT_UMODELEN], delta[CRDT_UMODELEN * 2 + 2];
+    umode_letters(livel, sizeof livel, umode_str(live));
+    if (strcmp(livel, rec->umodes) != 0) {
+      build_umode_delta(delta, sizeof delta, livel, rec->umodes);
+      if (delta[0]) {
+        char nbuf[CRDT_NUMERICLEN], *pv[4];
+        ircd_strncpy(nbuf, numbuf, sizeof nbuf);
+        pv[0] = cli_name(live); pv[1] = nbuf; pv[2] = delta; pv[3] = NULL;
+        set_user_mode(cli_from(live), live, 3, pv, ALLOWMODES_ANY);
+        c->umoded++;
+      }
+    }
   }
 }
 
@@ -1062,8 +1103,8 @@ static void recon_user_cb(const char *key, uint32_t key_len,
     return;                       /* P10 intro may still be in flight on this legacy burst */
   rec = (const struct CrdtUserRecord *)val->data;
   live = findNUser(nb);
-  if (live) {                     /* 3n: already live — reconcile drift (nick; umode TODO) */
-    crdt_reconcile_user_update(live, rec, c);
+  if (live) {                     /* 3n/3o: already live — reconcile nick + umode drift */
+    crdt_reconcile_user_update(live, rec, nb, c);
     return;
   }
   nc = crdt_materialize_one_user(key, key_len, val);   /* 3l: create not-yet-live */
@@ -1091,10 +1132,10 @@ void crdt_shadow_reconcile_users(void)
    * there (x3.services sits perpetually in burst; a global gate would wedge all
    * materialization). */
   crdt_lwwmap_foreach(&g_crdt.users, recon_user_cb, &c);
-  if (c.created || c.renamed)
+  if (c.created || c.renamed || c.umoded)
     log_write(LS_SYSTEM, L_NOTICE, 0,
-              "CRDT user-reconcile: created+gatewayed %u, renamed %u user(s) from doc",
-              c.created, c.renamed);
+              "CRDT user-reconcile: created %u, renamed %u, umode %u user(s) from doc",
+              c.created, c.renamed, c.umoded);
 }
 
 /* ---- Phase 3j: channel CREATE (channel birth) via CRDT ----

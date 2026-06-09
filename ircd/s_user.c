@@ -1563,7 +1563,7 @@ int whisper(struct Client* source, const char* nick, const char* channel,
  * @param[in] prop If non-zero, also include FLAG_OPER.
  */
 void send_umode_out(struct Client *cptr, struct Client *sptr,
-                    struct Flags *old, int prop)
+                    struct Flags *old, int prop, int crdt_gate)
 {
   int i;
   struct Client *acptr;
@@ -1573,7 +1573,16 @@ void send_umode_out(struct Client *cptr, struct Client *sptr,
   for (i = HighestFd; i >= 0; i--)
   {
     if ((acptr = LocalClientArray[i]) && IsServer(acptr) &&
-        (acptr != cptr) && (acptr != sptr) && *umodeBuf)
+        (acptr != cptr) && (acptr != sptr) && *umodeBuf
+        /* Phase 3o (CRDT-mesh): when @a crdt_gate, suppress the P10 umode MODE to
+         * CRDT-aware peers — the change rides the doc (crdt_shadow_reconcile_users
+         * applies the delta to the remote copy on CRDT peers).  This same loop, now
+         * legacy-only, IS the §17.7 gateway: when reconcile drives the change via
+         * set_user_mode(cptr=CRDT uplink), it re-emits the MODE to legacy here.
+         * crdt_gate is set only on the set_user_mode (/MODE) and oper-up paths,
+         * which mirror to the doc; sethost stays crdt_gate=0 (host-param not yet
+         * reconciled, so it must keep flowing on P10). */
+        && !(crdt_gate && feature_bool(FEAT_CRDT_PRIMARY) && IsCrdtAware(acptr)))
       sendcmdto_one(sptr, CMD_MODE, acptr, "%s %s", cli_name(sptr), umodeBuf);
   }
   if (cptr && MyUser(cptr))
@@ -2609,10 +2618,10 @@ int set_user_mode(struct Client *cptr, struct Client *sptr, int parc,
 
     assert(UserStats.opers <= UserStats.clients + UserStats.unknowns);
     assert(UserStats.inv_clients <= UserStats.clients + UserStats.unknowns);
-    send_umode_out(cptr, acptr, &setflags, prop);
+    send_umode_out(cptr, acptr, &setflags, prop, 1 /* 3o: CRDT-gate (/MODE umodes) */);
 
     if (force) /* Let the user know */
-      send_umode_out(acptr, acptr, &setflags, 1);
+      send_umode_out(acptr, acptr, &setflags, 1, 1 /* 3o: CRDT-gate */);
 
     if (FlagHas(&setflags, FLAG_HIDDENHOST) && !IsHiddenHost(acptr)) {
       unhide_hostmask(acptr);

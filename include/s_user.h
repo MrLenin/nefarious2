@@ -80,7 +80,7 @@ extern int set_nick_name(struct Client* cptr, struct Client* sptr,
                          const char* nick, int parc, char* parv[],
                          int svsnick);
 extern void send_umode_out(struct Client* cptr, struct Client* sptr,
-                          struct Flags* old, int prop);
+                          struct Flags* old, int prop, int crdt_gate);
 extern int whisper(struct Client* source, const char* nick,
                    const char* channel, const char* text, int is_notice);
 extern void send_user_info(struct Client* to, char* names, int rpl,

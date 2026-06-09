@@ -133,7 +133,7 @@ static void apply_sethost_changes(struct Client *sptr, const char *hostmask,
   SetHiddenHost(sptr);
 
   hide_hostmask(sptr);
-  send_umode_out(sptr, sptr, setflags, 0);
+  send_umode_out(sptr, sptr, setflags, 0, 0 /* 3o: sethost stays on P10 (host-param not reconciled) */);
 
   /* Update bouncer aliases with new visible host */
   bounce_emit_alias_update(sptr, "host", cli_user(sptr)->host);
@@ -210,7 +210,7 @@ int m_sethost(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
     ClearSetHost(sptr);
     cli_user(sptr)->sethost[0] = '\0';
     hide_hostmask(sptr);
-    send_umode_out(cptr, sptr, &setflags, 0);
+    send_umode_out(cptr, sptr, &setflags, 0, 0 /* 3o: sethost stays on P10 (host-param not reconciled) */);
     return 0;
   }
 
@@ -303,7 +303,7 @@ int mo_sethost(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
     ClearSetHost(sptr);
     cli_user(sptr)->sethost[0] = '\0';
     hide_hostmask(sptr);
-    send_umode_out(cptr, sptr, &setflags, 0);
+    send_umode_out(cptr, sptr, &setflags, 0, 0 /* 3o: sethost stays on P10 (host-param not reconciled) */);
     return 0;
   }
 
@@ -325,7 +325,7 @@ int mo_sethost(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
     SetSetHost(sptr);
     SetHiddenHost(sptr);
     hide_hostmask(sptr);
-    send_umode_out(cptr, sptr, &setflags, 0);
+    send_umode_out(cptr, sptr, &setflags, 0, 0 /* 3o: sethost stays on P10 (host-param not reconciled) */);
     return 0;
   }
 
@@ -385,7 +385,7 @@ int mo_sethost(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
   SetHiddenHost(sptr);
 
   hide_hostmask(sptr);
-  send_umode_out(cptr, sptr, &setflags, 0);
+  send_umode_out(cptr, sptr, &setflags, 0, 0 /* 3o: sethost stays on P10 (host-param not reconciled) */);
 
   return 0;
 }
