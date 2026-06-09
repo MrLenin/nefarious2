@@ -939,6 +939,14 @@ int crdt_state_gc(struct CrdtNetworkState *st,
   while (cur) {
     struct CrdtOp *nx = cur->next;
     if (stable->seq[cur->origin] >= cur->seq) {
+      /* This op is causally stable (every peer has it). If it's an LWW delete, its
+       * tombstone is now reclaimable too — free it (unless a newer write superseded
+       * it). Fixes unbounded growth of delete-tombstones (e.g. quit users / 3m). */
+      if (cur->type == CRDT_OP_DELETE) {
+        struct CrdtLWWMap *m = lww_for(st, cur->coll);
+        if (m)
+          freed += crdt_lwwmap_gc_deleted(m, cur->key, cur->key_len, cur->ts);
+      }
       op_free(cur);
       freed++;
     } else {

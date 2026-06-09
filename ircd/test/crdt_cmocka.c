@@ -1102,12 +1102,41 @@ static void test_user_explicit_removal_gate(void **state)
   crdt_state_clear(&s2);
 }
 
+/* LWW delete-tombstone GC: a user-remove tombstone is reclaimed only once its DELETE
+ * op is causally stable (all peers saw it); kept while unstable (no resurrection). */
+static void test_lww_tombstone_gc(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s;
+  struct CrdtUserRecord u;
+  struct CrdtStateVector stable;
+  memset(&u, 0, sizeof u);
+  strcpy(u.nick, "ghost"); u.server = 4;
+  crdt_state_init(&s, 4);
+  crdt_user_set(&s, "DAAAB", &u);
+  crdt_user_remove(&s, "DAAAB");
+  assert_int_equal(1, crdt_user_is_explicitly_removed(&s, "DAAAB"));
+
+  /* unstable (nothing acked past the delete): tombstone KEPT */
+  crdt_sv_init(&stable);
+  crdt_state_gc(&s, &stable);
+  assert_int_equal(1, crdt_user_is_explicitly_removed(&s, "DAAAB"));
+
+  /* stable (peer 4 acked well past the delete): tombstone RECLAIMED, no resurrection */
+  crdt_sv_update(&stable, 4, 1000);
+  crdt_state_gc(&s, &stable);
+  assert_int_equal(0, crdt_user_is_explicitly_removed(&s, "DAAAB"));
+  assert_null(crdt_user_get(&s, "DAAAB"));
+  crdt_state_clear(&s);
+}
+
 /* ================================================================== */
 
 int main(void)
 {
   const struct CMUnitTest tests[] = {
     cmocka_unit_test(test_user_explicit_removal_gate),
+    cmocka_unit_test(test_lww_tombstone_gc),
     cmocka_unit_test(test_A_convergence),
     cmocka_unit_test(test_B_collision_different_user_oldest_wins),
     cmocka_unit_test(test_B_collision_same_user_newest_wins),

@@ -217,6 +217,13 @@ const struct CrdtLWWValue *crdt_lwwmap_get(const struct CrdtLWWMap *map,
 int crdt_lwwmap_is_deleted(const struct CrdtLWWMap *map,
                            const char *key, uint32_t key_len);
 
+/** Reclaim a delete-tombstone whose causally-stable DELETE op is being GC'd: frees
+ *  the entry iff it is a tombstone written at exactly @a ts (no newer write
+ *  superseded it). Safe against resurrection — only called once every peer has the
+ *  delete. Returns 1 if freed. */
+int crdt_lwwmap_gc_deleted(struct CrdtLWWMap *map, const char *key,
+                           uint32_t key_len, struct HLC ts);
+
 /** Delete key (LWW write of a tombstone). Returns 1 if applied, 0 if stale. */
 int crdt_lwwmap_delete(struct CrdtLWWMap *map, const char *key,
                        uint32_t key_len, struct HLC ts, uint16_t writer);

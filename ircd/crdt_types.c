@@ -415,6 +415,34 @@ int crdt_lwwmap_delete(struct CrdtLWWMap *map, const char *key,
   return 0;
 }
 
+/* Reclaim a delete-tombstone: free the entry IFF it exists, is a tombstone, and its
+ * write is EXACTLY @a ts (no newer set/delete superseded it). Called from
+ * crdt_state_gc when the matching causally-stable DELETE op is reclaimed — every peer
+ * has applied that delete, so freeing the entry cannot resurrect the value (a peer
+ * behind the GC floor is served a full snapshot, which reflects the entry as absent).
+ * The ts-equality check makes delete→re-add→… races safe: if a newer write resurrected
+ * the key, the entry's ts differs and we leave it. Returns 1 if freed. */
+int crdt_lwwmap_gc_deleted(struct CrdtLWWMap *map, const char *key,
+                           uint32_t key_len, struct HLC ts)
+{
+  uint32_t b = fnv1a(key, key_len) % map->nbuckets;
+  struct CrdtLWWEntry **pp = &map->buckets[b], *e;
+  for (e = *pp; e; pp = &e->ht_next, e = e->ht_next) {
+    if (e->key_len == key_len && memcmp(e->key, key, key_len) == 0) {
+      if (e->deleted && hlc_compare(&e->val.ts, &ts) == 0) {
+        *pp = e->ht_next;
+        free(e->val.data);
+        free(e->key);
+        free(e);
+        map->entry_count--;
+        return 1;
+      }
+      return 0;                  /* present but superseded / not a tombstone */
+    }
+  }
+  return 0;                      /* absent (already reclaimed) */
+}
+
 uint32_t crdt_lwwmap_size(const struct CrdtLWWMap *map)
 {
   uint32_t n = 0;
