@@ -54,7 +54,15 @@ struct CrdtServerRecord {
 struct CrdtUserRecord {
   char     nick[CRDT_NICKLEN];
   char     ident[CRDT_IDENTLEN];
-  char     host[CRDT_HOSTLEN];        /**< displayed host (cli_user->host) */
+  char     host[CRDT_HOSTLEN];        /**< displayed host (cli_user->host) — the
+                                       *   final string for ANY host type (realhost,
+                                       *   +x cloak, sethost, fakehost) */
+  char     realhost[CRDT_HOSTLEN];    /**< real host (cli_user->realhost) — kept
+                                       *   SEPARATE from the displayed host so a
+                                       *   materialized user has the correct realhost
+                                       *   (oper WHOIS / ban-matching) and the §17.7
+                                       *   gateway emits the real host (not a cloak →
+                                       *   no legacy double-cloak). Host-rep parity. */
   char     realname[CRDT_REALLEN];    /**< cli_info */
   char     account[CRDT_ACCOUNTLEN];  /**< "" if not logged in */
   char     umodes[CRDT_UMODELEN];     /**< umode_str() form, e.g. "+rix" */

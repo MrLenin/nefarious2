@@ -254,6 +254,7 @@ void crdt_shadow_user_add(struct Client *cptr)
   strncpy(rec.nick, cli_name(cptr), sizeof rec.nick - 1);
   strncpy(rec.ident, cli_user(cptr)->username, sizeof rec.ident - 1);
   strncpy(rec.host, cli_user(cptr)->host, sizeof rec.host - 1);
+  strncpy(rec.realhost, cli_user(cptr)->realhost, sizeof rec.realhost - 1);
   strncpy(rec.realname, cli_info(cptr), sizeof rec.realname - 1);
   strncpy(rec.account, cli_user(cptr)->account, sizeof rec.account - 1);
   umode_letters(rec.umodes, sizeof rec.umodes, umode_str(cptr));
@@ -563,6 +564,7 @@ static void mat_user_cb(const char *key, uint32_t key_len,
   MCK(strcmp(rec->nick, cli_name(live)), "nick");
   MCK(strcmp(rec->ident, cli_user(live)->username), "ident");
   MCK(strcmp(rec->host, cli_user(live)->host), "host");
+  MCK(strcmp(rec->realhost, cli_user(live)->realhost), "realhost");
   MCK(strcmp(rec->realname, cli_info(live)), "realname");
   MCK(strcmp(rec->account, cli_user(live)->account), "account");
   MCK(memcmp(rec->ip6, &cli_ip(live), sizeof rec->ip6), "ip");
@@ -806,8 +808,8 @@ static struct Client *crdt_materialize_one_user(const char *key, uint32_t key_le
   hAddClient(nc);
   ircd_strncpy(cli_username(nc), rec->ident, USERLEN + 1);
   ircd_strncpy(cli_user(nc)->username, rec->ident, USERLEN + 1);
-  ircd_strncpy(cli_user(nc)->host, rec->host, HOSTLEN + 1);
-  ircd_strncpy(cli_user(nc)->realhost, rec->host, HOSTLEN + 1);  /* doc has one host */
+  ircd_strncpy(cli_user(nc)->host, rec->host, HOSTLEN + 1);          /* displayed host */
+  ircd_strncpy(cli_user(nc)->realhost, rec->realhost, HOSTLEN + 1);  /* real host (host-rep parity) */
   ircd_strncpy(cli_info(nc), rec->realname, REALLEN + 1);
   if (rec->account[0]) {
     ircd_strncpy(cli_user(nc)->account, rec->account, ACCOUNTLEN + 1);

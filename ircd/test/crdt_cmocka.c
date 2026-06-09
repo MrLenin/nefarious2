@@ -649,7 +649,8 @@ static void test_user_record_full_roundtrip(void **state)
   unsigned char ip[16] = { 0,0,0,0,0,0,0,0,0,0,0xff,0xff,1,2,3,4 };
   memset(&u, 0, sizeof u);
   strcpy(u.nick, "alice"); strcpy(u.ident, "al");
-  strcpy(u.host, "host.example.net"); strcpy(u.realname, "Alice Roberts");
+  strcpy(u.host, "host.example.net"); strcpy(u.realhost, "real.example.net");
+  strcpy(u.realname, "Alice Roberts");
   strcpy(u.account, "alice_acct"); strcpy(u.umodes, "+rix");
   memcpy(u.ip6, ip, 16);
   u.nick_ts = 1780000000ULL; u.acc_create = 1779000000ULL;
