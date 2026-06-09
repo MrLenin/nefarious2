@@ -37,6 +37,11 @@ void crdt_shadow_join(struct Channel *chptr, struct Client *who,
  *  remove_user_from_channel, for non-alias members). */
 void crdt_shadow_part(struct Channel *chptr, struct Client *who);
 
+/** Phase 3j: mark a channel's CRDT creationtime incarnation boundary (called from
+ *  destruct_channel). Bumps the LOCAL ctime_del so a later recreate to a higher TS
+ *  is not resurrected to the stale value. No-op unless FEAT_CRDT_ENABLED. */
+void crdt_shadow_channel_destroy(struct Channel *chptr);
+
 /** Mirror a registered user into the shadow user registry (called from
  *  register_user on success). Skips bouncer aliases. Idempotent — also safe
  *  to call on nick change to refresh the record. */
@@ -93,6 +98,13 @@ void crdt_shadow_reconcile_modes(void);
  *  remove direction (PART/KICK/QUIT) stay on P10. Idempotent (find_member_link
  *  guard). No-op unless FEAT_CRDT_PRIMARY. */
 void crdt_shadow_reconcile_members(void);
+
+/** Phase 3j: birth a not-yet-live channel locally from the doc (present members +
+ *  not FindChannel) so members/modes/bans can reconcile into it; must run BEFORE
+ *  crdt_shadow_reconcile_members. LOCAL ONLY (no gateway — legacy births via the 3f
+ *  JOIN-gateway). creationtime from the incarnation min-register. No-op unless
+ *  FEAT_CRDT_PRIMARY. */
+void crdt_shadow_reconcile_create_channels(void);
 
 /** Phase 3g: drive live channel membership REMOVE (PART / delete-on-leave) from
  *  the doc + §17.7 gateway. Removes a live member ONLY when the doc OR-Set has

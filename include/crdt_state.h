@@ -113,7 +113,8 @@ enum CrdtCollection {
   CRDT_COLL_MEMBER_STATUS, /**< chan\0numeric -> CrdtMemberRecord (LWW) */
   CRDT_COLL_CHANMETA,      /**< channel-name -> CrdtChanMeta (LWW) */
   CRDT_COLL_CHAN_BANS,     /**< per-channel +b ban masks (OR-Set) — Phase 3i */
-  CRDT_COLL_CHAN_EXCEPTS   /**< per-channel +e except masks (OR-Set) — Phase 3i */
+  CRDT_COLL_CHAN_EXCEPTS,  /**< per-channel +e except masks (OR-Set) — Phase 3i */
+  CRDT_COLL_CHAN_CTIME     /**< per-channel creationtime (incarnation min-register) — Phase 3j */
 };
 
 struct CrdtOp {
@@ -152,6 +153,14 @@ struct CrdtChannel {
   struct CrdtORSet    members;    /**< set of user numerics */
   struct CrdtORSet    bans;       /**< set of +b ban masks */
   struct CrdtORSet    excepts;    /**< set of +e except masks */
+  /* Phase 3j: channel creationtime as an incarnation MIN-register. IRC channel
+   * TS is lower-TS-wins (NOT LWW), so concurrent creates within one incarnation
+   * resolve to min(ctime). ctime_del marks the incarnation boundary (bumped on
+   * destroy) so a recreate to a HIGHER TS is not resurrected to the stale value.
+   * Live iff hlc_compare(&ctime_set, &ctime_del) > 0. */
+  uint64_t            ctime;
+  struct HLC          ctime_set;  /**< HLC of the latest create within this incarnation */
+  struct HLC          ctime_del;  /**< HLC of the latest destroy (incarnation marker) */
   struct CrdtChannel *next;       /**< bucket chain */
 };
 
@@ -204,6 +213,16 @@ void crdt_chan_ban_add(struct CrdtNetworkState *st, const char *chan,
                        const char *mask, int is_except);
 void crdt_chan_ban_remove(struct CrdtNetworkState *st, const char *chan,
                           const char *mask, uint8_t priority, int is_except);
+/** Phase 3j: set/get a channel's creationtime as an incarnation min-register.
+ *  set() merges in {value, set_hlc=now, del_hlc=current}, records a
+ *  CRDT_COLL_CHAN_CTIME op (so it replicates via delta). clear() bumps the local
+ *  incarnation marker (ctime_del=now) — LOCAL ONLY, no op; the next set-op carries
+ *  the new del_hlc to peers. get() returns the live creationtime, or 0 if absent /
+ *  destroyed. */
+void crdt_chan_ctime_set(struct CrdtNetworkState *st, const char *chan,
+                         uint64_t creationtime);
+void crdt_chan_ctime_clear(struct CrdtNetworkState *st, const char *chan);
+uint64_t crdt_chan_ctime_get(struct CrdtNetworkState *st, const char *chan);
 void crdt_server_set(struct CrdtNetworkState *st, uint16_t numeric,
                      enum CrdtServerState state);
 /** SQUIT — one LWW write, zero membership tombstones (proposal §17.3.2). */
@@ -228,6 +247,11 @@ void crdt_chanmeta_set(struct CrdtNetworkState *st, const char *chan,
  *  or NULL for OR-Set collections. Exposed for snapshot apply (crdt_wire.c). */
 struct CrdtLWWMap *crdt_state_lww_for(struct CrdtNetworkState *st,
                                       enum CrdtCollection coll);
+/** Phase 3j: merge a channel ctime register entry (incarnation min-register).
+ *  Exposed for snapshot apply (crdt_wire.c), parallel to crdt_lwwmap_set. */
+void crdt_chan_ctime_merge(struct CrdtNetworkState *st, const char *chan,
+                           uint32_t clen, uint64_t value,
+                           struct HLC set_hlc, struct HLC del_hlc);
 /** Apply a single remote op (idempotent via state-vector check). */
 void crdt_state_apply_op(struct CrdtNetworkState *st, const struct CrdtOp *op);
 /** Delta sync: replay every op in src's oplog that dst hasn't seen, into dst.

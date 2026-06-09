@@ -442,6 +442,11 @@ int destruct_channel(struct Channel* chptr)
 
   assert(0 == chptr->members);
 
+  /* Phase 3j: mark the CRDT creationtime incarnation boundary BEFORE the channel
+   * is torn down, so a later recreate to a higher TS isn't resurrected to this
+   * incarnation's stale (lower) creationtime. Local-only; no-op without CRDT. */
+  crdt_shadow_channel_destroy(chptr);
+
   /*
    * Now, find all invite links from channel structure
    */
@@ -5598,14 +5603,31 @@ joinbuf_flush(struct JoinBuf *jbuf)
     if (jbuf->jb_alias_source)
       sendcmdto_set_alias_source(jbuf->jb_alias_source);
     sendcmdto_want_s2s_tags(1);
-    sendcmdto_serv_butone(jbuf->jb_source, CMD_CREATE, jbuf->jb_connect,
-			  "%s %Tu", chanlist, jbuf->jb_create);
+    /* Phase 3j: channel birth rides CRDT between CRDT-primary peers. Suppress the
+     * P10 CREATE (and the AUTOCHANMODES MODE below) to CRDT-aware servers — they
+     * birth the channel via reconcile-create from the doc (creationtime = the
+     * incarnation min-register) + default modes from the doc modes snapshot. Still
+     * relay to legacy peers; a deep CRDT leaf with no legacy peer reaches legacy via
+     * the 3f JOIN-gateway (the gateway node re-emits the founder JOIN). */
+    if (feature_bool(FEAT_CRDT_PRIMARY))
+      sendcmdto_flag_serv_butone(jbuf->jb_source, CMD_CREATE, jbuf->jb_connect,
+				 FLAG_LAST_FLAG, FLAG_CRDT_AWARE,
+				 "%s %Tu", chanlist, jbuf->jb_create);
+    else
+      sendcmdto_serv_butone(jbuf->jb_source, CMD_CREATE, jbuf->jb_connect,
+			    "%s %Tu", chanlist, jbuf->jb_create);
     if (feature_bool(FEAT_AUTOCHANMODES) && feature_str(FEAT_AUTOCHANMODES_LIST)
          && strlen(feature_str(FEAT_AUTOCHANMODES_LIST)) > 0 && MyUser(jbuf->jb_source)) {
       for (name = ircd_strtok(&p, chanlist, ","); name; name = ircd_strtok(&p, 0, ",")) {
-        if (!IsLocalChannel(name))
-          sendcmdto_serv_butone(&me, CMD_MODE, jbuf->jb_connect, "%s +%s", name,
-                                feature_str(FEAT_AUTOCHANMODES_LIST));
+        if (!IsLocalChannel(name)) {
+          if (feature_bool(FEAT_CRDT_PRIMARY))
+            sendcmdto_flag_serv_butone(&me, CMD_MODE, jbuf->jb_connect,
+                                       FLAG_LAST_FLAG, FLAG_CRDT_AWARE, "%s +%s",
+                                       name, feature_str(FEAT_AUTOCHANMODES_LIST));
+          else
+            sendcmdto_serv_butone(&me, CMD_MODE, jbuf->jb_connect, "%s +%s", name,
+                                  feature_str(FEAT_AUTOCHANMODES_LIST));
+        }
       }
     }
     break;

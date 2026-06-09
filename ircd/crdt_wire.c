@@ -320,6 +320,14 @@ int crdt_snapshot_encode(const struct CrdtNetworkState *st,
       snap_put_orset(&w, &c->members);
       snap_put_orset(&w, &c->bans);
       snap_put_orset(&w, &c->excepts);
+      /* Phase 3j: ctime incarnation min-register {value, set_hlc, del_hlc} */
+      wput_u64(&w, c->ctime);
+      wput_u64(&w, c->ctime_set.physical_ms);
+      wput_u16(&w, c->ctime_set.logical);
+      wput_u16(&w, c->ctime_set.node_id);
+      wput_u64(&w, c->ctime_del.physical_ms);
+      wput_u16(&w, c->ctime_del.logical);
+      wput_u16(&w, c->ctime_del.node_id);
       chan_n++;
     }
   }
@@ -421,6 +429,20 @@ int crdt_snapshot_apply(struct CrdtNetworkState *st,
     if (snap_get_orset(&r, &ch->members) < 0) return -1;
     if (snap_get_orset(&r, &ch->bans) < 0) return -1;
     if (snap_get_orset(&r, &ch->excepts) < 0) return -1;
+    /* Phase 3j: ctime register — MERGE (not assign) so snapshot catch-up on a
+     * non-fresh replica can't regress the min-resolved value. */
+    {
+      uint64_t cv = rget_u64(&r);
+      struct HLC cs, cd;
+      cs.physical_ms = rget_u64(&r);
+      cs.logical = rget_u16(&r);
+      cs.node_id = rget_u16(&r);
+      cd.physical_ms = rget_u64(&r);
+      cd.logical = rget_u16(&r);
+      cd.node_id = rget_u16(&r);
+      if (r.err) return -1;
+      crdt_chan_ctime_merge(st, cname, nlen, cv, cs, cd);
+    }
   }
 
   if (r.err) return -1;

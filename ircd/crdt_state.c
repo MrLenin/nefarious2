@@ -325,6 +325,99 @@ void crdt_chan_ban_remove(struct CrdtNetworkState *st, const char *chan,
   }
 }
 
+/* ------------------------------------------------------------------ */
+/* Phase 3j: channel creationtime — incarnation MIN-register           */
+/* ------------------------------------------------------------------ */
+/* Wire/op payload for a CRDT_COLL_CHAN_CTIME SET op. memcpy'd into op->val
+ * (same-build layout, like CrdtChanMeta); the digest hashes fields, not the
+ * struct, to stay padding-independent. */
+struct ctime_payload {
+  uint64_t   value;
+  struct HLC set_hlc;
+  struct HLC del_hlc;
+};
+
+static struct HLC hlc_max(struct HLC a, struct HLC b)
+{
+  return (hlc_compare(&a, &b) >= 0) ? a : b;
+}
+
+/* Merge an incoming {value, set_hlc, del_hlc} into a channel's ctime register.
+ * Commutative/associative/idempotent (a proper join): del = max; within the
+ * surviving incarnation (set > del) the LOWER value wins (IRC lower-TS-wins);
+ * a set older than the merged del is a superseded incarnation and is dropped. */
+static void ctime_merge(struct CrdtChannel *ch, uint64_t value,
+                        struct HLC set_hlc, struct HLC del_hlc)
+{
+  struct HLC del2 = hlc_max(ch->ctime_del, del_hlc);
+  int a_live = hlc_compare(&ch->ctime_set, &del2) > 0;   /* current entry survives */
+  int b_live = hlc_compare(&set_hlc, &del2) > 0;          /* incoming survives */
+  if (a_live && b_live) {
+    ch->ctime = (ch->ctime < value) ? ch->ctime : value;  /* min */
+    ch->ctime_set = hlc_max(ch->ctime_set, set_hlc);
+  } else if (b_live) {
+    ch->ctime = value;
+    ch->ctime_set = set_hlc;
+  } else if (a_live) {
+    /* keep current value/set */
+  } else {
+    ch->ctime = 0;                                         /* deleted (no live set) */
+    ch->ctime_set = hlc_max(ch->ctime_set, set_hlc);
+  }
+  ch->ctime_del = del2;
+}
+
+void crdt_chan_ctime_set(struct CrdtNetworkState *st, const char *chan,
+                         uint64_t creationtime)
+{
+  struct HLC now = hlc_local_event(&st->clock);
+  uint32_t clen = (uint32_t)strlen(chan);
+  struct CrdtChannel *ch = chan_get(st, chan, clen, 1);
+  struct HLC incarnation = ch->ctime_del;   /* the incarnation this create belongs to */
+  struct ctime_payload pl;
+  uint64_t seq;
+  struct CrdtOp *op;
+  ctime_merge(ch, creationtime, now, incarnation);
+  pl.value = creationtime;
+  pl.set_hlc = now;
+  pl.del_hlc = incarnation;
+  seq = st->next_seq++;
+  op = op_new(st->my_numeric, seq, CRDT_OP_SET, CRDT_COLL_CHAN_CTIME);
+  op->chan = memdup(chan, clen);
+  op->chan_len = clen;
+  op->val = memdup(&pl, sizeof pl);
+  op->val_len = sizeof pl;
+  op->ts = now;
+  op->writer = st->my_numeric;
+  record(st, op);
+}
+
+void crdt_chan_ctime_clear(struct CrdtNetworkState *st, const char *chan)
+{
+  struct HLC now = hlc_local_event(&st->clock);
+  struct CrdtChannel *ch = chan_find(st, chan, (uint32_t)strlen(chan));
+  if (!ch) return;
+  /* LOCAL incarnation bump — no op recorded; the NEXT create's set-op carries
+   * this del_hlc, so the boundary propagates with the recreate. */
+  if (hlc_compare(&now, &ch->ctime_del) > 0)
+    ch->ctime_del = now;
+}
+
+uint64_t crdt_chan_ctime_get(struct CrdtNetworkState *st, const char *chan)
+{
+  struct CrdtChannel *ch = chan_find(st, chan, (uint32_t)strlen(chan));
+  if (!ch) return 0;
+  return (hlc_compare(&ch->ctime_set, &ch->ctime_del) > 0) ? ch->ctime : 0;
+}
+
+void crdt_chan_ctime_merge(struct CrdtNetworkState *st, const char *chan,
+                           uint32_t clen, uint64_t value,
+                           struct HLC set_hlc, struct HLC del_hlc)
+{
+  struct CrdtChannel *ch = chan_get(st, chan, clen, 1);
+  ctime_merge(ch, value, set_hlc, del_hlc);
+}
+
 void crdt_server_set(struct CrdtNetworkState *st, uint16_t numeric,
                      enum CrdtServerState state)
 {
@@ -489,6 +582,13 @@ void crdt_state_apply_op(struct CrdtNetworkState *st, const struct CrdtOp *op)
       crdt_orset_merge_add(set, op->key, op->key_len, op->tag);
     else
       crdt_orset_merge_remove(set, op->tag, op->priority);
+  } else if (op->coll == CRDT_COLL_CHAN_CTIME) {   /* Phase 3j incarnation min-register */
+    if (op->val && op->val_len == sizeof(struct ctime_payload)) {
+      const struct ctime_payload *pl = (const struct ctime_payload *)op->val;
+      crdt_chan_ctime_merge(st, op->chan, op->chan_len, pl->value,
+                            pl->set_hlc, pl->del_hlc);
+      hlc_receive(&st->clock, &pl->set_hlc);       /* advance our clock */
+    }
   } else {
     struct CrdtLWWMap *map = lww_for(st, op->coll);
     if (op->type == CRDT_OP_SET)
@@ -559,6 +659,14 @@ static int chans_eq(const struct CrdtNetworkState *a,
       struct CrdtChannel *cb = chan_find(b, ca->name, ca->name_len);
       if (!cb) { if (crdt_orset_size(&ca->members) != 0) return 0; continue; }
       if (!members_eq(&ca->members, &cb->members)) return 0;
+      /* Phase 3j: live creationtime must agree (the incarnation min-register).
+       * Compare ONLY the live value — ctime_set/ctime_del are local bookkeeping
+       * that legitimately differ for a destroyed channel. */
+      {
+        uint64_t va = (hlc_compare(&ca->ctime_set, &ca->ctime_del) > 0) ? ca->ctime : 0;
+        uint64_t vb = (hlc_compare(&cb->ctime_set, &cb->ctime_del) > 0) ? cb->ctime : 0;
+        if (va != vb) return 0;
+      }
     }
     for (struct CrdtChannel *cb = b->chan_buckets[bk]; cb; cb = cb->next) {
       struct CrdtChannel *ca = chan_find(a, cb->name, cb->name_len);
@@ -628,6 +736,23 @@ static uint64_t digest_lww(uint64_t acc, const struct CrdtLWWMap *m, uint8_t ns)
   return acc;
 }
 
+/* Phase 3j: hash a channel's LIVE creationtime only. ctime_set/ctime_del are
+ * local (a destroyed channel's del differs per server), so hashing them would
+ * make destroyed channels falsely diverge; the live value (min-resolved, or 0
+ * when destroyed) is the convergent observable. */
+static uint64_t digest_ctime(uint64_t acc, const struct CrdtChannel *c)
+{
+  if (hlc_compare(&c->ctime_set, &c->ctime_del) > 0) {
+    uint64_t h = FNV64_OFFSET;
+    uint8_t ns = 13;
+    h = fnv64(h, &ns, 1);
+    h = fnv64(h, c->name, c->name_len);
+    h = fnv64(h, &c->ctime, sizeof c->ctime);
+    acc ^= h;
+  }
+  return acc;
+}
+
 static uint64_t digest_orset(uint64_t acc, const struct CrdtORSet *s,
                              const char *cname, uint32_t cnlen, uint8_t ns)
 {
@@ -676,6 +801,7 @@ uint64_t crdt_state_digest(const struct CrdtNetworkState *st)
       acc = digest_orset(acc, &c->members, c->name, c->name_len, 10);
       acc = digest_orset(acc, &c->bans, c->name, c->name_len, 11);
       acc = digest_orset(acc, &c->excepts, c->name, c->name_len, 12);
+      acc = digest_ctime(acc, c);
     }
   }
   return acc;
@@ -722,6 +848,7 @@ uint64_t crdt_state_digest_materialized(const struct CrdtNetworkState *st)
       acc = digest_orset_present(acc, &c->members, c->name, c->name_len, 10);
       acc = digest_orset_present(acc, &c->bans, c->name, c->name_len, 11);
       acc = digest_orset_present(acc, &c->excepts, c->name, c->name_len, 12);
+      acc = digest_ctime(acc, c);
     }
   }
   return acc;

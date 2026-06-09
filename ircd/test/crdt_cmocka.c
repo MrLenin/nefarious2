@@ -350,6 +350,59 @@ static void test_chan_ban_op_replicates(void **state)
 }
 
 /* ================================================================== */
+/* Phase 3j: per-channel creationtime is an incarnation MIN-register.
+ * Concurrent creates converge to the LOWER TS (IRC lower-TS-wins, the safe
+ * direction); a destroy (clear, a LOCAL incarnation bump) + recreate to a
+ * HIGHER TS is NOT resurrected to the stale lower value — the set-op carries
+ * its del_hlc so the boundary rides to every peer. Also covers the snapshot
+ * roundtrip of the register. */
+static void test_chan_ctime_min_incarnation(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s1, s2;
+  uint8_t buf[8192];
+  int n;
+
+  /* --- concurrent create: s1=400, s2=407, both incarnation-0 -> min wins --- */
+  crdt_state_init(&s1, 1);
+  crdt_state_init(&s2, 2);
+  crdt_chan_ctime_set(&s1, "#c", 400);
+  crdt_chan_ctime_set(&s2, "#c", 407);
+  crdt_state_sync(&s1, &s2);
+  crdt_state_sync(&s2, &s1);
+  assert_int_equal(400, (int)crdt_chan_ctime_get(&s1, "#c"));  /* not 407 (LWW would pick 407) */
+  assert_int_equal(400, (int)crdt_chan_ctime_get(&s2, "#c"));
+  crdt_state_clear(&s1);
+  crdt_state_clear(&s2);
+
+  /* --- destroy + recreate to a HIGHER TS: no resurrection to 400 --- */
+  crdt_state_init(&s1, 1);
+  crdt_state_init(&s2, 2);
+  crdt_chan_ctime_set(&s1, "#c", 400);          /* incarnation 1 */
+  crdt_state_sync(&s2, &s1);
+  assert_int_equal(400, (int)crdt_chan_ctime_get(&s2, "#c"));
+  crdt_chan_ctime_clear(&s1, "#c");             /* destroy (local incarnation bump) */
+  assert_int_equal(0, (int)crdt_chan_ctime_get(&s1, "#c"));    /* deleted -> 0 */
+  crdt_chan_ctime_set(&s1, "#c", 500);          /* recreate, HIGHER TS, incarnation 2 */
+  crdt_state_sync(&s2, &s1);                     /* the set-op carries del_hlc */
+  assert_int_equal(500, (int)crdt_chan_ctime_get(&s1, "#c"));
+  assert_int_equal(500, (int)crdt_chan_ctime_get(&s2, "#c"));  /* NOT 400 */
+
+  /* --- snapshot roundtrip preserves the register --- */
+  {
+    struct CrdtNetworkState s3;
+    crdt_state_init(&s3, 3);
+    n = crdt_snapshot_encode(&s1, buf, sizeof buf);
+    assert_true(n > 0);
+    assert_true(crdt_snapshot_apply(&s3, buf, (size_t)n) >= 0);
+    assert_int_equal(500, (int)crdt_chan_ctime_get(&s3, "#c"));
+    crdt_state_clear(&s3);
+  }
+  crdt_state_clear(&s1);
+  crdt_state_clear(&s2);
+}
+
+/* ================================================================== */
 /* Scenario E — SQUIT as server-state transition (no tombstone storm) */
 /* ================================================================== */
 
@@ -983,6 +1036,7 @@ int main(void)
     cmocka_unit_test(test_C_part_yields_to_concurrent_join),
     cmocka_unit_test(test_orset_explicit_removal_gate),
     cmocka_unit_test(test_chan_ban_op_replicates),
+    cmocka_unit_test(test_chan_ctime_min_incarnation),
     cmocka_unit_test(test_E_squit_creates_no_membership_tombstones),
     cmocka_unit_test(test_wire_sv_roundtrip),
     cmocka_unit_test(test_wire_delta_converges),

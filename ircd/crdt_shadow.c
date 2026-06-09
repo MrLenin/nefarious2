@@ -138,6 +138,10 @@ static void write_chanmeta(struct Channel *chptr)
   meta.topic_time = (uint64_t)chptr->topic_time;
   strncpy(meta.topic_nick, chptr->topic_nick, sizeof meta.topic_nick - 1);
   crdt_chanmeta_set(&g_crdt, chptr->chname, &meta);
+  /* Phase 3j: creationtime ALSO rides a dedicated incarnation min-register (IRC
+   * is lower-TS-wins, not LWW). chanmeta keeps topic_time/topic_nick (genuinely
+   * LWW). reconcile-create + the materialize !existed rebuild read ctime from here. */
+  crdt_chan_ctime_set(&g_crdt, chptr->chname, (uint64_t)chptr->creationtime);
 }
 
 void crdt_shadow_join(struct Channel *chptr, struct Client *who,
@@ -160,6 +164,16 @@ void crdt_shadow_join(struct Channel *chptr, struct Client *who,
    * write_member_status reads the member's current flags (0 for a plain join). */
   write_member_status(chptr, find_member_link(chptr, who));
   write_chanmeta(chptr);
+  /* Phase 3j AUTOCHANMODES fix: SetAutoChanModes (channel.c) sets mode.mode
+   * DIRECTLY (no modebuf), so the create's default modes (+nt…) never reach the
+   * doc via the modebuf->crdt_shadow_modes path. Snapshot them here the FIRST time
+   * we record this channel (doc has no modes entry yet) so a reconcile-created
+   * channel on a CRDT peer rebuilds +nt. Fires ~once per channel lifecycle; only
+   * for local-origin joins (peer-origin joins returned at the from_crdt_peer gate). */
+  if ((chptr->mode.mode & CRDT_MODE_MASK) &&
+      !crdt_lwwmap_get(&g_crdt.modes, chptr->chname,
+                       (uint32_t)strlen(chptr->chname)))
+    crdt_shadow_modes(chptr, cli_from(who));
   crdt_sync_push();                   /* eager-propagate to CRDT peers */
 }
 
@@ -175,6 +189,17 @@ void crdt_shadow_part(struct Channel *chptr, struct Client *who)
   crdt_chan_remove(&g_crdt, chptr->chname, user_numeric(who, num, sizeof num),
                    CRDT_PRIORITY_USER);
   crdt_sync_push();                   /* eager-propagate to CRDT peers */
+}
+
+void crdt_shadow_channel_destroy(struct Channel *chptr)
+{
+  if (!shadow_on())
+    return;
+  /* Phase 3j: bump the LOCAL ctime incarnation marker so a later recreate to a
+   * HIGHER TS is not resurrected to this incarnation's (lower) creationtime.
+   * Local-only (no op recorded); the next create's set-op carries the new
+   * del_hlc to peers. Called from destruct_channel. */
+  crdt_chan_ctime_clear(&g_crdt, chptr->chname);
 }
 
 void crdt_shadow_user_add(struct Client *cptr)
@@ -810,6 +835,38 @@ static void mat_banbuild_cb(const char *key, uint32_t key_len, void *ctx)
   *list = nb;
 }
 
+/* Phase 3j: rebuild a freshly-created channel's creationtime/topic/modes/bans
+ * from the doc. Shared by materialize_live (!existed) and reconcile_create_channels
+ * so the two never drift. creationtime comes from the incarnation MIN-register
+ * (NOT chanmeta — IRC is lower-TS-wins); topic_time/topic_nick stay LWW (chanmeta). */
+static void rebuild_channel_from_doc(struct Channel *chptr,
+                                     struct CrdtChannel *dc, const char *nbuf)
+{
+  const struct CrdtLWWValue *v;
+  uint64_t ct = crdt_chan_ctime_get(&g_crdt, nbuf);
+  if (ct)
+    chptr->creationtime = (time_t)ct;
+  v = crdt_lwwmap_get(&g_crdt.chanmeta, nbuf, dc->name_len);
+  if (v && v->data_len == sizeof(struct CrdtChanMeta)) {
+    const struct CrdtChanMeta *meta = (const struct CrdtChanMeta *)v->data;
+    chptr->topic_time = (time_t)meta->topic_time;
+    ircd_strncpy(chptr->topic_nick, meta->topic_nick, sizeof chptr->topic_nick - 1);
+  }
+  v = crdt_lwwmap_get(&g_crdt.topics, nbuf, dc->name_len);
+  if (v && v->data)
+    ircd_strncpy(chptr->topic, (const char *)v->data, TOPICLEN + 1);
+  v = crdt_lwwmap_get(&g_crdt.modes, nbuf, dc->name_len);
+  if (v && v->data_len == sizeof(struct ShadowModeSnap)) {
+    const struct ShadowModeSnap *s = (const struct ShadowModeSnap *)v->data;
+    chptr->mode.mode |= s->mode;
+    if (s->mode & MODE_LIMIT) chptr->mode.limit = s->limit;
+    if (s->mode & MODE_KEY)
+      ircd_strncpy(chptr->mode.key, s->key, sizeof chptr->mode.key);
+  }
+  crdt_orset_foreach(&dc->bans, mat_banbuild_cb, &chptr->banlist);
+  crdt_orset_foreach(&dc->excepts, mat_banbuild_cb, &chptr->exceptlist);
+}
+
 void crdt_shadow_materialize_live(void)
 {
   unsigned int created = 0, chans = 0;
@@ -827,7 +884,6 @@ void crdt_shadow_materialize_live(void)
       char nbuf[CHANNELLEN + 1];
       struct Channel *chptr;
       int existed;
-      const struct CrdtLWWValue *v;
       struct mat_join_ctx jc;
       if (crdt_orset_size(&dc->members) == 0)
         continue;
@@ -835,33 +891,18 @@ void crdt_shadow_materialize_live(void)
         continue;
       memcpy(nbuf, dc->name, dc->name_len); nbuf[dc->name_len] = '\0';
       existed = (FindChannel(nbuf) != NULL);
+      /* Phase 3j: don't materialize a dead/draining channel — one with present doc
+       * members but no LIVE creationtime (locally destructed, tombstone lagging).
+       * An already-live (P10/BURST-built) channel is unaffected (existed). */
+      if (!existed && crdt_chan_ctime_get(&g_crdt, nbuf) == 0)
+        continue;
       chptr = get_channel(&me, nbuf, CGT_CREATE);
       if (!chptr)
         continue;
       if (!existed) {
         /* fresh channel: rebuild creationtime/topic/modes/bans from the doc
          * (only when WE created it — never clobber a BURST-built channel). */
-        v = crdt_lwwmap_get(&g_crdt.chanmeta, nbuf, dc->name_len);
-        if (v && v->data_len == sizeof(struct CrdtChanMeta)) {
-          const struct CrdtChanMeta *meta = (const struct CrdtChanMeta *)v->data;
-          chptr->creationtime = (time_t)meta->creationtime;
-          chptr->topic_time = (time_t)meta->topic_time;
-          ircd_strncpy(chptr->topic_nick, meta->topic_nick,
-                       sizeof chptr->topic_nick - 1);
-        }
-        v = crdt_lwwmap_get(&g_crdt.topics, nbuf, dc->name_len);
-        if (v && v->data)
-          ircd_strncpy(chptr->topic, (const char *)v->data, TOPICLEN + 1);
-        v = crdt_lwwmap_get(&g_crdt.modes, nbuf, dc->name_len);
-        if (v && v->data_len == sizeof(struct ShadowModeSnap)) {
-          const struct ShadowModeSnap *s = (const struct ShadowModeSnap *)v->data;
-          chptr->mode.mode |= s->mode;
-          if (s->mode & MODE_LIMIT) chptr->mode.limit = s->limit;
-          if (s->mode & MODE_KEY)
-            ircd_strncpy(chptr->mode.key, s->key, sizeof chptr->mode.key);
-        }
-        crdt_orset_foreach(&dc->bans, mat_banbuild_cb, &chptr->banlist);
-        crdt_orset_foreach(&dc->excepts, mat_banbuild_cb, &chptr->exceptlist);
+        rebuild_channel_from_doc(chptr, dc, nbuf);
         chans++;
       }
       /* members — always (find_member_link guards against doubles) */
@@ -874,6 +915,55 @@ void crdt_shadow_materialize_live(void)
     log_write(LS_SYSTEM, L_NOTICE, 0,
               "CRDT materialize: created %u user(s), %u channel(s) from doc",
               created, chans);
+}
+
+/* ---- Phase 3j: channel CREATE (channel birth) via CRDT ----
+ * Steady-state create-from-doc for a SINGLE not-yet-live channel (the create-half
+ * of materialize, lifted to run on every CR D/U + verify tick). Births a channel
+ * locally when the doc has present members for it but it isn't live here yet, so
+ * the downstream reconcilers (members/modes/bans/member-status) have a channel to
+ * act on. Must run BEFORE reconcile_members. LOCAL ONLY — no §17.7 gateway here:
+ * legacy learns the channel via the 3f JOIN-gateway (reconcile_members re-emits the
+ * founder JOIN with the doc creationtime; ms_join births it) + founder-op via the
+ * 3h MODE-gateway. creationtime is the incarnation MIN-register value. */
+void crdt_shadow_reconcile_create_channels(void)
+{
+  unsigned int created = 0;
+  int bk;
+  if (!shadow_on() || !feature_bool(FEAT_CRDT_PRIMARY))
+    return;
+  for (bk = 0; bk < CRDT_CHAN_BUCKETS; bk++) {
+    struct CrdtChannel *dc;
+    for (dc = g_crdt.chan_buckets[bk]; dc; dc = dc->next) {
+      char nbuf[CHANNELLEN + 1];
+      struct Channel *chptr;
+      if (crdt_orset_size(&dc->members) == 0)
+        continue;                          /* never create an empty channel (destroy-on-empty) */
+      if (dc->name_len >= sizeof nbuf)
+        continue;
+      memcpy(nbuf, dc->name, dc->name_len); nbuf[dc->name_len] = '\0';
+      if (FindChannel(nbuf))
+        continue;                          /* already live (P10 BURST/CREATE or a prior pass) */
+      /* Require a LIVE creationtime incarnation. A channel we locally destructed
+       * (ctime_del bumped) but whose doc members haven't yet tombstoned — the
+       * P10-QUIT-fast vs CRDT-tombstone-slow skew — has ctime 0; do NOT resurrect
+       * it (and never birth a ts=0 channel). It stays dead until the tombstone
+       * clears the member, or a genuine new create post-dates the destroy. */
+      if (crdt_chan_ctime_get(&g_crdt, nbuf) == 0)
+        continue;
+      chptr = get_channel(&me, nbuf, CGT_CREATE);   /* &me => server, no SetAutoChanModes */
+      if (!chptr)
+        continue;
+      rebuild_channel_from_doc(chptr, dc, nbuf);
+      created++;
+      log_write(LS_SYSTEM, L_NOTICE, 0,
+                "CRDT create-reconcile: created channel %s from doc (ts=%lu)",
+                nbuf, (unsigned long)chptr->creationtime);
+    }
+  }
+  if (created)
+    log_write(LS_SYSTEM, L_NOTICE, 0,
+              "CRDT create-reconcile: created %u channel(s) from doc", created);
 }
 
 /* ---- Phase 3d: TOPIC via CRDT + §17.7 hybrid gateway ----
@@ -1491,6 +1581,7 @@ static void crdt_shadow_verify_cb(struct Event *ev)
   crdt_shadow_reconcile_topics();  /* Phase 3d: drive live topics from CRDT (+gateway) —
                                       catches 2-hop foreign-origin topics via anti-entropy */
   crdt_shadow_reconcile_modes();   /* Phase 3e: same for persistent channel modes */
+  crdt_shadow_reconcile_create_channels(); /* Phase 3j: birth channels from doc before members */
   crdt_shadow_reconcile_members(); /* Phase 3f: same for channel membership (JOIN-add) */
   crdt_shadow_reconcile_removes(); /* Phase 3g: membership remove (PART / delete-on-leave) */
   crdt_shadow_reconcile_member_status(); /* Phase 3h: per-member status (+o/+v/+h) */
