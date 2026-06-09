@@ -2412,10 +2412,11 @@ static int modebuf_is_crdt_only(const struct ModeBuf *mbuf)
     return 0;                          /* extended modes ride P10 */
   for (i = 0; i < mbuf->mb_count; i++) {
     unsigned int t = MB_TYPE(mbuf, i) & ~dir;
-    /* permit channel param-modes (KEY/LIMIT) and member-ops (CHANOP/HALFOP/VOICE);
-     * bans/excepts (MODE_BAN/EXCEPT) and +A/+U (MODE_APASS/UPASS) ride P10. */
-    if (!(t & (MODE_KEY | MODE_LIMIT | MODE_CHANOP | MODE_HALFOP | MODE_VOICE)))
-      return 0;                        /* ban / except / +A / +U present */
+    /* permit channel param-modes (KEY/LIMIT), member-ops (CHANOP/HALFOP/VOICE),
+     * and list-modes (BAN/EXCEPT — Phase 3i); +A/+U (MODE_APASS/UPASS) ride P10. */
+    if (!(t & (MODE_KEY | MODE_LIMIT | MODE_CHANOP | MODE_HALFOP | MODE_VOICE
+               | MODE_BAN | MODE_EXCEPT)))
+      return 0;                        /* +A / +U present */
   }
   return (chg & CRDT_MODE_MASK) || mbuf->mb_count;  /* and something is changing */
 }

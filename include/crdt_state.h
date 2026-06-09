@@ -111,7 +111,9 @@ enum CrdtCollection {
   CRDT_COLL_TOPICS,        /**< channel-name -> topic string (LWW) */
   CRDT_COLL_MODES,         /**< channel-name -> mode snapshot blob (LWW) */
   CRDT_COLL_MEMBER_STATUS, /**< chan\0numeric -> CrdtMemberRecord (LWW) */
-  CRDT_COLL_CHANMETA       /**< channel-name -> CrdtChanMeta (LWW) */
+  CRDT_COLL_CHANMETA,      /**< channel-name -> CrdtChanMeta (LWW) */
+  CRDT_COLL_CHAN_BANS,     /**< per-channel +b ban masks (OR-Set) — Phase 3i */
+  CRDT_COLL_CHAN_EXCEPTS   /**< per-channel +e except masks (OR-Set) — Phase 3i */
 };
 
 struct CrdtOp {
@@ -195,6 +197,13 @@ void crdt_chan_join(struct CrdtNetworkState *st, const char *chan,
                     const char *numeric);
 void crdt_chan_remove(struct CrdtNetworkState *st, const char *chan,
                       const char *numeric, uint8_t priority);
+/** Phase 3i: op-recording add/remove of a +b/+e mask in a channel's bans/excepts
+ *  OR-Set (is_except selects the list). Unlike a direct crdt_orset_add, these
+ *  record a CRDT_OP so the change replicates via delta sync (not only snapshot). */
+void crdt_chan_ban_add(struct CrdtNetworkState *st, const char *chan,
+                       const char *mask, int is_except);
+void crdt_chan_ban_remove(struct CrdtNetworkState *st, const char *chan,
+                          const char *mask, uint8_t priority, int is_except);
 void crdt_server_set(struct CrdtNetworkState *st, uint16_t numeric,
                      enum CrdtServerState state);
 /** SQUIT — one LWW write, zero membership tombstones (proposal §17.3.2). */

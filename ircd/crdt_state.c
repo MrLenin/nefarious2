@@ -273,6 +273,58 @@ void crdt_chan_remove(struct CrdtNetworkState *st, const char *chan,
   }
 }
 
+/* Phase 3i: op-recording ban/except add/remove (mirrors crdt_chan_join/remove,
+ * but on the bans/excepts OR-Set so steady-state +b/-b replicate via delta sync
+ * — a direct crdt_orset_add records no op and only replicates via snapshot). */
+void crdt_chan_ban_add(struct CrdtNetworkState *st, const char *chan,
+                       const char *mask, int is_except)
+{
+  uint64_t seq = st->next_seq++;
+  struct CrdtTag tag = { st->my_numeric, seq };
+  struct CrdtChannel *ch = crdt_state_channel(st, chan, 1);
+  struct CrdtORSet *set = is_except ? &ch->excepts : &ch->bans;
+  enum CrdtCollection coll = is_except ? CRDT_COLL_CHAN_EXCEPTS : CRDT_COLL_CHAN_BANS;
+  uint32_t klen = (uint32_t)strlen(mask);
+  uint32_t clen = (uint32_t)strlen(chan);
+  struct CrdtOp *op;
+  crdt_orset_add(set, mask, klen, tag);
+  op = op_new(st->my_numeric, seq, CRDT_OP_ADD, coll);
+  op->chan = memdup(chan, clen);
+  op->chan_len = clen;
+  op->key = memdup(mask, klen);
+  op->key_len = klen;
+  op->tag = tag;
+  record(st, op);
+}
+
+void crdt_chan_ban_remove(struct CrdtNetworkState *st, const char *chan,
+                          const char *mask, uint8_t priority, int is_except)
+{
+  struct CrdtChannel *ch = crdt_state_channel(st, chan, 0);
+  struct CrdtORSet *set;
+  enum CrdtCollection coll;
+  struct CrdtTag removed[64];
+  uint32_t klen, clen;
+  int n, i;
+  if (!ch) return;
+  set = is_except ? &ch->excepts : &ch->bans;
+  coll = is_except ? CRDT_COLL_CHAN_EXCEPTS : CRDT_COLL_CHAN_BANS;
+  klen = (uint32_t)strlen(mask);
+  clen = (uint32_t)strlen(chan);
+  n = crdt_orset_remove(set, mask, klen, priority, removed, 64);
+  for (i = 0; i < n; i++) {
+    uint64_t seq = st->next_seq++;
+    struct CrdtOp *op = op_new(st->my_numeric, seq, CRDT_OP_REMOVE, coll);
+    op->chan = memdup(chan, clen);
+    op->chan_len = clen;
+    op->key = memdup(mask, klen);
+    op->key_len = klen;
+    op->tag = removed[i];
+    op->priority = priority;
+    record(st, op);
+  }
+}
+
 void crdt_server_set(struct CrdtNetworkState *st, uint16_t numeric,
                      enum CrdtServerState state)
 {
@@ -428,6 +480,15 @@ void crdt_state_apply_op(struct CrdtNetworkState *st, const struct CrdtOp *op)
       crdt_orset_merge_add(&ch->members, op->key, op->key_len, op->tag);
     else
       crdt_orset_merge_remove(&ch->members, op->tag, op->priority);
+  } else if (op->coll == CRDT_COLL_CHAN_BANS ||
+             op->coll == CRDT_COLL_CHAN_EXCEPTS) {   /* Phase 3i ban/except OR-Sets */
+    struct CrdtChannel *ch = chan_get(st, op->chan, op->chan_len, 1);
+    struct CrdtORSet *set = (op->coll == CRDT_COLL_CHAN_EXCEPTS) ? &ch->excepts
+                                                                 : &ch->bans;
+    if (op->type == CRDT_OP_ADD)
+      crdt_orset_merge_add(set, op->key, op->key_len, op->tag);
+    else
+      crdt_orset_merge_remove(set, op->tag, op->priority);
   } else {
     struct CrdtLWWMap *map = lww_for(st, op->coll);
     if (op->type == CRDT_OP_SET)

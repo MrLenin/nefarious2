@@ -19,6 +19,7 @@
 #include "list.h"            /* make_client / add_client_to_list (3c materialize) */
 #include "struct.h"          /* struct User (cli_user(c)->server) */
 #include "ircd.h"           /* GlobalClientList, me, TStime */
+#include "ircd_alloc.h"     /* MyMalloc/DupString (3i ban-mask dup) */
 #include "ircd_events.h"
 #include "ircd_features.h"
 #include "ircd_log.h"
@@ -312,38 +313,37 @@ static void crdt_collect_cb(const char *key, uint32_t key_len, void *ctx)
   }
 }
 
-/** Bring an OR-Set into line with a channel's real Ban list (add new masks,
- *  remove masks no longer present). */
-static void reconcile_list(struct CrdtORSet *set, struct Ban *list)
+/** Bring a channel's bans/excepts OR-Set into line with its real Ban list (add
+ *  new masks, remove masks no longer present). Uses the op-recording
+ *  crdt_chan_ban_add/remove (NOT a direct crdt_orset_add) so steady-state +b/-b
+ *  replicate via delta sync, not only via the full snapshot (Phase 3i). */
+static void reconcile_list(const char *chan, int is_except, struct Ban *list)
 {
+  struct CrdtChannel *cc = crdt_state_channel(&g_crdt, chan, 1);
+  struct CrdtORSet *set = is_except ? &cc->excepts : &cc->bans;
   struct Ban *b;
-  struct crdt_collect_ctx cc;
+  struct crdt_collect_ctx col;
   int i;
   for (b = list; b; b = b->next) {
     uint32_t len = (uint32_t)strlen(b->banstr);
-    if (!crdt_orset_contains(set, b->banstr, len)) {
-      struct CrdtTag tag = { g_crdt.my_numeric, ++g_crdt.next_seq };
-      crdt_orset_add(set, b->banstr, len, tag);
-    }
+    if (!crdt_orset_contains(set, b->banstr, len))
+      crdt_chan_ban_add(&g_crdt, chan, b->banstr, is_except);
   }
-  cc.n = 0;
-  crdt_orset_foreach(set, crdt_collect_cb, &cc);
-  for (i = 0; i < cc.n; i++)
-    if (!mask_in_banlist(list, cc.masks[i]))
-      crdt_orset_remove(set, cc.masks[i], (uint32_t)strlen(cc.masks[i]),
-                        CRDT_PRIORITY_USER, NULL, 0);
+  col.n = 0;
+  crdt_orset_foreach(set, crdt_collect_cb, &col);
+  for (i = 0; i < col.n; i++)
+    if (!mask_in_banlist(list, col.masks[i]))
+      crdt_chan_ban_remove(&g_crdt, chan, col.masks[i], CRDT_PRIORITY_USER, is_except);
 }
 
 void crdt_shadow_lists(struct Channel *chptr, struct Client *from)
 {
-  struct CrdtChannel *cc;
   if (!shadow_on() || !chptr)
     return;
   if (from_crdt_peer(from))            /* single-writer: peer owns this op */
     return;
-  cc = crdt_state_channel(&g_crdt, chptr->chname, 1);
-  reconcile_list(&cc->bans, chptr->banlist);
-  reconcile_list(&cc->excepts, chptr->exceptlist);
+  reconcile_list(chptr->chname, 0, chptr->banlist);
+  reconcile_list(chptr->chname, 1, chptr->exceptlist);
   crdt_sync_push();                    /* eager-propagate to CRDT peers */
 }
 
@@ -1078,6 +1078,96 @@ void crdt_shadow_reconcile_member_status(void)
               "CRDT member-status-reconcile: drove %u member(s) from doc", changed);
 }
 
+/* ---- Phase 3i: channel BANS/EXCEPTS (+b/+e) via CRDT + §17.7 gateway ----
+ * Drive live ban/except lists FROM the doc bans/excepts OR-Sets + bridge to legacy.
+ * ADD (3f pattern) for present-not-live masks; tombstone-gated REMOVE (3g pattern,
+ * crdt_orset_is_explicitly_removed) for live masks the doc explicitly removed. Both
+ * directions are suppressed to CRDT peers (channel.c modebuf_is_crdt_only), so there
+ * is no P10-fast/CRDT-slow skew. modebuf_flush_nomirror skips crdt_shadow_lists →
+ * no re-mirror loop. The doc OR-Set key == the live Ban->banstr (both normalized via
+ * pretty_extmask before storage), so make_ban(key)/mask_in_banlist are idempotent. */
+
+struct reconcile_ban_ctx { struct Ban **livehead; unsigned int modeflag;
+                           struct ModeBuf *mbuf; unsigned int *changed; };
+
+static void reconcile_ban_add_cb(const char *key, uint32_t key_len, void *ctx)
+{
+  struct reconcile_ban_ctx *c = ctx;
+  char mask[CRDT_MASKLEN];
+  uint32_t l = key_len < CRDT_MASKLEN - 1 ? key_len : CRDT_MASKLEN - 1;
+  struct Ban *nb;
+  char *dup;
+  memcpy(mask, key, l); mask[l] = '\0';
+  if (mask_in_banlist(*c->livehead, mask))   /* already live — echo guard / idempotent */
+    return;
+  nb = make_ban(mask);
+  if (!nb)
+    return;
+  ircd_strncpy(nb->who, "*", sizeof nb->who);
+  nb->when = TStime();
+  nb->next = *c->livehead;
+  *c->livehead = nb;
+  DupString(dup, mask);                       /* modebuf frees it (free=1) post-flush */
+  modebuf_mode_string(c->mbuf, MODE_ADD | c->modeflag, dup, 1);
+  (*c->changed)++;
+}
+
+static void reconcile_one_banlist(struct CrdtORSet *docset, struct Ban **livehead,
+                                  unsigned int modeflag, struct ModeBuf *mbuf,
+                                  unsigned int *changed)
+{
+  struct reconcile_ban_ctx ctx;
+  struct Ban **pp;
+  ctx.livehead = livehead; ctx.modeflag = modeflag; ctx.mbuf = mbuf; ctx.changed = changed;
+  /* ADD: doc-present masks not yet live (foreach yields present-only) */
+  crdt_orset_foreach(docset, reconcile_ban_add_cb, &ctx);
+  /* REMOVE: live masks the doc has EXPLICITLY tombstoned (never on mere absence).
+   * pointer-to-pointer unlink idiom — no destruct hazard (bans don't empty channels). */
+  pp = livehead;
+  while (*pp) {
+    struct Ban *b = *pp;
+    if (crdt_orset_is_explicitly_removed(docset, b->banstr, (uint32_t)strlen(b->banstr))) {
+      char *dup;
+      DupString(dup, b->banstr);
+      modebuf_mode_string(mbuf, MODE_DEL | modeflag, dup, 1);
+      *pp = b->next;
+      free_ban(b);
+      (*changed)++;
+    } else {
+      pp = &b->next;
+    }
+  }
+}
+
+void crdt_shadow_reconcile_bans(void)
+{
+  unsigned int changed = 0;
+  int bk;
+  if (!shadow_on() || !feature_bool(FEAT_CRDT_PRIMARY))
+    return;
+  for (bk = 0; bk < CRDT_CHAN_BUCKETS; bk++) {
+    struct CrdtChannel *dc;
+    for (dc = g_crdt.chan_buckets[bk]; dc; dc = dc->next) {
+      char nbuf[CHANNELLEN + 1];
+      struct Channel *chptr;
+      struct ModeBuf mbuf;
+      if (dc->name_len >= sizeof nbuf)
+        continue;
+      memcpy(nbuf, dc->name, dc->name_len); nbuf[dc->name_len] = '\0';
+      chptr = FindChannel(nbuf);
+      if (!chptr)
+        continue;                            /* never create a channel here */
+      modebuf_init(&mbuf, &me, NULL, chptr, MODEBUF_DEST_CHANNEL | MODEBUF_DEST_SERVER);
+      reconcile_one_banlist(&dc->bans, &chptr->banlist, MODE_BAN, &mbuf, &changed);
+      reconcile_one_banlist(&dc->excepts, &chptr->exceptlist, MODE_EXCEPT, &mbuf, &changed);
+      modebuf_flush_nomirror(&mbuf);
+    }
+  }
+  if (changed)
+    log_write(LS_SYSTEM, L_NOTICE, 0,
+              "CRDT ban-reconcile: drove %u ban/except change(s) from doc", changed);
+}
+
 /* ---- Phase 3f: channel MEMBERSHIP (JOIN-add) via CRDT + §17.7 gateway ----
  * Drive live channel membership FROM the doc (a JOIN that propagated over CRDT,
  * not P10) and bridge it to the legacy P10 tree. Send-side suppression of the
@@ -1404,6 +1494,7 @@ static void crdt_shadow_verify_cb(struct Event *ev)
   crdt_shadow_reconcile_members(); /* Phase 3f: same for channel membership (JOIN-add) */
   crdt_shadow_reconcile_removes(); /* Phase 3g: membership remove (PART / delete-on-leave) */
   crdt_shadow_reconcile_member_status(); /* Phase 3h: per-member status (+o/+v/+h) */
+  crdt_shadow_reconcile_bans();    /* Phase 3i: channel bans/excepts (+b/+e) */
   crdt_sync_broadcast();   /* periodic anti-entropy: pull deltas from peers */
   crdt_shadow_gc();        /* reclaim causally-stable ops/tombstones */
 }

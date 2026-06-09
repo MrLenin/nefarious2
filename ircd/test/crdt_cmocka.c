@@ -313,6 +313,43 @@ static void test_orset_explicit_removal_gate(void **state)
 }
 
 /* ================================================================== */
+/* Phase 3i: ban/except OR-Set ops replicate via DELTA sync (not just snapshot).
+ * Guards against the regression where crdt_shadow_lists used a direct
+ * crdt_orset_add (no op) so steady-state +b/-b never reached peers. */
+static void test_chan_ban_op_replicates(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s1, s2;
+  const char *B = "bad!*@*.evil", *E = "ok!*@*.good";
+  crdt_state_init(&s1, 1);
+  crdt_state_init(&s2, 2);
+
+  /* +b on s1 -> delta sync -> s2 has it in bans */
+  crdt_chan_ban_add(&s1, "#c", B, 0);
+  crdt_state_sync(&s2, &s1);
+  assert_int_equal(1, crdt_orset_contains(&crdt_state_channel(&s2, "#c", 0)->bans,
+                                          B, (uint32_t)strlen(B)));
+  /* +e on s1 -> goes to excepts, NOT bans */
+  crdt_chan_ban_add(&s1, "#c", E, 1);
+  crdt_state_sync(&s2, &s1);
+  assert_int_equal(1, crdt_orset_contains(&crdt_state_channel(&s2, "#c", 0)->excepts,
+                                          E, (uint32_t)strlen(E)));
+  assert_int_equal(0, crdt_orset_contains(&crdt_state_channel(&s2, "#c", 0)->bans,
+                                          E, (uint32_t)strlen(E)));
+  /* -b on s1 -> delta sync -> s2 removes it */
+  crdt_chan_ban_remove(&s1, "#c", B, CRDT_PRIORITY_USER, 0);
+  crdt_state_sync(&s2, &s1);
+  assert_int_equal(0, crdt_orset_contains(&crdt_state_channel(&s2, "#c", 0)->bans,
+                                          B, (uint32_t)strlen(B)));
+  /* the except is untouched */
+  assert_int_equal(1, crdt_orset_contains(&crdt_state_channel(&s2, "#c", 0)->excepts,
+                                          E, (uint32_t)strlen(E)));
+
+  crdt_state_clear(&s1);
+  crdt_state_clear(&s2);
+}
+
+/* ================================================================== */
 /* Scenario E — SQUIT as server-state transition (no tombstone storm) */
 /* ================================================================== */
 
@@ -945,6 +982,7 @@ int main(void)
     cmocka_unit_test(test_C_kick_beats_concurrent_join),
     cmocka_unit_test(test_C_part_yields_to_concurrent_join),
     cmocka_unit_test(test_orset_explicit_removal_gate),
+    cmocka_unit_test(test_chan_ban_op_replicates),
     cmocka_unit_test(test_E_squit_creates_no_membership_tombstones),
     cmocka_unit_test(test_wire_sv_roundtrip),
     cmocka_unit_test(test_wire_delta_converges),

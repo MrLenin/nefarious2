@@ -107,6 +107,12 @@ void crdt_shadow_reconcile_removes(void);
  *  Echo-guarded; skips not-yet-materialized members. No-op unless FEAT_CRDT_PRIMARY. */
 void crdt_shadow_reconcile_member_status(void);
 
+/** Phase 3i: drive live channel bans/excepts (+b/+e) from the doc bans/excepts
+ *  OR-Sets + §17.7 gateway. ADD present-not-live masks (3f), tombstone-gated REMOVE
+ *  of live masks the doc explicitly removed (3g, crdt_orset_is_explicitly_removed);
+ *  emits via modebuf_flush_nomirror (local + legacy only). No-op unless FEAT_CRDT_PRIMARY. */
+void crdt_shadow_reconcile_bans(void);
+
 /* ---- Phase 2 wire-sync accessors (used by m_crdt.c) ----
  * These expose the shadow document to the CR token handlers while keeping the
  * CrdtNetworkState itself private to this module. */
