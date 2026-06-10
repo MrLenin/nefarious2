@@ -2045,7 +2045,10 @@ doprintf(struct Client *dest, struct BufData *buf_p, const char *fmt,
 
       /* &me is used if it's not a definite server */
       if (dest && (IsServer(dest) || IsMe(dest))) {
-	if (IsServer(cptr) || IsMe(cptr))
+	/* Tier2: a STAT_MESH_SERVER stub IS a server (cli_serv set, cli_user==NULL);
+	 * IsServer is exact ==STAT_SERVER so guard it explicitly here, else the else
+	 * branch derefs cli_user(stub)->server (NULL) -> SIGSEGV. */
+	if (IsServer(cptr) || IsMe(cptr) || IsMeshStub(cptr))
 	  str1 = cli_yxx(cptr);
 	else {
 	  str1 = cli_yxx(cli_user(cptr)->server);
@@ -2054,7 +2057,7 @@ doprintf(struct Client *dest, struct BufData *buf_p, const char *fmt,
 	fld_s.flags &= ~(FLAG_ALT | FLAG_COLON);
       } else {
 	str1 = *cli_name(cptr) ? cli_name(cptr) : "*";
-	if (!IsServer(cptr) && !IsMe(cptr) && fld_s.flags & FLAG_ALT) {
+	if (!IsServer(cptr) && !IsMe(cptr) && !IsMeshStub(cptr) && fld_s.flags & FLAG_ALT) {
 	  assert(0 != cli_user(cptr));
 	  assert(0 != *(cli_name(cptr)));
 	  str2 = cli_user(cptr)->username;

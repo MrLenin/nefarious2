@@ -116,6 +116,18 @@ static int from_crdt_peer(struct Client *from)
          && IsCrdtAware(from);
 }
 
+/* Tier2 P1: true if @a u is a "mesh-only" user — its owning server is a
+ * STAT_MESH_SERVER stub (tree-departed but mesh-reachable).  Such a user exists
+ * only in the CRDT layer here; legacy (non-CRDT) peers already received the SQUIT
+ * for its server, so the §17.7 legacy gateway emits (NICK/JOIN/PART/KICK) MUST be
+ * skipped for it — it propagates to other CRDT-mesh servers via the doc, and the
+ * real P10 introduction returns when its server relinks. */
+static int crdt_user_is_mesh_only(struct Client *u)
+{
+  return u && cli_user(u) && cli_user(u)->server
+         && IsMeshStub(cli_user(u)->server);
+}
+
 /** Build the full P10 numeric ("YYXXX") for a user into @a buf. */
 static const char *user_numeric(struct Client *who, char *buf, size_t n)
 {
@@ -1003,17 +1015,19 @@ static struct Client *crdt_materialize_one_user(const char *key, uint32_t key_le
   rec = (const struct CrdtUserRecord *)val->data;
   srvnum[0] = numbuf[0]; srvnum[1] = numbuf[1]; srvnum[2] = '\0';
   srv = FindNServer(srvnum);
-  if (!srv || !IsServer(srv))             /* owning server not a live tree server:
-                                             skip-and-retry on the next pass.
-     Tier2 NB: do NOT materialize onto a STAT_MESH_SERVER stub.  A stub's
-     Connection is a dead/socket_del'd sink — make_client(cli_from(stub)) on it
-     crashes.  It is also unnecessary: existing remote users are KEPT live by the
-     stub conversion (not re-materialized), and a message from a split-born user is
-     delivered with its source prefix reconstructed from the doc
-     (crdt_shadow_user_record), not from a live source Client.  So new
-     split-born users simply don't appear here until relink — acceptable; the doc
-     still has them.  (Phase 4c: this FindNServer+IsServer guard is the local
-     SPLIT-iff-unreachable gate; reachability is per-viewpoint, not replicated.) */
+  if (!srv || (!IsServer(srv) && !IsMeshStub(srv)))
+    /* owning server unreachable via any transport: skip-and-retry next pass.
+       Tier2 P1: a STAT_MESH_SERVER stub (tree-departed but mesh-reachable) IS a
+       valid materialize parent — make_client(cli_from(stub)) shares the stub's
+       dead-sink Connection (fd=-1; every send path skips a dead/fd<0 parent, so
+       nothing writes the dead socket), and the stub keeps cli_serv/cli_yxx.  This
+       admits SPLIT-BORN users (connected to the partitioned server during the
+       split) so they are visible + addressable on every mesh server.  The Q1
+       spike (2026-06-10) proved the old crash was NOT here but in the §17.7
+       gateway re-intro emitting a NICK with the stub as %C source — that is now
+       skipped for mesh-only users (crdt_user_is_mesh_only) and %C treats a stub
+       as a server.  On relink crdt_shadow_retire_mesh_stub reaps these users
+       (they are in cli_serv(stub)->client_list) before the real numeric returns. */
     return NULL;
   nc = make_client(cli_from(srv), STAT_UNKNOWN);
   if (!nc)
@@ -1214,6 +1228,10 @@ static void crdt_gateway_user_intro(struct Client *nc)
   const char *um;
   struct Client *srv = cli_user(nc)->server;
   if (!srv)
+    return;
+  if (IsMeshStub(srv))    /* Tier2 P1: a mesh-only user is NOT announced to legacy
+                             P10 — those peers already SQUIT'd its server; it rides
+                             the CRDT doc and the real NICK returns on relink. */
     return;
   um = umode_str(nc);
   sendcmdto_flag_serv_butone(srv, CMD_NICK, NULL,
@@ -1795,9 +1813,12 @@ static void reconcile_member_cb(const char *key, uint32_t key_len, void *ctx)
                                          CAP_EXTJOIN, CAP_NONE, "%H %s :%s", c->chptr,
                                          IsAccount(u) ? cli_account(u) : "*", cli_info(u));
   /* §17.7 GATEWAY: re-emit JOIN onto legacy P10 servers only (forbid CRDT-aware —
-   * they already have it via CRDT). A no-op on a leaf with no legacy peers. */
-  sendcmdto_flag_serv_butone(u, CMD_JOIN, NULL, FLAG_LAST_FLAG, FLAG_CRDT_AWARE,
-                             "%H %Tu", c->chptr, c->chptr->creationtime);
+   * they already have it via CRDT). A no-op on a leaf with no legacy peers.
+   * Tier2 P1: skip for a mesh-only joiner — legacy SQUIT'd its server and never got
+   * its NICK, so a JOIN would reference an unknown user. */
+  if (!crdt_user_is_mesh_only(u))
+    sendcmdto_flag_serv_butone(u, CMD_JOIN, NULL, FLAG_LAST_FLAG, FLAG_CRDT_AWARE,
+                               "%H %Tu", c->chptr, c->chptr->creationtime);
   (*c->changed)++;
 }
 
@@ -1888,19 +1909,25 @@ void crdt_shadow_reconcile_removes(void)
           int is_kick = kv && kv->data &&
                         kv->data_len == sizeof(struct CrdtKickInfo) &&
                         (!mv || hlc_compare(&kv->ts, &mv->ts) > 0);
+          /* Tier2 P1: a mesh-only victim was never NICK'd to legacy peers (they
+           * SQUIT'd its server), so skip the §17.7 legacy KICK/PART for it — local
+           * clients still get the notify; CRDT peers handle it via the doc. */
+          int victim_mesh_only = crdt_user_is_mesh_only(victim);
           if (is_kick) {
             const struct CrdtKickInfo *ki = (const struct CrdtKickInfo *)kv->data;
             struct Client *kicker = ki->kicker[0] ? findNUser(ki->kicker) : NULL;
             struct Client *from = kicker ? kicker : &me;   /* fall back to server-kick */
             sendcmdto_channel_butserv_butone(from, CMD_KICK, chptr, NULL, 0,
                                              "%H %C :%s", chptr, victim, ki->reason);
-            sendcmdto_flag_serv_butone(from, CMD_KICK, NULL, FLAG_LAST_FLAG,
-                                       FLAG_CRDT_AWARE, "%H %C :%s", chptr, victim,
-                                       ki->reason);
+            if (!victim_mesh_only)
+              sendcmdto_flag_serv_butone(from, CMD_KICK, NULL, FLAG_LAST_FLAG,
+                                         FLAG_CRDT_AWARE, "%H %C :%s", chptr, victim,
+                                         ki->reason);
           } else {
             sendcmdto_channel_butserv_butone(victim, CMD_PART, chptr, NULL, 0, "%H", chptr);
-            sendcmdto_flag_serv_butone(victim, CMD_PART, NULL, FLAG_LAST_FLAG,
-                                       FLAG_CRDT_AWARE, "%H", chptr);
+            if (!victim_mesh_only)
+              sendcmdto_flag_serv_butone(victim, CMD_PART, NULL, FLAG_LAST_FLAG,
+                                         FLAG_CRDT_AWARE, "%H", chptr);
           }
         }
         remove_user_from_channel(victim, chptr);   /* chptr may be freed here */
