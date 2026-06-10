@@ -458,6 +458,28 @@ void crdt_server_relink(struct CrdtNetworkState *st, uint16_t numeric)
   crdt_server_set(st, numeric, CRDT_SRV_ACTIVE);
 }
 
+void crdt_state_resume_seq(struct CrdtNetworkState *st)
+{
+  /* After adopting a peer's snapshot/delta (which raises local_sv to the peer's
+   * view), resume our own op-seq ABOVE that floor.  A process restart resets
+   * next_seq to 1 while peers still remember our pre-restart seq; without this,
+   * our post-restart ops carry already-seen seqs and peers dedup them via
+   * crdt_sv_has_seen, dropping them forever.  Idempotent; never lowers next_seq. */
+  uint64_t seen = st->local_sv.seq[st->my_numeric];
+  if (seen >= st->next_seq)
+    st->next_seq = seen + 1;
+}
+
+int crdt_server_state(const struct CrdtNetworkState *st, uint16_t numeric)
+{
+  char key[8];
+  uint32_t klen = server_key(numeric, key, sizeof key);
+  const struct CrdtLWWValue *sv = crdt_lwwmap_get(&st->servers, key, klen);
+  if (!sv)
+    return -1;   /* absent */
+  return (int)((const struct CrdtServerRecord *)sv->data)->state;  /* ACTIVE/SPLIT */
+}
+
 void crdt_topic_set(struct CrdtNetworkState *st, const char *chan,
                     const char *topic)
 {

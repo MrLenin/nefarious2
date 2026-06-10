@@ -252,6 +252,13 @@ void crdt_server_set(struct CrdtNetworkState *st, uint16_t numeric,
 /** SQUIT — one LWW write, zero membership tombstones (proposal §17.3.2). */
 void crdt_server_squit(struct CrdtNetworkState *st, uint16_t numeric);
 void crdt_server_relink(struct CrdtNetworkState *st, uint16_t numeric);
+/** Resume our own op-seq above the adopted local_sv floor after applying a peer
+ *  snapshot/delta — so a restarted server (next_seq reset, peers remembering its
+ *  old seq) does not mint already-seen seqs that peers dedup.  Idempotent. */
+void crdt_state_resume_seq(struct CrdtNetworkState *st);
+/** Current doc state of server @a numeric: CRDT_SRV_ACTIVE (0), CRDT_SRV_SPLIT
+ *  (1), or -1 if absent.  Used by the single-writer self-ACTIVE assert. */
+int crdt_server_state(const struct CrdtNetworkState *st, uint16_t numeric);
 /** Set a channel topic (LWW). Records a SET op so it replicates. */
 void crdt_topic_set(struct CrdtNetworkState *st, const char *chan,
                     const char *topic);

@@ -204,6 +204,7 @@ int crdt_delta_apply(struct CrdtNetworkState *st,
     }
     crdt_op_free_fields(&op);
   }
+  crdt_state_resume_seq(st);   /* resume our seq past any adopted SV (restart epoch) */
   return applied;
 }
 
@@ -452,6 +453,7 @@ int crdt_snapshot_apply(struct CrdtNetworkState *st,
    * by the merge semantics; crdt_sv_update never lowers) */
   for (i = 0; i < CRDT_MAX_SERVERS; i++)
     crdt_sv_update(&st->local_sv, (uint16_t)i, snap_sv.seq[i]);
+  crdt_state_resume_seq(st);   /* resume our seq past the adopted SV (restart epoch) */
 
   return 0;
 }

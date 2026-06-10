@@ -279,32 +279,44 @@ void crdt_shadow_user_remove(struct Client *cptr)
   crdt_sync_push();                    /* eager-propagate to CRDT peers */
 }
 
-/* Phase 4a: servers-map producers (SQUIT-as-SPLIT, proposal §17.3).
+/* Phase 4a: servers-map producers (SQUIT-as-SPLIT, proposal §17.3) — SINGLE-WRITER.
  *
- * UNLIKE every other producer, these are NOT single-writer-gated by
- * from_crdt_peer: a server cannot write its OWN ACTIVE/SPLIT state (the squitted
- * server is gone), so the OBSERVING server writes it, resolved by LWW+HLC.  The
- * writer is kept near-unique by the direct-uplink rule: server_estab fires on
- * BOTH ends of every direct CRDT link (so each server's state is written by its
- * direct peer), and the SQUIT producer only fires for a DIRECT peer
- * (cli_serv->up == &me).  So in a P10 tree each server's state has effectively
- * one writer (its uplink) -> no oscillation, clean convergence.
+ * Each server owns its OWN entry and writes my_numeric->ACTIVE (self-assert),
+ * mirroring the single-writer model used for users/channels.  This is what makes
+ * the servers map converge cleanly: no two servers ever compete to write the
+ * same entry.  (The earlier multi-writer design — every peer writing the hub's
+ * ACTIVE via server_estab — diverged in the HLC/writer-sensitive digest, since
+ * different replicas kept different winning writes.)  The squitted peer can't
+ * write its own SPLIT, so its DIRECT uplink records peer->SPLIT (single observer
+ * writer, gated on cli_serv->up == &me); on relink the peer re-asserts ACTIVE
+ * (a fresh HLC beats that SPLIT).  next_seq is wall-clock-seeded
+ * (crdt_shadow_init) and lifted by crdt_state_resume_seq, so a restarted
+ * server's self-ACTIVE is not deduped by peers' stale state vectors.
  *
  * NB: SPLIT tracks P10-routability (it gates materialization — a SPLIT server's
  * users are not built into live Clients).  A CR-only overlay does NOT make a
  * server P10-routable, so it does NOT suppress SPLIT; the overlay's role is to
  * keep the DOC converged during the split (CR ops keep flowing), which makes the
- * eventual relink reburst-free.  (Redundant P10 CRDT paths that could keep a
- * server routable after one link dies do not exist in a P10 tree; that is a
- * Tier-2 mesh-routing concern.) */
-void crdt_shadow_server_add(struct Client *srv)
+ * eventual relink reburst-free. */
+static void crdt_assert_self_active(void)
 {
   if (!shadow_on() || !feature_bool(FEAT_CRDT_PRIMARY))
     return;
-  if (!srv || !IsServer(srv) || !IsCrdtAware(srv) || !cli_yxx(srv)[0])
+  /* write only when our own entry is not already ACTIVE: the initial assert, or
+   * a RE-assert after a peer marked us SPLIT and we relinked (the relink's fresh
+   * HLC must beat that SPLIT).  No churn in steady state (the guard short-circuits). */
+  if (crdt_server_state(&g_crdt, g_crdt.my_numeric) == CRDT_SRV_ACTIVE)
     return;
-  crdt_server_set(&g_crdt, (uint16_t)base64toint(cli_yxx(srv)), CRDT_SRV_ACTIVE);
+  crdt_server_set(&g_crdt, g_crdt.my_numeric, CRDT_SRV_ACTIVE);
   crdt_sync_push();                    /* eager-propagate to CRDT peers */
+}
+
+void crdt_shadow_server_add(struct Client *srv)
+{
+  /* a CRDT peer linked — trigger to (re-)assert OUR OWN ACTIVE. */
+  if (!srv || !IsServer(srv) || !IsCrdtAware(srv))
+    return;
+  crdt_assert_self_active();
 }
 
 void crdt_shadow_server_squit(struct Client *srv)
@@ -313,10 +325,10 @@ void crdt_shadow_server_squit(struct Client *srv)
     return;
   if (!srv || !IsServer(srv) || !IsCrdtAware(srv) || !cli_yxx(srv)[0])
     return;
-  /* direct peer only (its uplink is us): the direct uplink owns the peer's
-   * server-state, so only it writes SPLIT.  A relayed SQUIT (cli_serv->up != &me)
-   * is the squitting hub's job to record.  cli_serv->up survives close_connection
-   * (which has already run by the exit_client SQUIT branch), unlike MyConnect. */
+  /* direct peer only (its uplink is us): the direct uplink owns recording the
+   * peer's SPLIT.  A relayed SQUIT (cli_serv->up != &me) is the squitting hub's
+   * job to record.  cli_serv->up survives close_connection (already run by the
+   * exit_client SQUIT branch), unlike MyConnect. */
   if (!cli_serv(srv) || cli_serv(srv)->up != &me)
     return;
   crdt_server_squit(&g_crdt, (uint16_t)base64toint(cli_yxx(srv)));
@@ -2000,6 +2012,11 @@ static void crdt_shadow_verify_cb(struct Event *ev)
 {
   if (ev_type(ev) != ET_EXPIRE)
     return;
+  /* Phase 4a: (re-)assert our own server -> ACTIVE.  Robust post-sync re-assert
+   * for the case where a peer marked us SPLIT and the SPLIT reached our doc only
+   * AFTER server_estab's immediate assert ran (e.g. via a relink snapshot).  A
+   * no-op once our entry is ACTIVE. */
+  crdt_assert_self_active();
   crdt_shadow_verify();
   crdt_shadow_materialize_check();  /* Phase 3b dry-run: doc -> live fidelity */
   /* Phase 3l: create+gateway users BEFORE materialize_live (the bulk path creates
@@ -2039,6 +2056,18 @@ void crdt_shadow_init(uint16_t my_numeric)
   if (g_inited)
     return;
   crdt_state_init(&g_crdt, my_numeric);
+  /* Restart-epoch defense: seed next_seq from the wall clock (ms) so a restarted
+   * server's freshly-reset op sequence never reuses seqs from a previous
+   * incarnation that peers still remember in their state vectors (which would
+   * dedup the post-restart ops via crdt_sv_has_seen).  crdt_state_resume_seq()
+   * additionally lifts next_seq past any SV adopted from a peer snapshot/delta.
+   * (Engine crdt_state_init keeps next_seq=1 so the cmocka suite stays
+   * deterministic; the wall-clock seed is a live-integration concern.) */
+  {
+    struct HLC seed = hlc_local_event(&g_crdt.clock);
+    if (seed.physical_ms > g_crdt.next_seq)
+      g_crdt.next_seq = seed.physical_ms;
+  }
   g_inited = 1;
   timer_add(timer_init(&g_verify_timer), crdt_shadow_verify_cb, 0,
             TT_PERIODIC, CRDT_VERIFY_INTERVAL);

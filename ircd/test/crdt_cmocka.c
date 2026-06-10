@@ -534,6 +534,52 @@ static void test_server_state_converges(void **state)
   crdt_state_clear(&s2);
 }
 
+/* Phase 4a follow-up: a process restart resets next_seq to 1, but peers still
+ * remember the restarted server's pre-restart state vector.  When the restarted
+ * server adopts a peer snapshot (raising its local_sv to the peer's view of its
+ * OLD seq), it must RESUME minting above that floor — else its post-restart ops
+ * carry already-seen seqs and peers dedup them via crdt_sv_has_seen, dropping
+ * them forever (a persistent post-restart divergence). */
+static void test_restart_resumes_seq_past_adopted_sv(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s1, s2;
+  uint8_t buf[16384];
+  int n, applied, i;
+  struct CrdtUserRecord u = mkuser("a", 1, "a", 0x01010101);
+
+  crdt_state_init(&s1, 1);
+  crdt_state_init(&s2, 2);
+
+  /* s1 makes 5 ops; s2 receives them -> s2.local_sv[1] = 5 */
+  for (i = 0; i < 5; i++) {
+    char num[CRDT_NUMERICLEN];
+    snprintf(num, sizeof num, "U%03d", i);
+    crdt_user_set(&s1, num, &u);
+  }
+  n = crdt_delta_encode(&s1.oplog, &s2.local_sv, buf, sizeof buf);
+  crdt_delta_apply(&s2, buf, (size_t)n);
+
+  /* s1 "restarts": fresh state (next_seq back to 1), then adopts s2's snapshot
+   * (whose SV carries s1's OLD seq=5). */
+  crdt_state_clear(&s1);
+  crdt_state_init(&s1, 1);
+  n = crdt_snapshot_encode(&s2, buf, sizeof buf);
+  assert_true(crdt_snapshot_apply(&s1, buf, (size_t)n) >= 0);
+
+  /* A NEW post-restart op MUST carry a seq above s2's view of s1 (5), so s2
+   * applies it instead of deduping it. */
+  crdt_user_set(&s1, "NEW1", &u);
+  n = crdt_delta_encode(&s1.oplog, &s2.local_sv, buf, sizeof buf);
+  applied = crdt_delta_apply(&s2, buf, (size_t)n);
+  assert_true(applied >= 1);                     /* RED without crdt_state_resume_seq */
+  assert_non_null(crdt_user_get(&s2, "NEW1"));
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+
+  crdt_state_clear(&s1);
+  crdt_state_clear(&s2);
+}
+
 /* ================================================================== */
 /* Phase 2 — wire serialization round-trip                            */
 /* ================================================================== */
@@ -1197,6 +1243,7 @@ int main(void)
     cmocka_unit_test(test_kick_info_replicates_and_hlc_gates),
     cmocka_unit_test(test_E_squit_creates_no_membership_tombstones),
     cmocka_unit_test(test_server_state_converges),
+    cmocka_unit_test(test_restart_resumes_seq_past_adopted_sv),
     cmocka_unit_test(test_wire_sv_roundtrip),
     cmocka_unit_test(test_wire_delta_converges),
     cmocka_unit_test(test_wire_digest_converges),
