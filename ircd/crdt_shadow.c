@@ -100,10 +100,20 @@ static int shadow_on(void)
  *  region. A non-CRDT server bridging two CRDT islands makes each island's entry
  *  server a second writer for cross-bridge users (gateway case at both ends), so
  *  the re-mirror redundancy persists across that bridge. Phase 3d (hybrid
- *  gateway) formalizes the boundary. */
+ *  gateway) formalizes the boundary.
+ *
+ *  Tier2: a STAT_MESH_SERVER stub (a tree-departed-but-mesh-reachable CRDT peer,
+ *  crdt_shadow_convert_to_stub) counts as a peer too. Its held users belong to
+ *  the partitioned peer, which still owns them in the doc and replicates their
+ *  state over the mesh — so we must NOT re-mirror changes to them, including the
+ *  teardown in crdt_shadow_retire_mesh_stub (the stub keeps FLAG_CRDT_AWARE).
+ *  Without this, exit_one_client on a held user would mint a DELETE/PART
+ *  tombstone, breaking the retire's zero-tombstone contract and creating an
+ *  HLC-bearing divergence that SV-only anti-entropy cannot repair. */
 static int from_crdt_peer(struct Client *from)
 {
-  return from && from != &me && IsServer(from) && IsCrdtAware(from);
+  return from && from != &me && (IsServer(from) || IsMeshStub(from))
+         && IsCrdtAware(from);
 }
 
 /** Build the full P10 numeric ("YYXXX") for a user into @a buf. */
