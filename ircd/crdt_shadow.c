@@ -279,6 +279,50 @@ void crdt_shadow_user_remove(struct Client *cptr)
   crdt_sync_push();                    /* eager-propagate to CRDT peers */
 }
 
+/* Phase 4a: servers-map producers (SQUIT-as-SPLIT, proposal §17.3).
+ *
+ * UNLIKE every other producer, these are NOT single-writer-gated by
+ * from_crdt_peer: a server cannot write its OWN ACTIVE/SPLIT state (the squitted
+ * server is gone), so the OBSERVING server writes it, resolved by LWW+HLC.  The
+ * writer is kept near-unique by the direct-uplink rule: server_estab fires on
+ * BOTH ends of every direct CRDT link (so each server's state is written by its
+ * direct peer), and the SQUIT producer only fires for a DIRECT peer
+ * (cli_serv->up == &me).  So in a P10 tree each server's state has effectively
+ * one writer (its uplink) -> no oscillation, clean convergence.
+ *
+ * NB: SPLIT tracks P10-routability (it gates materialization — a SPLIT server's
+ * users are not built into live Clients).  A CR-only overlay does NOT make a
+ * server P10-routable, so it does NOT suppress SPLIT; the overlay's role is to
+ * keep the DOC converged during the split (CR ops keep flowing), which makes the
+ * eventual relink reburst-free.  (Redundant P10 CRDT paths that could keep a
+ * server routable after one link dies do not exist in a P10 tree; that is a
+ * Tier-2 mesh-routing concern.) */
+void crdt_shadow_server_add(struct Client *srv)
+{
+  if (!shadow_on() || !feature_bool(FEAT_CRDT_PRIMARY))
+    return;
+  if (!srv || !IsServer(srv) || !IsCrdtAware(srv) || !cli_yxx(srv)[0])
+    return;
+  crdt_server_set(&g_crdt, (uint16_t)base64toint(cli_yxx(srv)), CRDT_SRV_ACTIVE);
+  crdt_sync_push();                    /* eager-propagate to CRDT peers */
+}
+
+void crdt_shadow_server_squit(struct Client *srv)
+{
+  if (!shadow_on() || !feature_bool(FEAT_CRDT_PRIMARY))
+    return;
+  if (!srv || !IsServer(srv) || !IsCrdtAware(srv) || !cli_yxx(srv)[0])
+    return;
+  /* direct peer only (its uplink is us): the direct uplink owns the peer's
+   * server-state, so only it writes SPLIT.  A relayed SQUIT (cli_serv->up != &me)
+   * is the squitting hub's job to record.  cli_serv->up survives close_connection
+   * (which has already run by the exit_client SQUIT branch), unlike MyConnect. */
+  if (!cli_serv(srv) || cli_serv(srv)->up != &me)
+    return;
+  crdt_server_squit(&g_crdt, (uint16_t)base64toint(cli_yxx(srv)));
+  crdt_sync_push();                    /* eager-propagate to CRDT peers */
+}
+
 void crdt_shadow_topic(struct Channel *chptr, struct Client *from)
 {
   if (!shadow_on())
@@ -515,9 +559,11 @@ void crdt_shadow_verify(void)
   }
 
   log_write(LS_SYSTEM, L_NOTICE, 0,
-            "CRDT shadow verify: %u channels, %u/%u users, %u mismatch(es) "
+            "CRDT shadow verify: %u channels, %u/%u users, %u servers, %u mismatch(es) "
             "oplog=%u digest=%016llx mdigest=%016llx",
-            checked, crdt_users, real_users, mismatches, g_crdt.oplog.count,
+            checked, crdt_users, real_users,
+            crdt_lwwmap_size(&g_crdt.servers),   /* Phase 4a: servers-map size */
+            mismatches, g_crdt.oplog.count,
             (unsigned long long)crdt_state_digest(&g_crdt),
             (unsigned long long)crdt_state_digest_materialized(&g_crdt));
 
@@ -869,6 +915,13 @@ static struct Client *crdt_materialize_one_user(const char *key, uint32_t key_le
   srv = FindNServer(srvnum);
   if (!srv || !IsServer(srv))             /* owning server not in tree yet:
                                              skip-and-retry on the next pass */
+    return NULL;
+  /* Phase 4a: explicit SQUIT-as-SPLIT gate (proposal §17.3.3) — do not build a
+   * live Client for a user whose owning server is explicitly SPLIT in the doc.
+   * crdt_user_visible returns 1 for an unknown server (no entry), so this only
+   * skips servers we have positively marked SPLIT; it augments, never weakens,
+   * the FindNServer routability guard above. */
+  if (!crdt_user_visible(&g_crdt, numbuf))
     return NULL;
   nc = make_client(cli_from(srv), STAT_UNKNOWN);
   if (!nc)

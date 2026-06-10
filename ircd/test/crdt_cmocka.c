@@ -488,6 +488,52 @@ static void test_E_squit_creates_no_membership_tombstones(void **state)
   crdt_state_clear(&st);
 }
 
+/* Phase 4a: the servers LWW-map is a NEW convergence surface — it is multi-writer
+ * (the squitted server can't write its own state, so whichever server OBSERVES the
+ * transition writes it), resolved by LWW+HLC.  Two replicas writing divergent
+ * server-state concurrently MUST converge, and a later relink (causally after a
+ * received SQUIT) MUST win network-wide (§17.3.5 quick-reconnect across replicas). */
+static void test_server_state_converges(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s1, s2;
+  uint8_t buf[8192];
+  int n;
+  struct CrdtUserRecord u = mkuser("x", 7, "id", 0x07070707u);
+  crdt_state_init(&s1, 1);
+  crdt_state_init(&s2, 2);
+
+  /* a user on server 7 exists on both (same content, each tags with own origin) */
+  crdt_user_set(&s1, "U000", &u);
+  crdt_user_set(&s2, "U000", &u);
+
+  /* concurrent divergent server-state: s1 observes server 7 SPLIT, s2 ACTIVE */
+  crdt_server_squit(&s1, 7);
+  crdt_server_set(&s2, 7, CRDT_SRV_ACTIVE);
+  assert_true(crdt_state_digest(&s1) != crdt_state_digest(&s2));
+
+  /* exchange both ways -> LWW(servers) by HLC -> converge to ONE state */
+  n = crdt_delta_encode(&s1.oplog, &s2.local_sv, buf, sizeof buf);
+  crdt_delta_apply(&s2, buf, (size_t)n);
+  n = crdt_delta_encode(&s2.oplog, &s1.local_sv, buf, sizeof buf);
+  crdt_delta_apply(&s1, buf, (size_t)n);
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+  /* both replicas agree on the user's visibility (whichever HLC won) */
+  assert_int_equal(crdt_user_visible(&s1, "U000"), crdt_user_visible(&s2, "U000"));
+
+  /* quick-reconnect: s2 (having received s1's SQUIT, so its clock is causally
+   * past it) relinks server 7 -> a strictly-later HLC -> ACTIVE wins everywhere */
+  crdt_server_relink(&s2, 7);
+  n = crdt_delta_encode(&s2.oplog, &s1.local_sv, buf, sizeof buf);
+  crdt_delta_apply(&s1, buf, (size_t)n);
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+  assert_int_equal(1, crdt_user_visible(&s1, "U000"));
+  assert_int_equal(1, crdt_user_visible(&s2, "U000"));
+
+  crdt_state_clear(&s1);
+  crdt_state_clear(&s2);
+}
+
 /* ================================================================== */
 /* Phase 2 — wire serialization round-trip                            */
 /* ================================================================== */
@@ -1150,6 +1196,7 @@ int main(void)
     cmocka_unit_test(test_chan_ctime_min_incarnation),
     cmocka_unit_test(test_kick_info_replicates_and_hlc_gates),
     cmocka_unit_test(test_E_squit_creates_no_membership_tombstones),
+    cmocka_unit_test(test_server_state_converges),
     cmocka_unit_test(test_wire_sv_roundtrip),
     cmocka_unit_test(test_wire_delta_converges),
     cmocka_unit_test(test_wire_digest_converges),

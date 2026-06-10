@@ -185,6 +185,10 @@ int server_estab(struct Client *cptr, struct ConfItem *aconf)
   sendto_opmask_butone(0, SNO_NETWORK, "Net junction: %s %s", cli_name(&me),
                        cli_name(cptr));
   SetJunction(cptr);
+  /* Phase 4a (SQUIT-as-SPLIT, §17.3): record this directly-linked CRDT-aware
+   * peer as ACTIVE in the doc (clears any prior SPLIT on relink).  No-op for
+   * non-CRDT peers / non-CRDT-primary; the hook self-gates. */
+  crdt_shadow_server_add(cptr);
   /*
    * Old sendto_serv_but_one() call removed because we now
    * need to send different names to different servers

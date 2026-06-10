@@ -1039,6 +1039,14 @@ int exit_client(struct Client *cptr,
   if (IsServer(victim)) {
     char netsplit_batch_id[32] = "";
 
+    /* Phase 4a (SQUIT-as-SPLIT, §17.3): record a directly-linked CRDT-aware peer
+     * as SPLIT in the doc BEFORE the exit_downlinks cascade.  ONE LWW write, not
+     * N user/membership tombstones — its users are hidden at materialize time and
+     * reappear on relink (server_estab -> ACTIVE) with no re-burst.  The hook
+     * self-gates (direct peer / CRDT-aware / CRDT-primary); cli_serv->up is still
+     * valid here (close_connection cleared MyConnect but not the tree parent). */
+    crdt_shadow_server_squit(victim);
+
     /* (Alias promotions already executed before the SQUIT broadcast
      * loop above.  bounce_promote_alias() removed the old primary
      * from channels and updated session pointers — by the time

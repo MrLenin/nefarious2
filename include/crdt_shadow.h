@@ -61,6 +61,19 @@ void crdt_shadow_user_add(struct Client *cptr);
 /** Mirror a user removal (called from exit_one_client for IsUser clients). */
 void crdt_shadow_user_remove(struct Client *cptr);
 
+/** Phase 4a (SQUIT-as-SPLIT, §17.3): record a directly-linked CRDT-aware server
+ *  as ACTIVE in the doc (called from server_estab; fires on both ends of every
+ *  direct CRDT link, so each server's state is written by its direct uplink).
+ *  Clears any prior SPLIT on relink.  Multi-writer LWW — NOT single-writer gated.
+ *  No-op for non-CRDT peers / non-CRDT-primary. */
+void crdt_shadow_server_add(struct Client *srv);
+
+/** Phase 4a: record a directly-linked CRDT-aware server as SPLIT (called from
+ *  exit_client's IsServer SQUIT branch).  Fires only for a DIRECT peer
+ *  (cli_serv->up == &me); a relayed SQUIT is the squitting uplink's to record.
+ *  Users on a SPLIT server are hidden at materialize time, not tombstoned. */
+void crdt_shadow_server_squit(struct Client *srv);
+
 /** Mirror a channel topic (called from do_settopic and the burst topic-clear).
  *  Records chptr->topic into the shadow topics map. @a from is the incoming
  *  link the change arrived on (cptr), or the local source; the single-writer
