@@ -345,6 +345,10 @@ extern void crdt_send_snapshot(struct Client* to);
  *  (unicast) or a #channel name (deliver to local channel members). */
 extern void crdt_gossip_message(struct Client* from, char cmd, const char* target,
                                 const char* msgid, const char* text);
+/** Tier2 full-partition liveness: gossip an ephemeral CR H liveness beacon
+ *  (CR H <ourYXX> <CurrentTime>) over every CRDT transport.  Receivers track
+ *  the last beacon per server; a mesh stub whose beacon goes stale is retired. */
+extern void crdt_gossip_beacon(void);
 extern int ms_bouncer_transfer(struct Client*, struct Client*, int, char*[]);
 extern int m_persistence(struct Client*, struct Client*, int, char*[]);
 extern void persistence_send_status(struct Client *to);

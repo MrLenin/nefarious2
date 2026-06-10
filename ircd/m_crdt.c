@@ -225,6 +225,21 @@ void crdt_gossip_message(struct Client *from, char cmd, const char *target,
                     NumNick(from), target, text);
 }
 
+/* Tier2 full-partition liveness: gossip our ephemeral liveness beacon
+ * (CR H <ourYXX> <CurrentTime>) to all CRDT transports.  Receivers track the last
+ * beacon per server; a mesh stub whose beacon goes stale is retired (full
+ * partition).  Ephemeral — never touches the doc. */
+void crdt_gossip_beacon(void)
+{
+  struct Client *acptr;
+  if (!crdt_shadow_active() || !feature_bool(FEAT_CRDT_PRIMARY))
+    return;
+  for (acptr = GlobalClientList; acptr; acptr = cli_next(acptr))
+    if (IsCrdtSyncTarget(acptr))
+      sendcmdto_one(&me, CMD_CRDT_REPLICATION, acptr, "H %s %ld",
+                    cli_yxx(&me), (long)CurrentTime);
+}
+
 int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
 {
   const char *sub;
@@ -369,6 +384,19 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
       if (p != cptr && IsCrdtSyncTarget(p))
         sendcmdto_one(&me, CMD_CRDT_REPLICATION, p, "M %s %s %s %s :%s",
                       m_msgid, m_cmd, srcyxx, target, m_text);
+  } else if (sub[0] == 'H' && !sub[1]) {
+    /* Tier2 full-partition liveness beacon — H <srvYXX> <emit_ts>.  Record + relay
+     * if FRESH (newer emit_ts); a dup/old beacon drops, terminating the flood.
+     * Ephemeral — never touches the doc. */
+    struct Client *p;
+    if (parc < 4)
+      return 0;
+    if (!crdt_shadow_beacon_record((unsigned int)base64toint(parv[2]),
+                                   (time_t)atol(parv[3])))
+      return 0;
+    for (p = GlobalClientList; p; p = cli_next(p))
+      if (p != cptr && IsCrdtSyncTarget(p))
+        sendcmdto_one(&me, CMD_CRDT_REPLICATION, p, "H %s %s", parv[2], parv[3]);
   }
   return 0;
 }

@@ -60,6 +60,27 @@ static struct crdt_peer_sv g_peers[CRDT_MAX_PEERS];
 /** How often the shadow is reconciled against real state (seconds). */
 #define CRDT_VERIFY_INTERVAL 30
 
+/* Tier2 full-partition liveness: every CRDT-primary server gossips an ephemeral
+ * CR H beacon each verify cycle; receivers track the last beacon per server
+ * numeric.  A mesh stub whose beacon goes stale (no beacon for CRDT_BEACON_STALE
+ * seconds — the peer is unreachable via ANY CRDT path, i.e. a full/permanent
+ * partition) is retired.  This is what the coarse keep-vs-teardown gate cannot
+ * detect (an unrelated transport still existing != the stubbed peer reachable). */
+#define CRDT_BEACON_STALE 90            /* 3 verify intervals */
+static struct { time_t emit_ts; time_t recv_ts; } crdt_beacon[CRDT_MAX_SERVERS];
+
+/* Record a beacon for server `num` emitted at `emit_ts`.  Returns 1 if FRESH
+ * (newer than the last seen -> the caller should relay it), 0 if dup/old (drop,
+ * which terminates the gossip flood). */
+int crdt_shadow_beacon_record(unsigned int num, time_t emit_ts)
+{
+  if (num >= CRDT_MAX_SERVERS || emit_ts <= crdt_beacon[num].emit_ts)
+    return 0;
+  crdt_beacon[num].emit_ts = emit_ts;
+  crdt_beacon[num].recv_ts = CurrentTime;
+  return 1;
+}
+
 /** Shadow is active only once initialised AND the feature is enabled. */
 static int shadow_on(void)
 {
@@ -367,6 +388,10 @@ void crdt_shadow_convert_to_stub(struct Client *srv)
     if (*acptrp) held++;
   SetMeshStub(srv);
   SetFlag(srv, FLAG_MAP);            /* keep the stub's users visible in WHO */
+  {                                  /* seed the liveness clock: it was just reachable */
+    unsigned int n = (unsigned int)base64toint(cli_yxx(srv));
+    if (n < CRDT_MAX_SERVERS) crdt_beacon[n].recv_ts = CurrentTime;
+  }
   log_write(LS_SYSTEM, L_NOTICE, 0,
             "CRDT mesh: %s tree-split but mesh-reachable; %u user(s) held live "
             "(T2 mesh stub)", cli_name(srv), held);
@@ -2101,6 +2126,25 @@ static void crdt_shadow_verify_cb(struct Event *ev)
   crdt_shadow_reconcile_user_removes(); /* Phase 3m: QUIT / delete-on-leave (after channel cleanup) */
   crdt_sync_broadcast();   /* periodic anti-entropy: pull deltas from peers */
   crdt_shadow_gc();        /* reclaim causally-stable ops/tombstones */
+
+  /* Tier2 full-partition liveness: emit our beacon, then retire any mesh stub
+   * whose beacon has gone stale (no CR H for CRDT_BEACON_STALE s -> the peer is
+   * unreachable via ANY CRDT path -> full/permanent partition).  Collect-then-
+   * retire (retire frees the stub + its users -> can't free a live iterator). */
+  crdt_gossip_beacon();
+  {
+    struct Client *acptr, *stale[16];
+    int ns = 0, k;
+    for (acptr = GlobalClientList; acptr && ns < 16; acptr = cli_next(acptr))
+      if (IsMeshStub(acptr)) {
+        unsigned int n = (unsigned int)base64toint(cli_yxx(acptr));
+        if (n < CRDT_MAX_SERVERS &&
+            CurrentTime - crdt_beacon[n].recv_ts > CRDT_BEACON_STALE)
+          stale[ns++] = acptr;
+      }
+    for (k = 0; k < ns; k++)
+      crdt_shadow_retire_mesh_stub(stale[k], "mesh beacon stale (full partition)");
+  }
 }
 
 void crdt_shadow_init(uint16_t my_numeric)
