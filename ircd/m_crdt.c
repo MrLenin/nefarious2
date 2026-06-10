@@ -28,6 +28,8 @@
 #include "send.h"
 #include "crdt_state.h"   /* Tier2 T2-b: struct CrdtUserRecord (CR M source prefix) */
 #include "ircd_string.h"  /* Tier2 T2-b: ircd_strncpy (msgid dedup ring) */
+#include "channel.h"      /* Tier2 T2-b: Membership (CR M channel deliver) */
+#include "hash.h"         /* Tier2 T2-b: FindChannel (CR M channel deliver) */
 
 #include "crdt_shadow.h"
 #include "crdt_wire.h"
@@ -205,18 +207,22 @@ static int crdt_m_seen_check_add(const char *msgid)
   return 0;
 }
 
-void crdt_gossip_privmsg(struct Client *from, struct Client *to,
+/* Gossip a live message to a mesh-only target via ephemeral CR M.
+ *   cmd    'P' (PRIVMSG) or 'N' (NOTICE)
+ *   target a 5-char user numeric (unicast) OR a #channel name
+ * Wire: :<srv> CR M <msgid> <cmd> <srcYXX> <target> :<text> */
+void crdt_gossip_message(struct Client *from, char cmd, const char *target,
                          const char *msgid, const char *text)
 {
   struct Client *acptr;
-  if (!crdt_shadow_active() || !from || !to || !text)
+  if (!crdt_shadow_active() || !from || !target || !text)
     return;
   crdt_m_seen_check_add(msgid);        /* record so an echo/relay-back is deduped */
   for (acptr = GlobalClientList; acptr; acptr = cli_next(acptr))
     if (IsCrdtSyncTarget(acptr))
-      sendcmdto_one(&me, CMD_CRDT_REPLICATION, acptr, "M %s %s%s %s%s :%s",
-                    msgid && *msgid ? msgid : "*",
-                    NumNick(from), NumNick(to), text);
+      sendcmdto_one(&me, CMD_CRDT_REPLICATION, acptr, "M %s %c %s%s %s :%s",
+                    msgid && *msgid ? msgid : "*", cmd,
+                    NumNick(from), target, text);
 }
 
 int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
@@ -316,31 +322,53 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
       crdt_shadow_record_peer_sv((uint16_t)base64toint(cli_yxx(cptr)),
                                  svbytes, (size_t)svn);
   } else if (sub[0] == 'M' && !sub[1]) {
-    /* Tier2 T2-b: ephemeral live message — M <msgid> <srcYXX> <tgtYXX> :<text>.
-     * Deliver to a LOCAL target (source prefix reconstructed from the converged
-     * doc, since the sender may not be live on this split server) and relay
-     * onward; msgid-deduped so multi-path arrivals deliver/relay once.  NEVER
-     * touches the doc/oplog. */
-    const char *m_msgid, *srcyxx, *tgtyxx, *m_text;
-    struct Client *tgt, *p;
-    if (parc < 6)
+    /* Tier2 T2-b: ephemeral live message —
+     *   M <msgid> <cmd> <srcYXX> <target> :<text>   cmd='P'(PRIVMSG)/'N'(NOTICE),
+     * target = a 5-char user numeric (unicast) or a #channel.  Deliver to the
+     * LOCAL target (a user, or all local members of a channel) with the source
+     * prefix reconstructed from the converged doc (the sender may not be live on
+     * this split server), then relay onward; msgid-deduped so multi-path arrivals
+     * deliver/relay once.  NEVER touches the doc/oplog. */
+    const char *m_msgid, *m_cmd, *srcyxx, *target, *m_text, *cmdstr;
+    const struct CrdtUserRecord *src;
+    struct Client *p;
+    if (parc < 7)
       return 0;
-    m_msgid = parv[2]; srcyxx = parv[3]; tgtyxx = parv[4]; m_text = parv[parc - 1];
+    m_msgid = parv[2]; m_cmd = parv[3]; srcyxx = parv[4]; target = parv[5];
+    m_text = parv[parc - 1];
     if (crdt_m_seen_check_add(m_msgid))
       return 0;                        /* already handled via another mesh path */
-    tgt = findNUser(tgtyxx);
-    if (tgt && MyConnect(tgt)) {
-      const struct CrdtUserRecord *src = crdt_shadow_user_record(srcyxx);
-      if (src && src->nick[0])
-        sendrawto_one(tgt, ":%s!%s@%s PRIVMSG %s :%s", src->nick, src->ident,
-                      src->host[0] ? src->host : "mesh", cli_name(tgt), m_text);
-      else
-        sendrawto_one(tgt, ":%s PRIVMSG %s :%s", srcyxx, cli_name(tgt), m_text);
+    cmdstr = (m_cmd[0] == 'N') ? "NOTICE" : "PRIVMSG";
+    src = crdt_shadow_user_record(srcyxx);
+    if (target[0] == '#' || target[0] == '&') {           /* channel delivery */
+      struct Channel *ch = FindChannel(target);
+      struct Membership *memb;
+      if (ch)
+        for (memb = ch->members; memb; memb = memb->next_member)
+          if (MyConnect(memb->user)) {
+            if (src && src->nick[0])
+              sendrawto_one(memb->user, ":%s!%s@%s %s %s :%s", src->nick,
+                            src->ident, src->host[0] ? src->host : "mesh",
+                            cmdstr, target, m_text);
+            else
+              sendrawto_one(memb->user, ":%s %s %s :%s", srcyxx, cmdstr, target,
+                            m_text);
+          }
+    } else {                                              /* unicast delivery */
+      struct Client *tgt = findNUser(target);
+      if (tgt && MyConnect(tgt)) {
+        if (src && src->nick[0])
+          sendrawto_one(tgt, ":%s!%s@%s %s %s :%s", src->nick, src->ident,
+                        src->host[0] ? src->host : "mesh", cmdstr, cli_name(tgt),
+                        m_text);
+        else
+          sendrawto_one(tgt, ":%s %s %s :%s", srcyxx, cmdstr, cli_name(tgt), m_text);
+      }
     }
     for (p = GlobalClientList; p; p = cli_next(p))   /* gossip relay (excl source) */
       if (p != cptr && IsCrdtSyncTarget(p))
-        sendcmdto_one(&me, CMD_CRDT_REPLICATION, p, "M %s %s %s :%s",
-                      m_msgid, srcyxx, tgtyxx, m_text);
+        sendcmdto_one(&me, CMD_CRDT_REPLICATION, p, "M %s %s %s %s :%s",
+                      m_msgid, m_cmd, srcyxx, target, m_text);
   }
   return 0;
 }

@@ -584,6 +584,20 @@ void relay_channel_message(struct Client* sptr, const char* name, const char* te
     /* Clear the msgid override after broadcast */
     sendcmdto_set_client_msgid(NULL);
 
+    /* Tier2 T2-b: if the channel has any mesh-only member (its server is a stub),
+     * gossip via CR M so those members get it on their home server (the fan-out
+     * above dropped them at the dead-sink stub).  One gossip covers all mesh
+     * servers; each delivers to its local channel members. */
+    {
+      struct Membership *mmemb;
+      for (mmemb = chptr->members; mmemb; mmemb = mmemb->next_member)
+        if (cli_user(mmemb->user) && cli_user(mmemb->user)->server &&
+            IsMeshStub(cli_user(mmemb->user)->server)) {
+          crdt_gossip_message(sptr, 'P', chptr->chname, msgid[0] ? msgid : "*", mytext);
+          break;
+        }
+    }
+
     /* Echo message back to sender if they have echo-message cap */
     if (need_echo) {
       const char *echo_ctags = cli_client_tags(sptr);
@@ -735,6 +749,18 @@ void relay_channel_notice(struct Client* sptr, const char* name, const char* tex
 
     /* Clear the msgid override after broadcast */
     sendcmdto_set_client_msgid(NULL);
+
+    /* Tier2 T2-b: gossip via CR M if the channel has any mesh-only member (see
+     * relay_channel_message). */
+    {
+      struct Membership *mmemb;
+      for (mmemb = chptr->members; mmemb; mmemb = mmemb->next_member)
+        if (cli_user(mmemb->user) && cli_user(mmemb->user)->server &&
+            IsMeshStub(cli_user(mmemb->user)->server)) {
+          crdt_gossip_message(sptr, 'N', chptr->chname, msgid[0] ? msgid : "*", mytext);
+          break;
+        }
+    }
 
     /* Echo notice back to sender if they have echo-message cap */
     if (need_echo) {
@@ -1275,7 +1301,9 @@ void relay_private_message(struct Client* sptr, const char* name, const char* te
    * targets is a later increment. */
   if (cli_user(acptr) && cli_user(acptr)->server &&
       IsMeshStub(cli_user(acptr)->server)) {
-    crdt_gossip_privmsg(sptr, acptr, pm_msgid, mytext);
+    char tyxx[6];
+    ircd_snprintf(0, tyxx, sizeof tyxx, "%s%s", NumNick(acptr));
+    crdt_gossip_message(sptr, 'P', tyxx, pm_msgid, mytext);
     return;
   }
 
@@ -1489,6 +1517,16 @@ void relay_private_notice(struct Client* sptr, const char* name, const char* tex
     ircd_snprintf(0, pm_timestamp, sizeof(pm_timestamp), "%lu.%03lu",
                   (unsigned long)tv.tv_sec,
                   (unsigned long)(tv.tv_usec / 1000));
+  }
+
+  /* Tier2 T2-b: NOTICE to a mesh-only user -> gossip via ephemeral CR M (the
+   * normal send would resolve cli_from -> the dead-sink stub and drop). */
+  if (cli_user(acptr) && cli_user(acptr)->server &&
+      IsMeshStub(cli_user(acptr)->server)) {
+    char tyxx[6];
+    ircd_snprintf(0, tyxx, sizeof tyxx, "%s%s", NumNick(acptr));
+    crdt_gossip_message(sptr, 'N', tyxx, pm_msgid, mytext);
+    return;
   }
 
   /* Alias source rewriting (see relay_private_message) */
