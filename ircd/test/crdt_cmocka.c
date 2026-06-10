@@ -580,6 +580,125 @@ static void test_restart_resumes_seq_past_adopted_sv(void **state)
   crdt_state_clear(&s2);
 }
 
+/* Phase 4c: server-state convergence in a MESH (triangle), not just the star.
+ *
+ * The 2-node test_server_state_converges passes because a single bidirectional
+ * exchange reconciles the LWW(servers) map.  In a TRIANGLE with a redundant edge
+ * (A-B, A-C P10 + B-C overlay) the live single-writer model does NOT converge:
+ *
+ *   1. cut A-C -> A (C's direct uplink) writes C=SPLIT; C (A's uplink) writes
+ *      A=SPLIT  (crdt_shadow_server_squit, single observer-writer).
+ *   2. each node self-asserts self=ACTIVE only when it SEES itself !=ACTIVE
+ *      (crdt_assert_self_active) -- a heal that depends on the SPLIT-about-self
+ *      reaching the originating node across the mesh.
+ *   3. per-round GC against DIRECT peers reclaims the racing servers ops before
+ *      the heal has propagated everywhere.
+ *   4. on relink A-C exchanges a snapshot A<->C -- but B's links never dropped,
+ *      so B gets NO refreshing snapshot and the reconciling ops are gone.
+ *
+ * Live, nef4 was left permanently stale; crdt_state_digest (which hashes LWW
+ * value+HLC+writer for the servers map and is NOT GC-invariant) never reconverged.
+ *
+ * This test PASSES: the pure ENGINE (LWW + delta + snapshot + causal GC) DOES
+ * converge a triangle partition+relink given full anti-entropy.  That is the
+ * point — it localizes the live non-convergence to the WIRE/integration layer
+ * (eager-relay-once + GC reclaiming reconciling ops before the heal lands +
+ * relink snapshotting only the relinked peer), which the engine harness cannot
+ * model.  The Phase 4c fix therefore does NOT try to make a per-viewpoint value
+ * survive that wire layer: production stops writing the servers map entirely and
+ * derives reachability LOCALLY (FindNServer at the materialize gate = SPLIT iff
+ * unreachable via all transports).  This test is retained as the proof the engine
+ * primitive is sound and a guard for any future convergent Tier-2 liveness design. */
+static void tri_xchg(struct CrdtNetworkState *x, struct CrdtNetworkState *y,
+                     uint8_t *buf, size_t bufsz)
+{
+  int n;
+  n = crdt_delta_encode(&x->oplog, &y->local_sv, buf, bufsz);
+  crdt_delta_apply(y, buf, (size_t)n);
+  n = crdt_delta_encode(&y->oplog, &x->local_sv, buf, bufsz);
+  crdt_delta_apply(x, buf, (size_t)n);
+}
+static void tri_self_assert(struct CrdtNetworkState *s)
+{
+  if (crdt_server_state(s, s->my_numeric) != CRDT_SRV_ACTIVE)
+    crdt_server_set(s, s->my_numeric, CRDT_SRV_ACTIVE);
+}
+static void test_server_state_converges_mesh(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState A, B, C;          /* A=hub(1) B=leaf2(2) C=leaf3(3) */
+  struct CrdtStateVector st;
+  uint8_t buf[16384];
+  int r;
+  struct CrdtUserRecord ua = mkuser("a", 1, "a", 0x01010101u);
+  struct CrdtUserRecord ub = mkuser("b", 2, "b", 0x02020202u);
+  struct CrdtUserRecord uc = mkuser("c", 3, "c", 0x03030303u);
+
+  crdt_state_init(&A, 1);
+  crdt_state_init(&B, 2);
+  crdt_state_init(&C, 3);
+
+  /* boot: a user on each server + each asserts itself ACTIVE (peer-link trigger) */
+  crdt_user_set(&A, "U001", &ua); tri_self_assert(&A);
+  crdt_user_set(&B, "U002", &ub); tri_self_assert(&B);
+  crdt_user_set(&C, "U003", &uc); tri_self_assert(&C);
+
+  /* converge the full triangle (A-B, A-C, B-C) */
+  for (r = 0; r < 4; r++) {
+    tri_xchg(&A, &B, buf, sizeof buf);
+    tri_xchg(&A, &C, buf, sizeof buf);
+    tri_xchg(&B, &C, buf, sizeof buf);
+  }
+  assert_true(crdt_state_digest(&A) == crdt_state_digest(&B));
+  assert_true(crdt_state_digest(&B) == crdt_state_digest(&C));
+
+  /* ---- partition: cut A-C.  Live edges: A-B, B-C (a line). ---- */
+  crdt_server_squit(&A, 3);   /* A: its direct downlink C is gone */
+  crdt_server_squit(&C, 1);   /* C: its direct uplink A is gone   */
+
+  for (r = 0; r < 6; r++) {
+    tri_self_assert(&A); tri_self_assert(&B); tri_self_assert(&C);
+    tri_xchg(&A, &B, buf, sizeof buf);
+    tri_xchg(&B, &C, buf, sizeof buf);
+    /* per-node GC against DIRECT peers only (as live) */
+    { const struct CrdtStateVector *v[2] = { &A.local_sv, &B.local_sv };
+      crdt_sv_global_min(&st, v, 2); crdt_state_gc(&A, &st); }
+    { const struct CrdtStateVector *v[3] = { &B.local_sv, &A.local_sv, &C.local_sv };
+      crdt_sv_global_min(&st, v, 3); crdt_state_gc(&B, &st); }
+    { const struct CrdtStateVector *v[2] = { &C.local_sv, &B.local_sv };
+      crdt_sv_global_min(&st, v, 2); crdt_state_gc(&C, &st); }
+  }
+
+  /* ---- relink A-C: snapshot exchange A<->C only (B's links never dropped) ---- */
+  { int n = crdt_snapshot_encode(&A, buf, sizeof buf);
+    assert_true(crdt_snapshot_apply(&C, buf, (size_t)n) >= 0);
+    n = crdt_snapshot_encode(&C, buf, sizeof buf);
+    assert_true(crdt_snapshot_apply(&A, buf, (size_t)n) >= 0); }
+
+  /* full triangle anti-entropy resumes */
+  for (r = 0; r < 6; r++) {
+    tri_self_assert(&A); tri_self_assert(&B); tri_self_assert(&C);
+    tri_xchg(&A, &B, buf, sizeof buf);
+    tri_xchg(&A, &C, buf, sizeof buf);
+    tri_xchg(&B, &C, buf, sizeof buf);
+    { const struct CrdtStateVector *v[3] = { &A.local_sv, &B.local_sv, &C.local_sv };
+      crdt_sv_global_min(&st, v, 3); crdt_state_gc(&A, &st);
+      crdt_state_gc(&B, &st); crdt_state_gc(&C, &st); }
+  }
+
+  /* the whole point: the convergent doc must reconverge across the triangle */
+  assert_true(crdt_state_digest(&A) == crdt_state_digest(&B));
+  assert_true(crdt_state_digest(&B) == crdt_state_digest(&C));
+  /* and the users are visible everywhere again (relink healed materialization) */
+  assert_int_equal(1, crdt_user_visible(&A, "U003"));
+  assert_int_equal(1, crdt_user_visible(&B, "U003"));
+  assert_int_equal(1, crdt_user_visible(&C, "U003"));
+
+  crdt_state_clear(&A);
+  crdt_state_clear(&B);
+  crdt_state_clear(&C);
+}
+
 /* ================================================================== */
 /* Phase 2 — wire serialization round-trip                            */
 /* ================================================================== */
@@ -1243,6 +1362,7 @@ int main(void)
     cmocka_unit_test(test_kick_info_replicates_and_hlc_gates),
     cmocka_unit_test(test_E_squit_creates_no_membership_tombstones),
     cmocka_unit_test(test_server_state_converges),
+    cmocka_unit_test(test_server_state_converges_mesh),
     cmocka_unit_test(test_restart_resumes_seq_past_adopted_sv),
     cmocka_unit_test(test_wire_sv_roundtrip),
     cmocka_unit_test(test_wire_delta_converges),

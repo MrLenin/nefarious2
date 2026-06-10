@@ -279,60 +279,42 @@ void crdt_shadow_user_remove(struct Client *cptr)
   crdt_sync_push();                    /* eager-propagate to CRDT peers */
 }
 
-/* Phase 4a: servers-map producers (SQUIT-as-SPLIT, proposal §17.3) — SINGLE-WRITER.
+/* Phase 4c: server reachability is a LOCAL determination, NOT replicated state.
  *
- * Each server owns its OWN entry and writes my_numeric->ACTIVE (self-assert),
- * mirroring the single-writer model used for users/channels.  This is what makes
- * the servers map converge cleanly: no two servers ever compete to write the
- * same entry.  (The earlier multi-writer design — every peer writing the hub's
- * ACTIVE via server_estab — diverged in the HLC/writer-sensitive digest, since
- * different replicas kept different winning writes.)  The squitted peer can't
- * write its own SPLIT, so its DIRECT uplink records peer->SPLIT (single observer
- * writer, gated on cli_serv->up == &me); on relink the peer re-asserts ACTIVE
- * (a fresh HLC beats that SPLIT).  next_seq is wall-clock-seeded
- * (crdt_shadow_init) and lifted by crdt_state_resume_seq, so a restarted
- * server's self-ACTIVE is not deduped by peers' stale state vectors.
+ * Phase 4a tried to replicate per-server ACTIVE/SPLIT in the convergent doc (a
+ * servers LWW map, single observer-writer per entry, SQUIT-as-SPLIT §17.3).  Live
+ * MESH testing (triangle: P10 star nef3-nef4,nef3-nef5 + CR overlay nef4<->nef5)
+ * proved it does NOT converge: reachability is inherently PER-VIEWPOINT — during a
+ * partition nef3 truthfully sees nef5 unreachable while nef5 sees nef3 unreachable,
+ * so the shared LWW map has genuinely conflicting writers; and the racing
+ * SPLIT/ACTIVE ops get GC'd before the self-ACTIVE heal propagates across the
+ * redundant edge, leaving a node whose links never dropped permanently stale (it
+ * gets no refreshing snapshot).  The engine LWW itself converges fine
+ * (test_server_state_converges_mesh) — the gap is the live wire layer, and no
+ * amount of patching makes a per-viewpoint value robust as shared state.
  *
- * NB: SPLIT tracks P10-routability (it gates materialization — a SPLIT server's
- * users are not built into live Clients).  A CR-only overlay does NOT make a
- * server P10-routable, so it does NOT suppress SPLIT; the overlay's role is to
- * keep the DOC converged during the split (CR ops keep flowing), which makes the
- * eventual relink reburst-free. */
-static void crdt_assert_self_active(void)
-{
-  if (!shadow_on() || !feature_bool(FEAT_CRDT_PRIMARY))
-    return;
-  /* write only when our own entry is not already ACTIVE: the initial assert, or
-   * a RE-assert after a peer marked us SPLIT and we relinked (the relink's fresh
-   * HLC must beat that SPLIT).  No churn in steady state (the guard short-circuits). */
-  if (crdt_server_state(&g_crdt, g_crdt.my_numeric) == CRDT_SRV_ACTIVE)
-    return;
-  crdt_server_set(&g_crdt, g_crdt.my_numeric, CRDT_SRV_ACTIVE);
-  crdt_sync_push();                    /* eager-propagate to CRDT peers */
-}
-
+ * So SPLIT is derived LOCALLY: a remote server's users are materialized iff that
+ * server is reachable via a live CRDT transport from HERE — which the
+ * FindNServer + IsServer guard in crdt_materialize_one_user already enforces (P10
+ * routability).  That IS the plan's crdt_transport_reachable intent (SPLIT iff
+ * unreachable via ALL transports), realized as a local check rather than a
+ * replicated map.  No observer writes another server's state and we no longer
+ * write our own, so the servers map stays empty in production and the doc digest
+ * (data: users/channels/topics) converges across the mesh.
+ *
+ * The engine servers-map + crdt_server_* / crdt_user_visible are retained (tested,
+ * unused in production) for a future Tier-2 design where overlay-reachability is
+ * the routing input and a convergent liveness model (e.g. single-writer-per-key
+ * heartbeat with locally-derived staleness) can be built deliberately. */
 void crdt_shadow_server_add(struct Client *srv)
 {
-  /* a CRDT peer linked — trigger to (re-)assert OUR OWN ACTIVE. */
-  if (!srv || !IsServer(srv) || !IsCrdtAware(srv))
-    return;
-  crdt_assert_self_active();
+  (void)srv;   /* reachability is local now (FindNServer); nothing to replicate */
 }
 
 void crdt_shadow_server_squit(struct Client *srv)
 {
-  if (!shadow_on() || !feature_bool(FEAT_CRDT_PRIMARY))
-    return;
-  if (!srv || !IsServer(srv) || !IsCrdtAware(srv) || !cli_yxx(srv)[0])
-    return;
-  /* direct peer only (its uplink is us): the direct uplink owns recording the
-   * peer's SPLIT.  A relayed SQUIT (cli_serv->up != &me) is the squitting hub's
-   * job to record.  cli_serv->up survives close_connection (already run by the
-   * exit_client SQUIT branch), unlike MyConnect. */
-  if (!cli_serv(srv) || cli_serv(srv)->up != &me)
-    return;
-  crdt_server_squit(&g_crdt, (uint16_t)base64toint(cli_yxx(srv)));
-  crdt_sync_push();                    /* eager-propagate to CRDT peers */
+  (void)srv;   /* a SQUIT hides the peer's users via the local FindNServer gate;
+                  no SPLIT is written to the doc (it could not converge in a mesh) */
 }
 
 void crdt_shadow_topic(struct Channel *chptr, struct Client *from)
@@ -468,7 +450,7 @@ void crdt_shadow_verify(void)
   struct Channel *chptr;
   struct Client *acptr;
   unsigned int checked = 0, mismatches = 0;
-  uint32_t real_users = 0, crdt_users;
+  uint32_t real_users = 0, crdt_users, crdt_srvs = 1;  /* +1: ourself */
 
   if (!shadow_on())
     return;
@@ -570,11 +552,17 @@ void crdt_shadow_verify(void)
               real_users, crdt_users);
   }
 
+  /* Phase 4c: report LOCALLY-reachable CRDT-aware servers (reachability is local
+   * now, not a replicated map) — drops on a partition, restores on relink. */
+  for (acptr = GlobalClientList; acptr; acptr = cli_next(acptr))
+    if (IsServer(acptr) && IsCrdtAware(acptr))
+      crdt_srvs++;
+
   log_write(LS_SYSTEM, L_NOTICE, 0,
             "CRDT shadow verify: %u channels, %u/%u users, %u servers, %u mismatch(es) "
             "oplog=%u digest=%016llx mdigest=%016llx",
             checked, crdt_users, real_users,
-            crdt_lwwmap_size(&g_crdt.servers),   /* Phase 4a: servers-map size */
+            crdt_srvs,                            /* Phase 4c: reachable CRDT servers */
             mismatches, g_crdt.oplog.count,
             (unsigned long long)crdt_state_digest(&g_crdt),
             (unsigned long long)crdt_state_digest_materialized(&g_crdt));
@@ -925,15 +913,13 @@ static struct Client *crdt_materialize_one_user(const char *key, uint32_t key_le
   rec = (const struct CrdtUserRecord *)val->data;
   srvnum[0] = numbuf[0]; srvnum[1] = numbuf[1]; srvnum[2] = '\0';
   srv = FindNServer(srvnum);
-  if (!srv || !IsServer(srv))             /* owning server not in tree yet:
-                                             skip-and-retry on the next pass */
-    return NULL;
-  /* Phase 4a: explicit SQUIT-as-SPLIT gate (proposal §17.3.3) — do not build a
-   * live Client for a user whose owning server is explicitly SPLIT in the doc.
-   * crdt_user_visible returns 1 for an unknown server (no entry), so this only
-   * skips servers we have positively marked SPLIT; it augments, never weakens,
-   * the FindNServer routability guard above. */
-  if (!crdt_user_visible(&g_crdt, numbuf))
+  if (!srv || !IsServer(srv))             /* owning server not reachable from here:
+                                             skip-and-retry on the next pass.
+     Phase 4c: this FindNServer + IsServer guard IS the SQUIT-as-SPLIT gate — a
+     server's users are materialized iff it is reachable via a live CRDT transport
+     from HERE (local crdt_transport_reachable / §17.3.3 SPLIT-iff-unreachable),
+     instead of consulting a replicated servers map that cannot converge in a mesh
+     (reachability is per-viewpoint; see crdt_shadow_server_squit). */
     return NULL;
   nc = make_client(cli_from(srv), STAT_UNKNOWN);
   if (!nc)
@@ -2012,11 +1998,8 @@ static void crdt_shadow_verify_cb(struct Event *ev)
 {
   if (ev_type(ev) != ET_EXPIRE)
     return;
-  /* Phase 4a: (re-)assert our own server -> ACTIVE.  Robust post-sync re-assert
-   * for the case where a peer marked us SPLIT and the SPLIT reached our doc only
-   * AFTER server_estab's immediate assert ran (e.g. via a relink snapshot).  A
-   * no-op once our entry is ACTIVE. */
-  crdt_assert_self_active();
+  /* Phase 4c: no servers-map self-assert — reachability is a local determination
+   * (FindNServer at the materialize gate), not replicated doc state. */
   crdt_shadow_verify();
   crdt_shadow_materialize_check();  /* Phase 3b dry-run: doc -> live fidelity */
   /* Phase 3l: create+gateway users BEFORE materialize_live (the bulk path creates
