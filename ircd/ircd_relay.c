@@ -873,6 +873,19 @@ void server_relay_channel_message(struct Client* sptr, const char* name, const c
 
     sendcmdto_set_client_msgid(NULL);
 
+    /* Tier2 P2: gossip to any mesh-only channel member (the fan-out above dropped
+     * them at the dead-sink stub/anchor).  One gossip covers all mesh servers. */
+    {
+      struct Membership *mmemb;
+      for (mmemb = chptr->members; mmemb; mmemb = mmemb->next_member)
+        if (cli_user(mmemb->user) && cli_user(mmemb->user)->server &&
+            IsMeshStub(cli_user(mmemb->user)->server)) {
+          crdt_gossip_message(sptr, 'P', chptr->chname,
+                              relay_msgid[0] ? relay_msgid : "*", text);
+          break;
+        }
+    }
+
 #ifdef USE_ROCKSDB
     /* Store server-relayed message in history database.
      * Uses the same msgid that was broadcast to clients above. */
@@ -967,6 +980,19 @@ void server_relay_channel_notice(struct Client* sptr, const char* name, const ch
     }
 
     sendcmdto_set_client_msgid(NULL);
+
+    /* Tier2 P2: gossip to any mesh-only channel member (fan-out above dropped them
+     * at the dead-sink stub/anchor). */
+    {
+      struct Membership *mmemb;
+      for (mmemb = chptr->members; mmemb; mmemb = mmemb->next_member)
+        if (cli_user(mmemb->user) && cli_user(mmemb->user)->server &&
+            IsMeshStub(cli_user(mmemb->user)->server)) {
+          crdt_gossip_message(sptr, 'N', chptr->chname,
+                              relay_msgid[0] ? relay_msgid : "*", text);
+          break;
+        }
+    }
 
 #ifdef USE_ROCKSDB
     /* Store server-relayed notice in history database.
@@ -1667,6 +1693,17 @@ void server_relay_private_message(struct Client* sptr, const char* name, const c
                   (unsigned long)(tv.tv_usec / 1000));
   }
 
+  /* Tier2 P2: remote-origin (server-relayed) PM to a mesh-only target (its P10 tree
+   * path is a dead-sink mesh stub/anchor) -> gossip over the mesh instead of the
+   * dropped forward; delivered + deduped on the target's home server. */
+  if (cli_user(acptr) && cli_user(acptr)->server &&
+      IsMeshStub(cli_user(acptr)->server)) {
+    char tyxx[6];
+    ircd_snprintf(0, tyxx, sizeof tyxx, "%s%s", NumNick(acptr));
+    crdt_gossip_message(from, 'P', tyxx, pm_msgid[0] ? pm_msgid : "*", text);
+    return;
+  }
+
   /* Per-target direction guard for split S2S delivery:
    * If target is behind the primary's server direction, keep alias numeric
    * to avoid fake direction — that server handles rewriting locally. */
@@ -1774,6 +1811,16 @@ void server_relay_private_notice(struct Client* sptr, const char* name, const ch
     ircd_snprintf(0, pm_timestamp, sizeof(pm_timestamp), "%lu.%03lu",
                   (unsigned long)tv.tv_sec,
                   (unsigned long)(tv.tv_usec / 1000));
+  }
+
+  /* Tier2 P2: remote-origin NOTICE to a mesh-only target -> gossip over the mesh
+   * instead of the dropped dead-sink forward. */
+  if (cli_user(acptr) && cli_user(acptr)->server &&
+      IsMeshStub(cli_user(acptr)->server)) {
+    char tyxx[6];
+    ircd_snprintf(0, tyxx, sizeof tyxx, "%s%s", NumNick(acptr));
+    crdt_gossip_message(from, 'N', tyxx, pm_msgid[0] ? pm_msgid : "*", text);
+    return;
   }
 
   /* Per-target direction guard (see server_relay_private_message) */

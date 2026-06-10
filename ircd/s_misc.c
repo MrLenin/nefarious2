@@ -775,16 +775,23 @@ static void exit_downlinks(struct Client *cptr, struct Client *sptr, char *comme
   }
 }
 
-/* Tier2 T2-a: tear down a mesh stub (relink reconciliation; full-partition is a
- * later increment needing a mesh-liveness signal — see crdt-mesh-tier2a-plan.md).
- * Defined here (not crdt_shadow.c) because exit_one_client is static to this file.
- * Mirrors exit_downlinks for the held users: exit_one_client gives each a
- * common-channel QUIT to local members but NO network QUIT and NO doc tombstone,
- * so they re-materialize from the still-converged doc once the peer re-bursts (the
- * §17.3 zero-tombstone property).  Then restores IsServer so exit_one_client runs
- * the full server teardown (ClearServerYXX frees the server_list[] slot,
- * remove_dlink, Count_*serverquits, free).  Uses exit_one_client (NOT exit_client)
- * so the conversion hook in exit_client does not re-fire and re-stub the server. */
+/* Tier2 T2-a: tear down a mesh stub (relink reconciliation, beacon-staleness sweep,
+ * or full partition).  Defined here (not crdt_shadow.c) because exit_one_client is
+ * static to this file.  Mirrors exit_downlinks for the held/materialized users:
+ * exit_one_client gives each a common-channel QUIT to local members but NO network
+ * QUIT and NO doc tombstone, so they re-materialize from the still-converged doc
+ * once the peer re-bursts (the §17.3 zero-tombstone property), then frees the stub
+ * (ClearServerYXX frees the server_list[] slot, frees the server struct + the owned
+ * Connection).  Uses exit_one_client (NOT exit_client) so the conversion hook in
+ * exit_client does not re-fire and re-stub the server.
+ *
+ * Tier2 P2: TWO stub flavours.  (Case A) a CONVERTED stub keeps its real tree DLink
+ * (cli_serv->updown != NULL) — it must go through the IsServer teardown branch
+ * (remove_dlink), so restore SetServer first.  (Case B) a SYNTHETIC anchor
+ * (crdt_shadow_make_anchor, updown == NULL) has NO DLink — it must STAY
+ * STAT_MESH_SERVER through exit_one_client so the IsServer/remove_dlink branch is
+ * SKIPPED (remove_dlink asserts a non-NULL link), while ClearServerYXX (gated on
+ * client_list) + the generic free tail still run. */
 void crdt_shadow_retire_mesh_stub(struct Client *stub, const char *comment)
 {
   struct Client **acptrp;
@@ -797,7 +804,10 @@ void crdt_shadow_retire_mesh_stub(struct Client *stub, const char *comment)
   for (i = 0; i <= cli_serv(stub)->nn_mask; ++acptrp, ++i)
     if (*acptrp)
       exit_one_client(*acptrp, comment);
-  SetServer(stub);                 /* restore so exit_one_client does server teardown */
+  if (cli_serv(stub)->updown)      /* Case A: real tree DLink -> needs remove_dlink */
+    SetServer(stub);               /* restore so exit_one_client does server teardown */
+  /* Case B synthetic anchor (updown == NULL): leave STAT_MESH_SERVER -> exit_one_client
+   * skips the remove_dlink branch but still ClearServerYXX's the slot + frees. */
   exit_one_client(stub, comment);
 }
 

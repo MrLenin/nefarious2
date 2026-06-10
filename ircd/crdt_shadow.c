@@ -419,6 +419,46 @@ void crdt_shadow_convert_to_stub(struct Client *srv)
             "(T2 mesh stub)", cli_name(srv), held);
 }
 
+/* Tier2 P2 (Case B): build a SYNTHETIC mesh anchor for a partitioned-but-mesh-
+ * reachable server that THIS node has NO P10 link to (FindNServer fails), so its
+ * users can be materialized + addressed here.  Unlike the Case-A converted stub it
+ * owns a FRESH dead Connection (make_client(NULL): fd=-1, never socketed -> every
+ * send drops, no socket hazard) and is registered in server_list[] (SetServerYXX)
+ * WITHOUT a routing DLink (no add_dlink), so it is FindNServer-resolvable yet
+ * excluded from the tree/burst/SQUIT/links walks (never IsServer; nothing routes
+ * through it and it is not in cli_serv(&me)->down).  Retired by the beacon-staleness
+ * sweep / relink pre-retire via crdt_shadow_retire_mesh_stub (updown==NULL branch).
+ * @a srvnum is the 2-char server numeric (the user key's first two chars). */
+static struct Client *crdt_shadow_make_anchor(const char *srvnum)
+{
+  struct Client *nc;
+  char yxx[6];
+  nc = make_client(NULL, STAT_MESH_SERVER);   /* fresh owned dead-sink Connection */
+  if (!nc)
+    return NULL;
+  make_server(nc);
+  cli_serv(nc)->up = &me;          /* parent for accessors, but NOT a routing downlink */
+  cli_serv(nc)->updown = NULL;     /* no DLink -> retire skips remove_dlink (asserts non-NULL) */
+  cli_serv(nc)->timestamp = TStime();
+  cli_hopcount(nc) = 2;            /* nominal; never used for routing */
+  ircd_snprintf(0, cli_name(nc), HOSTLEN, "mesh-%s.crdt", srvnum); /* placeholder until CR H name */
+  ircd_strncpy(cli_info(nc), "CRDT mesh anchor (partitioned server)", REALLEN + 1);
+  /* server part from the user key + a MAX 3-char client capacity (NUMNICKBASE^3-1)
+   * so base64toint(client) never truncates -> no client_list slot collision. */
+  yxx[0] = srvnum[0]; yxx[1] = srvnum[1];
+  inttobase64(yxx + 2, 64u * 64u * 64u - 1u, 3);
+  yxx[5] = '\0';
+  SetServerYXX(nc, nc, yxx);       /* server_list[srvnum]=nc + client_list; NO add_dlink */
+  SetFlag(nc, FLAG_MAP);           /* keep its users visible in WHO */
+  SetCrdtAware(nc);                /* its users are mesh-owned: from_crdt_peer self-skips */
+  add_client_to_list(nc);
+  hAddClient(nc);
+  log_write(LS_SYSTEM, L_NOTICE, 0,
+            "CRDT mesh: synthetic anchor for server %s (mesh-reachable, no P10 link)",
+            srvnum);
+  return nc;
+}
+
 void crdt_shadow_topic(struct Channel *chptr, struct Client *from)
 {
   if (!shadow_on())
@@ -1015,19 +1055,33 @@ static struct Client *crdt_materialize_one_user(const char *key, uint32_t key_le
   rec = (const struct CrdtUserRecord *)val->data;
   srvnum[0] = numbuf[0]; srvnum[1] = numbuf[1]; srvnum[2] = '\0';
   srv = FindNServer(srvnum);
-  if (!srv || (!IsServer(srv) && !IsMeshStub(srv)))
-    /* owning server unreachable via any transport: skip-and-retry next pass.
-       Tier2 P1: a STAT_MESH_SERVER stub (tree-departed but mesh-reachable) IS a
-       valid materialize parent — make_client(cli_from(stub)) shares the stub's
-       dead-sink Connection (fd=-1; every send path skips a dead/fd<0 parent, so
-       nothing writes the dead socket), and the stub keeps cli_serv/cli_yxx.  This
-       admits SPLIT-BORN users (connected to the partitioned server during the
-       split) so they are visible + addressable on every mesh server.  The Q1
-       spike (2026-06-10) proved the old crash was NOT here but in the §17.7
-       gateway re-intro emitting a NICK with the stub as %C source — that is now
-       skipped for mesh-only users (crdt_user_is_mesh_only) and %C treats a stub
-       as a server.  On relink crdt_shadow_retire_mesh_stub reaps these users
-       (they are in cli_serv(stub)->client_list) before the real numeric returns. */
+  if (!srv) {
+    /* Tier2 P2 (Case B): no P10 server for this numeric HERE (we have no direct link
+       to it — e.g. nef4 reaching nef5 via nef3, torn down at the SQUIT).  If the
+       server is still mesh-reachable (a FRESH CR H beacon flowed to us, via an
+       overlay or relay), build a SYNTHETIC anchor so its users materialize + are
+       addressable; if the beacon is STALE (full partition) keep skipping -> users
+       stay hidden (correct SPLIT, the reachability gate).  Idempotent: once created,
+       the next pass FindNServer's the anchor and takes the IsMeshStub path below. */
+    unsigned int sidx = (unsigned int)base64toint(srvnum);
+    if (sidx >= CRDT_MAX_SERVERS ||
+        CurrentTime - crdt_beacon[sidx].recv_ts > CRDT_BEACON_STALE)
+      return NULL;
+    srv = crdt_shadow_make_anchor(srvnum);
+    if (!srv)
+      return NULL;
+  } else if (!IsServer(srv) && !IsMeshStub(srv))
+    /* owning server present but not a usable parent (handshake/etc.): retry next pass.
+       Tier2 P1: a STAT_MESH_SERVER stub (Case A converted, or a Case-B synthetic
+       anchor above) IS a valid materialize parent — make_client(cli_from(stub))
+       shares its dead-sink Connection (fd=-1; every send path skips a dead/fd<0
+       parent), and it keeps cli_serv/cli_yxx.  This admits SPLIT-BORN users so they
+       are visible + addressable on every mesh server.  The Q1 spike (2026-06-10)
+       proved the old crash was NOT here but in the §17.7 gateway re-intro emitting a
+       NICK with the stub as %C source — now skipped for mesh-only users
+       (crdt_user_is_mesh_only) with %C treating a stub as a server.  On relink/full
+       partition crdt_shadow_retire_mesh_stub reaps these users (cli_serv(stub)->
+       client_list) before the real numeric returns. */
     return NULL;
   nc = make_client(cli_from(srv), STAT_UNKNOWN);
   if (!nc)
