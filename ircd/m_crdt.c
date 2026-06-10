@@ -121,7 +121,11 @@ void crdt_sync_request(struct Client *peer)
   bn = crdt_b64_encode(sv, (size_t)n, b64, sizeof b64);
   if (bn < 0)
     return;
-  sendcmdto_one(&me, CMD_CRDT_REPLICATION, peer, "S :%s", b64);
+  /* Tier2 Fix A: carry our doc digest alongside the SV. A peer whose SV equals
+   * ours but whose digest differs is an SV-invisible divergence the delta path
+   * can't repair; the receiver escalates such a case to a CR F snapshot. */
+  sendcmdto_one(&me, CMD_CRDT_REPLICATION, peer, "S %016llx :%s",
+                (unsigned long long)crdt_shadow_digest(), b64);
 }
 
 void crdt_sync_broadcast(void)
@@ -249,7 +253,10 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
   sub = parv[1];
 
   if (sub[0] == 'S' && !sub[1]) {
-    /* peer's state vector -> record it (for GC) + reply with the delta it lacks */
+    /* peer's state vector -> record it (for GC) + reply with the delta it lacks.
+     * Fix A form: "S <digest> :<sv>" (parc>=4); legacy "S :<sv>" (parc==3) carries
+     * no digest -> escalation is skipped (degrades to delta/floor behaviour). The
+     * SV blob is always the LAST param. */
     uint8_t svbytes[8192];
     int svn = crdt_b64_decode(parv[parc - 1], svbytes, sizeof svbytes);
     if (svn >= 0) {
@@ -259,6 +266,19 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
        * oplog -> send a full snapshot instead of an incomplete delta */
       if (crdt_shadow_peer_behind_floor(svbytes, (size_t)svn))
         send_crdt_snapshot(cptr);
+      /* Fix A: equal SV but different doc digest = SV-invisible divergence the
+       * delta path cannot repair (an empty delta) -> escalate to a CR F snapshot,
+       * whose HLC-merge is the only content-level reconcile. Both peers broadcast
+       * CR S each cycle, so the commutative merge converges both in one round. The
+       * SV-equal gate keeps this from firing during normal op-lag. */
+      else if (parc >= 4 && crdt_shadow_sv_equal(svbytes, (size_t)svn)
+               && (uint64_t)strtoull(parv[2], NULL, 16) != crdt_shadow_digest()) {
+        log_write(LS_SYSTEM, L_NOTICE, 0,
+                  "CRDT sync: digest mismatch at equal SV (peer=%s local=%016llx)"
+                  " -> full snapshot to %s", parv[2],
+                  (unsigned long long)crdt_shadow_digest(), cli_name(cptr));
+        send_crdt_snapshot(cptr);
+      }
       else
         send_crdt_delta(cptr, svbytes, svn);
     }

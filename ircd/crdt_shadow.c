@@ -2021,6 +2021,27 @@ int crdt_shadow_peer_behind_floor(const uint8_t *sv, size_t len)
   return 0;
 }
 
+/* Tier2 Fix A (digest-aware anti-entropy): returns 1 iff the peer's state vector
+ * equals OUR local SV on every origin.  When the SVs are equal a delta would be
+ * empty, so an equal-SV-but-different-DIGEST peer is the SV-invisible divergence
+ * that the delta path can never repair (a pair-local CR F snapshot is the only
+ * content-level reconcile, crdt_wire.c bypasses SV dedup).  Gating the snapshot
+ * escalation on SV-equality keeps it from firing during normal op-lag, when the
+ * SVs differ and the ordinary delta already heals the gap. */
+int crdt_shadow_sv_equal(const uint8_t *sv, size_t len)
+{
+  static struct CrdtStateVector peer;   /* static: avoid a 32KB stack frame */
+  int i;
+  if (!g_inited)
+    return 0;
+  if (crdt_sv_decode(&peer, sv, len) < 0)
+    return 0;
+  for (i = 0; i < CRDT_MAX_SERVERS; i++)
+    if (peer.seq[i] != g_crdt.local_sv.seq[i])
+      return 0;
+  return 1;
+}
+
 void crdt_shadow_record_peer_sv(uint16_t origin, const uint8_t *sv, size_t len)
 {
   int i, slot = -1;

@@ -1423,6 +1423,80 @@ static void test_lww_tombstone_gc(void **state)
 }
 
 /* ================================================================== */
+/* Fix A (digest-aware anti-entropy): the state vector counts ops per origin but
+ * does NOT summarise content/HLC, so two replicas can share an SV yet hold
+ * different content (e.g. a CR F snapshot HLC-merge or ctime incarnation change
+ * that bypasses the oplog). SV-based anti-entropy emits an empty delta for such a
+ * pair and never repairs it; only a CR F snapshot (which HLC-merges, bypassing SV
+ * dedup) reconciles content. These two suites encode that invariant. */
+
+/* DETECTION: equal SV is possible with different digest. */
+static void test_equal_sv_can_differ_in_content(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s1, s2, src;
+  uint8_t buf[8192];
+  int n, i, sv_eq;
+  struct CrdtUserRecord u  = mkuser("a", 1, "a", 0x01010101);
+  struct CrdtUserRecord u2 = mkuser("a", 1, "a", 0x02020202);  /* different bytes */
+  struct HLC hi = { 0xFFFFFFFFFFFFULL, 0, 1 };  /* far-future -> always wins merge */
+  crdt_state_init(&s1, 1);
+  crdt_state_init(&s2, 2);
+  crdt_state_init(&src, 3);
+  /* shared op-backed content from a common origin (3): equal SV + equal digest */
+  crdt_user_set(&src, "AAAAA", &u);
+  n = crdt_delta_encode(&src.oplog, &s1.local_sv, buf, sizeof buf);
+  crdt_delta_apply(&s1, buf, (size_t)n);
+  n = crdt_delta_encode(&src.oplog, &s2.local_sv, buf, sizeof buf);
+  crdt_delta_apply(&s2, buf, (size_t)n);
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+  /* diverge s1's CONTENT via a higher-HLC, NON-op-backed write (mimics the CR F
+   * HLC-merge / ctime incarnation change that bypasses the oplog) */
+  crdt_lwwmap_set(&s1.users, "AAAAA", 5, &u2, sizeof u2, hi, 1);
+  /* SV is unchanged (no op) but the digest now differs: the SV-invisible case */
+  sv_eq = 1;
+  for (i = 0; i < CRDT_MAX_SERVERS; i++)
+    if (s1.local_sv.seq[i] != s2.local_sv.seq[i]) { sv_eq = 0; break; }
+  assert_true(sv_eq);
+  assert_true(crdt_state_digest(&s1) != crdt_state_digest(&s2));
+  crdt_state_clear(&s1);
+  crdt_state_clear(&s2);
+  crdt_state_clear(&src);
+}
+
+/* REPAIR: a CR F snapshot converges an equal-SV/different-content divergence. */
+static void test_snapshot_converges_equal_sv_divergence(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s1, s2, src;
+  uint8_t buf[8192];
+  int n;
+  struct CrdtUserRecord u  = mkuser("a", 1, "a", 0x01010101);
+  struct CrdtUserRecord u2 = mkuser("a", 1, "a", 0x02020202);
+  struct HLC hi = { 0xFFFFFFFFFFFFULL, 0, 1 };
+  crdt_state_init(&s1, 1);
+  crdt_state_init(&s2, 2);
+  crdt_state_init(&src, 3);
+  crdt_user_set(&src, "AAAAA", &u);
+  n = crdt_delta_encode(&src.oplog, &s1.local_sv, buf, sizeof buf);
+  crdt_delta_apply(&s1, buf, (size_t)n);
+  n = crdt_delta_encode(&src.oplog, &s2.local_sv, buf, sizeof buf);
+  crdt_delta_apply(&s2, buf, (size_t)n);
+  crdt_lwwmap_set(&s1.users, "AAAAA", 5, &u2, sizeof u2, hi, 1);
+  assert_true(crdt_state_digest(&s1) != crdt_state_digest(&s2));  /* diverged */
+  /* the Fix A repair: a snapshot from the divergent peer HLC-merges content,
+   * converging the digest even though the SVs were already equal (an empty delta
+   * would never have repaired it). */
+  n = crdt_snapshot_encode(&s1, buf, sizeof buf);
+  assert_true(n > 0);
+  crdt_snapshot_apply(&s2, buf, (size_t)n);
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));  /* converged */
+  crdt_state_clear(&s1);
+  crdt_state_clear(&s2);
+  crdt_state_clear(&src);
+}
+
+/* ================================================================== */
 
 int main(void)
 {
@@ -1446,6 +1520,8 @@ int main(void)
     cmocka_unit_test(test_server_state_converges_mesh),
     cmocka_unit_test(test_restart_resumes_seq_past_adopted_sv),
     cmocka_unit_test(test_snapshot_apply_raises_gc_floor),
+    cmocka_unit_test(test_equal_sv_can_differ_in_content),
+    cmocka_unit_test(test_snapshot_converges_equal_sv_divergence),
     cmocka_unit_test(test_wire_sv_roundtrip),
     cmocka_unit_test(test_wire_delta_converges),
     cmocka_unit_test(test_wire_digest_converges),

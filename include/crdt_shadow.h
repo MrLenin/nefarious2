@@ -232,4 +232,9 @@ int crdt_shadow_apply_snapshot(const uint8_t *buf, size_t len);
  *  (CR F) rather than a delta (CR D). */
 int crdt_shadow_peer_behind_floor(const uint8_t *sv, size_t len);
 
+/** Tier2 Fix A: non-zero iff the peer's encoded state vector @a sv equals our
+ *  local SV on every origin. An equal-SV peer whose CR S digest differs from ours
+ *  is an SV-invisible divergence that only a CR F snapshot can repair. */
+int crdt_shadow_sv_equal(const uint8_t *sv, size_t len);
+
 #endif /* INCLUDED_crdt_shadow_h */
