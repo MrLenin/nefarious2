@@ -699,6 +699,87 @@ static void test_server_state_converges_mesh(void **state)
   crdt_state_clear(&C);
 }
 
+/* Phase 4c: snapshot-apply must raise gc_floor so snapshot-acquired state can
+ * RE-PROPAGATE to a third node.
+ *
+ * Live finding (partition/merge demo): on relink, a node (nef3) acquires a
+ * partitioned peer's (nef5's) state via a CR F full snapshot.  A snapshot
+ * delivers STATE but NO ops -- so nef3 has nef5's users with nothing in its
+ * oplog for them (oplog=0).  A third node (nef4) whose link never dropped is
+ * only slightly behind on nef5's seq; the sync responder serves it a DELTA, but
+ * nef3 has no ops in that range -> empty delta -> nef4 stays permanently stale.
+ *
+ * The responder already has a snapshot-fallback for peers "behind the GC floor"
+ * (crdt_shadow_peer_behind_floor -> send_crdt_snapshot).  It never fires here
+ * because crdt_snapshot_apply raised local_sv but NOT gc_floor.  The fix: a
+ * snapshot reclaims the oplog below its SV (we hold state, not ops), so
+ * gc_floor must rise to the adopted SV -- the op-level analog of resume_seq.
+ *
+ * This test models the responder's serve decision (delta vs snapshot-fallback)
+ * with the engine's gc_floor and asserts the third node converges.  RED before
+ * the gc_floor lift (empty delta -> B stale); GREEN after. */
+static int tri_behind_floor(const struct CrdtNetworkState *server,
+                            const struct CrdtNetworkState *peer)
+{
+  int i;
+  for (i = 0; i < CRDT_MAX_SERVERS; i++)
+    if (peer->local_sv.seq[i] < server->gc_floor.seq[i])
+      return 1;
+  return 0;
+}
+static void tri_serve(struct CrdtNetworkState *server, struct CrdtNetworkState *peer,
+                      uint8_t *buf, size_t bufsz)
+{
+  int n;
+  if (tri_behind_floor(server, peer)) {        /* ops gone -> snapshot-fallback */
+    n = crdt_snapshot_encode(server, buf, bufsz);
+    crdt_snapshot_apply(peer, buf, (size_t)n);
+  } else {                                      /* serve a delta from the oplog */
+    n = crdt_delta_encode(&server->oplog, &peer->local_sv, buf, bufsz);
+    crdt_delta_apply(peer, buf, (size_t)n);
+  }
+}
+static void test_snapshot_apply_raises_gc_floor(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState A, B, C;          /* A=hub(1) B=leaf(2) C=partitioned(3) */
+  uint8_t buf[16384];
+  int n;
+  struct CrdtUserRecord uc = mkuser("c", 3, "c", 0x03030303u);
+
+  crdt_state_init(&A, 1);
+  crdt_state_init(&B, 2);
+  crdt_state_init(&C, 3);
+
+  /* C (origin 3) creates state while partitioned -> ops in C's oplog only */
+  crdt_user_set(&C, "U030", &uc);
+  crdt_user_set(&C, "U031", &uc);
+  crdt_user_set(&C, "U032", &uc);
+
+  /* A acquires C's state via SNAPSHOT (the relink CR F path): state, no ops */
+  n = crdt_snapshot_encode(&C, buf, sizeof buf);
+  assert_true(crdt_snapshot_apply(&A, buf, (size_t)n) >= 0);
+  assert_non_null(crdt_user_get(&A, "U030"));        /* A has the state ... */
+  assert_int_equal(0, (int)A.oplog.count);            /* ... but holds NO ops for it */
+
+  /* THE FIX: snapshot-apply raised gc_floor to the adopted SV, so a peer still
+   * behind C's seq is detected as below-floor (and will be sent a snapshot). */
+  assert_true(A.gc_floor.seq[3] >= C.local_sv.seq[3]);   /* RED without the fix */
+
+  /* B is behind (none of C's state). A serves B by the floor decision. Without
+   * the fix A serves an empty delta (no C-ops) and B stays stale; with the fix A
+   * snapshots B. */
+  tri_serve(&A, &B, buf, sizeof buf);
+  assert_non_null(crdt_user_get(&B, "U030"));            /* RED: stale without fix */
+  assert_non_null(crdt_user_get(&B, "U032"));
+  assert_true(crdt_state_digest_materialized(&A) ==
+              crdt_state_digest_materialized(&B));
+
+  crdt_state_clear(&A);
+  crdt_state_clear(&B);
+  crdt_state_clear(&C);
+}
+
 /* ================================================================== */
 /* Phase 2 — wire serialization round-trip                            */
 /* ================================================================== */
@@ -1364,6 +1445,7 @@ int main(void)
     cmocka_unit_test(test_server_state_converges),
     cmocka_unit_test(test_server_state_converges_mesh),
     cmocka_unit_test(test_restart_resumes_seq_past_adopted_sv),
+    cmocka_unit_test(test_snapshot_apply_raises_gc_floor),
     cmocka_unit_test(test_wire_sv_roundtrip),
     cmocka_unit_test(test_wire_delta_converges),
     cmocka_unit_test(test_wire_digest_converges),

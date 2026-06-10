@@ -455,6 +455,18 @@ int crdt_snapshot_apply(struct CrdtNetworkState *st,
     crdt_sv_update(&st->local_sv, (uint16_t)i, snap_sv.seq[i]);
   crdt_state_resume_seq(st);   /* resume our seq past the adopted SV (restart epoch) */
 
+  /* Phase 4c: a snapshot delivers STATE up to snap_sv but NO ops below it — those
+   * seq ranges are unserveable as deltas from here.  Raise gc_floor to snap_sv so
+   * a peer still behind that point is detected as below-floor and served a fresh
+   * snapshot (crdt_shadow_peer_behind_floor -> send_crdt_snapshot) instead of an
+   * empty/incomplete delta that would leave it permanently stale.  This is the
+   * op-level analog of resume_seq; without it, state acquired via a relink
+   * snapshot cannot RE-PROPAGATE to a third node (the mesh-merge gap that the
+   * partition/merge demo exposed).  crdt_sv_update never lowers, so this only
+   * raises the floor. */
+  for (i = 0; i < CRDT_MAX_SERVERS; i++)
+    crdt_sv_update(&st->gc_floor, (uint16_t)i, snap_sv.seq[i]);
+
   return 0;
 }
 
