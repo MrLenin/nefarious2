@@ -311,10 +311,60 @@ void crdt_shadow_server_add(struct Client *srv)
   (void)srv;   /* reachability is local now (FindNServer); nothing to replicate */
 }
 
-void crdt_shadow_server_squit(struct Client *srv)
+/* Tier 2 (T2-a): on a CRDT-server SQUIT, keep a tree-departed but mesh-reachable
+ * server's users ALIVE as a "mesh stub" instead of tearing them down.  Called from
+ * exit_client's IsServer SQUIT branch BEFORE exit_downlinks; close_connection has
+ * already run (cli_fd==-1, FLAG_DEADSOCKET, cli_connect still valid, MyConnect
+ * still true).  Returns 1 if srv was converted to a stub — the caller MUST then
+ * skip exit_downlinks + exit_one_client for srv (its users + Client survive).
+ * Returns 0 to let the normal cascade tear it down.
+ *
+ * The conversion is near-empty because remote users SHARE their introducing
+ * server's Connection (list.c:248): cli_from(user) and cli_user(user)->server
+ * already point at srv, so once srv becomes a dead-sink stub (cli_fd==-1) every
+ * user auto-routes through it and can_send() drops the send (presence-only T2-a).
+ * We only drop srv's tree DLink and flip its status to STAT_MESH_SERVER. */
+int crdt_shadow_server_squit(struct Client *srv)
 {
-  (void)srv;   /* a SQUIT hides the peer's users via the local FindNServer gate;
-                  no SPLIT is written to the doc (it could not converge in a mesh) */
+  struct Client *acptr;
+  int have_transport = 0;
+
+  if (!shadow_on() || !feature_bool(FEAT_CRDT_PRIMARY))
+    return 0;
+  if (!srv || !IsServer(srv) || !IsCrdtAware(srv) || !cli_serv(srv))
+    return 0;
+  /* T2-a v1 is LEAF-ONLY: a departing server that itself has tree-downlinks falls
+   * back to the normal cascade (recursive keep-alive is a later increment). */
+  if (cli_serv(srv)->down)
+    return 0;
+  /* keep-vs-teardown gate (coarse, safe): is there ANY live CRDT transport other
+   * than the dying link through which srv's doc could still flow?  The
+   * full-partition teardown + the per-tick reconcile are the backstops if it
+   * cannot actually reach srv. */
+  for (acptr = GlobalClientList; acptr; acptr = cli_next(acptr))
+    if (acptr != srv && IsCrdtSyncTarget(acptr)) { have_transport = 1; break; }
+  if (!have_transport)
+    return 0;
+  /* CONVERT in place: flip to a non-server dead-sink stub.  Users are untouched —
+   * the shared Connection (list.c:248) keeps cli_from(user)==srv and
+   * cli_user(user)->server==srv valid, and close_connection already set
+   * cli_fd==-1 so can_send() drops sends to them (presence-only).  We DELIBERATELY
+   * leave the tree DLink (cli_serv->updown) in place: STAT_MESH_SERVER is excluded
+   * from every IsServer-gated tree/burst/LINKS walk, and keeping updown lets
+   * crdt_shadow_retire_mesh_stub() reuse exit_one_client()'s server teardown
+   * (whose remove_dlink asserts lp!=NULL). */
+  {
+    unsigned int held = 0, i;
+    struct Client **acptrp = cli_serv(srv)->client_list;
+    for (i = 0; i <= cli_serv(srv)->nn_mask; ++acptrp, ++i)
+      if (*acptrp) held++;
+    SetMeshStub(srv);
+    SetFlag(srv, FLAG_MAP);          /* keep the stub's users visible in WHO */
+    log_write(LS_SYSTEM, L_NOTICE, 0,
+              "CRDT mesh: %s tree-split but mesh-reachable; %u user(s) held live "
+              "(T2-a mesh stub)", cli_name(srv), held);
+  }
+  return 1;
 }
 
 void crdt_shadow_topic(struct Channel *chptr, struct Client *from)
@@ -913,8 +963,11 @@ static struct Client *crdt_materialize_one_user(const char *key, uint32_t key_le
   rec = (const struct CrdtUserRecord *)val->data;
   srvnum[0] = numbuf[0]; srvnum[1] = numbuf[1]; srvnum[2] = '\0';
   srv = FindNServer(srvnum);
-  if (!srv || !IsServer(srv))             /* owning server not reachable from here:
+  if (!srv || (!IsServer(srv) && !IsMeshStub(srv)))
+                                          /* owning server not reachable from here:
                                              skip-and-retry on the next pass.
+     Tier2 T2-a: a STAT_MESH_SERVER stub IS locally reachable (via the mesh) — a
+     user born on a split server materializes onto the stub (dead-sink routed).
      Phase 4c: this FindNServer + IsServer guard IS the SQUIT-as-SPLIT gate — a
      server's users are materialized iff it is reachable via a live CRDT transport
      from HERE (local crdt_transport_reachable / §17.3.3 SPLIT-iff-unreachable),

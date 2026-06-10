@@ -1028,6 +1028,11 @@ struct Client {
 #define STAT_UNKNOWN_SERVER     0x020 /**< connection on a server port */
 #define STAT_SERVER             0x040 /**< fully registered server */
 #define STAT_USER               0x080 /**< fully registered user */
+#define STAT_MESH_SERVER        0x100 /**< Tier2 T2-a: tree-departed but
+                                           mesh-reachable server stub; keeps its
+                                           users live (dead send-sink). Excluded
+                                           from every IsServer/IsClient/IsRegistered
+                                           mask by design. */
 
 /*
  * status macros.
@@ -1060,6 +1065,8 @@ struct Client {
         (STAT_CONNECTING | STAT_HANDSHAKE | STAT_ME | STAT_SERVER))
 /** Return non-zero if the client is a registered server. */
 #define IsServer(x)             (cli_status(x) == STAT_SERVER)
+/** Return non-zero if the client is a Tier2 T2-a mesh-server stub. */
+#define IsMeshStub(x)           (cli_status(x) == STAT_MESH_SERVER)
 /** Return non-zero if the client is a registered user. */
 #define IsUser(x)               (cli_status(x) == STAT_USER)
 
@@ -1070,6 +1077,8 @@ struct Client {
 #define SetHandshake(x)         (cli_status(x) = STAT_HANDSHAKE)
 /** Mark a client with STAT_SERVER. */
 #define SetServer(x)            (cli_status(x) = STAT_SERVER)
+/** Convert a (former) server client into a Tier2 T2-a mesh-server stub. */
+#define SetMeshStub(x)          (cli_status(x) = STAT_MESH_SERVER)
 /** Mark a client with STAT_ME. */
 #define SetMe(x)                (cli_status(x) = STAT_ME)
 /** Mark a client with STAT_USER. */

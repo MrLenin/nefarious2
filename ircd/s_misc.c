@@ -775,6 +775,32 @@ static void exit_downlinks(struct Client *cptr, struct Client *sptr, char *comme
   }
 }
 
+/* Tier2 T2-a: tear down a mesh stub (relink reconciliation; full-partition is a
+ * later increment needing a mesh-liveness signal — see crdt-mesh-tier2a-plan.md).
+ * Defined here (not crdt_shadow.c) because exit_one_client is static to this file.
+ * Mirrors exit_downlinks for the held users: exit_one_client gives each a
+ * common-channel QUIT to local members but NO network QUIT and NO doc tombstone,
+ * so they re-materialize from the still-converged doc once the peer re-bursts (the
+ * §17.3 zero-tombstone property).  Then restores IsServer so exit_one_client runs
+ * the full server teardown (ClearServerYXX frees the server_list[] slot,
+ * remove_dlink, Count_*serverquits, free).  Uses exit_one_client (NOT exit_client)
+ * so the conversion hook in exit_client does not re-fire and re-stub the server. */
+void crdt_shadow_retire_mesh_stub(struct Client *stub, const char *comment)
+{
+  struct Client **acptrp;
+  unsigned int i;
+  if (!stub || !IsMeshStub(stub) || !cli_serv(stub))
+    return;
+  log_write(LS_SYSTEM, L_NOTICE, 0,
+            "CRDT mesh: retiring mesh stub %s (%s)", cli_name(stub), comment);
+  acptrp = cli_serv(stub)->client_list;
+  for (i = 0; i <= cli_serv(stub)->nn_mask; ++acptrp, ++i)
+    if (*acptrp)
+      exit_one_client(*acptrp, comment);
+  SetServer(stub);                 /* restore so exit_one_client does server teardown */
+  exit_one_client(stub, comment);
+}
+
 /* exit_client, rewritten 25-9-94 by Run */
 /**
  * Exits a client of *any* type (user, server, etc)
@@ -1044,8 +1070,14 @@ int exit_client(struct Client *cptr,
      * N user/membership tombstones — its users are hidden at materialize time and
      * reappear on relink (server_estab -> ACTIVE) with no re-burst.  The hook
      * self-gates (direct peer / CRDT-aware / CRDT-primary); cli_serv->up is still
-     * valid here (close_connection cleared MyConnect but not the tree parent). */
-    crdt_shadow_server_squit(victim);
+     * valid here (close_connection cleared MyConnect but not the tree parent).
+     *
+     * Tier2 T2-a: if the departing server is still mesh-reachable, this CONVERTS
+     * it into a STAT_MESH_SERVER stub (its users stay live) and returns 1 — we
+     * then SKIP exit_downlinks + exit_one_client so the stub + its users survive
+     * the split.  Returns 0 to fall through to the normal cascade. */
+    if (crdt_shadow_server_squit(victim))
+      return (cptr == victim) ? CPTR_KILLED : 0;
 
     /* (Alias promotions already executed before the SQUIT broadcast
      * loop above.  bounce_promote_alias() removed the old primary

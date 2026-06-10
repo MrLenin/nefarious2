@@ -68,11 +68,18 @@ void crdt_shadow_user_remove(struct Client *cptr);
  *  No-op for non-CRDT peers / non-CRDT-primary. */
 void crdt_shadow_server_add(struct Client *srv);
 
-/** Phase 4a: record a directly-linked CRDT-aware server as SPLIT (called from
- *  exit_client's IsServer SQUIT branch).  Fires only for a DIRECT peer
- *  (cli_serv->up == &me); a relayed SQUIT is the squitting uplink's to record.
- *  Users on a SPLIT server are hidden at materialize time, not tombstoned. */
-void crdt_shadow_server_squit(struct Client *srv);
+/** Tier2 T2-a: on a CRDT-server SQUIT, keep a tree-departed but mesh-reachable
+ *  server's users alive as a STAT_MESH_SERVER stub (dead send-sink) instead of
+ *  tearing them down.  Called from exit_client's IsServer SQUIT branch BEFORE
+ *  exit_downlinks.  Returns 1 if converted to a stub (caller MUST then skip
+ *  exit_downlinks + exit_one_client for srv); 0 to let the normal cascade run. */
+int crdt_shadow_server_squit(struct Client *srv);
+
+/** Tier2 T2-a: tear down a mesh stub (relink reconciliation).  Removes its held
+ *  users (no doc tombstone -> they re-materialize on re-burst) and frees the stub
+ *  + its server_list[] slot.  Call BEFORE the relinking peer re-registers its
+ *  numeric (SetServerYXX), so the slot is clean. */
+void crdt_shadow_retire_mesh_stub(struct Client *stub, const char *comment);
 
 /** Mirror a channel topic (called from do_settopic and the burst topic-clear).
  *  Records chptr->topic into the shadow topics map. @a from is the incoming

@@ -41,6 +41,7 @@
 #include "msg.h"
 #include "numeric.h"
 #include "numnicks.h"
+#include "crdt_shadow.h"   /* Tier2 T2-a: retire a mesh stub on relink */
 #include "querycmds.h"
 #include "s_bsd.h"
 #include "s_conf.h"
@@ -630,6 +631,18 @@ int mr_server(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
 
   memset(cli_passwd(cptr), 0, sizeof(cli_passwd(cptr)));
 
+  /* Tier2 T2-a: if a mesh stub still holds this server's name/numeric (it split
+   * earlier and we kept its users live), retire it BEFORE check_loop_and_lh —
+   * otherwise the stub looks like a duplicate server and the relink is rejected.
+   * Its users re-materialize from the still-converged doc on re-burst. */
+  {
+    struct Client *crdt_stub = FindClient(host);
+    if ((!crdt_stub || !IsMeshStub(crdt_stub)) && parc > 7)
+      crdt_stub = FindNServer(parv[6]);
+    if (crdt_stub && IsMeshStub(crdt_stub))
+      crdt_shadow_retire_mesh_stub(crdt_stub, "mesh stub retired on relink");
+  }
+
   ret = check_loop_and_lh(cptr, sptr, &ghost, host, (parc > 7 ? parv[6] : NULL), timestamp, hop, 1);
   if (ret != 1)
     return ret;
@@ -869,6 +882,17 @@ int ms_server(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
   if (parv[parc - 1][0] == '\0')
     return exit_client_msg(cptr, cptr, &me,
                            "No server info specified for %s", host);
+
+  /* Tier2 T2-a: retire any mesh stub holding this name/numeric BEFORE
+   * check_loop_and_lh (relayed relink — e.g. nef4 sees nef5 re-introduced via
+   * nef3), else the stub trips the duplicate-server check. */
+  {
+    struct Client *crdt_stub = FindClient(host);
+    if ((!crdt_stub || !IsMeshStub(crdt_stub)) && parc > 7)
+      crdt_stub = FindNServer(parv[6]);
+    if (crdt_stub && IsMeshStub(crdt_stub))
+      crdt_shadow_retire_mesh_stub(crdt_stub, "mesh stub retired on relink");
+  }
 
   ret = check_loop_and_lh(cptr, sptr, NULL, host, (parc > 7 ? parv[6] : NULL), timestamp, hop, parv[5][0] == 'J');
   if (ret != 1)

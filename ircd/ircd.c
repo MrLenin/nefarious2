@@ -625,10 +625,16 @@ static void check_pings(struct Event* ev) {
    
 
     /* Remove dead clients. */
-    if (IsDead(cptr)) {
+    if (IsDead(cptr) && !IsMeshStub(cptr)) {
       exit_client(cptr, cptr, &me, cli_info(cptr));
       continue;
     }
+    /* Tier2 T2-a: a mesh-server stub is intentionally a dead send-sink
+     * (FLAG_DEADSOCKET, fd==-1) that holds a split server's users live — do NOT
+     * reap it here, and skip the ping logic below (it has no socket to ping;
+     * retire is driven by relink / full-partition, not ping timeout). */
+    if (IsMeshStub(cptr))
+      continue;
 
     /* Phase 4b: CRDT overlay links are long-lived unregistered (STAT_HANDSHAKE)
      * connections carrying only CR tokens — exempt from the registration ping
