@@ -388,6 +388,12 @@ void crdt_chan_ctime_set(struct CrdtNetworkState *st, const char *chan,
   uint64_t seq;
   struct CrdtOp *op;
   ctime_merge(ch, creationtime, now, incarnation);
+  /* zero the struct (incl. each struct HLC's trailing alignment padding, sizeof 16
+   * vs 12 used) before populating: memdup(&pl) below serializes the whole struct
+   * into op->val, and uninit padding bytes from a by-value HLC would otherwise be
+   * b64-encoded onto the wire (valgrind "uninit value" at crdt_b64_encode; benign
+   * same-build but a cross-build wire-determinism wart). */
+  memset(&pl, 0, sizeof pl);
   pl.value = creationtime;
   pl.set_hlc = now;
   pl.del_hlc = incarnation;
