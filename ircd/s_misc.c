@@ -1065,19 +1065,30 @@ int exit_client(struct Client *cptr,
   if (IsServer(victim)) {
     char netsplit_batch_id[32] = "";
 
-    /* Phase 4a (SQUIT-as-SPLIT, §17.3): record a directly-linked CRDT-aware peer
-     * as SPLIT in the doc BEFORE the exit_downlinks cascade.  ONE LWW write, not
-     * N user/membership tombstones — its users are hidden at materialize time and
-     * reappear on relink (server_estab -> ACTIVE) with no re-burst.  The hook
-     * self-gates (direct peer / CRDT-aware / CRDT-primary); cli_serv->up is still
-     * valid here (close_connection cleared MyConnect but not the tree parent).
-     *
-     * Tier2 T2-a: if the departing server is still mesh-reachable, this CONVERTS
-     * it into a STAT_MESH_SERVER stub (its users stay live) and returns 1 — we
-     * then SKIP exit_downlinks + exit_one_client so the stub + its users survive
-     * the split.  Returns 0 to fall through to the normal cascade. */
-    if (crdt_shadow_server_squit(victim))
+    /* Tier2 T2-a/c: if the departing CRDT server is still mesh-reachable, KEEP it
+     * (and its users) alive as a STAT_MESH_SERVER stub instead of cascading — so
+     * its users stay visible (T2-a presence) AND addressable for deliver-FROM
+     * (T2-c, via the T2-b send-hooks).  For a NON-leaf departed server we tear
+     * down its tree-downlinks first (their users QUIT) then convert the now-leaf
+     * server; a leaf has no downlinks so this matches the T2-a behaviour.
+     * (Deeper-subtree CRDT-aware servers are torn down here for now — full
+     * recursive keep-alive is a follow-up; see crdt-mesh-tier2a-plan.md.)
+     * close_connection already ran; cli_serv->up/down are still valid. */
+    if (crdt_shadow_mesh_reachable(victim)) {
+      struct DLink *clp, *cnext;
+      send_netsplit_batch_start(victim, cli_serv(victim)->up,
+                                 netsplit_batch_id, sizeof(netsplit_batch_id));
+      set_active_network_batch(netsplit_batch_id);
+      for (clp = cli_serv(victim)->down; clp; clp = cnext) {
+        cnext = clp->next;
+        exit_downlinks(clp->value.cptr, killer, comment1);
+        exit_one_client(clp->value.cptr, cli_name(&me));
+      }
+      set_active_network_batch(NULL);
+      send_netsplit_batch_end(netsplit_batch_id);
+      crdt_shadow_convert_to_stub(victim);   /* victim is now a leaf — keep it */
       return (cptr == victim) ? CPTR_KILLED : 0;
+    }
 
     /* (Alias promotions already executed before the SQUIT broadcast
      * loop above.  bounce_promote_alias() removed the old primary

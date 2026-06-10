@@ -68,12 +68,15 @@ void crdt_shadow_user_remove(struct Client *cptr);
  *  No-op for non-CRDT peers / non-CRDT-primary. */
 void crdt_shadow_server_add(struct Client *srv);
 
-/** Tier2 T2-a: on a CRDT-server SQUIT, keep a tree-departed but mesh-reachable
- *  server's users alive as a STAT_MESH_SERVER stub (dead send-sink) instead of
- *  tearing them down.  Called from exit_client's IsServer SQUIT branch BEFORE
- *  exit_downlinks.  Returns 1 if converted to a stub (caller MUST then skip
- *  exit_downlinks + exit_one_client for srv); 0 to let the normal cascade run. */
-int crdt_shadow_server_squit(struct Client *srv);
+/** Tier2 T2-a/c: keep-vs-teardown gate — non-zero iff @a srv is a CRDT-aware
+ *  server still reachable via SOME live CRDT transport other than the dying link
+ *  (so its users should be kept alive as a mesh stub rather than torn down). */
+int crdt_shadow_mesh_reachable(struct Client *srv);
+
+/** Tier2 T2-a/c: convert a (now-leaf) departed server into a STAT_MESH_SERVER
+ *  dead-sink stub in place — its users stay live + addressable.  Call only after
+ *  the caller has torn down any tree-downlinks (exit_client does this for T2-c). */
+void crdt_shadow_convert_to_stub(struct Client *srv);
 
 /** Tier2 T2-a: tear down a mesh stub (relink reconciliation).  Removes its held
  *  users (no doc tombstone -> they re-materialize on re-burst) and frees the stub
