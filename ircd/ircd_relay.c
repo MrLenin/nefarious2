@@ -1268,6 +1268,17 @@ void relay_private_message(struct Client* sptr, const char* name, const char* te
                   (unsigned long)(tv.tv_usec / 1000));
   }
 
+  /* Tier2 T2-b: if the target lives on a mesh stub (its P10 tree path is down but
+   * it is mesh-reachable), the normal send resolves cli_from -> the dead-sink stub
+   * and drops.  Gossip via ephemeral CR M instead (delivered on the target's home
+   * server, deduped by msgid).  v1: PRIVMSG only; history/echo for mesh-only
+   * targets is a later increment. */
+  if (cli_user(acptr) && cli_user(acptr)->server &&
+      IsMeshStub(cli_user(acptr)->server)) {
+    crdt_gossip_privmsg(sptr, acptr, pm_msgid, mytext);
+    return;
+  }
+
   /* Alias source rewriting for S2S legacy compat.
    * If target is on the primary's server direction, keep alias numeric
    * (avoids fake direction — server_relay handles rewriting there). */

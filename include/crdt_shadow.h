@@ -81,6 +81,10 @@ int crdt_shadow_server_squit(struct Client *srv);
  *  numeric (SetServerYXX), so the slot is clean. */
 void crdt_shadow_retire_mesh_stub(struct Client *stub, const char *comment);
 
+/** Tier2 T2-b: doc lookup of a user record by 5-char numeric (CR M source-prefix
+ *  reconstruction).  Returns NULL if absent / not initialised. */
+const struct CrdtUserRecord *crdt_shadow_user_record(const char *numeric);
+
 /** Mirror a channel topic (called from do_settopic and the burst topic-clear).
  *  Records chptr->topic into the shadow topics map. @a from is the incoming
  *  link the change arrived on (cptr), or the local source; the single-writer

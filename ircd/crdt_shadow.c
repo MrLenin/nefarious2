@@ -1946,6 +1946,16 @@ uint64_t crdt_shadow_digest(void)
   return g_inited ? crdt_state_digest(&g_crdt) : 0;
 }
 
+/* Tier2 T2-b: doc lookup of a user record by numeric, for CR M source-prefix
+ * reconstruction (the sender may not be live on a tree-split server, but the
+ * converged doc still has its nick/ident/host). */
+const struct CrdtUserRecord *crdt_shadow_user_record(const char *numeric)
+{
+  if (!g_inited || !numeric)
+    return NULL;
+  return crdt_user_get(&g_crdt, numeric);
+}
+
 int crdt_shadow_encode_snapshot(uint8_t *buf, size_t cap)
 {
   return g_inited ? crdt_snapshot_encode(&g_crdt, buf, cap) : -1;

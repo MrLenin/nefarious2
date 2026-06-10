@@ -26,6 +26,8 @@
 #include "msg.h"
 #include "numnicks.h"
 #include "send.h"
+#include "crdt_state.h"   /* Tier2 T2-b: struct CrdtUserRecord (CR M source prefix) */
+#include "ircd_string.h"  /* Tier2 T2-b: ircd_strncpy (msgid dedup ring) */
 
 #include "crdt_shadow.h"
 #include "crdt_wire.h"
@@ -174,6 +176,49 @@ void crdt_send_snapshot(struct Client *to)
   send_crdt_snapshot(to);              /* Phase 3c: CRDT-authoritative BURST */
 }
 
+/* ================================================================== */
+/* Tier2 T2-b — ephemeral live-message gossip (CR M)                  */
+/*                                                                    */
+/* A PRIVMSG to a user on a mesh stub (its P10 tree path is down but it */
+/* is mesh-reachable, T2-a) is gossiped as an EPHEMERAL CR M line over  */
+/* the CRDT transports — it NEVER enters the doc/oplog/snapshot.  Each  */
+/* receiver delivers it if the target is local and relays it onward;    */
+/* a small msgid ring dedups so a message arriving via multiple mesh    */
+/* paths is delivered/relayed exactly once.  Wire:                      */
+/*   :<srv> CR M <msgid> <srcYXX> <tgtYXX> :<text>                       */
+/* ================================================================== */
+#define CR_M_SEEN 256
+static char crdt_m_seen[CR_M_SEEN][64];
+static int  crdt_m_seen_idx = 0;
+
+/* return 1 if msgid was already seen (dup), else record it and return 0 */
+static int crdt_m_seen_check_add(const char *msgid)
+{
+  int i;
+  if (!msgid || !*msgid)
+    return 0;                          /* no msgid -> can't dedup; treat as new */
+  for (i = 0; i < CR_M_SEEN; i++)
+    if (crdt_m_seen[i][0] && 0 == strcmp(crdt_m_seen[i], msgid))
+      return 1;
+  ircd_strncpy(crdt_m_seen[crdt_m_seen_idx], msgid, sizeof crdt_m_seen[0]);
+  crdt_m_seen_idx = (crdt_m_seen_idx + 1) % CR_M_SEEN;
+  return 0;
+}
+
+void crdt_gossip_privmsg(struct Client *from, struct Client *to,
+                         const char *msgid, const char *text)
+{
+  struct Client *acptr;
+  if (!crdt_shadow_active() || !from || !to || !text)
+    return;
+  crdt_m_seen_check_add(msgid);        /* record so an echo/relay-back is deduped */
+  for (acptr = GlobalClientList; acptr; acptr = cli_next(acptr))
+    if (IsCrdtSyncTarget(acptr))
+      sendcmdto_one(&me, CMD_CRDT_REPLICATION, acptr, "M %s %s%s %s%s :%s",
+                    msgid && *msgid ? msgid : "*",
+                    NumNick(from), NumNick(to), text);
+}
+
 int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
 {
   const char *sub;
@@ -270,6 +315,32 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
     if (svn >= 0)
       crdt_shadow_record_peer_sv((uint16_t)base64toint(cli_yxx(cptr)),
                                  svbytes, (size_t)svn);
+  } else if (sub[0] == 'M' && !sub[1]) {
+    /* Tier2 T2-b: ephemeral live message — M <msgid> <srcYXX> <tgtYXX> :<text>.
+     * Deliver to a LOCAL target (source prefix reconstructed from the converged
+     * doc, since the sender may not be live on this split server) and relay
+     * onward; msgid-deduped so multi-path arrivals deliver/relay once.  NEVER
+     * touches the doc/oplog. */
+    const char *m_msgid, *srcyxx, *tgtyxx, *m_text;
+    struct Client *tgt, *p;
+    if (parc < 6)
+      return 0;
+    m_msgid = parv[2]; srcyxx = parv[3]; tgtyxx = parv[4]; m_text = parv[parc - 1];
+    if (crdt_m_seen_check_add(m_msgid))
+      return 0;                        /* already handled via another mesh path */
+    tgt = findNUser(tgtyxx);
+    if (tgt && MyConnect(tgt)) {
+      const struct CrdtUserRecord *src = crdt_shadow_user_record(srcyxx);
+      if (src && src->nick[0])
+        sendrawto_one(tgt, ":%s!%s@%s PRIVMSG %s :%s", src->nick, src->ident,
+                      src->host[0] ? src->host : "mesh", cli_name(tgt), m_text);
+      else
+        sendrawto_one(tgt, ":%s PRIVMSG %s :%s", srcyxx, cli_name(tgt), m_text);
+    }
+    for (p = GlobalClientList; p; p = cli_next(p))   /* gossip relay (excl source) */
+      if (p != cptr && IsCrdtSyncTarget(p))
+        sendcmdto_one(&me, CMD_CRDT_REPLICATION, p, "M %s %s %s :%s",
+                      m_msgid, srcyxx, tgtyxx, m_text);
   }
   return 0;
 }

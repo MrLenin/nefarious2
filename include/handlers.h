@@ -338,6 +338,11 @@ extern void crdt_sync_push(void);
 /** Phase 3c: send the full CRDT document as a CR F snapshot to @a to — the
  *  CRDT-authoritative replacement for P10 BURST on a CRDT-primary link. */
 extern void crdt_send_snapshot(struct Client* to);
+/** Tier2 T2-b: gossip a live PRIVMSG to a mesh-only target (its tree path is down
+ *  but it is mesh-reachable) as an ephemeral CR M line over the CRDT transports —
+ *  delivered to the target on its home server, deduped by @a msgid; never the doc. */
+extern void crdt_gossip_privmsg(struct Client* from, struct Client* to,
+                                const char* msgid, const char* text);
 extern int ms_bouncer_transfer(struct Client*, struct Client*, int, char*[]);
 extern int m_persistence(struct Client*, struct Client*, int, char*[]);
 extern void persistence_send_status(struct Client *to);
