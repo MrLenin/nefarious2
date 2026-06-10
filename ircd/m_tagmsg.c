@@ -290,6 +290,21 @@ int m_tagmsg(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
         sendcmdto_serv_butone_v3(sptr, CMD_TAGMSG, cptr, "@%s %s",
                               client_tags, chptr->chname);
       }
+
+      /* Tier2 T2-b: if any channel member is on a mesh stub, gossip the TAGMSG
+       * over the mesh (cmd 'T', client tags as payload) — the P10 fan-out above
+       * dropped those members at the dead-sink stub.  One gossip covers all mesh
+       * servers; each delivers to its local msgtags-capable channel members. */
+      {
+        struct Membership *mmemb;
+        for (mmemb = chptr->members; mmemb; mmemb = mmemb->next_member)
+          if (cli_user(mmemb->user) && cli_user(mmemb->user)->server &&
+              IsMeshStub(cli_user(mmemb->user)->server)) {
+            crdt_gossip_message(sptr, 'T', chptr->chname, tagmsg_msgid,
+                                client_tags);
+            break;
+          }
+      }
     }
   }
   else {
@@ -326,9 +341,20 @@ int m_tagmsg(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
       }
       else {
         /* Remote user - forward to their server with tags */
-        sendcmdto_set_s2s_tags(0, dm_msgid);
-        sendcmdto_one(sptr, CMD_TAGMSG, acptr, "@%s %C",
-                      client_tags, acptr);
+        if (cli_user(acptr) && cli_user(acptr)->server &&
+            IsMeshStub(cli_user(acptr)->server)) {
+          /* Tier2 T2-b: the target's P10 tree path is a dead-sink mesh stub, so the
+           * normal forward drops.  Gossip over the mesh instead (cmd 'T', client
+           * tags as payload), delivered on the target's home server, deduped by
+           * msgid. */
+          char tyxx[6];
+          ircd_snprintf(0, tyxx, sizeof tyxx, "%s%s", NumNick(acptr));
+          crdt_gossip_message(sptr, 'T', tyxx, dm_msgid, client_tags);
+        } else {
+          sendcmdto_set_s2s_tags(0, dm_msgid);
+          sendcmdto_one(sptr, CMD_TAGMSG, acptr, "@%s %C",
+                        client_tags, acptr);
+        }
 
         /* Echo TAGMSG back to sender if they have echo-message */
         {

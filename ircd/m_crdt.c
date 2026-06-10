@@ -17,6 +17,7 @@
 
 #include "config.h"
 
+#include "capab.h"        /* Tier2 T2-b: CAP_MSGTAGS gate for CR M TAGMSG delivery */
 #include "client.h"
 #include "ircd.h"
 #include "ircd_alloc.h"
@@ -358,41 +359,65 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
                                  svbytes, (size_t)svn);
   } else if (sub[0] == 'M' && !sub[1]) {
     /* Tier2 T2-b: ephemeral live message —
-     *   M <msgid> <cmd> <srcYXX> <target> :<text>   cmd='P'(PRIVMSG)/'N'(NOTICE),
-     * target = a 5-char user numeric (unicast) or a #channel.  Deliver to the
-     * LOCAL target (a user, or all local members of a channel) with the source
-     * prefix reconstructed from the converged doc (the sender may not be live on
-     * this split server), then relay onward; msgid-deduped so multi-path arrivals
-     * deliver/relay once.  NEVER touches the doc/oplog. */
+     *   M <msgid> <cmd> <srcYXX> <target> :<payload>
+     * cmd='P'(PRIVMSG)/'N'(NOTICE) -> payload is the message text; cmd='T'(TAGMSG)
+     * -> payload is the client-only tag string (rides the @-prefix, no body, and is
+     * delivered only to message-tags-capable recipients).  target = a 5-char user
+     * numeric (unicast) or a #channel.  Deliver to the LOCAL target (a user, or all
+     * local members of a channel) with the source prefix reconstructed from the
+     * converged doc (the sender may not be live on this split server), then relay
+     * onward; msgid-deduped so multi-path arrivals deliver/relay once.  NEVER
+     * touches the doc/oplog. */
     const char *m_msgid, *m_cmd, *srcyxx, *target, *m_text, *cmdstr;
     const struct CrdtUserRecord *src;
     struct Client *p;
+    int is_tag;
     if (parc < 7)
       return 0;
     m_msgid = parv[2]; m_cmd = parv[3]; srcyxx = parv[4]; target = parv[5];
     m_text = parv[parc - 1];
     if (crdt_m_seen_check_add(m_msgid))
       return 0;                        /* already handled via another mesh path */
-    cmdstr = (m_cmd[0] == 'N') ? "NOTICE" : "PRIVMSG";
+    is_tag = (m_cmd[0] == 'T');
+    cmdstr = (m_cmd[0] == 'N') ? "NOTICE" : (is_tag ? "TAGMSG" : "PRIVMSG");
     src = crdt_shadow_user_record(srcyxx);
     if (target[0] == '#' || target[0] == '&') {           /* channel delivery */
       struct Channel *ch = FindChannel(target);
       struct Membership *memb;
       if (ch)
-        for (memb = ch->members; memb; memb = memb->next_member)
-          if (MyConnect(memb->user)) {
+        for (memb = ch->members; memb; memb = memb->next_member) {
+          if (!MyConnect(memb->user))
+            continue;
+          if (is_tag) {                /* TAGMSG: @tags prefix, no body, cap-gated */
+            if (!CapActive(memb->user, CAP_MSGTAGS))
+              continue;
             if (src && src->nick[0])
-              sendrawto_one(memb->user, ":%s!%s@%s %s %s :%s", src->nick,
-                            src->ident, src->host[0] ? src->host : "mesh",
-                            cmdstr, target, m_text);
+              sendrawto_one(memb->user, "@%s :%s!%s@%s TAGMSG %s", m_text,
+                            src->nick, src->ident,
+                            src->host[0] ? src->host : "mesh", target);
             else
-              sendrawto_one(memb->user, ":%s %s %s :%s", srcyxx, cmdstr, target,
-                            m_text);
-          }
+              sendrawto_one(memb->user, "@%s :%s TAGMSG %s", m_text, srcyxx, target);
+          } else if (src && src->nick[0])
+            sendrawto_one(memb->user, ":%s!%s@%s %s %s :%s", src->nick,
+                          src->ident, src->host[0] ? src->host : "mesh",
+                          cmdstr, target, m_text);
+          else
+            sendrawto_one(memb->user, ":%s %s %s :%s", srcyxx, cmdstr, target,
+                          m_text);
+        }
     } else {                                              /* unicast delivery */
       struct Client *tgt = findNUser(target);
       if (tgt && MyConnect(tgt)) {
-        if (src && src->nick[0])
+        if (is_tag) {                  /* TAGMSG: @tags prefix, no body, cap-gated */
+          if (CapActive(tgt, CAP_MSGTAGS)) {
+            if (src && src->nick[0])
+              sendrawto_one(tgt, "@%s :%s!%s@%s TAGMSG %s", m_text, src->nick,
+                            src->ident, src->host[0] ? src->host : "mesh",
+                            cli_name(tgt));
+            else
+              sendrawto_one(tgt, "@%s :%s TAGMSG %s", m_text, srcyxx, cli_name(tgt));
+          }
+        } else if (src && src->nick[0])
           sendrawto_one(tgt, ":%s!%s@%s %s %s :%s", src->nick, src->ident,
                         src->host[0] ? src->host : "mesh", cmdstr, cli_name(tgt),
                         m_text);
