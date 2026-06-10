@@ -108,7 +108,8 @@ void crdt_sync_request(struct Client *peer)
   uint8_t sv[8192];
   char b64[12000];
   int n, bn;
-  if (!crdt_shadow_active() || !IsServer(peer) || !IsCrdtAware(peer))
+  if (!crdt_shadow_active() || !IsCrdtAware(peer) ||
+      (!IsServer(peer) && !IsCrdtOverlay(peer)))
     return;
   n = crdt_shadow_encode_sv(sv, sizeof sv);
   if (n < 0)
@@ -125,7 +126,7 @@ void crdt_sync_broadcast(void)
   if (!crdt_shadow_active())
     return;
   for (acptr = GlobalClientList; acptr; acptr = cli_next(acptr))
-    if (IsServer(acptr) && MyConnect(acptr) && IsCrdtAware(acptr))
+    if (IsCrdtSyncTarget(acptr))
       crdt_sync_request(acptr);
 }
 
@@ -144,7 +145,7 @@ void crdt_sync_push(void)
   dn = crdt_shadow_encode_local_unpushed(delta, CR_DELTA_MAX);
   if (dn > 4)
     for (acptr = GlobalClientList; acptr; acptr = cli_next(acptr))
-      if (IsServer(acptr) && MyConnect(acptr) && IsCrdtAware(acptr))
+      if (IsCrdtSyncTarget(acptr))
         send_crdt_blob(acptr, 'U', delta, dn);
   MyFree(delta);
 }
@@ -164,7 +165,7 @@ static void crdt_relay_delta(struct Client *from, const uint8_t *bin, int bn)
   if (!crdt_shadow_active() || bn <= 0)
     return;
   for (acptr = GlobalClientList; acptr; acptr = cli_next(acptr))
-    if (acptr != from && IsServer(acptr) && MyConnect(acptr) && IsCrdtAware(acptr))
+    if (acptr != from && IsCrdtSyncTarget(acptr))
       send_crdt_blob(acptr, 'D', bin, bn);
 }
 
@@ -271,4 +272,20 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
                                  svbytes, (size_t)svn);
   }
   return 0;
+}
+
+/* Phase 4b: UNREGISTERED-state CR handler.  A CRDT mesh overlay link
+ * (mr_crdtmesh) stays in STAT_HANDSHAKE / UNREGISTERED_HANDLER permanently and
+ * carries ONLY CR tokens — never a P10 SERVER/BURST and never the routing tree.
+ * Its CR lines arrive via the normal connect_dopacket -> parse_client path (which
+ * ignores the sender prefix), so they dispatch through this UNREG slot instead of
+ * ms_crdt's SERVER slot.  ms_crdt keys the peer numeric off cli_yxx(cptr), which
+ * mr_crdtmesh stored at handshake, so SV recording + dedup are correct.  Gate
+ * strictly on IsCrdtOverlay so an ordinary unregistered/handshake connection can
+ * never inject CRDT state. */
+int mr_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
+{
+  if (!IsCrdtOverlay(cptr))
+    return 0;
+  return ms_crdt(cptr, sptr, parc, parv);
 }

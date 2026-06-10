@@ -1091,8 +1091,19 @@ struct Message msgtab[] = {
     TOK_CRDT_REPLICATION,
     0, MAXPARA, 0, 0, NULL,
     /* UNREG, CLIENT, SERVER, OPER, SERVICE */
-    { m_ignore, m_ignore, ms_crdt, m_ignore, m_ignore },
+    /* UNREG = mr_crdt: a CRDT mesh overlay link (Phase 4b) stays in
+     * STAT_HANDSHAKE (UNREGISTERED_HANDLER), so its CR tokens dispatch
+     * through this slot; mr_crdt forwards to ms_crdt iff IsCrdtOverlay. */
+    { mr_crdt, m_ignore, ms_crdt, m_ignore, m_ignore },
     "S|D|U|V <args> - CRDT mesh state sync"
+  },
+  {
+    MSG_CRDTMESH,
+    TOK_CRDTMESH,
+    0, MAXPARA, MFLG_SLOW | MFLG_UNREG | MFLG_NOSHUN, 0, NULL,
+    /* UNREG, CLIENT, SERVER, OPER, SERVICE */
+    { mr_crdtmesh, m_ignore, m_ignore, m_ignore, m_ignore },
+    "<name> <numeric> :<info> - CRDT mesh overlay-link handshake"
   },
   {
     MSG_FINGERPRINT,

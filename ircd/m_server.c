@@ -31,6 +31,7 @@
 #include "hash.h"
 #include "ircd.h"
 #include "ircd_log.h"
+#include "handlers.h"
 #include "ircd_features.h"
 #include "ircd_reply.h"
 #include "ircd_string.h"
@@ -662,6 +663,146 @@ int mr_server(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
   }
 
   return ret;
+}
+
+/** Handle a CRDTMESH overlay-link handshake from an unregistered connection (Phase 4b).
+ *
+ * A CRDT mesh overlay link carries ONLY CR (CRDT sync) tokens — it is NOT a P10
+ * SERVER link.  It deliberately skips check_loop_and_lh / make_server /
+ * SetServerYXX / server_estab, so a redundant CRDT edge between two servers that
+ * are already linked via the P10 tree does NOT trip P10's duplicate-server loop
+ * break (which would SQUIT the younger link).  The peer stays in STAT_HANDSHAKE
+ * with FLAG_CRDT_OVERLAY; its CR tokens dispatch through the UNREGISTERED CR
+ * handler (mr_crdt), and its server numeric is stored in cli_yxx WITHOUT
+ * SetServerYXX (which would alias server_list[] and hijack canonical routing).
+ *
+ * The handshake mirrors PASS+SERVER but with PASS+CRDTMESH and no tree state.
+ * Both sides authenticate each other against a Connect block carrying `crdtmesh;`.
+ *
+ * \a parv[1] is the peer's server name
+ * \a parv[2] is the peer's server numeric (P10 YY) — MUST match its canonical id
+ * \a parv[\a parc - 1] is the server description
+ *
+ * @param[in] cptr Client that sent us the message.
+ * @param[in] sptr Original source of message.
+ * @param[in] parc Number of arguments.
+ * @param[in] parv Argument vector.
+ */
+int mr_crdtmesh(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
+{
+  char*            host;
+  struct ConfItem* aconf;
+  struct Client*   canon;
+  int              initiator;
+
+  if (IsUserPort(cptr))
+    return exit_client_msg(cptr, cptr, &me,
+                           "Cannot connect a CRDT mesh link to a user port");
+  if (!feature_bool(FEAT_CRDT_ENABLED))
+    return exit_client(cptr, cptr, &me, "CRDT not enabled here");
+  if (parc < 3)
+    return exit_client(cptr, cptr, &me, "Need more parameters");
+
+  host = clean_servername(parv[1]);
+  if (!host)
+    return exit_client_msg(cptr, cptr, &me, "Bogus server name (%s)", parv[1]);
+  if (EmptyString(parv[2]) || strlen(parv[2]) > 3)
+    return exit_client_msg(cptr, cptr, &me, "Bogus numeric (%s)", parv[2]);
+
+  /* Did WE initiate this link?  completed_connection() set STAT_HANDSHAKE on the
+   * outbound overlay before this handler runs; an inbound (accepted) overlay is
+   * still STAT_UNKNOWN_SERVER here. */
+  initiator = IsHandshake(cptr);
+
+  /* Set the name so the Connect-block lookup works (mirrors mr_server).  Do NOT
+   * hAddClient under this name: the canonical P10 server of the same name may
+   * legitimately already be in the hash, and a second entry would break
+   * FindClient routing.  The overlay is reached via LocalClientArray + the read
+   * loop, never by name. */
+  ircd_strncpy(cli_name(cptr), host, HOSTLEN + 1);
+  ircd_strncpy(cli_info(cptr),
+               (parc > 3 && parv[parc-1][0]) ? parv[parc-1] : cli_name(&me),
+               REALLEN + 1);
+
+  if (conf_check_server(cptr)) {
+    ++ServerStats->is_ref;
+    return exit_client(cptr, cptr, &me, "No Connect block");
+  }
+  host = cli_name(cptr);
+
+  if (!(aconf = find_conf_byname(cli_confs(cptr), host, CONF_SERVER))) {
+    ++ServerStats->is_ref;
+    return exit_client_msg(cptr, cptr, &me,
+                           "Access denied. No conf line for server %s", host);
+  }
+  if (!(aconf->flags & CONF_CRDTMESH))
+    return exit_client_msg(cptr, cptr, &me,
+                           "Connect block for %s is not a crdtmesh link", host);
+  if (!verify_sslclifp(cptr, aconf)) {
+    ++ServerStats->is_ref;
+    return exit_client_msg(cptr, cptr, &me,
+                           "No Access (SSL fingerprint mismatch) %s", host);
+  }
+  if (*aconf->passwd && !!strcmp(aconf->passwd, cli_passwd(cptr))) {
+    ++ServerStats->is_ref;
+    return exit_client_msg(cptr, cptr, &me,
+                           "No Access (passwd mismatch) %s", host);
+  }
+  memset(cli_passwd(cptr), 0, sizeof(cli_passwd(cptr)));
+
+  /* The announced numeric MUST agree with the peer's canonical P10 identity (if
+   * linked) so CR op / state-vector dedup keys match across both transports.  If
+   * the canonical server isn't linked yet, accept the claimed numeric (the
+   * overlay legitimately operates while the P10 path is down — that is the
+   * partition-tolerance Phase 4 is for). */
+  canon = FindNServer(parv[2]);
+  if (canon && IsServer(canon) && 0 != ircd_strcmp(cli_name(canon), host))
+    return exit_client_msg(cptr, cptr, &me,
+                           "CRDT mesh numeric %s aliases server %s",
+                           parv[2], cli_name(canon));
+
+  /* Allocate the Server struct (cli_serv) like mr_server does — the codebase
+   * assumes connecting/handshake/server links have cli_serv (completed_connection
+   * timestamp loop, exit_client link-cancel notice).  We deliberately do NOT
+   * SetServerYXX / server_estab / add_dlink, so the overlay never becomes
+   * IsServer and stays out of routing / server_list[] / the SQUIT cascade. */
+  make_server(cptr);
+  cli_serv(cptr)->timestamp = TStime();
+  cli_serv(cptr)->up = &me;
+  *(cli_serv(cptr))->by = '\0';
+
+  /* Store the peer numeric WITHOUT SetServerYXX (which would register into
+   * server_list[] and hijack FindNServer for the canonical path).  ms_crdt reads
+   * base64toint(cli_yxx(cptr)) for SV recording. */
+  ircd_strncpy(cli_yxx(cptr), parv[2], sizeof(cli_yxx(cptr)));
+
+  SetCrdtOverlay(cptr);
+  SetCrdtAware(cptr);
+  SetHandshake(cptr);
+  cli_lasttime(cptr) = CurrentTime;
+  ClearPingSent(cptr);
+
+  /* The accepting side replies with its own PASS + CRDTMESH so the initiator
+   * learns OUR numeric; the initiator already sent its CRDTMESH from
+   * completed_connection() and does not reply. */
+  if (!initiator) {
+    if (!EmptyString(aconf->passwd))
+      sendrawto_one(cptr, MSG_PASS " :%s", aconf->passwd);
+    sendrawto_one(cptr, "%s %s %s :%s", MSG_CRDTMESH, cli_name(&me),
+                  NumServ(&me), cli_info(&me));
+  }
+
+  sendto_opmask_butone(0, SNO_OLDSNO,
+                       "CRDT mesh overlay link established with %s [%s]",
+                       cli_name(cptr), parv[2]);
+  log_write(LS_NETWORK, L_NOTICE, 0, "CRDTMESH: overlay link up with %s [%s]",
+            cli_name(cptr), parv[2]);
+
+  /* Pull the peer's state immediately (CR S -> peer replies with delta/snapshot);
+   * the 30s anti-entropy timer also covers this. */
+  crdt_sync_request(cptr);
+
+  return IsDead(cptr) ? CPTR_KILLED : 0;
 }
 
 /** Handle a SERVER message from another server.

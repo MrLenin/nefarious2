@@ -549,6 +549,21 @@ static int completed_connection(struct Client* cptr)
   if (!EmptyString(aconf->passwd))
     sendrawto_one(cptr, MSG_PASS " :%s", aconf->passwd);
 
+  if (aconf->flags & CONF_CRDTMESH) {
+    /* Phase 4b: CR-only overlay link — NO P10 SERVER token, no timestamp, no
+     * cli_serv (this client never make_server()'d).  Announce ourselves with
+     * CRDTMESH; the peer's mr_crdtmesh validates + replies with its own
+     * PASS+CRDTMESH, and both sides then sync via CR tokens.  FLAG_CRDT_OVERLAY
+     * is set by mr_crdtmesh on receipt of the peer's CRDTMESH (kept off until
+     * then so a hung handshake is still reaped by the registration timeout). */
+    SetHandshake(cptr);
+    cli_lasttime(cptr) = CurrentTime;
+    ClearPingSent(cptr);
+    sendrawto_one(cptr, "%s %s %s :%s", MSG_CRDTMESH, cli_name(&me),
+                  NumServ(&me), cli_info(&me));
+    return (IsDead(cptr)) ? 0 : 1;
+  }
+
   /*
    * Create a unique timestamp
    */
@@ -1478,6 +1493,91 @@ int connect_server(struct ConfItem* aconf, struct Client* by)
   add_client_to_list(cptr);
   hAddClient(cptr);
 /*    nextping = CurrentTime; */
+
+  return (s_state(&cli_socket(cptr)) == SS_CONNECTED) ?
+    completed_connection(cptr) : 1;
+}
+
+/** Initiate an outbound CRDT mesh overlay link (Phase 4b).
+ *
+ * Like connect_server() but for a CR-only overlay edge: it does NOT make_server()
+ * (the overlay has no cli_serv and never joins the routing tree), does NOT
+ * hAddClient() under the peer's name (the canonical P10 server of that name may
+ * legitimately already be in the hash — a second entry would break FindClient
+ * routing), and bypasses the "server already present" guard for the same reason.
+ * completed_connection() recognises the CONF_CRDTMESH block and sends
+ * PASS+CRDTMESH instead of PASS+SERVER.  The peer remains a STAT_HANDSHAKE /
+ * FLAG_CRDT_OVERLAY client carrying only CR tokens.
+ * @param aconf Connect block (must have CONF_CRDTMESH set).
+ * @param by    Requesting oper (or NULL for autoconnect).
+ * @return 0 on failure, non-zero on success / in-progress.
+ */
+int connect_overlay(struct ConfItem* aconf, struct Client* by)
+{
+  struct Client* cptr = 0;
+  assert(0 != aconf);
+
+  if (aconf->dns_pending) {
+    sendto_opmask_butone(0, SNO_OLDSNO, "Overlay %s connect DNS pending",
+                         aconf->name);
+    return 0;
+  }
+
+  /* Caller (try_connections) already deduped against an existing overlay to this
+   * peer.  Note we deliberately do NOT FindClient(aconf->name): that returns the
+   * canonical P10 server of the same name (which legitimately exists — the
+   * overlay is a redundant edge), never the overlay itself (it is not hashed). */
+
+  if (!irc_in_addr_valid(&aconf->address.addr)
+      && !ircd_aton(&aconf->address.addr, aconf->host)) {
+    char buf[HOSTLEN + 1];
+    host_from_uh(buf, aconf->host, HOSTLEN);
+    gethost_byname(buf, connect_dns_callback, aconf);
+    aconf->dns_pending = 1;
+    return 0;
+  }
+  cptr = make_client(NULL, STAT_UNKNOWN_SERVER);
+  ircd_strncpy(cli_name(cptr), aconf->name, HOSTLEN + 1);
+  ircd_strncpy(cli_sockhost(cptr), aconf->host, HOSTLEN + 1);
+
+  attach_confs_byhost(cptr, aconf->host, CONF_SERVER);
+  if (!find_conf_byhost(cli_confs(cptr), aconf->host, CONF_SERVER)) {
+    sendto_opmask_butone(0, SNO_OLDSNO, "Host %s is not enabled for connecting: "
+                         "no Connect block", aconf->name);
+    det_confs_butmask(cptr, 0);
+    free_client(cptr);
+    return 0;
+  }
+  if (!connect_inet(aconf, cptr)) {
+    det_confs_butmask(cptr, 0);
+    free_client(cptr);
+    return 0;
+  }
+
+  /* Allocate the Server struct (cli_serv) like a normal link: the whole codebase
+   * assumes "connecting/handshake/server ⟹ cli_serv != NULL" (e.g.
+   * completed_connection()'s timestamp loop and exit_client()'s link-cancel
+   * notice both deref cli_serv on IsHandshake clients).  The overlay is a link in
+   * handshake state, so it needs the struct.  It is special ONLY in that it never
+   * becomes IsServer: we never SetServer/SetServerYXX/add_dlink it, so it stays
+   * out of routing / server_list[] / the SQUIT cascade. */
+  make_server(cptr);
+  *(cli_serv(cptr))->by = '\0';
+  cli_serv(cptr)->up = &me;
+
+  /* SetConnecting now; the read
+   * loop routes its bytes through connect_dopacket -> parse_client like any
+   * handshake connection, and FLAG_CRDT_OVERLAY is set by mr_crdtmesh once the
+   * peer's CRDTMESH arrives. */
+  SetConnecting(cptr);
+
+  if (cli_fd(cptr) > HighestFd)
+    HighestFd = cli_fd(cptr);
+  LocalClientArray[cli_fd(cptr)] = cptr;
+  Count_newunknown(UserStats);
+  add_client_to_list(cptr);   /* GlobalClientList: enumeration + safe teardown */
+  /* NB: deliberately NOT hAddClient — avoids a name-hash collision with the
+   * canonical P10 server of the same name. */
 
   return (s_state(&cli_socket(cptr)) == SS_CONNECTED) ?
     completed_connection(cptr) : 1;

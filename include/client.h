@@ -205,6 +205,12 @@ enum Flag
                                          Advertised via 'C' in SERVER flags.
                                          Capability only; actual sync is gated
                                          on FEAT_CRDT_ENABLED at sync time. */
+    FLAG_CRDT_OVERLAY,              /**< Phase 4b: this is a CR-only mesh overlay
+                                         link, NOT a P10 tree edge. A long-lived
+                                         STAT_HANDSHAKE connection carrying only
+                                         CR tokens; never IsServer, never in the
+                                         routing tree / server_list[]. Exempt
+                                         from the registration ping timeout. */
     FLAG_GOTID,                     /**< successful ident lookup achieved */
     FLAG_DOID,                      /**< I-lines say must use ident return */
     FLAG_NONL,                      /**< No \n in buffer */
@@ -1183,6 +1189,13 @@ struct Client {
 #define IsBxfAware(x)           HasFlag(x, FLAG_BXF_AWARE)
 /** Test if the client speaks the CR (CRDT sync) token. */
 #define IsCrdtAware(x)          HasFlag(x, FLAG_CRDT_AWARE)
+/** Return non-zero if the client is a CR-only mesh overlay link (Phase 4b). */
+#define IsCrdtOverlay(x)        HasFlag(x, FLAG_CRDT_OVERLAY)
+/** Return non-zero if @a x is a directly-connected CRDT sync peer — either a
+ *  canonical P10 CRDT-aware server link OR a CR-only mesh overlay link (Phase 4b).
+ *  The single predicate for CR send / eager relay / anti-entropy / GC enumeration. */
+#define IsCrdtSyncTarget(x)     (MyConnect(x) && IsCrdtAware(x) && \
+                                 (IsServer(x) || IsCrdtOverlay(x)))
 /** Return non-zero if the client has an account stamp. */
 #define IsAccount(x)            HasFlag(x, FLAG_ACCOUNT)
 /** Return non-zero if the client has set mode +x (hidden host). */
@@ -1333,6 +1346,8 @@ struct Client {
 #define SetBxfAware(x)          SetFlag(x, FLAG_BXF_AWARE)
 /** Mark the client as CR (CRDT sync) capable. */
 #define SetCrdtAware(x)         SetFlag(x, FLAG_CRDT_AWARE)
+/** Mark a client as a CR-only mesh overlay link (Phase 4b). */
+#define SetCrdtOverlay(x)       SetFlag(x, FLAG_CRDT_OVERLAY)
 /** Mark a client as having an account stamp. */
 #define SetAccount(x)           SetFlag(x, FLAG_ACCOUNT)
 /** Mark a client as having mode +x (hidden host). */

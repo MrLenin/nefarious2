@@ -536,6 +536,33 @@ static void try_connections(struct Event* ev) {
     if (hold && next > aconf->hold)
         next = aconf->hold;
 
+    /* Phase 4b: CR-only mesh overlay link.  Handled separately because, unlike a
+     * P10 link, the canonical server of this name legitimately already exists
+     * (the overlay is a REDUNDANT edge) — so the FindServer() "already linked"
+     * skip below must NOT apply.  The overlay is not in the name hash, so detect
+     * an existing/in-progress overlay to this peer by scanning the client list. */
+    if (aconf->flags & CONF_CRDTMESH) {
+      struct Client *ov;
+      int present = 0;
+      if (hold || done)
+        continue;
+      for (ov = GlobalClientList; ov; ov = cli_next(ov))
+        if (IsCrdtOverlay(ov) && MyConnect(ov) &&
+            0 == ircd_strcmp(cli_name(ov), aconf->name)) {
+          present = 1;
+          break;
+        }
+      if (present)
+        continue;
+      /* NB: do NOT set `done` — the overlay is a redundant edge and must not
+       * starve the canonical P10 link from connecting in the same tick (the
+       * overlay block is checked first, since make_conf prepends to the list). */
+      if (connect_overlay(aconf, 0))
+        sendto_opmask_butone(0, SNO_OLDSNO,
+                             "CRDT mesh overlay to %s activated.", aconf->name);
+      continue;
+    }
+
     /* Do not try to connect if its use is still on hold until future,
      * we have already initiated a connection this try_connections(),
      * too many links in its connection class, it is already linked,
@@ -602,6 +629,14 @@ static void check_pings(struct Event* ev) {
       exit_client(cptr, cptr, &me, cli_info(cptr));
       continue;
     }
+
+    /* Phase 4b: CRDT overlay links are long-lived unregistered (STAT_HANDSHAKE)
+     * connections carrying only CR tokens — exempt from the registration ping
+     * timeout (they never "finish registration").  Liveness is covered by TCP
+     * EOF (handled by the IsDead check above) plus the periodic CR anti-entropy
+     * writes (a write to a dead socket fails -> FLAG_DEADSOCKET). */
+    if (IsCrdtOverlay(cptr))
+      continue;
 
     /* Check for client batch timeout (draft/multiline) */
     check_client_batch_timeout(cptr);

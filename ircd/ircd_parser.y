@@ -195,6 +195,7 @@ static void free_slist(struct SLink **link) {
 %token TIMEOUT
 %token FAST
 %token AUTOCONNECT
+%token CRDTMESH
 %token PROGRAM
 %token TOK_IPV4 TOK_IPV6
 %token DNS
@@ -726,7 +727,7 @@ connectitems: connectitem connectitems | connectitem;
 connectitem: connectname | connectpass | connectclass | connecthost | connectfrom
               | connectport | connectvhost | connectleaf | connecthub
               | connecthublimit | connectmaxhops | connectauto | connectssl
-              | connectsslfp | connectsslciphers;
+              | connectsslfp | connectsslciphers | connectcrdtmesh;
 connectname: NAME '=' QSTRING ';'
 {
  MyFree(name);
@@ -783,6 +784,7 @@ connectmaxhops: MAXHOPS '=' expr ';'
 };
 connectauto: AUTOCONNECT '=' YES ';' { flags |= CONF_AUTOCONNECT; }
  | AUTOCONNECT '=' NO ';' { flags &= ~CONF_AUTOCONNECT; };
+connectcrdtmesh: CRDTMESH ';' { flags |= CONF_CRDTMESH; };
 connectssl: SSLTOK '=' YES ';'
 {
 #ifdef USE_SSL

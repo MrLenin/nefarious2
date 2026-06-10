@@ -1919,7 +1919,12 @@ static void crdt_shadow_gc(void)
     return;
   vecs[n++] = &g_crdt.local_sv;
   for (acptr = GlobalClientList; acptr; acptr = cli_next(acptr)) {
-    if (IsServer(acptr) && MyConnect(acptr) && IsCrdtAware(acptr)) {
+    /* Phase 4b: include CR-only overlay peers, not just P10 server links — the
+     * GC floor must account for EVERY transport that could still owe a peer an
+     * op (esp. a peer reachable only via the overlay during a P10 split).  A
+     * peer reachable via both transports resolves to the same numeric-keyed SV
+     * slot, so the duplicate vecs[] entry is idempotent under crdt_sv_global_min. */
+    if (IsCrdtSyncTarget(acptr)) {
       const struct CrdtStateVector *sv =
         peer_sv_lookup((uint16_t)base64toint(cli_yxx(acptr)));
       vecs[n++] = sv ? sv : &zero;
