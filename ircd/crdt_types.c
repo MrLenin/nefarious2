@@ -37,6 +37,48 @@ static uint32_t fnv1a(const void *d, uint32_t n)
   return h;
 }
 
+/* ---- CrdtMsgidDedup: time-windowed msgid dedup set (see crdt_types.h) ---- */
+void crdt_dedup_init(struct CrdtMsgidDedup *d) { memset(d, 0, sizeof *d); }
+
+static void dedup_store(struct CrdtMsgidDedup *d, uint32_t slot,
+                        const char *id, uint64_t now)
+{
+  size_t n = strlen(id);
+  if (n >= CRDT_DEDUP_IDLEN) n = CRDT_DEDUP_IDLEN - 1;
+  memcpy(d->slot[slot].id, id, n);
+  d->slot[slot].id[n] = '\0';
+  d->slot[slot].ts = now;
+}
+
+int crdt_dedup_check_add(struct CrdtMsgidDedup *d, const char *id,
+                         uint64_t now, uint64_t window)
+{
+  uint32_t h, i, slot, victim = 0;
+  uint64_t oldest = (uint64_t)-1;
+  if (!id || !*id || (id[0] == '*' && !id[1]))
+    return 0;                                /* no msgid -> cannot dedup */
+  h = fnv1a(id, (uint32_t)strlen(id));
+  /* fresh duplicate? */
+  for (i = 0; i < CRDT_DEDUP_PROBE; i++) {
+    slot = (h + i) & (CRDT_DEDUP_SLOTS - 1u);
+    if (d->slot[slot].ts && now - d->slot[slot].ts <= window
+        && 0 == strcmp(d->slot[slot].id, id))
+      return 1;
+  }
+  /* not fresh -> record into the first empty/expired probe slot */
+  for (i = 0; i < CRDT_DEDUP_PROBE; i++) {
+    slot = (h + i) & (CRDT_DEDUP_SLOTS - 1u);
+    if (!d->slot[slot].ts || now - d->slot[slot].ts > window) {
+      dedup_store(d, slot, id, now);
+      return 0;
+    }
+    if (d->slot[slot].ts < oldest) { oldest = d->slot[slot].ts; victim = slot; }
+  }
+  /* probe run full + all fresh -> overwrite the oldest (graceful degradation) */
+  dedup_store(d, victim, id, now);
+  return 0;
+}
+
 static uint32_t tag_hash(struct CrdtTag t)
 {
   uint32_t h = 2166136261u;

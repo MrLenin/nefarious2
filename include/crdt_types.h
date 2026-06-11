@@ -266,4 +266,29 @@ static inline int crdt_sv_has_seen(const struct CrdtStateVector *sv,
 void crdt_sv_global_min(struct CrdtStateVector *out,
                         const struct CrdtStateVector *const *vecs, int n);
 
+/* ============================================================
+ * CrdtMsgidDedup — time-windowed msgid dedup set (CR M gossip)
+ * ============================================================
+ * Replaces a count-bounded ring: at high gossip volume a fixed-N ring evicts a
+ * msgid before its duplicate arrives via a slower mesh path -> double delivery.
+ * This is a time-windowed open-addressing hash set: an entry stays "seen" for
+ * `window` seconds regardless of how many other msgids pass through, then becomes
+ * reclaimable. Pure (caller supplies `now`) so it links in the engine test harness.
+ */
+#define CRDT_DEDUP_SLOTS  8192u     /* power of 2 */
+#define CRDT_DEDUP_IDLEN  64        /* max msgid length incl NUL */
+#define CRDT_DEDUP_PROBE  8u        /* linear-probe run length */
+struct CrdtMsgidDedup {
+  struct { char id[CRDT_DEDUP_IDLEN]; uint64_t ts; } slot[CRDT_DEDUP_SLOTS];
+};
+/** Zero a dedup set (a static one is already zero-init; ts==0 means an empty slot). */
+void crdt_dedup_init(struct CrdtMsgidDedup *d);
+/** Returns 1 if @a id was seen within @a window of @a now (a duplicate — the caller
+ *  drops it); else records (id, now) and returns 0. A NULL/empty/"*" id is never
+ *  dedupable (returns 0, not recorded). O(1) (bounded probe); time-based eviction
+ *  (no count bound). On a full+all-fresh probe run the oldest entry is overwritten
+ *  (graceful degradation = a rare re-delivery, never a crash). */
+int  crdt_dedup_check_add(struct CrdtMsgidDedup *d, const char *id,
+                          uint64_t now, uint64_t window);
+
 #endif /* INCLUDED_crdt_types_h */

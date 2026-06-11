@@ -1573,6 +1573,51 @@ static void test_snapshot_converges_equal_sv_divergence(void **state)
 }
 
 /* ================================================================== */
+/* R3: time-windowed msgid dedup (crdt_dedup_*) — replaces the count-bounded ring. */
+
+static void test_dedup_basic(void **state)
+{
+  (void)state;
+  static struct CrdtMsgidDedup d; crdt_dedup_init(&d);
+  assert_int_equal(0, crdt_dedup_check_add(&d, "a", 100, 60));  /* new */
+  assert_int_equal(1, crdt_dedup_check_add(&d, "a", 110, 60));  /* dup within window */
+  assert_int_equal(0, crdt_dedup_check_add(&d, "b", 110, 60));  /* different id */
+}
+
+static void test_dedup_window_expiry(void **state)
+{
+  (void)state;
+  static struct CrdtMsgidDedup d; crdt_dedup_init(&d);
+  assert_int_equal(0, crdt_dedup_check_add(&d, "a", 100, 60));
+  assert_int_equal(0, crdt_dedup_check_add(&d, "a", 200, 60));  /* expired -> new */
+  assert_int_equal(1, crdt_dedup_check_add(&d, "a", 210, 60));  /* fresh dup again */
+}
+
+static void test_dedup_no_msgid(void **state)
+{
+  (void)state;  /* "*"/empty/NULL are never dedupable (else distinct msgid-less msgs
+                   would spuriously dedup against each other — the old ring's bug). */
+  static struct CrdtMsgidDedup d; crdt_dedup_init(&d);
+  assert_int_equal(0, crdt_dedup_check_add(&d, "*", 100, 60));
+  assert_int_equal(0, crdt_dedup_check_add(&d, "*", 100, 60));
+  assert_int_equal(0, crdt_dedup_check_add(&d, "", 100, 60));
+  assert_int_equal(0, crdt_dedup_check_add(&d, NULL, 100, 60));
+}
+
+static void test_dedup_not_count_bounded(void **state)
+{
+  (void)state;  /* the scale fix: >256 distinct ids in the window, the FIRST is STILL
+                   deduped — the old 256-ring would have count-evicted it. */
+  static struct CrdtMsgidDedup d; crdt_dedup_init(&d);
+  char id[32]; int i;
+  for (i = 0; i < 300; i++) {
+    snprintf(id, sizeof id, "m%d", i);
+    assert_int_equal(0, crdt_dedup_check_add(&d, id, 100, 60));  /* all new */
+  }
+  assert_int_equal(1, crdt_dedup_check_add(&d, "m0", 100, 60));  /* m0 still seen */
+}
+
+/* ================================================================== */
 
 int main(void)
 {
@@ -1601,6 +1646,10 @@ int main(void)
     cmocka_unit_test(test_snapshot_apply_raises_gc_floor),
     cmocka_unit_test(test_equal_sv_can_differ_in_content),
     cmocka_unit_test(test_snapshot_converges_equal_sv_divergence),
+    cmocka_unit_test(test_dedup_basic),
+    cmocka_unit_test(test_dedup_window_expiry),
+    cmocka_unit_test(test_dedup_no_msgid),
+    cmocka_unit_test(test_dedup_not_count_bounded),
     cmocka_unit_test(test_wire_sv_roundtrip),
     cmocka_unit_test(test_wire_delta_converges),
     cmocka_unit_test(test_wire_digest_converges),

@@ -194,22 +194,20 @@ void crdt_send_snapshot(struct Client *to)
 /* paths is delivered/relayed exactly once.  Wire:                      */
 /*   :<srv> CR M <msgid> <srcYXX> <tgtYXX> :<text>                       */
 /* ================================================================== */
-#define CR_M_SEEN 256
-static char crdt_m_seen[CR_M_SEEN][64];
-static int  crdt_m_seen_idx = 0;
+/* R3 (dedup-at-scale): a TIME-WINDOWED dedup set (crdt_dedup_*, engine-tested)
+ * replaces the old 256-entry count-bounded ring.  At steady-state CR M volume the
+ * ring would evict a msgid before its duplicate arrived via a slower mesh path
+ * (double-delivery); the windowed set keeps each msgid "seen" for ~the max mesh
+ * propagation latency regardless of volume, and (unlike the ring) never spuriously
+ * dedupes two distinct msgid-less ("*") messages against each other. */
+#define CRDT_M_SEEN_WINDOW 90        /* s; > worst-case mesh propagation latency */
+static struct CrdtMsgidDedup crdt_m_seen;   /* static zero-init => all slots empty */
 
-/* return 1 if msgid was already seen (dup), else record it and return 0 */
+/* return 1 if msgid was already seen within the window (dup), else record it -> 0. */
 static int crdt_m_seen_check_add(const char *msgid)
 {
-  int i;
-  if (!msgid || !*msgid)
-    return 0;                          /* no msgid -> can't dedup; treat as new */
-  for (i = 0; i < CR_M_SEEN; i++)
-    if (crdt_m_seen[i][0] && 0 == strcmp(crdt_m_seen[i], msgid))
-      return 1;
-  ircd_strncpy(crdt_m_seen[crdt_m_seen_idx], msgid, sizeof crdt_m_seen[0]);
-  crdt_m_seen_idx = (crdt_m_seen_idx + 1) % CR_M_SEEN;
-  return 0;
+  return crdt_dedup_check_add(&crdt_m_seen, msgid, (uint64_t)CurrentTime,
+                              CRDT_M_SEEN_WINDOW);
 }
 
 /* Gossip a live message to a mesh-only target via ephemeral CR M.
