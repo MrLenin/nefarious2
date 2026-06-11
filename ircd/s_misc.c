@@ -855,6 +855,7 @@ int exit_client(struct Client *cptr,
   struct Client* acptr = 0;
   struct DLink *dlp;
   time_t on_for;
+  int crdt_resync_subtree = 0;   /* R3: prompt re-materialize of a mesh-reachable reaped subtree */
 
   char comment1[HOSTLEN + HOSTLEN + 2];
   assert(killer);
@@ -1134,8 +1135,31 @@ int exit_client(struct Client *cptr,
     /* Clear active batch and end IRCv3 netsplit batch */
     set_active_network_batch(NULL);
     send_netsplit_batch_end(netsplit_batch_id);
+    /* R3 (cut exactly-once): this normal cascade REAPED a relayed/partitioned subtree
+     * (crdt_shadow_mesh_reachable() is false for a RELAYED server — the in-place
+     * dead-sink stub is valid only for DIRECT peers, so the mesh-reachable keep-branch
+     * above returned early only for those).  A relayed-but-still-gossip-reachable
+     * server (e.g. a leaf behind a cut intermediate, holding a direct CR overlay back
+     * to us) has its users reaped here, leaving them orphaned (in-doc, not live) until
+     * the next ~30s verify tick -> live unicast to them drops across the window.  Flag
+     * a prompt re-materialize once victim is fully gone (below). */
+    crdt_resync_subtree = feature_bool(FEAT_CRDT_PRIMARY);
   }
   exit_one_client(victim, comment);
+
+  if (crdt_resync_subtree) {
+    /* victim is now fully removed -> FindNServer(a reaped numeric) == NULL -> the
+     * reconcile takes the P2 Case-B synthetic-anchor path (a FRESH Connection, the
+     * relayed-safe model) in crdt_materialize_one_user, never the crash-prone in-place
+     * stub.  Beacon-freshness self-gates: a genuinely partitioned subtree (stale CR H
+     * beacon) gets no anchor and correctly stays gone (SPLIT); a legacy/non-CRDT SQUIT
+     * is a no-op (its users aren't in the doc).  Mirrors the verify-tick order
+     * (users -> channels -> members -> status), just event-driven so failover is prompt. */
+    crdt_shadow_reconcile_users();
+    crdt_shadow_reconcile_create_channels();
+    crdt_shadow_reconcile_members();
+    crdt_shadow_reconcile_member_status();
+  }
 
   /*
    *  cptr can only have been killed if it was cptr itself that got killed here,

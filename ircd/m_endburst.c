@@ -85,6 +85,7 @@
 #include "capab.h"
 #include "channel.h"
 #include "client.h"
+#include "crdt_shadow.h"
 #include "handlers.h"
 #include "hash.h"
 #include "ircd.h"
@@ -166,6 +167,21 @@ int ms_end_of_burst(struct Client* cptr, struct Client* sptr, int parc, char* pa
    * restructuring clients.  Merge same-session multi-primary into
    * one primary + alias here; older lastnick wins the primary slot. */
   bounce_post_burst_reconcile();
+
+  /* R3 (heal exactly-once): a server that split earlier and rejoined had its mesh-stub
+   * retired in mr/ms_server, which reaps (exit_one_client) its users LIVE but leaves
+   * them in the still-converged doc (no tombstone).  On a converged-doc relink the CR
+   * state vectors match, so NO CR F/CR D flows -> neither the CR-F nor the applied>0
+   * delta materialize fires, and the periodic verify-timer materialize is burst-gated
+   * -> the reaped users stay orphaned (in-doc, not live) until the next ~30s cycle after
+   * the burst clears, dropping live unicast to them across the whole window.  EOB is the
+   * definitive "this server's burst is done -> it is now IsServer + the doc is current"
+   * signal (fires for direct AND propagated relinks via EOB propagation), so re-run the
+   * burst-safe user reconcile NOW to re-materialize them immediately.  reconcile_users
+   * self-gates (shadow + FEAT_CRDT_PRIMARY + a PER-USER owning-server burst guard, so it
+   * never pre-creates a user a still-bursting legacy peer will deliver) and is idempotent
+   * (findNUser skips already-live users), so calling it on every EOB is safe + cheap. */
+  crdt_shadow_reconcile_users();
 
   if (MyConnect(sptr)) {
     sendcmdto_one(&me, CMD_END_OF_BURST_ACK, sptr, "");
