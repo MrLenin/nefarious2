@@ -750,6 +750,11 @@ void relay_channel_notice(struct Client* sptr, const char* name, const char* tex
         from = cli_user(sptr)->alias_primary;
       }
 
+      /* R4a (channel-over-mesh): per-server local-delivery dedup (see relay_channel_message). */
+      if (feature_bool(FEAT_CRDT_PRIMARY) && msgid[0] &&
+          crdt_shadow_chan_local_check_add(msgid))
+        sendcmdto_set_skip_local_members();
+
       if (client_tags && *client_tags) {
         sendcmdto_channel_butone_with_client_tags(from, CMD_NOTICE, chptr, cli_from(sptr),
                            SKIP_DEAF | SKIP_BURST, '\0', client_tags,
@@ -763,16 +768,18 @@ void relay_channel_notice(struct Client* sptr, const char* name, const char* tex
     /* Clear the msgid override after broadcast */
     sendcmdto_set_client_msgid(NULL);
 
-    /* Tier2 T2-b: gossip via CR M if the channel has any mesh-only member (see
-     * relay_channel_message). */
-    {
+    /* R4a (channel-over-mesh): flood to any member on a remote CRDT-aware server (see
+     * relay_channel_message); each receiver delivers exactly once via the dedup. */
+    if (feature_bool(FEAT_CRDT_PRIMARY)) {
       struct Membership *mmemb;
-      for (mmemb = chptr->members; mmemb; mmemb = mmemb->next_member)
-        if (cli_user(mmemb->user) && cli_user(mmemb->user)->server &&
-            IsMeshStub(cli_user(mmemb->user)->server)) {
+      for (mmemb = chptr->members; mmemb; mmemb = mmemb->next_member) {
+        struct Client *msrv = cli_user(mmemb->user) ? cli_user(mmemb->user)->server : NULL;
+        if (msrv && msrv != &me &&
+            (IsMeshStub(msrv) || (IsServer(msrv) && IsCrdtAware(msrv)))) {
           crdt_gossip_message(sptr, 'N', chptr->chname, msgid[0] ? msgid : "*", mytext);
           break;
         }
+      }
     }
 
     /* Echo notice back to sender if they have echo-message cap */
@@ -994,6 +1001,11 @@ void server_relay_channel_notice(struct Client* sptr, const char* name, const ch
       sendcmdto_set_client_msgid(relay_msgid);
     }
 
+    /* R4a (channel-over-mesh): per-server local-delivery dedup (see relay_channel_message). */
+    if (feature_bool(FEAT_CRDT_PRIMARY) && relay_msgid[0] &&
+        crdt_shadow_chan_local_check_add(relay_msgid))
+      sendcmdto_set_skip_local_members();
+
     if (client_tags && *client_tags) {
       sendcmdto_channel_butone_with_client_tags(sptr, CMD_NOTICE, chptr, one,
                          SKIP_DEAF | SKIP_BURST, '\0', client_tags,
@@ -1005,17 +1017,19 @@ void server_relay_channel_notice(struct Client* sptr, const char* name, const ch
 
     sendcmdto_set_client_msgid(NULL);
 
-    /* Tier2 P2: gossip to any mesh-only channel member (fan-out above dropped them
-     * at the dead-sink stub/anchor). */
-    {
+    /* R4a (channel-over-mesh): flood to any member on a remote CRDT-aware server, only
+     * if entered from a non-CRDT direction (see server_relay_channel_message). */
+    if (feature_bool(FEAT_CRDT_PRIMARY) && (!one || !IsCrdtAware(one))) {
       struct Membership *mmemb;
-      for (mmemb = chptr->members; mmemb; mmemb = mmemb->next_member)
-        if (cli_user(mmemb->user) && cli_user(mmemb->user)->server &&
-            IsMeshStub(cli_user(mmemb->user)->server)) {
+      for (mmemb = chptr->members; mmemb; mmemb = mmemb->next_member) {
+        struct Client *msrv = cli_user(mmemb->user) ? cli_user(mmemb->user)->server : NULL;
+        if (msrv && msrv != &me &&
+            (IsMeshStub(msrv) || (IsServer(msrv) && IsCrdtAware(msrv)))) {
           crdt_gossip_message(sptr, 'N', chptr->chname,
                               relay_msgid[0] ? relay_msgid : "*", text);
           break;
         }
+      }
     }
 
 #ifdef USE_ROCKSDB

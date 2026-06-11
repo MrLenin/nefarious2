@@ -82,6 +82,7 @@
 #include "capab.h"
 #include "channel.h"
 #include "client.h"
+#include "crdt_shadow.h"
 #include "hash.h"
 #include "history.h"
 #include "ircd.h"
@@ -263,6 +264,13 @@ int m_tagmsg(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
       /* Set msgid override so channel/client tag sends include it */
       sendcmdto_set_client_msgid(tagmsg_msgid);
 
+      /* R4a (channel-over-mesh): per-server local-delivery dedup (see relay_channel_message).
+       * sendcmdto_channel_client_tags is local-only, so the skip-override there just
+       * suppresses the redundant local TAGMSG when the CR-M plane already delivered it. */
+      if (feature_bool(FEAT_CRDT_PRIMARY) && tagmsg_msgid[0] &&
+          crdt_shadow_chan_local_check_add(tagmsg_msgid))
+        sendcmdto_set_skip_local_members();
+
       /* Relay TAGMSG with client-only tags to local channel members */
       sendcmdto_channel_client_tags(sptr, MSG_TAGMSG, chptr, sptr,
                                     SKIP_DEAF | SKIP_BURST, client_tags,
@@ -291,19 +299,20 @@ int m_tagmsg(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
                               client_tags, chptr->chname);
       }
 
-      /* Tier2 T2-b: if any channel member is on a mesh stub, gossip the TAGMSG
-       * over the mesh (cmd 'T', client tags as payload) — the P10 fan-out above
-       * dropped those members at the dead-sink stub.  One gossip covers all mesh
-       * servers; each delivers to its local msgtags-capable channel members. */
-      {
+      /* R4a (channel-over-mesh): flood TAGMSG (cmd 'T', client tags as payload) to any
+       * member on a remote CRDT-aware server (not just mesh-only); deduped to
+       * exactly-once per receiver via crdt_shadow_chan_local. */
+      if (feature_bool(FEAT_CRDT_PRIMARY)) {
         struct Membership *mmemb;
-        for (mmemb = chptr->members; mmemb; mmemb = mmemb->next_member)
-          if (cli_user(mmemb->user) && cli_user(mmemb->user)->server &&
-              IsMeshStub(cli_user(mmemb->user)->server)) {
+        for (mmemb = chptr->members; mmemb; mmemb = mmemb->next_member) {
+          struct Client *msrv = cli_user(mmemb->user) ? cli_user(mmemb->user)->server : NULL;
+          if (msrv && msrv != &me &&
+              (IsMeshStub(msrv) || (IsServer(msrv) && IsCrdtAware(msrv)))) {
             crdt_gossip_message(sptr, 'T', chptr->chname, tagmsg_msgid,
                                 client_tags);
             break;
           }
+        }
       }
     }
   }
@@ -443,6 +452,11 @@ int ms_tagmsg(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
     if (cli_s2s_msgid(cptr)[0])
       sendcmdto_set_client_msgid(cli_s2s_msgid(cptr));
 
+    /* R4a (channel-over-mesh): per-server local-delivery dedup (see relay_channel_message). */
+    if (feature_bool(FEAT_CRDT_PRIMARY) && cli_s2s_msgid(cptr)[0] &&
+        crdt_shadow_chan_local_check_add(cli_s2s_msgid(cptr)))
+      sendcmdto_set_skip_local_members();
+
     /* Relay to local channel members with message-tags capability */
     sendcmdto_channel_client_tags(sptr, MSG_TAGMSG, chptr, cptr,
                                   SKIP_DEAF | SKIP_BURST, client_tags,
@@ -459,18 +473,20 @@ int ms_tagmsg(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
     store_tagmsg_history(sptr, chptr, client_tags,
                          cli_s2s_msgid(cptr)[0] ? cli_s2s_msgid(cptr) : NULL);
 
-    /* Tier2 P2: remote-origin channel TAGMSG — gossip to any mesh-only member (the
-     * local fan-out above dropped them at the dead-sink stub/anchor). */
-    {
+    /* R4a (channel-over-mesh): flood TAGMSG to any member on a remote CRDT-aware server,
+     * only if entered from a non-CRDT direction (see server_relay_channel_message). */
+    if (feature_bool(FEAT_CRDT_PRIMARY) && (!cptr || !IsCrdtAware(cptr))) {
       struct Membership *mmemb;
-      for (mmemb = chptr->members; mmemb; mmemb = mmemb->next_member)
-        if (cli_user(mmemb->user) && cli_user(mmemb->user)->server &&
-            IsMeshStub(cli_user(mmemb->user)->server)) {
+      for (mmemb = chptr->members; mmemb; mmemb = mmemb->next_member) {
+        struct Client *msrv = cli_user(mmemb->user) ? cli_user(mmemb->user)->server : NULL;
+        if (msrv && msrv != &me &&
+            (IsMeshStub(msrv) || (IsServer(msrv) && IsCrdtAware(msrv)))) {
           crdt_gossip_message(sptr, 'T', chptr->chname,
                               cli_s2s_msgid(cptr)[0] ? cli_s2s_msgid(cptr) : "*",
                               client_tags);
           break;
         }
+      }
     }
   }
   else {

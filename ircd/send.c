@@ -2530,6 +2530,11 @@ void sendcmdto_channel_client_tags(struct Client *from, const char *cmd,
   struct MsgBuf *mb;
   struct Membership *member;
   char tagbuf[4608];
+  int skip_local = skip_local_members_once;  /* R4a: one-shot CRDT local-dedup skip */
+
+  skip_local_members_once = 0;
+  if (skip_local)
+    return;   /* CR-M plane already delivered this msgid to our locals (local-only fn) */
 
   vd.vd_format = pattern;
   va_start(vd.vd_args, pattern);
