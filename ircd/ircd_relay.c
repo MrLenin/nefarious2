@@ -50,6 +50,7 @@
 #include "channel.h"
 #include "chathistory_ephemeral.h"
 #include "client.h"
+#include "crdt_shadow.h"
 #include "hash.h"
 #include "history.h"
 #include "ircd.h"
@@ -571,6 +572,13 @@ void relay_channel_message(struct Client* sptr, const char* name, const char* te
         from = cli_user(sptr)->alias_primary;
       }
 
+      /* R4a (channel-over-mesh): per-server local-delivery dedup.  Mark this msgid as
+       * delivered-to-our-locals via the tree; if the CR-M plane already delivered it
+       * here, skip the redundant local fan-out (the relay to servers still happens). */
+      if (feature_bool(FEAT_CRDT_PRIMARY) && msgid[0] &&
+          crdt_shadow_chan_local_check_add(msgid))
+        sendcmdto_set_skip_local_members();
+
       if (client_tags && *client_tags) {
         sendcmdto_channel_butone_with_client_tags(from, CMD_PRIVATE, chptr, cli_from(sptr),
                            SKIP_DEAF | SKIP_BURST, text[0], client_tags,
@@ -584,18 +592,23 @@ void relay_channel_message(struct Client* sptr, const char* name, const char* te
     /* Clear the msgid override after broadcast */
     sendcmdto_set_client_msgid(NULL);
 
-    /* Tier2 T2-b: if the channel has any mesh-only member (its server is a stub),
-     * gossip via CR M so those members get it on their home server (the fan-out
-     * above dropped them at the dead-sink stub).  One gossip covers all mesh
-     * servers; each delivers to its local channel members. */
-    {
+    /* R4a (channel-over-mesh): flood live channel traffic to CRDT peers, not just to
+     * mesh-only members.  Fire CR M if ANY member is on a REMOTE CRDT-aware server
+     * (a mesh stub OR a live tree peer); each such server delivers to its locals exactly
+     * once — the crdt_shadow_chan_local dedup suppresses whichever of {tree copy, CR-M
+     * copy} arrives second, so steady-state is exactly-once and a tree-edge cut still
+     * delivers via the CR-M flood over overlays.  One gossip covers all CRDT servers.
+     * Gated on FEAT_CRDT_PRIMARY (mesh stubs + the dedup-mark only exist under it). */
+    if (feature_bool(FEAT_CRDT_PRIMARY)) {
       struct Membership *mmemb;
-      for (mmemb = chptr->members; mmemb; mmemb = mmemb->next_member)
-        if (cli_user(mmemb->user) && cli_user(mmemb->user)->server &&
-            IsMeshStub(cli_user(mmemb->user)->server)) {
+      for (mmemb = chptr->members; mmemb; mmemb = mmemb->next_member) {
+        struct Client *msrv = cli_user(mmemb->user) ? cli_user(mmemb->user)->server : NULL;
+        if (msrv && msrv != &me &&
+            (IsMeshStub(msrv) || (IsServer(msrv) && IsCrdtAware(msrv)))) {
           crdt_gossip_message(sptr, 'P', chptr->chname, msgid[0] ? msgid : "*", mytext);
           break;
         }
+      }
     }
 
     /* Echo message back to sender if they have echo-message cap */
@@ -862,6 +875,11 @@ void server_relay_channel_message(struct Client* sptr, const char* name, const c
       sendcmdto_set_client_msgid(relay_msgid);
     }
 
+    /* R4a (channel-over-mesh): per-server local-delivery dedup (see relay_channel_message). */
+    if (feature_bool(FEAT_CRDT_PRIMARY) && relay_msgid[0] &&
+        crdt_shadow_chan_local_check_add(relay_msgid))
+      sendcmdto_set_skip_local_members();
+
     if (client_tags && *client_tags) {
       sendcmdto_channel_butone_with_client_tags(sptr, CMD_PRIVATE, chptr, one,
                          SKIP_DEAF | SKIP_BURST, text[0], client_tags,
@@ -873,17 +891,23 @@ void server_relay_channel_message(struct Client* sptr, const char* name, const c
 
     sendcmdto_set_client_msgid(NULL);
 
-    /* Tier2 P2: gossip to any mesh-only channel member (the fan-out above dropped
-     * them at the dead-sink stub/anchor).  One gossip covers all mesh servers. */
-    {
+    /* R4a (channel-over-mesh): flood to any member on a REMOTE CRDT-aware server (mesh
+     * stub OR live tree peer), not just mesh-only members — BUT only if this message
+     * ENTERED the CRDT plane here, i.e. it arrived from a NON-CRDT (legacy) direction.
+     * If it came from a CRDT peer, that peer already flooded it network-wide; re-flooding
+     * would just be deduped waste (and a flood storm at scale).  Each receiving CRDT
+     * server delivers to its locals exactly once via the crdt_shadow_chan_local dedup. */
+    if (feature_bool(FEAT_CRDT_PRIMARY) && (!one || !IsCrdtAware(one))) {
       struct Membership *mmemb;
-      for (mmemb = chptr->members; mmemb; mmemb = mmemb->next_member)
-        if (cli_user(mmemb->user) && cli_user(mmemb->user)->server &&
-            IsMeshStub(cli_user(mmemb->user)->server)) {
+      for (mmemb = chptr->members; mmemb; mmemb = mmemb->next_member) {
+        struct Client *msrv = cli_user(mmemb->user) ? cli_user(mmemb->user)->server : NULL;
+        if (msrv && msrv != &me &&
+            (IsMeshStub(msrv) || (IsServer(msrv) && IsCrdtAware(msrv)))) {
           crdt_gossip_message(sptr, 'P', chptr->chname,
                               relay_msgid[0] ? relay_msgid : "*", text);
           break;
         }
+      }
     }
 
 #ifdef USE_ROCKSDB

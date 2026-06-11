@@ -81,6 +81,26 @@ int crdt_shadow_beacon_record(unsigned int num, time_t emit_ts)
   return 1;
 }
 
+/* R4a (channel-over-mesh): per-server "this channel message was already delivered to my
+ * LOCAL members" dedup, keyed by msgid.  Shared by the tree path (sendcmdto_channel_butone,
+ * via the channel relay) and the CR-M path (ms_crdt 'M'): whichever plane reaches a given
+ * server first delivers to its locals + marks the msgid; the other plane skips its LOCAL
+ * delivery (relay/flood propagation is unaffected).  This is what makes widening CR M to
+ * all-CRDT-peer members (so channel traffic survives a tree-edge cut) exactly-once at the
+ * client.  Deliberately SEPARATE from crdt_m_seen (the CR-M FLOOD dedup, which gates relay)
+ * — sharing would let a tree-first delivery suppress the CR-M relay and break the flood.
+ * Returns 1 if already delivered within the window (caller skips LOCAL delivery), else
+ * records it and returns 0 (caller delivers).  A missing/"*" msgid never dedupes. */
+#define CRDT_CHAN_LOCAL_WINDOW 90       /* s; > worst-case tree-vs-mesh arrival skew */
+static struct CrdtMsgidDedup crdt_chan_local_seen;
+int crdt_shadow_chan_local_check_add(const char *msgid)
+{
+  if (!msgid || !*msgid || (msgid[0] == '*' && !msgid[1]))
+    return 0;
+  return crdt_dedup_check_add(&crdt_chan_local_seen, msgid, (uint64_t)CurrentTime,
+                              CRDT_CHAN_LOCAL_WINDOW);
+}
+
 /** Shadow is active only once initialised AND the feature is enabled. */
 static int shadow_on(void)
 {

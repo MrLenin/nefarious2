@@ -95,6 +95,13 @@ const struct CrdtUserRecord *crdt_shadow_user_record(const char *numeric);
  *  terminating the gossip flood). */
 int crdt_shadow_beacon_record(unsigned int num, time_t emit_ts);
 
+/** R4a (channel-over-mesh): per-server local-delivery dedup for a channel message,
+ *  keyed by msgid, shared by the tree (sendcmdto_channel_butone via the relay) and the
+ *  CR-M plane.  Returns 1 if this msgid was already delivered to our locals within the
+ *  window (caller should SKIP local delivery; relay/flood is unaffected), else records
+ *  it and returns 0 (caller delivers).  A missing/"*" msgid never dedupes. */
+int crdt_shadow_chan_local_check_add(const char *msgid);
+
 /** Mirror a channel topic (called from do_settopic and the burst topic-clear).
  *  Records chptr->topic into the shadow topics map. @a from is the incoming
  *  link the change arrived on (cptr), or the local source; the single-writer

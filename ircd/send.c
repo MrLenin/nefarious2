@@ -121,6 +121,18 @@ void sendcmdto_set_alias_source(struct Client *alias)
   s2s_alias_source = alias;
 }
 
+/** R4a (channel-over-mesh): one-shot "skip LOCAL-member delivery" override for the next
+ *  sendcmdto_channel_butone[_with_client_tags] call.  Set by the channel relay when the
+ *  CRDT local-delivery dedup (crdt_shadow_chan_local_check_add) reports this msgid was
+ *  already delivered to our locals via the CR-M plane; the tree call then still relays to
+ *  servers but skips the redundant local fan-out.  Consumed (and reset) at call entry. */
+static int skip_local_members_once = 0;
+
+void sendcmdto_set_skip_local_members(void)
+{
+  skip_local_members_once = 1;
+}
+
 /** Frontier introducer gate (per design intent #135 + #254).
  *
  * When set, the next sendcmdto_serv_butone / sendcmdto_flag_serv_butone
@@ -2662,8 +2674,10 @@ void sendcmdto_channel_butone(struct Client *from, const char *cmd,
   char s2s_tagbuf[128];
   char userfmt_tags[64];
   int tflags;
+  int skip_local = skip_local_members_once;  /* R4a: one-shot CRDT local-dedup skip */
 
   vd.vd_format = pattern;
+  skip_local_members_once = 0;
 
   /* Consume alias source override for split S2S delivery.
    * When set, we build two S2S buffers: primary numeric for most servers,
@@ -2744,6 +2758,8 @@ void sendcmdto_channel_butone(struct Client *from, const char *cmd,
     cli_sentalong(member->user) = sentalong_marker;
 
     if (MyConnect(member->user)) { /* pick right buffer to send */
+      if (skip_local)            /* R4a: CR-M plane already delivered this msgid to our locals */
+        continue;
       if (!persistence_channel_visible(member->user, to->chname))
         continue;
       tflags = get_client_tag_flags(member->user, from, 0);
@@ -2838,8 +2854,10 @@ void sendcmdto_channel_butone_with_client_tags(struct Client *from,
   char s2s_tagbuf_v3[4200];     /* fits @A prefix + ,C<4094-byte client_tags> */
   char userfmt_tags[64];
   int has_ctags = (client_tags && *client_tags);
+  int skip_local = skip_local_members_once;  /* R4a: one-shot CRDT local-dedup skip */
 
   vd.vd_format = pattern;
+  skip_local_members_once = 0;
 
   /* Consume alias source override for split S2S delivery */
   alias_from = s2s_alias_source;
@@ -2934,6 +2952,8 @@ void sendcmdto_channel_butone_with_client_tags(struct Client *from,
     cli_sentalong(member->user) = sentalong_marker;
 
     if (MyConnect(member->user)) {
+      if (skip_local)            /* R4a: CR-M plane already delivered this msgid to our locals */
+        continue;
       if (!persistence_channel_visible(member->user, to->chname))
         continue;
       /* For clients with message-tags cap, include client-only tags */

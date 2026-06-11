@@ -69,6 +69,9 @@ extern void send_batch_perconn(struct Client *acptr, const char *fmt, ...);
 /* Override S2S tag source connection for alias source rewriting */
 extern void sendcmdto_set_s2s_cptr(struct Client *cptr);
 extern void sendcmdto_set_alias_source(struct Client *alias);
+/* R4a: skip LOCAL-member delivery in the next sendcmdto_channel_butone[_with_client_tags]
+ * call (still relays to servers) — set by the channel relay after the CRDT local dedup. */
+extern void sendcmdto_set_skip_local_members(void);
 /* Opt-in S2S tags for the next sendcmdto_serv_butone() call */
 extern void sendcmdto_want_s2s_tags(int want);
 /* Override batch ID for forwarded label responses (auto-cleared after use) */

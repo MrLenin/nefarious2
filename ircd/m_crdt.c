@@ -379,6 +379,12 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
     is_tag = (m_cmd[0] == 'T');
     cmdstr = (m_cmd[0] == 'N') ? "NOTICE" : (is_tag ? "TAGMSG" : "PRIVMSG");
     src = crdt_shadow_user_record(srcyxx);
+    /* R4a (channel-over-mesh): per-server local-delivery dedup.  If the TREE plane
+     * already delivered this msgid to our locals (the channel relay marked it), skip the
+     * redundant CR-M LOCAL delivery — but still relay the flood onward below.  Distinct
+     * from crdt_m_seen (the flood dedup at the top), which gates relay too; sharing it
+     * would let a tree-first delivery suppress the CR-M relay and break the flood. */
+    if (!crdt_shadow_chan_local_check_add(m_msgid)) {
     if (target[0] == '#' || target[0] == '&') {           /* channel delivery */
       struct Channel *ch = FindChannel(target);
       struct Membership *memb;
@@ -423,6 +429,7 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
           sendrawto_one(tgt, ":%s %s %s :%s", srcyxx, cmdstr, cli_name(tgt), m_text);
       }
     }
+    }  /* R4a: end local-delivery dedup guard (the flood relay below always runs) */
     for (p = GlobalClientList; p; p = cli_next(p))   /* gossip relay (excl source) */
       if (p != cptr && IsCrdtSyncTarget(p))
         sendcmdto_one(&me, CMD_CRDT_REPLICATION, p, "M %s %s %s %s :%s",
