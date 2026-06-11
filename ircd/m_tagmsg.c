@@ -458,6 +458,20 @@ int ms_tagmsg(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
      * Use S2S msgid if available so clients can deduplicate. */
     store_tagmsg_history(sptr, chptr, client_tags,
                          cli_s2s_msgid(cptr)[0] ? cli_s2s_msgid(cptr) : NULL);
+
+    /* Tier2 P2: remote-origin channel TAGMSG — gossip to any mesh-only member (the
+     * local fan-out above dropped them at the dead-sink stub/anchor). */
+    {
+      struct Membership *mmemb;
+      for (mmemb = chptr->members; mmemb; mmemb = mmemb->next_member)
+        if (cli_user(mmemb->user) && cli_user(mmemb->user)->server &&
+            IsMeshStub(cli_user(mmemb->user)->server)) {
+          crdt_gossip_message(sptr, 'T', chptr->chname,
+                              cli_s2s_msgid(cptr)[0] ? cli_s2s_msgid(cptr) : "*",
+                              client_tags);
+          break;
+        }
+    }
   }
   else {
     /* Target is a user */
@@ -481,8 +495,19 @@ int ms_tagmsg(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
     }
     else {
       /* Remote user - forward to their server with tags */
-      sendcmdto_one(sptr, CMD_TAGMSG, acptr, "@%s %C",
-                    client_tags, acptr);
+      if (cli_user(acptr) && cli_user(acptr)->server &&
+          IsMeshStub(cli_user(acptr)->server)) {
+        /* Tier2 P2: target's P10 tree path is a dead-sink mesh stub/anchor -> gossip
+         * over the mesh (cmd 'T', client tags) instead of the dropped forward. */
+        char tyxx[6];
+        ircd_snprintf(0, tyxx, sizeof tyxx, "%s%s", NumNick(acptr));
+        crdt_gossip_message(sptr, 'T', tyxx,
+                            cli_s2s_msgid(cptr)[0] ? cli_s2s_msgid(cptr) : "*",
+                            client_tags);
+      } else {
+        sendcmdto_one(sptr, CMD_TAGMSG, acptr, "@%s %C",
+                      client_tags, acptr);
+      }
     }
 
     sendcmdto_set_client_msgid(NULL);

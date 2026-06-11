@@ -1323,20 +1323,23 @@ void relay_private_message(struct Client* sptr, const char* name, const char* te
   /* Tier2 T2-b: if the target lives on a mesh stub (its P10 tree path is down but
    * it is mesh-reachable), the normal send resolves cli_from -> the dead-sink stub
    * and drops.  Gossip via ephemeral CR M instead (delivered on the target's home
-   * server, deduped by msgid).  v1: PRIVMSG only; history/echo for mesh-only
-   * targets is a later increment. */
+   * server, deduped by msgid), then SKIP the dead-sink P10 send + bouncer forwards
+   * below — but still fall through to echo-message + history (delivery completeness
+   * for a mesh-only target). */
+  int mesh_delivered = 0;
   if (cli_user(acptr) && cli_user(acptr)->server &&
       IsMeshStub(cli_user(acptr)->server)) {
     char tyxx[6];
     ircd_snprintf(0, tyxx, sizeof tyxx, "%s%s", NumNick(acptr));
     crdt_gossip_message(sptr, 'P', tyxx, pm_msgid, mytext);
-    return;
+    mesh_delivered = 1;
   }
 
   /* Alias source rewriting for S2S legacy compat.
    * If target is on the primary's server direction, keep alias numeric
-   * (avoids fake direction — server_relay handles rewriting there). */
-  {
+   * (avoids fake direction — server_relay handles rewriting there).
+   * Skipped for a mesh-delivered target (gossiped via CR M above). */
+  if (!mesh_delivered) {
     const char *client_tags = cli_client_tags(sptr);
     struct Client *from = sptr;
 
@@ -1369,11 +1372,12 @@ void relay_private_message(struct Client* sptr, const char* name, const char* te
     }
   }
 
-  /* Forward PM to all aliases of the target bouncer primary */
-  bounce_forward_pm_to_aliases(sptr, acptr, CMD_PRIVATE, mytext, pm_msgid);
-
-  /* Echo outgoing PM to other members of the sender's bouncer session */
-  bounce_echo_pm_to_session(sptr, acptr, CMD_PRIVATE, mytext, pm_msgid);
+  /* Forward PM to the target bouncer primary's aliases + the sender's other session
+   * members (skip for a mesh-delivered target — handled on its home server). */
+  if (!mesh_delivered) {
+    bounce_forward_pm_to_aliases(sptr, acptr, CMD_PRIVATE, mytext, pm_msgid);
+    bounce_echo_pm_to_session(sptr, acptr, CMD_PRIVATE, mytext, pm_msgid);
+  }
 
   /* Echo private message back to sender if they have echo-message cap */
 #ifdef USE_ROCKSDB
@@ -1546,17 +1550,20 @@ void relay_private_notice(struct Client* sptr, const char* name, const char* tex
   }
 
   /* Tier2 T2-b: NOTICE to a mesh-only user -> gossip via ephemeral CR M (the
-   * normal send would resolve cli_from -> the dead-sink stub and drop). */
+   * normal send would resolve cli_from -> the dead-sink stub and drop); skip the
+   * dead-sink send + bouncer forwards below but still echo + store history. */
+  int mesh_delivered = 0;
   if (cli_user(acptr) && cli_user(acptr)->server &&
       IsMeshStub(cli_user(acptr)->server)) {
     char tyxx[6];
     ircd_snprintf(0, tyxx, sizeof tyxx, "%s%s", NumNick(acptr));
     crdt_gossip_message(sptr, 'N', tyxx, pm_msgid, mytext);
-    return;
+    mesh_delivered = 1;
   }
 
-  /* Alias source rewriting (see relay_private_message) */
-  {
+  /* Alias source rewriting (see relay_private_message).
+   * Skipped for a mesh-delivered target (gossiped via CR M above). */
+  if (!mesh_delivered) {
     const char *client_tags = cli_client_tags(sptr);
     struct Client *from = sptr;
 
@@ -1584,11 +1591,12 @@ void relay_private_notice(struct Client* sptr, const char* name, const char* tex
     }
   }
 
-  /* Forward notice to all aliases of the target bouncer primary */
-  bounce_forward_pm_to_aliases(sptr, acptr, CMD_NOTICE, mytext, pm_msgid);
-
-  /* Echo outgoing notice to other members of the sender's bouncer session */
-  bounce_echo_pm_to_session(sptr, acptr, CMD_NOTICE, mytext, pm_msgid);
+  /* Forward notice to the target bouncer primary's aliases + the sender's other
+   * session members (skip for a mesh-delivered target — handled on its home server). */
+  if (!mesh_delivered) {
+    bounce_forward_pm_to_aliases(sptr, acptr, CMD_NOTICE, mytext, pm_msgid);
+    bounce_echo_pm_to_session(sptr, acptr, CMD_NOTICE, mytext, pm_msgid);
+  }
 
   /* Echo private notice back to sender if they have echo-message cap */
 #ifdef USE_ROCKSDB
