@@ -323,6 +323,12 @@ uint64_t crdt_state_digest_materialized(const struct CrdtNetworkState *st);
 int  crdt_state_gc(struct CrdtNetworkState *st,
                    const struct CrdtStateVector *stable);
 
+/** Reclaim orphaned per-member metadata (members_status / kick_info) for members
+ *  that have fully departed a channel (gone from the OR-Set, removal causally
+ *  stable) by minting DELETE ops so they ride the tombstone GC. Returns the count
+ *  reclaimed. Safe + idempotent to call each GC cycle. */
+int  crdt_state_reclaim_orphan_member_meta(struct CrdtNetworkState *st);
+
 /* ---- queries ---- */
 struct CrdtChannel *crdt_state_channel(struct CrdtNetworkState *st,
                                        const char *chan, int create);

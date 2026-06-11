@@ -953,6 +953,100 @@ uint64_t crdt_state_digest_materialized(const struct CrdtNetworkState *st)
 
 
 /* ------------------------------------------------------------------ */
+/* orphaned per-member metadata reclaim (members_status / kick_info)    */
+/* ------------------------------------------------------------------ */
+/* members_status (CrdtMemberRecord) and kick_info (CrdtKickInfo) are LWW
+ * registers keyed chan\0numeric, parallel to the members OR-Set. When a member
+ * departs, the OR-Set entry is tombstoned then GC'd, but these LIVE LWW entries
+ * are not deletes, so the tombstone GC never reclaims them — they leak forever for
+ * churned members. Reclaim them by minting a DELETE op (NOT a local free: a local
+ * free would be resurrected by a peer's CR F snapshot that still holds the live
+ * entry → digest flap; a real tombstone propagates + LWW-wins + rides the existing
+ * tombstone GC). Gate on the member being FULLY gone: neither contained NOR
+ * explicitly-removed in the OR-Set, i.e. the removal is causally stable (its
+ * tombstone already GC'd) — by which point reconcile-remove has consumed kick_info
+ * on every peer, so deleting it is safe (KICK-vs-PART already decided). members_
+ * status and kick_info are reclaimed independently; a later rejoin writes a fresh
+ * members_status whose newer HLC gates any still-lingering stale kick_info (NB10).
+ * NB: every peer's sweep mints these at ~the same causal point (multi-writer, but
+ * the deletes are idempotent + LWW-dedup'd + GC quickly — benign at this scale). */
+
+/* Mint a DELETE op for @a key in @a map/@a coll (mirrors crdt_user_remove). */
+static void mint_meta_delete(struct CrdtNetworkState *st, struct CrdtLWWMap *map,
+                             int coll, const char *key, uint32_t klen)
+{
+  struct HLC ts = hlc_local_event(&st->clock);
+  uint64_t seq;
+  struct CrdtOp *op;
+  crdt_lwwmap_delete(map, key, klen, ts, st->my_numeric);
+  seq = st->next_seq++;
+  op = op_new(st->my_numeric, seq, CRDT_OP_DELETE, coll);
+  op->key = memdup(key, klen);
+  op->key_len = klen;
+  op->ts = ts;
+  op->writer = st->my_numeric;
+  record(st, op);
+}
+
+#define ORPHAN_MAX 64                 /* per-pass cap; survivors caught next cycle */
+struct orphan_ctx {
+  struct CrdtNetworkState *st;
+  char     keys[ORPHAN_MAX][256];     /* full chan\0numeric keys to reclaim */
+  uint32_t lens[ORPHAN_MAX];
+  int      n;
+};
+
+/* foreach callback: collect (don't mutate the map mid-iterate) the keys of entries
+ * whose member is FULLY gone from the channel's OR-Set. */
+static void orphan_collect_cb(const char *key, uint32_t key_len,
+                              const struct CrdtLWWValue *val, void *ctx)
+{
+  struct orphan_ctx *o = (struct orphan_ctx *)ctx;
+  uint32_t clen, nlen;
+  const char *num;
+  struct CrdtChannel *ch;
+  (void)val;
+  if (o->n >= ORPHAN_MAX || key_len >= sizeof o->keys[0])
+    return;
+  clen = (uint32_t)strlen(key);          /* chan is NUL-terminated within the key */
+  if (clen + 1 > key_len)
+    return;                              /* malformed (no numeric part) */
+  num = key + clen + 1;
+  nlen = key_len - clen - 1;
+  ch = chan_get(o->st, key, clen, 0);    /* lookup, no create */
+  if (ch && (crdt_orset_contains(&ch->members, num, nlen) ||
+             crdt_orset_is_explicitly_removed(&ch->members, num, nlen)))
+    return;                              /* still a member, or mid-removal -> keep */
+  memcpy(o->keys[o->n], key, key_len);
+  o->lens[o->n] = key_len;
+  o->n++;
+}
+
+/* Reclaim orphaned members_status/kick_info entries for fully-departed members by
+ * minting DELETE ops. Returns the number reclaimed. Idempotent + safe to call every
+ * GC cycle. */
+int crdt_state_reclaim_orphan_member_meta(struct CrdtNetworkState *st)
+{
+  static struct orphan_ctx o;            /* static: 32KB, avoids a huge stack frame */
+  int i, total = 0;
+
+  o.st = st; o.n = 0;
+  crdt_lwwmap_foreach(&st->members_status, orphan_collect_cb, &o);
+  for (i = 0; i < o.n; i++)
+    mint_meta_delete(st, &st->members_status, CRDT_COLL_MEMBER_STATUS,
+                     o.keys[i], o.lens[i]);
+  total += o.n;
+
+  o.n = 0;
+  crdt_lwwmap_foreach(&st->kick_info, orphan_collect_cb, &o);
+  for (i = 0; i < o.n; i++)
+    mint_meta_delete(st, &st->kick_info, CRDT_COLL_KICK_INFO, o.keys[i], o.lens[i]);
+  total += o.n;
+
+  return total;
+}
+
+/* ------------------------------------------------------------------ */
 /* causal-stability GC                                                */
 /* ------------------------------------------------------------------ */
 

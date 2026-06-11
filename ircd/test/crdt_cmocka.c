@@ -1423,6 +1423,82 @@ static void test_lww_tombstone_gc(void **state)
 }
 
 /* ================================================================== */
+/* Orphan per-member metadata reclaim (members_status/kick_info for departed
+ * members): the parallel LWW entries aren't tombstones, so the normal tombstone GC
+ * never reclaims them — crdt_state_reclaim_orphan_member_meta mints DELETE ops for
+ * members that have FULLY departed the OR-Set (removal causally stable). */
+
+/* DONE: a fully-departed member's metadata is reclaimed (delete-op minted). */
+static void test_orphan_member_meta_reclaimed(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s;
+  struct CrdtMemberRecord mr;
+  struct CrdtKickInfo ki;
+  struct CrdtStateVector stable;
+  memset(&mr, 0, sizeof mr); mr.status = CRDT_MEMBER_OP; mr.oplevel = 3;
+  memset(&ki, 0, sizeof ki); strcpy(ki.kicker, "AAAAA"); strcpy(ki.reason, "bye");
+  crdt_state_init(&s, 1);
+  crdt_chan_join(&s, "#c", "AAAAB");
+  crdt_member_status_set(&s, "#c", "AAAAB", &mr);
+  crdt_kick_info_set(&s, "#c", "AAAAB", &ki);
+  assert_non_null(crdt_member_status_get(&s, "#c", "AAAAB"));
+  assert_non_null(crdt_kick_info_get(&s, "#c", "AAAAB"));
+  /* member departs + removal becomes causally stable -> OR-Set tombstone GC'd */
+  crdt_chan_remove(&s, "#c", "AAAAB", CRDT_PRIORITY_USER);
+  crdt_sv_init(&stable); crdt_sv_update(&stable, 1, 1000);
+  crdt_state_gc(&s, &stable);
+  /* now fully gone -> reclaim mints DELETE ops -> entries read back NULL */
+  assert_true(crdt_state_reclaim_orphan_member_meta(&s) >= 2);
+  assert_null(crdt_member_status_get(&s, "#c", "AAAAB"));
+  assert_null(crdt_kick_info_get(&s, "#c", "AAAAB"));
+  /* the delete tombstones themselves GC after stability (no unbounded growth) */
+  crdt_sv_update(&stable, 1, 2000);
+  crdt_state_gc(&s, &stable);
+  crdt_state_clear(&s);
+}
+
+/* KEPT: a still-live member's metadata is NOT reclaimed. */
+static void test_orphan_meta_kept_while_member_live(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s;
+  struct CrdtMemberRecord mr;
+  memset(&mr, 0, sizeof mr); mr.status = CRDT_MEMBER_OP;
+  crdt_state_init(&s, 1);
+  crdt_chan_join(&s, "#c", "AAAAB");
+  crdt_member_status_set(&s, "#c", "AAAAB", &mr);
+  assert_int_equal(0, crdt_state_reclaim_orphan_member_meta(&s));
+  assert_non_null(crdt_member_status_get(&s, "#c", "AAAAB"));
+  crdt_state_clear(&s);
+}
+
+/* KEPT: while the OR-Set tombstone is still present (removal NOT yet causally
+ * stable), kick_info is retained — reconcile-remove on lagging peers still needs it
+ * for the KICK-vs-PART decision. */
+static void test_orphan_meta_kept_while_tombstone_present(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s;
+  struct CrdtMemberRecord mr;
+  struct CrdtKickInfo ki;
+  struct CrdtStateVector stable;
+  memset(&mr, 0, sizeof mr); mr.status = CRDT_MEMBER_OP;
+  memset(&ki, 0, sizeof ki); strcpy(ki.kicker, "AAAAA"); strcpy(ki.reason, "k");
+  crdt_state_init(&s, 1);
+  crdt_chan_join(&s, "#c", "AAAAB");
+  crdt_member_status_set(&s, "#c", "AAAAB", &mr);
+  crdt_kick_info_set(&s, "#c", "AAAAB", &ki);
+  crdt_chan_remove(&s, "#c", "AAAAB", CRDT_PRIORITY_USER);
+  crdt_sv_init(&stable);                 /* nothing stable -> tombstone remains */
+  crdt_state_gc(&s, &stable);
+  /* tombstone present (member is_explicitly_removed) -> kick_info retained */
+  assert_int_equal(0, crdt_state_reclaim_orphan_member_meta(&s));
+  assert_non_null(crdt_kick_info_get(&s, "#c", "AAAAB"));
+  crdt_state_clear(&s);
+}
+
+/* ================================================================== */
 /* Fix A (digest-aware anti-entropy): the state vector counts ops per origin but
  * does NOT summarise content/HLC, so two replicas can share an SV yet hold
  * different content (e.g. a CR F snapshot HLC-merge or ctime incarnation change
@@ -1503,6 +1579,9 @@ int main(void)
   const struct CMUnitTest tests[] = {
     cmocka_unit_test(test_user_explicit_removal_gate),
     cmocka_unit_test(test_lww_tombstone_gc),
+    cmocka_unit_test(test_orphan_member_meta_reclaimed),
+    cmocka_unit_test(test_orphan_meta_kept_while_member_live),
+    cmocka_unit_test(test_orphan_meta_kept_while_tombstone_present),
     cmocka_unit_test(test_A_convergence),
     cmocka_unit_test(test_B_collision_different_user_oldest_wins),
     cmocka_unit_test(test_B_collision_same_user_newest_wins),

@@ -2193,6 +2193,16 @@ static void crdt_shadow_gc(void)
   if (npeers < 1)
     return;                                  /* no connected CRDT peer */
   crdt_sv_global_min(&gmin, vecs, n);
+  /* reclaim orphaned per-member metadata (members_status/kick_info for fully-departed
+   * members) by minting DELETE ops FIRST, so this pass's GC can already start
+   * reclaiming any that became causally stable. */
+  {
+    int orph = crdt_state_reclaim_orphan_member_meta(&g_crdt);
+    if (orph > 0)
+      log_write(LS_SYSTEM, L_NOTICE, 0,
+                "CRDT GC: reclaimed %d orphan member-meta entr(ies) (departed members)",
+                orph);
+  }
   freed = crdt_state_gc(&g_crdt, &gmin);
   if (freed > 0)
     log_write(LS_SYSTEM, L_NOTICE, 0,
