@@ -11,9 +11,18 @@ event model (users/channels/topics/modes/members/bans/kicks) is fully CRDT-autho
 before writing or modifying any `crdt_*` code, the `CR` tokens, the mesh stub/anchor, or the gateway.
 
 Roadmap + the P10-retirement arc: `.claude/para/projects/crdt-mesh-roadmap.md`. Live per-phase state:
-personal memory `project_crdt_mesh_phase0.md`. Testnet topology: nef3 (CRDT hub, P10) + nef4/nef5
-(CRDT leaves); P10 star (nef3—nef4, nef3—nef5) **plus** a CR-only overlay nef4↔nef5 (triangle on the
-CR plane, star on the P10 plane).
+personal memory `project_crdt_mesh_phase0.md`. Testnet topology (expanded to **5 CRDT nodes**
+2026-06-11; build/gotcha details in `.claude/para/projects/crdt-mesh-testbed-expansion.md`):
+2-deep, 2-branch P10 tree `primary(.2) ← nef3(hub2,.6) ← { nef4(leaf2,.7) ← nef6(leaf4,.14) ;
+nef5(leaf3,.9) ← nef7(leaf5,.15) }`, **plus** 4 CR-only overlays nef4↔nef5, nef6↔nef3, nef7↔nef3,
+nef7↔nef6 (≥2 disjoint CR paths between most pairs — the R2-depth + R4-multi-path substrate).
+Numerics nef3=3 nef4=4 nef5=6 nef6=7 nef7=8; client ports 6669/6670/6672/6673/6674.
+**Bring-up gotchas**: depth-2 needs the intermediate `"HUB"="TRUE"` + bare `hub;` on hub2's downlink
+Connect block; the `pgrep` healthcheck greens before the 4496 listener (valgrind boot) so sequence
+targets-before-initiators or autoconnect gets "refused" → backoff; force a stuck P10 uplink with oper
+`CONNECT`; overlays only re-autoconnect on the 10-min `try_connections` cycle (can't force via CONNECT)
+— never restart 3+ nodes at once. (Older 3-node star nef3+nef4/nef5+overlay is the subset still
+described in many notes below.)
 
 ## Three layers (keep them straight)
 
