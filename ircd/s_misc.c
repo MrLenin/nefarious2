@@ -1081,11 +1081,20 @@ int exit_client(struct Client *cptr,
      * (T2-c, via the T2-b send-hooks).  For a NON-leaf departed server we tear
      * down its tree-downlinks first (their users QUIT) then convert the now-leaf
      * server; a leaf has no downlinks so this matches the T2-a behaviour.
-     * (Deeper-subtree CRDT-aware servers are torn down here for now — full
-     * recursive keep-alive is a follow-up; see crdt-mesh-tier2a-plan.md.)
-     * close_connection already ran; cli_serv->up/down are still valid. */
+     *
+     * R2 (recursive keep-alive): the deeper subtree's servers are RELAYED (reached
+     * via victim, not MyConnect) so the in-place dead-sink-shared-Connection stub
+     * model is invalid for them (it crashed on a relayed server — T2-c).  Instead
+     * we tear them down here and IMMEDIATELY re-materialize the whole subtree via P2
+     * synthetic anchors (crdt_shadow_reconcile_* walks the entire doc, building a
+     * fresh-Connection anchor for every beacon-fresh non-P10 server at ANY depth)
+     * so their users + channels don't flicker out until the next 30s verify tick.
+     * A genuinely unreachable (stale-beacon) deeper server gets no anchor — its
+     * users stay hidden, correct SPLIT.  close_connection already ran;
+     * cli_serv->up/down are still valid. */
     if (crdt_shadow_mesh_reachable(victim)) {
       struct DLink *clp, *cnext;
+      int had_downlinks = (cli_serv(victim)->down != NULL);
       send_netsplit_batch_start(victim, cli_serv(victim)->up,
                                  netsplit_batch_id, sizeof(netsplit_batch_id));
       set_active_network_batch(netsplit_batch_id);
@@ -1097,6 +1106,16 @@ int exit_client(struct Client *cptr,
       set_active_network_batch(NULL);
       send_netsplit_batch_end(netsplit_batch_id);
       crdt_shadow_convert_to_stub(victim);   /* victim is now a leaf — keep it */
+      if (had_downlinks) {
+        /* R2: re-materialize the just-torn-down (mesh-reachable) subtree NOW via
+         * anchors — presence first, then channels/members/status (verify_cb order).
+         * Idempotent + safe here: the teardown is complete, anchors use fresh
+         * Connections, and nothing iterates GlobalClientList on this exit path. */
+        crdt_shadow_reconcile_users();
+        crdt_shadow_reconcile_create_channels();
+        crdt_shadow_reconcile_members();
+        crdt_shadow_reconcile_member_status();
+      }
       return (cptr == victim) ? CPTR_KILLED : 0;
     }
 
