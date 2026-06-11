@@ -388,15 +388,20 @@ void crdt_chan_ctime_set(struct CrdtNetworkState *st, const char *chan,
   uint64_t seq;
   struct CrdtOp *op;
   ctime_merge(ch, creationtime, now, incarnation);
-  /* zero the struct (incl. each struct HLC's trailing alignment padding, sizeof 16
-   * vs 12 used) before populating: memdup(&pl) below serializes the whole struct
-   * into op->val, and uninit padding bytes from a by-value HLC would otherwise be
-   * b64-encoded onto the wire (valgrind "uninit value" at crdt_b64_encode; benign
-   * same-build but a cross-build wire-determinism wart). */
+  /* memdup(&pl) below serializes the WHOLE struct into op->val, so its padding goes
+   * on the wire. Each struct HLC is sizeof 16 but 12 bytes used (4 trailing pad), and
+   * hlc_max/ctime_merge pass HLCs BY VALUE — gcc copies only the 12 used bytes,
+   * leaving the locals' pad uninit. So `pl.set_hlc = now` (a whole-struct copy) would
+   * drag that uninit pad in even after a memset. Zero pl, then copy HLCs FIELD-BY-FIELD
+   * so the memset-zeroed padding survives (valgrind-clean + cross-build wire-determinism). */
   memset(&pl, 0, sizeof pl);
   pl.value = creationtime;
-  pl.set_hlc = now;
-  pl.del_hlc = incarnation;
+  pl.set_hlc.physical_ms = now.physical_ms;
+  pl.set_hlc.logical     = now.logical;
+  pl.set_hlc.node_id     = now.node_id;
+  pl.del_hlc.physical_ms = incarnation.physical_ms;
+  pl.del_hlc.logical     = incarnation.logical;
+  pl.del_hlc.node_id     = incarnation.node_id;
   seq = st->next_seq++;
   op = op_new(st->my_numeric, seq, CRDT_OP_SET, CRDT_COLL_CHAN_CTIME);
   op->chan = memdup(chan, clen);
