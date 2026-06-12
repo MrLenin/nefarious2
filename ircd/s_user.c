@@ -1265,11 +1265,16 @@ int set_nick_name(struct Client* cptr, struct Client* sptr,
        * copy on CRDT peers).  This same relay, now legacy-only, IS the §17.7
        * gateway: when reconcile drives the rename via set_nick_name(cptr=CRDT
        * uplink), it re-emits the NICK to legacy here. */
-      if (feature_bool(FEAT_CRDT_PRIMARY))
-        sendcmdto_flag_serv_butone(sptr, CMD_NICK, cptr, FLAG_LAST_FLAG,
-                                   FLAG_CRDT_AWARE, "%s %Tu", nick,
-                                   cli_lastnick(sptr));
-      else
+      if (feature_bool(FEAT_CRDT_PRIMARY)) {
+        /* Tier2 P1 (#4): skip the legacy NICK for a mesh-only user — legacy SQUIT'd
+         * its owning server and never received its NICK, so a rename sourced from it
+         * would reference an unknown user.  The change rides the doc to CRDT peers
+         * (crdt_shadow_reconcile_users), and the real P10 NICK returns on relink. */
+        if (!crdt_user_is_mesh_only(sptr))
+          sendcmdto_flag_serv_butone(sptr, CMD_NICK, cptr, FLAG_LAST_FLAG,
+                                     FLAG_CRDT_AWARE, "%s %Tu", nick,
+                                     cli_lastnick(sptr));
+      } else
         sendcmdto_serv_butone(sptr, CMD_NICK, cptr, "%s %Tu", nick,
                               cli_lastnick(sptr));
 
@@ -1581,8 +1586,12 @@ void send_umode_out(struct Client *cptr, struct Client *sptr,
          * set_user_mode(cptr=CRDT uplink), it re-emits the MODE to legacy here.
          * crdt_gate is set only on the set_user_mode (/MODE) and oper-up paths,
          * which mirror to the doc; sethost stays crdt_gate=0 (host-param not yet
-         * reconciled, so it must keep flowing on P10). */
-        && !(crdt_gate && feature_bool(FEAT_CRDT_PRIMARY) && IsCrdtAware(acptr)))
+         * reconciled, so it must keep flowing on P10).
+         * Tier2 P1 (#4): also skip ALL legacy peers for a mesh-only subject — legacy
+         * SQUIT'd its server and never got its NICK, so a MODE sourced from it would
+         * reference an unknown user; the change rides the doc and returns on relink. */
+        && !(crdt_gate && feature_bool(FEAT_CRDT_PRIMARY)
+             && (IsCrdtAware(acptr) || crdt_user_is_mesh_only(sptr))))
       sendcmdto_one(sptr, CMD_MODE, acptr, "%s %s", cli_name(sptr), umodeBuf);
   }
   if (cptr && MyUser(cptr))

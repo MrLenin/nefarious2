@@ -142,7 +142,7 @@ static int from_crdt_peer(struct Client *from)
  * for its server, so the §17.7 legacy gateway emits (NICK/JOIN/PART/KICK) MUST be
  * skipped for it — it propagates to other CRDT-mesh servers via the doc, and the
  * real P10 introduction returns when its server relinks. */
-static int crdt_user_is_mesh_only(struct Client *u)
+int crdt_user_is_mesh_only(struct Client *u)
 {
   return u && cli_user(u) && cli_user(u)->server
          && IsMeshStub(cli_user(u)->server);
