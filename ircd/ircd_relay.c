@@ -579,6 +579,22 @@ void relay_channel_message(struct Client* sptr, const char* name, const char* te
           crdt_shadow_chan_local_check_add(msgid))
         sendcmdto_set_skip_local_members();
 
+      /* R6a (tree demote): if the CR-M flood below will carry this to a directly-connected
+       * CRDT-aware peer (same member scan as the flood), suppress the now-redundant tree
+       * relay to CRDT-aware directions; legacy directions still get the tree copy.  Must be
+       * set BEFORE the relay call, which consumes the one-shot flag at entry. */
+      if (feature_bool(FEAT_CRDT_PRIMARY)) {
+        struct Membership *cmemb;
+        for (cmemb = chptr->members; cmemb; cmemb = cmemb->next_member) {
+          struct Client *csrv = cli_user(cmemb->user) ? cli_user(cmemb->user)->server : NULL;
+          if (csrv && csrv != &me &&
+              (IsMeshStub(csrv) || (IsServer(csrv) && IsCrdtAware(csrv)))) {
+            sendcmdto_set_skip_crdt_servers();
+            break;
+          }
+        }
+      }
+
       if (client_tags && *client_tags) {
         sendcmdto_channel_butone_with_client_tags(from, CMD_PRIVATE, chptr, cli_from(sptr),
                            SKIP_DEAF | SKIP_BURST, text[0], client_tags,
@@ -755,6 +771,21 @@ void relay_channel_notice(struct Client* sptr, const char* name, const char* tex
           crdt_shadow_chan_local_check_add(msgid))
         sendcmdto_set_skip_local_members();
 
+      /* R6a (tree demote, see relay_channel_message): suppress the redundant tree relay to
+       * CRDT-aware directions when the CR-M flood below will carry it there.  Set before the
+       * relay call (consumes the one-shot flag at entry). */
+      if (feature_bool(FEAT_CRDT_PRIMARY)) {
+        struct Membership *cmemb;
+        for (cmemb = chptr->members; cmemb; cmemb = cmemb->next_member) {
+          struct Client *csrv = cli_user(cmemb->user) ? cli_user(cmemb->user)->server : NULL;
+          if (csrv && csrv != &me &&
+              (IsMeshStub(csrv) || (IsServer(csrv) && IsCrdtAware(csrv)))) {
+            sendcmdto_set_skip_crdt_servers();
+            break;
+          }
+        }
+      }
+
       if (client_tags && *client_tags) {
         sendcmdto_channel_butone_with_client_tags(from, CMD_NOTICE, chptr, cli_from(sptr),
                            SKIP_DEAF | SKIP_BURST, '\0', client_tags,
@@ -887,6 +918,22 @@ void server_relay_channel_message(struct Client* sptr, const char* name, const c
         crdt_shadow_chan_local_check_add(relay_msgid))
       sendcmdto_set_skip_local_members();
 
+    /* R6a (tree demote): only a LEGACY-origin message (!IsCrdtAware(one)) fires the CR-M
+     * flood here — a CR-origin message was already flooded + tree-suppressed by its origin
+     * and never reaches this server_relay path on an R6a peer.  Matching that gate, suppress
+     * the redundant tree relay to CRDT-aware directions when we flood.  Set before the call. */
+    if (feature_bool(FEAT_CRDT_PRIMARY) && (!one || !IsCrdtAware(one))) {
+      struct Membership *cmemb;
+      for (cmemb = chptr->members; cmemb; cmemb = cmemb->next_member) {
+        struct Client *csrv = cli_user(cmemb->user) ? cli_user(cmemb->user)->server : NULL;
+        if (csrv && csrv != &me &&
+            (IsMeshStub(csrv) || (IsServer(csrv) && IsCrdtAware(csrv)))) {
+          sendcmdto_set_skip_crdt_servers();
+          break;
+        }
+      }
+    }
+
     if (client_tags && *client_tags) {
       sendcmdto_channel_butone_with_client_tags(sptr, CMD_PRIVATE, chptr, one,
                          SKIP_DEAF | SKIP_BURST, text[0], client_tags,
@@ -1005,6 +1052,21 @@ void server_relay_channel_notice(struct Client* sptr, const char* name, const ch
     if (feature_bool(FEAT_CRDT_PRIMARY) && relay_msgid[0] &&
         crdt_shadow_chan_local_check_add(relay_msgid))
       sendcmdto_set_skip_local_members();
+
+    /* R6a (tree demote, see server_relay_channel_message): only a legacy-origin message
+     * (!IsCrdtAware(one)) floods here; suppress the redundant tree relay to CRDT-aware
+     * directions when we flood.  Set before the relay call. */
+    if (feature_bool(FEAT_CRDT_PRIMARY) && (!one || !IsCrdtAware(one))) {
+      struct Membership *cmemb;
+      for (cmemb = chptr->members; cmemb; cmemb = cmemb->next_member) {
+        struct Client *csrv = cli_user(cmemb->user) ? cli_user(cmemb->user)->server : NULL;
+        if (csrv && csrv != &me &&
+            (IsMeshStub(csrv) || (IsServer(csrv) && IsCrdtAware(csrv)))) {
+          sendcmdto_set_skip_crdt_servers();
+          break;
+        }
+      }
+    }
 
     if (client_tags && *client_tags) {
       sendcmdto_channel_butone_with_client_tags(sptr, CMD_NOTICE, chptr, one,

@@ -133,6 +133,18 @@ void sendcmdto_set_skip_local_members(void)
   skip_local_members_once = 1;
 }
 
+/** R6a one-shot: skip the TREE relay to directly-connected CRDT-AWARE server directions in
+ *  the next sendcmdto_channel_butone[_with_client_tags] call.  Set by the channel relay when
+ *  the CR-M flood will carry this message to those CRDT peers (same TCP link carries CR), so
+ *  the tree no longer double-carries it; legacy (non-CRDT) directions still get the tree copy.
+ *  Consumed (and reset) at call entry. */
+static int skip_crdt_servers_once = 0;
+
+void sendcmdto_set_skip_crdt_servers(void)
+{
+  skip_crdt_servers_once = 1;
+}
+
 /** Frontier introducer gate (per design intent #135 + #254).
  *
  * When set, the next sendcmdto_serv_butone / sendcmdto_flag_serv_butone
@@ -2680,9 +2692,11 @@ void sendcmdto_channel_butone(struct Client *from, const char *cmd,
   char userfmt_tags[64];
   int tflags;
   int skip_local = skip_local_members_once;  /* R4a: one-shot CRDT local-dedup skip */
+  int skip_crdt = skip_crdt_servers_once;    /* R6a: one-shot CRDT-server tree-relay skip */
 
   vd.vd_format = pattern;
   skip_local_members_once = 0;
+  skip_crdt_servers_once = 0;
 
   /* Consume alias source override for split S2S delivery.
    * When set, we build two S2S buffers: primary numeric for most servers,
@@ -2785,6 +2799,11 @@ void sendcmdto_channel_butone(struct Client *from, const char *cmd,
         send_buffer(member->user, user_mb, 0);
       }
     } else {
+      /* R6a: the CR-M flood carries this message to directly-connected CRDT-aware peers
+       * (CR rides the same TCP link), so skip the redundant tree copy to them; legacy
+       * (non-CRDT) directions still get the tree relay. */
+      if (skip_crdt && IsCrdtAware(cli_from(member->user)))
+        continue;
       /* Use alias numeric for primary's server direction to avoid fake direction */
       if (serv_mb_alias && cli_from(member->user) == primary_dir)
         send_buffer(member->user, serv_mb_alias, 0);
@@ -2860,9 +2879,11 @@ void sendcmdto_channel_butone_with_client_tags(struct Client *from,
   char userfmt_tags[64];
   int has_ctags = (client_tags && *client_tags);
   int skip_local = skip_local_members_once;  /* R4a: one-shot CRDT local-dedup skip */
+  int skip_crdt = skip_crdt_servers_once;    /* R6a: one-shot CRDT-server tree-relay skip */
 
   vd.vd_format = pattern;
   skip_local_members_once = 0;
+  skip_crdt_servers_once = 0;
 
   /* Consume alias source override for split S2S delivery */
   alias_from = s2s_alias_source;
@@ -2998,6 +3019,10 @@ void sendcmdto_channel_butone_with_client_tags(struct Client *from,
        */
       struct Client *peer_link = cli_from(member->user);
       int is_v3 = IsIRCv3Aware(peer_link);
+      /* R6a: skip the redundant tree copy to a directly-connected CRDT-aware peer — the
+       * CR-M flood carries it there (same TCP link); legacy directions still relayed. */
+      if (skip_crdt && IsCrdtAware(peer_link))
+        continue;
       if (peer_link == primary_dir) {
         if (is_v3 && serv_mb_alias_v3)
           send_buffer(member->user, serv_mb_alias_v3, 0);

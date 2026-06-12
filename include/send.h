@@ -72,6 +72,11 @@ extern void sendcmdto_set_alias_source(struct Client *alias);
 /* R4a: skip LOCAL-member delivery in the next sendcmdto_channel_butone[_with_client_tags]
  * call (still relays to servers) — set by the channel relay after the CRDT local dedup. */
 extern void sendcmdto_set_skip_local_members(void);
+/* R6a: skip the TREE relay to directly-connected CRDT-AWARE server directions in the next
+ * sendcmdto_channel_butone[_with_client_tags] call (still relays to legacy directions) —
+ * set by the channel relay when the CR-M flood will carry this msg to those CRDT peers, so
+ * the tree no longer double-carries it.  One-shot; consumed (reset) at call entry. */
+extern void sendcmdto_set_skip_crdt_servers(void);
 /* Opt-in S2S tags for the next sendcmdto_serv_butone() call */
 extern void sendcmdto_want_s2s_tags(int want);
 /* Override batch ID for forwarded label responses (auto-cleared after use) */

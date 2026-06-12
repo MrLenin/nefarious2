@@ -412,6 +412,22 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
             sendrawto_one(memb->user, ":%s %s %s :%s", srcyxx, cmdstr, target,
                           m_text);
         }
+      /* R6b (gateway CR-M -> legacy bridge): re-emit this channel message to LEGACY P10
+       * peers (forbid CRDT-aware — they got the CR-M flood).  Being inside the !dup_local
+       * block means CR-M was the FIRST arrival here, i.e. the TREE did not carry this msgid
+       * to us (R6a demoted the tree among CRDT peers), so legacy members reachable only via
+       * us still receive it, exactly once (no tree copy to double with; a legacy-origin
+       * message arrives via the tree, is dedup-marked, and skips this block).  A no-op on a
+       * node with no legacy peers.  Skip a MESH-ONLY source: legacy SQUIT'd its server and
+       * cannot place it (the partition case = R6c).  TAGMSG ('T') deferred (its @-tag legacy
+       * form differs + its tree leg is not yet demoted). */
+      if (ch && !is_tag) {
+        struct Client *srcc = findNUser(srcyxx);
+        if (srcc && !crdt_user_is_mesh_only(srcc))
+          sendcmdto_flag_serv_butone(srcc, (m_cmd[0] == 'N') ? CMD_NOTICE : CMD_PRIVATE,
+                                     NULL, FLAG_LAST_FLAG, FLAG_CRDT_AWARE,
+                                     "%H :%s", ch, m_text);
+      }
     } else {                                              /* unicast delivery */
       struct Client *tgt = findNUser(target);
       if (tgt && MyConnect(tgt)) {
