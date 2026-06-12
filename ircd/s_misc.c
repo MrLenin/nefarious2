@@ -1054,8 +1054,14 @@ int exit_client(struct Client *cptr,
                 * crdt_shadow_reconcile_user_removes exits the remote copy on CRDT
                 * peers + §17.7-gateways a QUIT to legacy via THIS loop). SQUIT-
                 * cascade (victim is a server) takes the SQUIT branch above, so it
-                * still tears down materialized users on CRDT peers normally. */
-               && !(feature_bool(FEAT_CRDT_PRIMARY) && IsCrdtAware(dlp->value.cptr))) {
+                * still tears down materialized users on CRDT peers normally.
+                * Tier2 P1 (#4 follow-up): also skip ALL legacy peers for a mesh-only
+                * victim — legacy already SQUIT'd its server and never had its NICK, so
+                * a QUIT sourced from it references an unknown user (un-routable).  Its
+                * removal rides the doc to other CRDT peers; legacy already considers
+                * it gone from the earlier server SQUIT. */
+               && !(feature_bool(FEAT_CRDT_PRIMARY)
+                    && (IsCrdtAware(dlp->value.cptr) || crdt_user_is_mesh_only(victim)))) {
 	/* Held ghosts: BX X already handled the silent destroy on
 	 * IRCv3-aware peers; non-IRCv3-aware peers don't process BX X
 	 * and need a regular Q to clean up the phantom Client struct
