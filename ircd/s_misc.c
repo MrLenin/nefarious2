@@ -800,6 +800,15 @@ void crdt_shadow_retire_mesh_stub(struct Client *stub, const char *comment)
     return;
   log_write(LS_SYSTEM, L_NOTICE, 0,
             "CRDT mesh: retiring mesh stub %s (%s)", cli_name(stub), comment);
+  if (IsPresented(stub))
+    /* R6c: this stub was presented to legacy as a P10 subtree — SQUIT it from legacy
+     * (forbid CRDT-aware) BEFORE teardown, matching the timestamp legacy holds, so the
+     * real server's SERVER intro (server_estab, after SetServerYXX) lands cleanly with no
+     * duplicate-server collision.  Exactly one SQUIT (exit_one_client emits none).  CRDT
+     * peers handle retire via the doc/beacon, not this SQUIT. */
+    sendcmdto_flag_serv_butone(&me, CMD_SQUIT, NULL, FLAG_LAST_FLAG, FLAG_CRDT_AWARE,
+                               "%s %Tu :%s", cli_name(stub),
+                               cli_serv(stub)->timestamp, comment);
   acptrp = cli_serv(stub)->client_list;
   for (i = 0; i <= cli_serv(stub)->nn_mask; ++acptrp, ++i)
     if (*acptrp)

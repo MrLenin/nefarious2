@@ -211,6 +211,11 @@ enum Flag
                                          CR tokens; never IsServer, never in the
                                          routing tree / server_list[]. Exempt
                                          from the registration ping timeout. */
+    FLAG_CRDT_PRESENTED,            /**< R6c: a STAT_MESH_SERVER stub the gateway has
+                                         PRESENTED to legacy as a P10 subtree (SERVER
+                                         intro emitted).  Its users are no longer
+                                         "mesh-only" toward legacy — the §17.7 gates
+                                         emit to legacy for them; retire SQUITs it. */
     FLAG_GOTID,                     /**< successful ident lookup achieved */
     FLAG_DOID,                      /**< I-lines say must use ident return */
     FLAG_NONL,                      /**< No \n in buffer */
@@ -1198,6 +1203,8 @@ struct Client {
 #define IsBxfAware(x)           HasFlag(x, FLAG_BXF_AWARE)
 /** Test if the client speaks the CR (CRDT sync) token. */
 #define IsCrdtAware(x)          HasFlag(x, FLAG_CRDT_AWARE)
+/** R6c: test if a mesh-stub server has been PRESENTED to legacy as a P10 subtree. */
+#define IsPresented(x)          HasFlag(x, FLAG_CRDT_PRESENTED)
 /** Return non-zero if the client is a CR-only mesh overlay link (Phase 4b). */
 #define IsCrdtOverlay(x)        HasFlag(x, FLAG_CRDT_OVERLAY)
 /** Return non-zero if @a x is a directly-connected CRDT sync peer — either a
@@ -1355,6 +1362,10 @@ struct Client {
 #define SetBxfAware(x)          SetFlag(x, FLAG_BXF_AWARE)
 /** Mark the client as CR (CRDT sync) capable. */
 #define SetCrdtAware(x)         SetFlag(x, FLAG_CRDT_AWARE)
+/** R6c: mark a mesh-stub server as PRESENTED to legacy as a P10 subtree. */
+#define SetPresented(x)         SetFlag(x, FLAG_CRDT_PRESENTED)
+/** R6c: clear the PRESENTED mark. */
+#define ClearPresented(x)       ClrFlag(x, FLAG_CRDT_PRESENTED)
 /** Mark a client as a CR-only mesh overlay link (Phase 4b). */
 #define SetCrdtOverlay(x)       SetFlag(x, FLAG_CRDT_OVERLAY)
 /** Mark a client as having an account stamp. */

@@ -152,11 +152,15 @@ static int from_crdt_peer(struct Client *from)
  * only in the CRDT layer here; legacy (non-CRDT) peers already received the SQUIT
  * for its server, so the §17.7 legacy gateway emits (NICK/JOIN/PART/KICK) MUST be
  * skipped for it — it propagates to other CRDT-mesh servers via the doc, and the
- * real P10 introduction returns when its server relinks. */
+ * real P10 introduction returns when its server relinks.
+ * R6c: a stub the gateway has PRESENTED to legacy (FLAG_CRDT_PRESENTED) is NO LONGER
+ * mesh-only toward legacy — legacy now knows its server, so all the §17.7 gates
+ * (which consult this helper) emit for its users.  Flipping this one predicate flips
+ * every gate at once. */
 int crdt_user_is_mesh_only(struct Client *u)
 {
-  return u && cli_user(u) && cli_user(u)->server
-         && IsMeshStub(cli_user(u)->server);
+  struct Client *srv = (u && cli_user(u)) ? cli_user(u)->server : NULL;
+  return srv && IsMeshStub(srv) && !IsPresented(srv);
 }
 
 /** Build the full P10 numeric ("YYXXX") for a user into @a buf. */
@@ -430,6 +434,50 @@ int crdt_shadow_mesh_reachable(struct Client *srv)
   return 0;
 }
 
+/* R6c: does this node have a directly-linked LEGACY (non-CRDT) P10 peer to present to? */
+static int crdt_gateway_has_legacy_peer(void)
+{
+  struct DLink *lp;
+  for (lp = cli_serv(&me)->down; lp; lp = lp->next)
+    if (IsServer(lp->value.cptr) && !IsCrdtAware(lp->value.cptr))
+      return 1;
+  return 0;
+}
+
+/* R6c: PRESENT a mesh-stub @a srv to legacy as a P10 subtree behind this gateway, so legacy
+ * can place its users and receive their channel traffic FAITHFULLY (real source).  Idempotent
+ * (FLAG_CRDT_PRESENTED); a no-op when this node has no legacy peer (a pure-CRDT leaf).  Marks
+ * the stub PRESENTED — crdt_user_is_mesh_only then returns false for its users, so the §17.7
+ * reconcile/bridge gates emit for them.  Emits the SERVER intro to legacy-only (forbid
+ * CRDT-aware; mirror server_estab's J-form), then runs the proven post-split materialize suite
+ * so the now-ungated gates emit the stub's NICK/JOIN/MODE to legacy.  Forces IsIPv6 so legacy
+ * accepts the server-sourced IPv6 NICK form.  Retired (SQUIT to legacy) by
+ * crdt_shadow_retire_mesh_stub on relink. */
+static void crdt_present_stub(struct Client *srv)
+{
+  if (!srv || IsPresented(srv) || !cli_serv(srv) || !crdt_gateway_has_legacy_peer())
+    return;
+  SetPresented(srv);
+  if (!IsIPv6(srv))
+    SetIPv6(srv);
+  if (!Protocol(srv))
+    cli_serv(srv)->prot = 10;       /* Case-B anchor default (MAJOR_PROTOCOL "10") */
+  sendcmdto_flag_serv_butone(&me, CMD_SERVER, NULL, FLAG_LAST_FLAG, FLAG_CRDT_AWARE,
+                             "%s 2 0 %Tu J%02u %s%s +%s%s :%s",
+                             cli_name(srv), cli_serv(srv)->timestamp, Protocol(srv),
+                             NumServCap(srv), IsHub(srv) ? "h" : "",
+                             IsIPv6(srv) ? "6" : "", cli_info(srv));
+  log_write(LS_SYSTEM, L_NOTICE, 0,
+            "CRDT mesh: presented stub %s to legacy as a P10 subtree (R6c)", cli_name(srv));
+  /* Do NOT run the reconcile suite here: present() is called from make_anchor (Case B),
+   * which is itself called from inside a reconcile pass — a nested reconcile would
+   * intro the stub's users to legacy TWICE (numeric-collision ghost-kill).  Now that the
+   * stub is marked PRESENTED, the AMBIENT reconcile (the in-progress Case-B pass, or the
+   * post-split R2 block for Case A, or the 30s verify timer as a backstop) emits the
+   * users/channels to legacy exactly once via the now-ungated §17.7 gates.  The SERVER
+   * intro above is emitted first, so it precedes those NICKs. */
+}
+
 void crdt_shadow_convert_to_stub(struct Client *srv)
 {
   unsigned int held = 0, i;
@@ -448,6 +496,7 @@ void crdt_shadow_convert_to_stub(struct Client *srv)
   log_write(LS_SYSTEM, L_NOTICE, 0,
             "CRDT mesh: %s tree-split but mesh-reachable; %u user(s) held live "
             "(T2 mesh stub)", cli_name(srv), held);
+  crdt_present_stub(srv);            /* R6c: present to legacy as a P10 subtree (no-op w/o legacy) */
 }
 
 /* Tier2 P2 (Case B): build a SYNTHETIC mesh anchor for a partitioned-but-mesh-
@@ -503,6 +552,7 @@ static struct Client *crdt_shadow_make_anchor(const char *srvnum)
   log_write(LS_SYSTEM, L_NOTICE, 0,
             "CRDT mesh: synthetic anchor for server %s = %s (mesh-reachable, no P10 link)",
             srvnum, cli_name(nc));
+  crdt_present_stub(nc);             /* R6c: present to legacy as a P10 subtree (no-op w/o legacy) */
   return nc;
 }
 
@@ -1330,9 +1380,12 @@ static void crdt_gateway_user_intro(struct Client *nc)
   struct Client *srv = cli_user(nc)->server;
   if (!srv)
     return;
-  if (IsMeshStub(srv))    /* Tier2 P1: a mesh-only user is NOT announced to legacy
+  if (IsMeshStub(srv) && !IsPresented(srv))
+                          /* Tier2 P1: a mesh-only user is NOT announced to legacy
                              P10 — those peers already SQUIT'd its server; it rides
-                             the CRDT doc and the real NICK returns on relink. */
+                             the CRDT doc and the real NICK returns on relink.
+                             R6c: a PRESENTED stub IS known to legacy now, so fall
+                             through and introduce the user. */
     return;
   um = umode_str(nc);
   sendcmdto_flag_serv_butone(srv, CMD_NICK, NULL,
