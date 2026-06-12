@@ -101,7 +101,8 @@ const struct CrdtUserRecord *crdt_shadow_user_record(const char *numeric);
  *  + emit timestamp).  Returns 1 if the beacon is FRESH (newer than the last seen
  *  for that server -> caller should relay it onward), 0 if a dup/old beacon (drop,
  *  terminating the gossip flood). */
-int crdt_shadow_beacon_record(unsigned int num, time_t emit_ts);
+int crdt_shadow_beacon_record(unsigned int num, time_t emit_ts,
+                              const char *nn_cap, const char *name);
 
 /** R4a (channel-over-mesh): per-server local-delivery dedup for a channel message,
  *  keyed by msgid, shared by the tree (sendcmdto_channel_butone via the relay) and the

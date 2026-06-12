@@ -229,9 +229,11 @@ void crdt_gossip_message(struct Client *from, char cmd, const char *target,
 }
 
 /* Tier2 full-partition liveness: gossip our ephemeral liveness beacon
- * (CR H <ourYXX> <CurrentTime>) to all CRDT transports.  Receivers track the last
- * beacon per server; a mesh stub whose beacon goes stale is retired (full
- * partition).  Ephemeral — never touches the doc. */
+ * (CR H <ourYXX> <CurrentTime> <nn_capacity> :<name>) to all CRDT transports.
+ * Receivers track the last beacon per server; a mesh stub whose beacon goes stale
+ * is retired (full partition).  #3: the appended capacity + name let a receiver
+ * build a right-sized, real-named synthetic anchor for us.  Ephemeral — never
+ * touches the doc. */
 void crdt_gossip_beacon(void)
 {
   struct Client *acptr;
@@ -239,8 +241,9 @@ void crdt_gossip_beacon(void)
     return;
   for (acptr = GlobalClientList; acptr; acptr = cli_next(acptr))
     if (IsCrdtSyncTarget(acptr))
-      sendcmdto_one(&me, CMD_CRDT_REPLICATION, acptr, "H %s %ld",
-                    cli_yxx(&me), (long)CurrentTime);
+      sendcmdto_one(&me, CMD_CRDT_REPLICATION, acptr, "H %s %ld %s :%s",
+                    cli_yxx(&me), (long)CurrentTime,
+                    cli_serv(&me)->nn_capacity, cli_name(&me));
 }
 
 int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
@@ -435,18 +438,26 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
         sendcmdto_one(&me, CMD_CRDT_REPLICATION, p, "M %s %s %s %s :%s",
                       m_msgid, m_cmd, srcyxx, target, m_text);
   } else if (sub[0] == 'H' && !sub[1]) {
-    /* Tier2 full-partition liveness beacon — H <srvYXX> <emit_ts>.  Record + relay
-     * if FRESH (newer emit_ts); a dup/old beacon drops, terminating the flood.
-     * Ephemeral — never touches the doc. */
+    /* Tier2 full-partition liveness beacon — H <srvYXX> <emit_ts> [<nn_cap> :<name>].
+     * Record + relay if FRESH (newer emit_ts); a dup/old beacon drops, terminating
+     * the flood.  #3: nn_cap + name are append-only; an old-form beacon (parc==4)
+     * omits them and is relayed in old form (mixed-version safe).  Ephemeral. */
     struct Client *p;
+    const char *bcap = "", *bname = "";
     if (parc < 4)
       return 0;
+    if (parc >= 6) { bcap = parv[4]; bname = parv[parc - 1]; }
     if (!crdt_shadow_beacon_record((unsigned int)base64toint(parv[2]),
-                                   (time_t)atol(parv[3])))
+                                   (time_t)atol(parv[3]), bcap, bname))
       return 0;
     for (p = GlobalClientList; p; p = cli_next(p))
-      if (p != cptr && IsCrdtSyncTarget(p))
-        sendcmdto_one(&me, CMD_CRDT_REPLICATION, p, "H %s %s", parv[2], parv[3]);
+      if (p != cptr && IsCrdtSyncTarget(p)) {
+        if (bname[0])
+          sendcmdto_one(&me, CMD_CRDT_REPLICATION, p, "H %s %s %s :%s",
+                        parv[2], parv[3], bcap, bname);
+        else
+          sendcmdto_one(&me, CMD_CRDT_REPLICATION, p, "H %s %s", parv[2], parv[3]);
+      }
   }
   return 0;
 }

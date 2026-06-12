@@ -67,17 +67,28 @@ static struct crdt_peer_sv g_peers[CRDT_MAX_PEERS];
  * partition) is retired.  This is what the coarse keep-vs-teardown gate cannot
  * detect (an unrelated transport still existing != the stubbed peer reachable). */
 #define CRDT_BEACON_STALE 90            /* 3 verify intervals */
-static struct { time_t emit_ts; time_t recv_ts; } crdt_beacon[CRDT_MAX_SERVERS];
+static struct {
+  time_t emit_ts; time_t recv_ts;
+  char name[HOSTLEN + 1];           /* #3: real server name (for the synthetic anchor) */
+  char nn_cap[4];                   /* #3: base64 client capacity -> right-sized anchor mask */
+} crdt_beacon[CRDT_MAX_SERVERS];
 
 /* Record a beacon for server `num` emitted at `emit_ts`.  Returns 1 if FRESH
  * (newer than the last seen -> the caller should relay it), 0 if dup/old (drop,
- * which terminates the gossip flood). */
-int crdt_shadow_beacon_record(unsigned int num, time_t emit_ts)
+ * which terminates the gossip flood).  #3: @a nn_cap (base64 client capacity) and
+ * @a name (server name) ride the beacon append-only; either may be "" (old-form
+ * beacon) -> left unchanged so a later full beacon can fill them. */
+int crdt_shadow_beacon_record(unsigned int num, time_t emit_ts,
+                              const char *nn_cap, const char *name)
 {
   if (num >= CRDT_MAX_SERVERS || emit_ts <= crdt_beacon[num].emit_ts)
     return 0;
   crdt_beacon[num].emit_ts = emit_ts;
   crdt_beacon[num].recv_ts = CurrentTime;
+  if (nn_cap && nn_cap[0])
+    ircd_strncpy(crdt_beacon[num].nn_cap, nn_cap, sizeof crdt_beacon[num].nn_cap);
+  if (name && name[0])
+    ircd_strncpy(crdt_beacon[num].name, name, sizeof crdt_beacon[num].name);
   return 1;
 }
 
@@ -461,21 +472,37 @@ static struct Client *crdt_shadow_make_anchor(const char *srvnum)
   cli_serv(nc)->updown = NULL;     /* no DLink -> retire skips remove_dlink (asserts non-NULL) */
   cli_serv(nc)->timestamp = TStime();
   cli_hopcount(nc) = 2;            /* nominal; never used for routing */
-  ircd_snprintf(0, cli_name(nc), HOSTLEN, "mesh-%s.crdt", srvnum); /* placeholder until CR H name */
   ircd_strncpy(cli_info(nc), "CRDT mesh anchor (partitioned server)", REALLEN + 1);
-  /* server part from the user key + a MAX 3-char client capacity (NUMNICKBASE^3-1)
-   * so base64toint(client) never truncates -> no client_list slot collision. */
-  yxx[0] = srvnum[0]; yxx[1] = srvnum[1];
-  inttobase64(yxx + 2, 64u * 64u * 64u - 1u, 3);
-  yxx[5] = '\0';
+  /* #3: use the real server name + client capacity carried on the CR H beacon (the
+   * beacon's recv_ts gates anchor creation, so they are normally present).  The
+   * capacity right-sizes client_list: the owning server assigns client numerics
+   * within its OWN nn_mask, so a matching anchor mask fits every user with no slot
+   * collision — instead of always reserving the MAX 3-char mask (~2MB/anchor).
+   * Fall back to a placeholder name + MAX mask only if a beacon hasn't carried them. */
+  {
+    unsigned int sidx = (unsigned int)base64toint(srvnum);
+    const char *bname = (sidx < CRDT_MAX_SERVERS) ? crdt_beacon[sidx].name : "";
+    const char *bcap  = (sidx < CRDT_MAX_SERVERS) ? crdt_beacon[sidx].nn_cap : "";
+    if (bname[0])
+      ircd_strncpy(cli_name(nc), bname, HOSTLEN + 1);
+    else
+      ircd_snprintf(0, cli_name(nc), HOSTLEN, "mesh-%s.crdt", srvnum);
+    yxx[0] = srvnum[0]; yxx[1] = srvnum[1];
+    if (strlen(bcap) == 3) {              /* real capacity -> right-sized mask */
+      yxx[2] = bcap[0]; yxx[3] = bcap[1]; yxx[4] = bcap[2];
+    } else {                             /* unknown: MAX mask so client numerics never truncate */
+      inttobase64(yxx + 2, 64u * 64u * 64u - 1u, 3);
+    }
+    yxx[5] = '\0';
+  }
   SetServerYXX(nc, nc, yxx);       /* server_list[srvnum]=nc + client_list; NO add_dlink */
   SetFlag(nc, FLAG_MAP);           /* keep its users visible in WHO */
   SetCrdtAware(nc);                /* its users are mesh-owned: from_crdt_peer self-skips */
   add_client_to_list(nc);
   hAddClient(nc);
   log_write(LS_SYSTEM, L_NOTICE, 0,
-            "CRDT mesh: synthetic anchor for server %s (mesh-reachable, no P10 link)",
-            srvnum);
+            "CRDT mesh: synthetic anchor for server %s = %s (mesh-reachable, no P10 link)",
+            srvnum, cli_name(nc));
   return nc;
 }
 
