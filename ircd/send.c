@@ -1948,6 +1948,9 @@ void sendcmdto_serv_butone_v3(struct Client *from, const char *cmd,
   struct DLink *lp;
   struct Client *alias_from = NULL;
   struct Client *primary_dir = NULL;
+  int skip_crdt = skip_crdt_servers_once;   /* R6a: one-shot CRDT-server relay skip (TAGMSG demote/bridge) */
+
+  skip_crdt_servers_once = 0;
 
   if (s2s_alias_source) {
     alias_from = s2s_alias_source;
@@ -2017,6 +2020,8 @@ void sendcmdto_serv_butone_v3(struct Client *from, const char *cmd,
     if (one && lp->value.cptr == cli_from(one))
       continue;
     if (!IsIRCv3Aware(lp->value.cptr))
+      continue;
+    if (skip_crdt && IsCrdtAware(lp->value.cptr))   /* R6a: the CR-M flood covers this CRDT peer */
       continue;
     if (IsBurstGated(lp->value.cptr))
       continue;

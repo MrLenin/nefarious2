@@ -295,6 +295,20 @@ int m_tagmsg(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
       if (!IsLocalChannel(chptr->chname)) {
         sendcmdto_set_s2s_tags(0, tagmsg_msgid);
         sendcmdto_want_s2s_tags(1);
+        /* R6a (tree demote): suppress the TAGMSG tree relay to CRDT-aware peers when the
+         * CR-M flood below will carry it there (same member scan as the flood).  Set before
+         * the v3 call, which consumes the one-shot flag at entry. */
+        if (feature_bool(FEAT_CRDT_PRIMARY)) {
+          struct Membership *cmemb;
+          for (cmemb = chptr->members; cmemb; cmemb = cmemb->next_member) {
+            struct Client *csrv = cli_user(cmemb->user) ? cli_user(cmemb->user)->server : NULL;
+            if (csrv && csrv != &me &&
+                (IsMeshStub(csrv) || (IsServer(csrv) && IsCrdtAware(csrv)))) {
+              sendcmdto_set_skip_crdt_servers();
+              break;
+            }
+          }
+        }
         sendcmdto_serv_butone_v3(sptr, CMD_TAGMSG, cptr, "@%s %s",
                               client_tags, chptr->chname);
       }
@@ -464,6 +478,19 @@ int ms_tagmsg(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
 
     sendcmdto_set_client_msgid(NULL);
 
+    /* R6a (tree demote, see m_tagmsg): only a legacy-origin TAGMSG (!IsCrdtAware(cptr)) floods
+     * here; suppress the redundant tree relay to CRDT-aware peers when we flood. */
+    if (feature_bool(FEAT_CRDT_PRIMARY) && (!cptr || !IsCrdtAware(cptr))) {
+      struct Membership *cmemb;
+      for (cmemb = chptr->members; cmemb; cmemb = cmemb->next_member) {
+        struct Client *csrv = cli_user(cmemb->user) ? cli_user(cmemb->user)->server : NULL;
+        if (csrv && csrv != &me &&
+            (IsMeshStub(csrv) || (IsServer(csrv) && IsCrdtAware(csrv)))) {
+          sendcmdto_set_skip_crdt_servers();
+          break;
+        }
+      }
+    }
     /* Propagate to other servers */
     sendcmdto_serv_butone_v3(sptr, CMD_TAGMSG, cptr, "@%s %s",
                           client_tags, target);

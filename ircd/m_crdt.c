@@ -428,6 +428,17 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
                                      NULL, FLAG_LAST_FLAG, FLAG_CRDT_AWARE,
                                      "%H :%s", ch, m_text);
       }
+      /* R6b TAGMSG bridge: same gateway CR-M -> legacy bridge for TAGMSG.  The @tags v3 form
+       * goes via sendcmdto_serv_butone_v3 (which targets IRCv3-aware downlinks); with skip_crdt
+       * set it skips CRDT-aware peers -> legacy IRCv3 peers only.  m_text is the client-only
+       * tag string. */
+      if (ch && is_tag) {
+        struct Client *srcc = findNUser(srcyxx);
+        if (srcc && !crdt_user_is_mesh_only(srcc)) {
+          sendcmdto_set_skip_crdt_servers();
+          sendcmdto_serv_butone_v3(srcc, CMD_TAGMSG, NULL, "@%s %s", m_text, ch->chname);
+        }
+      }
     } else {                                              /* unicast delivery */
       struct Client *tgt = findNUser(target);
       if (tgt && MyConnect(tgt)) {
