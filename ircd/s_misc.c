@@ -798,6 +798,7 @@ void crdt_shadow_retire_mesh_stub(struct Client *stub, const char *comment)
   unsigned int i;
   if (!stub || !IsMeshStub(stub) || !cli_serv(stub))
     return;
+  crdt_mesh_stub_dec();             /* R6c: one fewer mesh-stub -> may exit partition state */
   log_write(LS_SYSTEM, L_NOTICE, 0,
             "CRDT mesh: retiring mesh stub %s (%s)", cli_name(stub), comment);
   if (IsPresented(stub))

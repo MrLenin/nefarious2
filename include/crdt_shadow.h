@@ -70,6 +70,13 @@ void crdt_shadow_user_remove(struct Client *cptr);
  *  returns when its server relinks.  (Defined in crdt_shadow.c.) */
 int crdt_user_is_mesh_only(struct Client *u);
 
+/** R6c flood-on-partition: non-zero if this node currently holds any STAT_MESH_SERVER stub,
+ *  i.e. it is (partially) partitioned and its live channel views may be missing members
+ *  reachable only via the mesh/gateway — so it should flood channel traffic unconditionally.
+ *  crdt_mesh_stub_dec() is called by crdt_shadow_retire_mesh_stub when a stub is freed. */
+int crdt_have_mesh_stub(void);
+void crdt_mesh_stub_dec(void);
+
 /** Phase 4a (SQUIT-as-SPLIT, §17.3): record a directly-linked CRDT-aware server
  *  as ACTIVE in the doc (called from server_estab; fires on both ends of every
  *  direct CRDT link, so each server's state is written by its direct uplink).

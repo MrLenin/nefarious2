@@ -163,6 +163,16 @@ int crdt_user_is_mesh_only(struct Client *u)
   return srv && IsMeshStub(srv) && !IsPresented(srv);
 }
 
+/* R6c flood-on-partition: O(1) count of STAT_MESH_SERVER stubs this node holds (created in
+ * crdt_shadow_convert_to_stub + crdt_shadow_make_anchor, freed in crdt_shadow_retire_mesh_stub
+ * — the only 3 lifecycle sites).  >0 means this node is partitioned: some servers are reachable
+ * only via the mesh, so its live channel views may be MISSING members (e.g. legacy users whose
+ * server can't be re-materialized here).  A partitioned node therefore floods channel traffic
+ * unconditionally so the mesh + a gateway can deliver/bridge it (see ircd_relay.c / m_tagmsg.c). */
+static unsigned int crdt_mesh_stub_count = 0;
+int crdt_have_mesh_stub(void) { return crdt_mesh_stub_count > 0; }
+void crdt_mesh_stub_dec(void) { if (crdt_mesh_stub_count) crdt_mesh_stub_count--; }
+
 /** Build the full P10 numeric ("YYXXX") for a user into @a buf. */
 static const char *user_numeric(struct Client *who, char *buf, size_t n)
 {
@@ -488,6 +498,7 @@ void crdt_shadow_convert_to_stub(struct Client *srv)
   for (i = 0; i <= cli_serv(srv)->nn_mask; ++acptrp, ++i)
     if (*acptrp) held++;
   SetMeshStub(srv);
+  crdt_mesh_stub_count++;            /* R6c: this node is now (partially) partitioned */
   SetFlag(srv, FLAG_MAP);            /* keep the stub's users visible in WHO */
   {                                  /* seed the liveness clock: it was just reachable */
     unsigned int n = (unsigned int)base64toint(cli_yxx(srv));
@@ -516,6 +527,7 @@ static struct Client *crdt_shadow_make_anchor(const char *srvnum)
   nc = make_client(NULL, STAT_MESH_SERVER);   /* fresh owned dead-sink Connection */
   if (!nc)
     return NULL;
+  crdt_mesh_stub_count++;            /* R6c: synthetic anchor = (partial) partition here */
   make_server(nc);
   cli_serv(nc)->up = &me;          /* parent for accessors, but NOT a routing downlink */
   cli_serv(nc)->updown = NULL;     /* no DLink -> retire skips remove_dlink (asserts non-NULL) */

@@ -299,15 +299,16 @@ int m_tagmsg(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
          * CR-M flood below will carry it there (same member scan as the flood).  Set before
          * the v3 call, which consumes the one-shot flag at entry. */
         if (feature_bool(FEAT_CRDT_PRIMARY)) {
+          int sk = crdt_have_mesh_stub();   /* R6c: partitioned -> CR-M is the carrier */
           struct Membership *cmemb;
-          for (cmemb = chptr->members; cmemb; cmemb = cmemb->next_member) {
+          for (cmemb = chptr->members; !sk && cmemb; cmemb = cmemb->next_member) {
             struct Client *csrv = cli_user(cmemb->user) ? cli_user(cmemb->user)->server : NULL;
             if (csrv && csrv != &me &&
-                (IsMeshStub(csrv) || (IsServer(csrv) && IsCrdtAware(csrv)))) {
-              sendcmdto_set_skip_crdt_servers();
-              break;
-            }
+                (IsMeshStub(csrv) || (IsServer(csrv) && IsCrdtAware(csrv))))
+              sk = 1;
           }
+          if (sk)
+            sendcmdto_set_skip_crdt_servers();
         }
         sendcmdto_serv_butone_v3(sptr, CMD_TAGMSG, cptr, "@%s %s",
                               client_tags, chptr->chname);
@@ -315,18 +316,19 @@ int m_tagmsg(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
 
       /* R4a (channel-over-mesh): flood TAGMSG (cmd 'T', client tags as payload) to any
        * member on a remote CRDT-aware server (not just mesh-only); deduped to
-       * exactly-once per receiver via crdt_shadow_chan_local. */
+       * exactly-once per receiver via crdt_shadow_chan_local.
+       * R6c: a partitioned node (crdt_have_mesh_stub) floods unconditionally (hidden members). */
       if (feature_bool(FEAT_CRDT_PRIMARY)) {
+        int fl = crdt_have_mesh_stub();
         struct Membership *mmemb;
-        for (mmemb = chptr->members; mmemb; mmemb = mmemb->next_member) {
+        for (mmemb = chptr->members; !fl && mmemb; mmemb = mmemb->next_member) {
           struct Client *msrv = cli_user(mmemb->user) ? cli_user(mmemb->user)->server : NULL;
           if (msrv && msrv != &me &&
-              (IsMeshStub(msrv) || (IsServer(msrv) && IsCrdtAware(msrv)))) {
-            crdt_gossip_message(sptr, 'T', chptr->chname, tagmsg_msgid,
-                                client_tags);
-            break;
-          }
+              (IsMeshStub(msrv) || (IsServer(msrv) && IsCrdtAware(msrv))))
+            fl = 1;
         }
+        if (fl)
+          crdt_gossip_message(sptr, 'T', chptr->chname, tagmsg_msgid, client_tags);
       }
     }
   }
