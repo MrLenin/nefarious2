@@ -507,6 +507,7 @@ enum Feature {
   FEAT_CRDT_BATCH_MS,
   FEAT_CRDT_STALE_TIMEOUT,
   FEAT_CRDT_OPLOG_MAX,
+  FEAT_CRDT_MESHMAP_PRESENCE,   /* Tier-2: drive presence/keep gates from the beacon set */
 
   FEAT_LAST_F
 };

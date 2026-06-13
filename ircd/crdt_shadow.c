@@ -539,14 +539,28 @@ int crdt_shadow_mesh_reachable(struct Client *srv)
    * the doc via the overlay, so delivery is unaffected. */
   if (!MyConnect(srv))
     return 0;
-  /* coarse, safe gate: is there ANY live CRDT transport other than the dying link
-   * through which srv's doc could still flow?  The reconcile + relink retire are
-   * the backstops if it cannot actually reach srv (full-partition teardown still
-   * deferred — see crdt-mesh-tier2a-plan.md). */
-  for (acptr = GlobalClientList; acptr; acptr = cli_next(acptr))
-    if (acptr != srv && IsCrdtSyncTarget(acptr))
-      return 1;
-  return 0;
+  /* Tier-2 S3: PRECISE keep-gate = is THIS server's own beacon fresh (S1 proved the
+   * beacon set is the presence oracle), vs the legacy COARSE heuristic "is there ANY
+   * live CRDT transport other than the dying link." Compute both; log a divergence;
+   * return the gated choice (FEAT_CRDT_MESHMAP_PRESENCE default off => coarse =>
+   * inert). The staleness sweep + relink retire remain the backstops either way; the
+   * beacon verdict only fails SAFE relative to coarse (tears down an already-mesh-
+   * stale server now instead of after the 90s sweep — no ghost, doc re-materializes
+   * if still reachable). */
+  {
+    unsigned int n = (unsigned int)base64toint(cli_yxx(srv));
+    int beacon_ok = (n < CRDT_MAX_SERVERS && crdt_beacon[n].recv_ts &&
+                     (CurrentTime - crdt_beacon[n].recv_ts) <= CRDT_BEACON_STALE);
+    int coarse_ok = 0;
+    for (acptr = GlobalClientList; acptr; acptr = cli_next(acptr))
+      if (acptr != srv && IsCrdtSyncTarget(acptr)) { coarse_ok = 1; break; }
+    if (beacon_ok != coarse_ok)
+      log_write(LS_SYSTEM, L_NOTICE, 0,
+                "CRDT keep-gate %s: coarse=%d beacon=%d (S3 %s)", cli_name(srv),
+                coarse_ok, beacon_ok,
+                feature_bool(FEAT_CRDT_MESHMAP_PRESENCE) ? "beacon" : "coarse/shadow");
+    return feature_bool(FEAT_CRDT_MESHMAP_PRESENCE) ? beacon_ok : coarse_ok;
+  }
 }
 
 /* R6c: does this node have a directly-linked LEGACY (non-CRDT) P10 peer to present to? */
