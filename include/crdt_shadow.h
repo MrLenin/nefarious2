@@ -109,7 +109,23 @@ const struct CrdtUserRecord *crdt_shadow_user_record(const char *numeric);
  *  for that server -> caller should relay it onward), 0 if a dup/old beacon (drop,
  *  terminating the gossip flood). */
 int crdt_shadow_beacon_record(unsigned int num, time_t emit_ts,
-                              const char *nn_cap, const char *name);
+                              const char *nn_cap, const char *name,
+                              const char *peers);
+
+/** Build this server's own direct-CRDT-peer set (comma-joined base64 numerics)
+ *  into @a out for the CR H beacon AND record our own mesh-map row locally.
+ *  Returns the peer count.  Observability-only (see crdt_meshmap.h). */
+int crdt_shadow_local_peers(char *out, size_t outsz);
+
+/** The gossiped mesh-topology map (read-only) for the /CRDT command.  Forward-
+ *  declared so callers that only pass the pointer need not include crdt_meshmap.h. */
+struct CrdtMeshMap;
+const struct CrdtMeshMap *crdt_shadow_meshmap(void);
+
+/** Beacon-derived metadata for rendering a node by numeric. */
+const char *crdt_shadow_beacon_name(unsigned int num);  /**< "" if unknown */
+time_t      crdt_shadow_beacon_recv(unsigned int num);  /**< last local recv time */
+time_t      crdt_shadow_beacon_stale_secs(void);        /**< staleness window */
 
 /** R4a (channel-over-mesh): per-server local-delivery dedup for a channel message,
  *  keyed by msgid, shared by the tree (sendcmdto_channel_butone via the relay) and the
@@ -134,9 +150,15 @@ void crdt_shadow_modes(struct Channel *chptr, struct Client *from);
  *  single-writer gate. */
 void crdt_shadow_lists(struct Channel *chptr, struct Client *from);
 
-/** Compare the shadow CRDT membership to the real channel state and log any
- *  divergence. No-op unless FEAT_CRDT_ENABLED. */
-void crdt_shadow_verify(void);
+/** §17.7 birth-modes bridge (3j gap fix): emit to legacy the persistent modes of
+ *  channels born from the doc THIS reconcile pass — called AFTER reconcile_members
+ *  has placed the channel on legacy. No-op on a node with no legacy peer. */
+void crdt_shadow_gateway_birth_modes(void);
+
+/** Compare the shadow CRDT membership to the real channel state and report any
+ *  divergence.  @a to == NULL -> the system log (the verify timer); a Client ->
+ *  the lines are NOTICE'd to that oper (/CRDT status).  No-op unless shadow_on. */
+void crdt_shadow_verify(struct Client *to);
 
 /** Phase 3b dry-run: walk the doc and confirm every entity could be rebuilt
  *  from it with field-for-field fidelity against live state. Logs reconstruction

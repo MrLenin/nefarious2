@@ -229,21 +229,27 @@ void crdt_gossip_message(struct Client *from, char cmd, const char *target,
 }
 
 /* Tier2 full-partition liveness: gossip our ephemeral liveness beacon
- * (CR H <ourYXX> <CurrentTime> <nn_capacity> :<name>) to all CRDT transports.
- * Receivers track the last beacon per server; a mesh stub whose beacon goes stale
- * is retired (full partition).  #3: the appended capacity + name let a receiver
- * build a right-sized, real-named synthetic anchor for us.  Ephemeral — never
- * touches the doc. */
+ * (CR H <ourYXX> <CurrentTime> <nn_capacity> <peers> :<name>) to all CRDT
+ * transports.  Receivers track the last beacon per server; a mesh stub whose
+ * beacon goes stale is retired (full partition).  #3: the appended capacity +
+ * name let a receiver build a right-sized, real-named synthetic anchor for us.
+ * <peers> (append-only, mesh-map) is our comma-joined direct-CRDT-peer numerics
+ * for the gossiped topology map — observability-only, never touches the doc. */
 void crdt_gossip_beacon(void)
 {
   struct Client *acptr;
+  char peers[256];
   if (!crdt_shadow_active() || !feature_bool(FEAT_CRDT_PRIMARY))
     return;
+  /* build our own direct-peer set (also records our own mesh-map row); "*" when
+   * we have no CRDT peers, so the positional param is always present. */
+  if (crdt_shadow_local_peers(peers, sizeof peers) == 0)
+    strcpy(peers, "*");
   for (acptr = GlobalClientList; acptr; acptr = cli_next(acptr))
     if (IsCrdtSyncTarget(acptr))
-      sendcmdto_one(&me, CMD_CRDT_REPLICATION, acptr, "H %s %ld %s :%s",
+      sendcmdto_one(&me, CMD_CRDT_REPLICATION, acptr, "H %s %ld %s %s :%s",
                     cli_yxx(&me), (long)CurrentTime,
-                    cli_serv(&me)->nn_capacity, cli_name(&me));
+                    cli_serv(&me)->nn_capacity, peers, cli_name(&me));
 }
 
 int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
@@ -315,6 +321,7 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
           crdt_shadow_reconcile_modes();
           crdt_shadow_reconcile_create_channels(); /* Phase 3j: birth channels before members */
           crdt_shadow_reconcile_members();
+          crdt_shadow_gateway_birth_modes(); /* 3j gap fix: bridge birth-modes after members place the channel on legacy */
           crdt_shadow_reconcile_removes();
           crdt_shadow_reconcile_member_status();
           crdt_shadow_reconcile_bans();
@@ -470,16 +477,23 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
      * the flood.  #3: nn_cap + name are append-only; an old-form beacon (parc==4)
      * omits them and is relayed in old form (mixed-version safe).  Ephemeral. */
     struct Client *p;
-    const char *bcap = "", *bname = "";
+    const char *bcap = "", *bname = "", *bpeers = "";
     if (parc < 4)
       return 0;
+    /* name is always the trailing param (parv[parc-1]); peers is the optional
+     * positional inserted before it (parc>=7), so an old binary's parc>=6 read of
+     * cap=parv[4]+name=parv[parc-1] stays correct and just ignores peers. */
     if (parc >= 6) { bcap = parv[4]; bname = parv[parc - 1]; }
+    if (parc >= 7) { bpeers = parv[5]; }
     if (!crdt_shadow_beacon_record((unsigned int)base64toint(parv[2]),
-                                   (time_t)atol(parv[3]), bcap, bname))
+                                   (time_t)atol(parv[3]), bcap, bname, bpeers))
       return 0;
     for (p = GlobalClientList; p; p = cli_next(p))
       if (p != cptr && IsCrdtSyncTarget(p)) {
-        if (bname[0])
+        if (bname[0] && bpeers[0])
+          sendcmdto_one(&me, CMD_CRDT_REPLICATION, p, "H %s %s %s %s :%s",
+                        parv[2], parv[3], bcap, bpeers, bname);
+        else if (bname[0])
           sendcmdto_one(&me, CMD_CRDT_REPLICATION, p, "H %s %s %s :%s",
                         parv[2], parv[3], bcap, bname);
         else

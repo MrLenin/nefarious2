@@ -98,6 +98,7 @@ IRCD_SRC = \
 	crdt_state.c \
 	crdt_wire.c \
 	crdt_shadow.c \
+	crdt_meshmap.c \
 	s2s_chunk.c \
 	crule.c \
 	dbuf.c \
@@ -151,6 +152,7 @@ IRCD_SRC = \
 	m_connect.c \
 	m_cprivmsg.c \
 	m_crdt.c \
+	m_crdtinfo.c \
 	m_create.c \
 	m_defaults.c \
 	m_destruct.c \

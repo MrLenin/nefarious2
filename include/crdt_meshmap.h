@@ -1,0 +1,96 @@
+/*
+ * crdt_meshmap.h - gossiped mesh-topology map (single-writer adjacency)
+ *
+ * The observability substrate behind the oper /CRDT command.  Each CRDT node
+ * declares ONLY its own direct-peer set on its CR H beacon (single-writer per
+ * key, ephemeral, OUTSIDE crdt_state_digest) — so this map can never cause the
+ * Phase 4a divergence that killed the replicated ACTIVE/SPLIT servers-map
+ * (crdt_shadow.c:370).  Reachability is NOT replicated; it is DERIVED here, by a
+ * local BFS over the union of single-writer adjacency rows, pruning beacon-stale
+ * nodes.  ("X's peer-set" is a per-owner fact and converges; "X is reachable" is
+ * a per-viewpoint value and must stay local — replicating it has conflicting
+ * writers.)
+ *
+ * Observability-only: this feeds the /CRDT diagram (and optionally the verify
+ * line).  It does NOT feed materialization/routing — those keep the proven local
+ * FindNServer reachability check.  Promoting this to a routing input is the
+ * separate, deliberate Tier-2 step (crdt_shadow.c:393).
+ *
+ * Pure: libc only (no Client / feature_int / sendto_*), so it links in the
+ * cmocka harness against just test_stub.o and is TDD-covered up front.
+ *
+ * Edge semantics are DIRECTIONAL (BFS follows u's declared peers[u]).  In a
+ * converged mesh declarations are symmetric, so directional == undirected; the
+ * only divergence is the brief warmup before a neighbour's first beacon arrives
+ * (it appears once its beacon floods in, sub-second) and a partition (its beacon
+ * goes stale -> pruned).  Both are self-correcting and documented.
+ */
+
+#ifndef INCLUDED_crdt_meshmap_h
+#define INCLUDED_crdt_meshmap_h
+
+#include <stdint.h>
+#include <sys/types.h>      /* time_t */
+#include "crdt_types.h"     /* CRDT_MAX_SERVERS */
+
+/** Max direct CRDT peers recorded per node.  A mesh's direct degree is small;
+ *  beyond this the extra are dropped and the integration layer logs it (no
+ *  silent cap).  Only affects the diagram, never routing. */
+#define CRDT_MESH_MAXDEG 32
+
+/** Direct-indexed by server numeric (like crdt_beacon[]).  ~size:
+ *  CRDT_MAX_SERVERS * (CRDT_MESH_MAXDEG*2 + ...) — a single static instance. */
+struct CrdtMeshMap {
+  uint8_t  present[CRDT_MAX_SERVERS];                    /**< a row has been set */
+  uint8_t  npeers[CRDT_MAX_SERVERS];                    /**< peers stored (<=MAXDEG) */
+  uint16_t peers[CRDT_MAX_SERVERS][CRDT_MESH_MAXDEG];   /**< neighbour numerics */
+  time_t   recv_ts[CRDT_MAX_SERVERS];                   /**< local recv time (staleness) */
+};
+
+/** Zero the whole map. */
+void crdt_meshmap_init(struct CrdtMeshMap *m);
+
+/** Record node @a node's declared direct-peer set (single-writer: the owner).
+ *  Stores up to CRDT_MESH_MAXDEG peers; out-of-range node/peer numerics are
+ *  skipped.  @a recv_ts is the local receive time used for staleness.  Returns
+ *  the number of peers actually stored; a return < @a n means the degree cap
+ *  truncated (caller should log). */
+int crdt_meshmap_set(struct CrdtMeshMap *m, uint16_t node,
+                     const uint16_t *peers, int n, time_t recv_ts);
+
+/** Drop a node's row (e.g. on retire). */
+void crdt_meshmap_clear(struct CrdtMeshMap *m, uint16_t node);
+
+/** True iff @a node is present and its last beacon is within @a stale of @a now. */
+int crdt_meshmap_fresh(const struct CrdtMeshMap *m, uint16_t node,
+                       time_t now, time_t stale);
+
+/** BFS reachability from @a from over FRESH nodes only.  @a out must be
+ *  CRDT_MAX_SERVERS bytes; out[n]=1 for each reachable node.  @a from is always
+ *  reachable (we always know ourselves) even if its own row is stale/absent.
+ *  Returns the reachable count (>=1). */
+int crdt_meshmap_reachable(const struct CrdtMeshMap *m, uint16_t from,
+                           time_t now, time_t stale, uint8_t *out);
+
+/** BFS spanning tree from @a from over FRESH nodes.  Arrays are indexed by
+ *  numeric and sized CRDT_MAX_SERVERS (parent/depth) — for each reachable node:
+ *    parent[n] = parent numeric, or -1 for the root and for unreachable nodes.
+ *    depth[n]  = hop distance from the root (0 = root).
+ *  @a order receives the reachable numerics in BFS visitation order (sized
+ *  CRDT_MAX_SERVERS).  Neighbours are visited in ascending numeric order, so the
+ *  tree is deterministic.  Returns the reachable count (== entries in order[]).
+ *  Any of parent/depth/order may be NULL if not needed. */
+int crdt_meshmap_spanning(const struct CrdtMeshMap *m, uint16_t from,
+                          time_t now, time_t stale,
+                          int16_t *parent, uint8_t *depth, uint16_t *order);
+
+/** Enumerate "cross edges": fresh declared edges (u<v, both endpoints reachable)
+ *  that are NOT tree edges (neither endpoint is the other's @a parent).  Writes
+ *  up to @a max (u,v) pairs into @a out_u / @a out_v.  Returns the TOTAL cross
+ *  edge count (may exceed @a max -> caller knows it truncated).  @a parent is the
+ *  crdt_meshmap_spanning result for the same (from,now,stale). */
+int crdt_meshmap_crossedges(const struct CrdtMeshMap *m, time_t now, time_t stale,
+                            const int16_t *parent,
+                            uint16_t *out_u, uint16_t *out_v, int max);
+
+#endif /* INCLUDED_crdt_meshmap_h */

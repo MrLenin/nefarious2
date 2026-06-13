@@ -28,7 +28,8 @@ CMOCKA_TESTPROGS = \
 	history_cmocka \
 	chathistory_presence_cmocka \
 	recv_classify_cmocka \
-	crdt_cmocka
+	crdt_cmocka \
+	crdt_meshmap_cmocka
 
 CMOCKA_LIBS = -lcmocka
 ZSTD_LIBS = -lzstd
@@ -52,6 +53,7 @@ DEP_SRC = \
 	chathistory_presence_cmocka.c \
 	recv_classify_cmocka.c \
 	crdt_cmocka.c \
+	crdt_meshmap_cmocka.c \
 	test_stub.c
 
 all: ${TESTPROGS}
@@ -162,6 +164,11 @@ recv_classify_cmocka: $(RECV_CLASSIFY_CMOCKA_OBJS)
 CRDT_CMOCKA_OBJS = crdt_cmocka.o test_stub.o ../crdt_types.o ../crdt_state.o ../crdt_hlc.o ../crdt_wire.o ../s2s_chunk.o
 crdt_cmocka: $(CRDT_CMOCKA_OBJS)
 	${CC} -o $@ $(LDFLAGS) $(CRDT_CMOCKA_OBJS) $(CMOCKA_LIBS)
+
+# CRDT mesh-topology map - pure graph (BFS/spanning/cross-edges); libc only.
+CRDT_MESHMAP_CMOCKA_OBJS = crdt_meshmap_cmocka.o test_stub.o ../crdt_meshmap.o
+crdt_meshmap_cmocka: $(CRDT_MESHMAP_CMOCKA_OBJS)
+	${CC} -o $@ $(LDFLAGS) $(CRDT_MESHMAP_CMOCKA_OBJS) $(CMOCKA_LIBS)
 
 .c.o:
 	${CC} ${CFLAGS} ${CPPFLAGS} -c $< -o $@

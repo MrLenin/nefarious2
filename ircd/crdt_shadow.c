@@ -12,6 +12,7 @@
 #include "crdt_state.h"
 #include "crdt_types.h"
 #include "crdt_wire.h"
+#include "crdt_meshmap.h"   /* gossiped mesh-topology map (observability) */
 
 #include "channel.h"
 #include "client.h"
@@ -33,6 +34,7 @@
 #include "send.h"            /* sendcmdto_* (Phase 3d topic gateway) */
 #include "handlers.h"        /* crdt_sync_broadcast */
 
+#include <stdarg.h>          /* verify_emit dual log/client targeting */
 #include <stdio.h>
 #include <string.h>
 
@@ -40,6 +42,12 @@
 static struct CrdtNetworkState g_crdt;
 static int                     g_inited = 0;
 static struct Timer            g_verify_timer;
+
+/* Gossiped mesh-topology map: single-writer adjacency rows accumulated from CR H
+ * beacons (each node declares only its own direct CRDT peers).  Ephemeral, NOT in
+ * the digest -> cannot diverge.  Observability-only: feeds the /CRDT command (and
+ * /CRDT status verify), NEVER materialization/routing.  See crdt_meshmap.h. */
+static struct CrdtMeshMap      g_meshmap;
 
 /** Eager-push high-water mark: the highest own-origin op seq we have already
  *  pushed to peers via CR U. Bounds eager push to ops WE created since last time
@@ -79,7 +87,8 @@ static struct {
  * @a name (server name) ride the beacon append-only; either may be "" (old-form
  * beacon) -> left unchanged so a later full beacon can fill them. */
 int crdt_shadow_beacon_record(unsigned int num, time_t emit_ts,
-                              const char *nn_cap, const char *name)
+                              const char *nn_cap, const char *name,
+                              const char *peers)
 {
   if (num >= CRDT_MAX_SERVERS || emit_ts <= crdt_beacon[num].emit_ts)
     return 0;
@@ -89,7 +98,103 @@ int crdt_shadow_beacon_record(unsigned int num, time_t emit_ts,
     ircd_strncpy(crdt_beacon[num].nn_cap, nn_cap, sizeof crdt_beacon[num].nn_cap);
   if (name && name[0])
     ircd_strncpy(crdt_beacon[num].name, name, sizeof crdt_beacon[num].name);
+
+  /* Mesh-map: this node declared its own direct-peer set (single-writer per key).
+   * peers is a comma-joined list of base64 server numerics; absent on an old-form
+   * beacon, in which case the prior row is left intact (a stale binary just won't
+   * refresh adjacency — observability-only, so harmless). */
+  if (peers && peers[0] && strcmp(peers, "*") != 0) {
+    uint16_t adj[CRDT_MESH_MAXDEG];
+    int n = 0;
+    const char *p = peers;
+    while (*p && n < CRDT_MESH_MAXDEG) {
+      char tok[8];
+      int t = 0;
+      while (*p && *p != ',' && t < (int)sizeof tok - 1)
+        tok[t++] = *p++;
+      tok[t] = '\0';
+      while (*p == ',')
+        p++;
+      if (t > 0) {
+        unsigned int pn = base64toint(tok);
+        if (pn < CRDT_MAX_SERVERS)
+          adj[n++] = (uint16_t)pn;
+      }
+    }
+    crdt_meshmap_set(&g_meshmap, (uint16_t)num, adj, n, CurrentTime);
+  }
   return 1;
+}
+
+/* Build this server's own direct-CRDT-peer list (base64 numerics, comma-joined)
+ * into @a out for the CR H beacon, AND record our own mesh-map row locally so the
+ * map is populated before any beacon round-trips back.  A node's direct peers are
+ * its IsCrdtSyncTarget transports (the same set crdt_gossip_beacon emits to).
+ * Returns the number of peers; logs once if the degree cap truncates. */
+int crdt_shadow_local_peers(char *out, size_t outsz)
+{
+  struct Client *acptr;
+  uint16_t adj[CRDT_MESH_MAXDEG];
+  int n = 0, total = 0;
+  size_t len = 0;
+
+  if (out && outsz)
+    out[0] = '\0';
+
+  for (acptr = GlobalClientList; acptr; acptr = cli_next(acptr)) {
+    const char *yxx;
+    size_t need;
+    if (!IsCrdtSyncTarget(acptr))
+      continue;
+    total++;
+    yxx = cli_yxx(acptr);
+    if (!yxx || !yxx[0])
+      continue;
+    if (n < CRDT_MESH_MAXDEG) {
+      unsigned int pn = base64toint(yxx);
+      if (pn < CRDT_MAX_SERVERS)
+        adj[n++] = (uint16_t)pn;
+    }
+    /* append "yxx," to the wire string, leaving room for the NUL */
+    need = strlen(yxx) + 1;
+    if (out && len + need + 1 < outsz) {
+      if (len)
+        out[len++] = ',';
+      memcpy(out + len, yxx, strlen(yxx));
+      len += strlen(yxx);
+      out[len] = '\0';
+    }
+  }
+
+  /* our own row, recorded locally (single-writer: us) */
+  crdt_meshmap_set(&g_meshmap, (uint16_t)base64toint(cli_yxx(&me)), adj, n, CurrentTime);
+
+  if (total > CRDT_MESH_MAXDEG)
+    log_write(LS_SYSTEM, L_NOTICE, 0,
+              "CRDT meshmap: direct CRDT degree %d exceeds cap %d; diagram truncated",
+              total, CRDT_MESH_MAXDEG);
+  return n;
+}
+
+/* Accessors for the /CRDT introspection command (observability). */
+const struct CrdtMeshMap *crdt_shadow_meshmap(void)
+{
+  return &g_meshmap;
+}
+
+const char *crdt_shadow_beacon_name(unsigned int num)
+{
+  return (num < CRDT_MAX_SERVERS) ? crdt_beacon[num].name : "";
+}
+
+time_t crdt_shadow_beacon_recv(unsigned int num)
+{
+  return (num < CRDT_MAX_SERVERS) ? crdt_beacon[num].recv_ts : 0;
+}
+
+time_t crdt_shadow_beacon_stale_secs(void)
+{
+  return CRDT_BEACON_STALE;
 }
 
 /* R4a (channel-over-mesh): per-server "this channel message was already delivered to my
@@ -696,7 +801,22 @@ void crdt_shadow_lists(struct Channel *chptr, struct Client *from)
   crdt_sync_push();                    /* eager-propagate to CRDT peers */
 }
 
-void crdt_shadow_verify(void)
+/* Emit one verify line either to the system log (timer path, @a to == NULL) or
+ * as a NOTICE to an oper (the /CRDT status command).  Same text, one source. */
+static void verify_emit(struct Client *to, const char *fmt, ...)
+{
+  char buf[512];
+  va_list vl;
+  va_start(vl, fmt);
+  vsnprintf(buf, sizeof buf, fmt, vl);
+  va_end(vl);
+  if (to)
+    sendcmdto_one(&me, CMD_NOTICE, to, "%C :%s", to, buf);
+  else
+    log_write(LS_SYSTEM, L_NOTICE, 0, "%s", buf);
+}
+
+void crdt_shadow_verify(struct Client *to)
 {
   struct Channel *chptr;
   struct Client *acptr;
@@ -714,7 +834,7 @@ void crdt_shadow_verify(void)
     checked++;
     if (crdt_n != chptr->users) {
       mismatches++;
-      log_write(LS_SYSTEM, L_NOTICE, 0,
+      verify_emit(to,
                 "CRDT shadow count divergence: %s real=%u crdt=%u",
                 chptr->chname, chptr->users, crdt_n);
     }
@@ -725,7 +845,7 @@ void crdt_shadow_verify(void)
       user_numeric(m->user, num, sizeof num);
       if (!cc || !crdt_orset_contains(&cc->members, num, strlen(num))) {
         mismatches++;
-        log_write(LS_SYSTEM, L_NOTICE, 0,
+        verify_emit(to,
                   "CRDT shadow member missing: %s in %s", num, chptr->chname);
       }
     }
@@ -736,7 +856,7 @@ void crdt_shadow_verify(void)
       const char *stopic = tv ? (const char *)tv->data : "";
       if (strcmp(stopic, chptr->topic) != 0) {
         mismatches++;
-        log_write(LS_SYSTEM, L_NOTICE, 0,
+        verify_emit(to,
                   "CRDT shadow topic divergence: %s shadow=\"%s\" real=\"%s\"",
                   chptr->chname, stopic, chptr->topic);
       }
@@ -752,7 +872,7 @@ void crdt_shadow_verify(void)
                   memcmp(mv->data, &cur, sizeof cur) != 0)) ||
           (!mv && cur.mode != 0)) {
         mismatches++;
-        log_write(LS_SYSTEM, L_NOTICE, 0,
+        verify_emit(to,
                   "CRDT shadow mode divergence: %s real_mode=0x%x",
                   chptr->chname, cur.mode);
       }
@@ -763,13 +883,13 @@ void crdt_shadow_verify(void)
       for (b = chptr->banlist; b; b = b->next)
         if (!crdt_orset_contains(&cc->bans, b->banstr, strlen(b->banstr))) {
           mismatches++;
-          log_write(LS_SYSTEM, L_NOTICE, 0,
+          verify_emit(to,
                     "CRDT shadow ban missing: %s in %s", b->banstr, chptr->chname);
         }
       for (b = chptr->exceptlist; b; b = b->next)
         if (!crdt_orset_contains(&cc->excepts, b->banstr, strlen(b->banstr))) {
           mismatches++;
-          log_write(LS_SYSTEM, L_NOTICE, 0,
+          verify_emit(to,
                     "CRDT shadow except missing: %s in %s", b->banstr, chptr->chname);
         }
     }
@@ -786,11 +906,11 @@ void crdt_shadow_verify(void)
     r = crdt_user_get(&g_crdt, num);
     if (!r) {
       mismatches++;
-      log_write(LS_SYSTEM, L_NOTICE, 0,
+      verify_emit(to,
                 "CRDT shadow user missing: %s (%s)", num, cli_name(acptr));
     } else if (strcmp(r->nick, cli_name(acptr)) != 0) {
       mismatches++;
-      log_write(LS_SYSTEM, L_NOTICE, 0,
+      verify_emit(to,
                 "CRDT shadow nick stale: %s shadow=%s real=%s",
                 num, r->nick, cli_name(acptr));
     }
@@ -798,7 +918,7 @@ void crdt_shadow_verify(void)
   crdt_users = crdt_lwwmap_size(&g_crdt.users);
   if (real_users != crdt_users) {
     mismatches++;
-    log_write(LS_SYSTEM, L_NOTICE, 0,
+    verify_emit(to,
               "CRDT shadow user count divergence: real=%u crdt=%u",
               real_users, crdt_users);
   }
@@ -809,7 +929,7 @@ void crdt_shadow_verify(void)
     if (IsServer(acptr) && IsCrdtAware(acptr))
       crdt_srvs++;
 
-  log_write(LS_SYSTEM, L_NOTICE, 0,
+  verify_emit(to,
             "CRDT shadow verify: %u channels, %u/%u users, %u servers, %u mismatch(es) "
             "oplog=%u digest=%016llx mdigest=%016llx",
             checked, crdt_users, real_users,
@@ -1609,6 +1729,52 @@ void crdt_shadow_reconcile_user_removes(void)
  * legacy learns the channel via the 3f JOIN-gateway (reconcile_members re-emits the
  * founder JOIN with the doc creationtime; ms_join births it) + founder-op via the
  * 3h MODE-gateway. creationtime is the incarnation MIN-register value. */
+/* §17.7 birth-modes bridge (3j gap fix, 2026-06-13): rebuild_channel_from_doc
+ * applies a channel's persistent modes DIRECTLY at CRDT-birth, so
+ * reconcile_mode_cb's echo guard (doc==live) never gateways them — legacy gets
+ * the CREATE + member JOINs + member-ops but not the channel modes (AUTOCHANMODES
+ * at birth is the motivating case). Collect channels born THIS reconcile pass
+ * that carry persistent modes; AFTER reconcile_members has gatewayed their member
+ * JOINs (which place the channel on legacy), emit the modes to legacy ONCE.
+ * Cycle-local + channel NAMES (re-FindChannel) so a mid-pass destroy is safe;
+ * modebuf_flush_nomirror routes via the channel-only suppression to legacy peers
+ * only (CRDT peers have them via the doc) — a no-op on a node with no legacy peer. */
+#define CRDT_BIRTH_MODES_MAX 32
+static char g_birth_modes[CRDT_BIRTH_MODES_MAX][CHANNELLEN + 1];
+static int  g_birth_modes_n;
+
+static void birth_modes_record(const char *chname)
+{
+  if (g_birth_modes_n < CRDT_BIRTH_MODES_MAX)
+    ircd_strncpy(g_birth_modes[g_birth_modes_n++], chname, CHANNELLEN + 1);
+  else
+    log_write(LS_SYSTEM, L_NOTICE, 0,
+              "CRDT birth-modes: >%d channels born in one pass; %s mode-bridge dropped",
+              CRDT_BIRTH_MODES_MAX, chname);
+}
+
+void crdt_shadow_gateway_birth_modes(void)
+{
+  int i;
+  for (i = 0; i < g_birth_modes_n; i++) {
+    struct Channel *chptr = FindChannel(g_birth_modes[i]);
+    struct ModeBuf mbuf;
+    unsigned int m;
+    if (!chptr || !(chptr->mode.mode & CRDT_MODE_MASK))
+      continue;
+    m = chptr->mode.mode & CRDT_MODE_MASK & ~(MODE_KEY | MODE_LIMIT);
+    modebuf_init(&mbuf, &me, NULL, chptr, MODEBUF_DEST_CHANNEL | MODEBUF_DEST_SERVER);
+    if (m)
+      modebuf_mode(&mbuf, MODE_ADD | m);
+    if (chptr->mode.mode & MODE_LIMIT)
+      modebuf_mode_uint(&mbuf, MODE_ADD | MODE_LIMIT, chptr->mode.limit);
+    if (chptr->mode.mode & MODE_KEY)
+      modebuf_mode_string(&mbuf, MODE_ADD | MODE_KEY, chptr->mode.key, 0);
+    modebuf_flush_nomirror(&mbuf);
+  }
+  g_birth_modes_n = 0;
+}
+
 void crdt_shadow_reconcile_create_channels(void)
 {
   unsigned int created = 0;
@@ -1638,6 +1804,8 @@ void crdt_shadow_reconcile_create_channels(void)
       if (!chptr)
         continue;
       rebuild_channel_from_doc(chptr, dc, nbuf);
+      if (chptr->mode.mode & CRDT_MODE_MASK)
+        birth_modes_record(nbuf);        /* bridge birth-modes to legacy after members */
       created++;
       log_write(LS_SYSTEM, L_NOTICE, 0,
                 "CRDT create-reconcile: created channel %s from doc (ts=%lu)",
@@ -2328,7 +2496,7 @@ static void crdt_shadow_verify_cb(struct Event *ev)
     return;
   /* Phase 4c: no servers-map self-assert — reachability is a local determination
    * (FindNServer at the materialize gate), not replicated doc state. */
-  crdt_shadow_verify();
+  crdt_shadow_verify(NULL);         /* NULL -> the system log (timer path) */
   crdt_shadow_materialize_check();  /* Phase 3b dry-run: doc -> live fidelity */
   /* Phase 3l: create+gateway users BEFORE materialize_live (the bulk path creates
    * users locally but never gateways; running reconcile_users first lets it §17.7-
@@ -2354,6 +2522,7 @@ static void crdt_shadow_verify_cb(struct Event *ev)
   crdt_shadow_reconcile_modes();   /* Phase 3e: same for persistent channel modes */
   crdt_shadow_reconcile_create_channels(); /* Phase 3j: birth channels from doc before members */
   crdt_shadow_reconcile_members(); /* Phase 3f: same for channel membership (JOIN-add) */
+  crdt_shadow_gateway_birth_modes(); /* 3j gap fix: bridge birth-modes AFTER members place the channel on legacy */
   crdt_shadow_reconcile_removes(); /* Phase 3g: membership remove (PART / delete-on-leave) */
   crdt_shadow_reconcile_member_status(); /* Phase 3h: per-member status (+o/+v/+h) */
   crdt_shadow_reconcile_bans();    /* Phase 3i: channel bans/excepts (+b/+e) */

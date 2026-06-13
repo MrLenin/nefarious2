@@ -1093,9 +1093,11 @@ struct Message msgtab[] = {
     /* UNREG, CLIENT, SERVER, OPER, SERVICE */
     /* UNREG = mr_crdt: a CRDT mesh overlay link (Phase 4b) stays in
      * STAT_HANDSHAKE (UNREGISTERED_HANDLER), so its CR tokens dispatch
-     * through this slot; mr_crdt forwards to ms_crdt iff IsCrdtOverlay. */
-    { mr_crdt, m_ignore, ms_crdt, m_ignore, m_ignore },
-    "S|D|U|V <args> - CRDT mesh state sync"
+     * through this slot; mr_crdt forwards to ms_crdt iff IsCrdtOverlay.
+     * OPER = mo_crdt: /CRDT [map|peers|status] mesh-state introspection (the
+     * S2S token is "CR", so opers reach mo_crdt via the full "CRDT" name). */
+    { mr_crdt, m_not_oper, ms_crdt, mo_crdt, m_ignore },
+    "[map|peers|status] - show CRDT mesh state (oper); S|D|U|V <args> S2S sync"
   },
   {
     MSG_CRDTMESH,
