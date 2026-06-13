@@ -84,6 +84,15 @@ int crdt_meshmap_spanning(const struct CrdtMeshMap *m, uint16_t from,
                           time_t now, time_t stale,
                           int16_t *parent, uint8_t *depth, uint16_t *order);
 
+/** Per-numeric set-difference classification of two boolean reachability sets
+ *  @a a and @a b (each CRDT_MAX_SERVERS bytes): out[n] = 0 if a[n]==b[n],
+ *  1 if a[n] && !b[n] (in A only), 2 if !a[n] && b[n] (in B only).  Returns the
+ *  number of divergent (nonzero) entries.  The Stage-1 shadow-oracle primitive
+ *  for comparing mesh-map BFS reachability against the per-node beacon set and
+ *  the P10 tree — pure so the classification is TDD-pinned before any presence
+ *  decision trusts it.  @a out may be NULL (count only). */
+int crdt_meshmap_set_diff(const uint8_t *a, const uint8_t *b, uint8_t *out);
+
 /** Enumerate "cross edges": fresh declared edges (u<v, both endpoints reachable)
  *  that are NOT tree edges (neither endpoint is the other's @a parent).  Writes
  *  up to @a max (u,v) pairs into @a out_u / @a out_v.  Returns the TOTAL cross

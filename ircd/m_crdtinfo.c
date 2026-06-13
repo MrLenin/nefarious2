@@ -201,6 +201,7 @@ static void render_status(struct Client *to)
   int crdt = 0, legacy = 0, stub = 0, presented = 0, rc;
 
   crdt_shadow_verify(to);                /* the canonical verify line(s) on demand */
+  crdt_shadow_presence_diff(to);         /* Tier-2 S1: mesh-map BFS vs beacon-set vs P10 divergences */
 
   for (a = GlobalClientList; a; a = cli_next(a)) {
     if (!IsServer(a))

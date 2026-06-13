@@ -944,6 +944,70 @@ void crdt_shadow_verify(struct Client *to)
    * increment; until then the shadow oplog grows (bounded enough for testing). */
 }
 
+/* Tier-2 Stage 1 (mesh-map -> presence input) — SHADOW ORACLE, log-only, mutates
+ * nothing. Measures, per server numeric, three reachability signals and reports
+ * their divergences so we can validate (before promoting anything) which is the
+ * right presence oracle for R7:
+ *   - BFS        : mesh-map transitive reachability (fresh adjacency path from us).
+ *   - beacon-set : that server's OWN CR H beacon is fresh (the signal the staleness
+ *                  sweep already uses). NB BFS is a SUBSET of this (BFS prunes the
+ *                  target by its own freshness too), so "beaconOnly" = a server
+ *                  whose beacon arrives but has no fresh adjacency path here
+ *                  (adjacency-warmup / declared-peers gap) and "BFSonly" should be
+ *                  ~empty. Steady-state beaconOnly>0 = a real adjacency gap to fix
+ *                  before BFS can be trusted for presence.
+ *   - P10 tree   : a live, non-stub, CRDT-aware server reachable via the P10 tree.
+ *                  BFS/beacon being a SUPERSET of this is the expected overlay /
+ *                  mesh-stub win (reachable via a CR overlay the tree lacks).
+ * @a to == NULL -> system log (verify timer); a Client -> NOTICE'd (/CRDT status). */
+void crdt_shadow_presence_diff(struct Client *to)
+{
+  static uint8_t bfs[CRDT_MAX_SERVERS], beacon[CRDT_MAX_SERVERS];
+  static uint8_t p10[CRDT_MAX_SERVERS], diff[CRDT_MAX_SERVERS];
+  const struct CrdtMeshMap *mm = crdt_shadow_meshmap();
+  struct Client *acptr;
+  unsigned int ournum;
+  time_t now = CurrentTime, stale = CRDT_BEACON_STALE;
+  int i, d_bb, d_bp, bfs_only_b = 0, beacon_only = 0, bfs_only_p = 0, p10_only = 0;
+
+  if (!shadow_on() || !feature_bool(FEAT_CRDT_PRIMARY))
+    return;
+  ournum = (unsigned int)base64toint(cli_yxx(&me));
+
+  crdt_meshmap_reachable(mm, (uint16_t)ournum, now, stale, bfs);
+
+  memset(beacon, 0, sizeof beacon);
+  for (i = 0; i < CRDT_MAX_SERVERS; i++)
+    if (crdt_beacon[i].recv_ts && (now - crdt_beacon[i].recv_ts) <= stale)
+      beacon[i] = 1;
+  beacon[ournum] = 1;                    /* we are always present to ourselves */
+
+  memset(p10, 0, sizeof p10);
+  for (acptr = GlobalClientList; acptr; acptr = cli_next(acptr))
+    if (IsServer(acptr) && IsCrdtAware(acptr) && !IsMeshStub(acptr)) {
+      unsigned int pn = (unsigned int)base64toint(cli_yxx(acptr));
+      if (pn < CRDT_MAX_SERVERS)
+        p10[pn] = 1;
+    }
+  p10[ournum] = 1;
+
+  d_bb = crdt_meshmap_set_diff(bfs, beacon, diff);
+  for (i = 0; i < CRDT_MAX_SERVERS; i++) {
+    if (diff[i] == 1) bfs_only_b++;
+    else if (diff[i] == 2) beacon_only++;
+  }
+  d_bp = crdt_meshmap_set_diff(bfs, p10, diff);
+  for (i = 0; i < CRDT_MAX_SERVERS; i++) {
+    if (diff[i] == 1) bfs_only_p++;
+    else if (diff[i] == 2) p10_only++;
+  }
+
+  verify_emit(to,
+              "CRDT presence-diff: BFS-vs-beacon %d (BFSonly %d beaconOnly %d); "
+              "BFS-vs-P10 %d (meshExtra %d treeOnly %d)",
+              d_bb, bfs_only_b, beacon_only, d_bp, bfs_only_p, p10_only);
+}
+
 /* ---- Phase 3b dry-run materialization check (doc -> live fidelity) ----
  * The inverse of crdt_shadow_verify (which walks live -> doc). For every entity
  * in the DOC, confirm a live entity exists with field-for-field fidelity over the
@@ -2535,6 +2599,7 @@ static void crdt_shadow_verify_cb(struct Event *ev)
    * unreachable via ANY CRDT path -> full/permanent partition).  Collect-then-
    * retire (retire frees the stub + its users -> can't free a live iterator). */
   crdt_gossip_beacon();
+  crdt_shadow_presence_diff(NULL);  /* Tier-2 S1 shadow oracle: log signal divergences (no mutation) */
   {
     struct Client *acptr, *stale[16];
     int ns = 0, k;

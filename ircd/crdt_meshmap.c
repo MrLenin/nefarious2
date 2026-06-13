@@ -156,6 +156,23 @@ int crdt_meshmap_spanning(const struct CrdtMeshMap *m, uint16_t from,
   return count;
 }
 
+int crdt_meshmap_set_diff(const uint8_t *a, const uint8_t *b, uint8_t *out)
+{
+  int i, n = 0;
+  if (!a || !b)
+    return 0;
+  for (i = 0; i < CRDT_MAX_SERVERS; i++) {
+    uint8_t c = 0;
+    if (a[i] && !b[i]) c = 1;            /* A only */
+    else if (!a[i] && b[i]) c = 2;       /* B only */
+    if (out)
+      out[i] = c;
+    if (c)
+      n++;
+  }
+  return n;
+}
+
 int crdt_meshmap_crossedges(const struct CrdtMeshMap *m, time_t now, time_t stale,
                             const int16_t *parent,
                             uint16_t *out_u, uint16_t *out_v, int max)

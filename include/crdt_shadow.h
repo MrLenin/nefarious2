@@ -160,6 +160,13 @@ void crdt_shadow_gateway_birth_modes(void);
  *  the lines are NOTICE'd to that oper (/CRDT status).  No-op unless shadow_on. */
 void crdt_shadow_verify(struct Client *to);
 
+/** Tier-2 Stage 1 SHADOW ORACLE (log-only, mutates nothing): report the
+ *  per-server divergences between mesh-map BFS reachability, the per-node beacon
+ *  set, and P10-tree reachability — to validate which signal is the right
+ *  presence oracle for R7 before anything depends on it. @a to == NULL -> log;
+ *  a Client -> NOTICE (/CRDT status). */
+void crdt_shadow_presence_diff(struct Client *to);
+
 /** Phase 3b dry-run: walk the doc and confirm every entity could be rebuilt
  *  from it with field-for-field fidelity against live state. Logs reconstruction
  *  gaps; mutates nothing. No-op unless FEAT_CRDT_ENABLED. */

@@ -252,6 +252,27 @@ static void test_crossedges_diamond_and_truncation(void **state)
   free(m);
 }
 
+static void test_set_diff(void **state)
+{
+  uint8_t a[CRDT_MAX_SERVERS], b[CRDT_MAX_SERVERS], out[CRDT_MAX_SERVERS];
+  (void)state;
+  memset(a, 0, sizeof a); memset(b, 0, sizeof b);
+  /* 1: agree-present, 2: A-only, 3: B-only, 4: agree-absent */
+  a[1] = 1; b[1] = 1;
+  a[2] = 1; b[2] = 0;
+  a[3] = 0; b[3] = 1;
+  /* index 4 left 0/0 */
+  assert_int_equal(2, crdt_meshmap_set_diff(a, b, out));
+  assert_int_equal(0, out[1]);     /* agree */
+  assert_int_equal(1, out[2]);     /* A only */
+  assert_int_equal(2, out[3]);     /* B only */
+  assert_int_equal(0, out[4]);     /* agree (both absent) */
+  /* NULL out = count only */
+  assert_int_equal(2, crdt_meshmap_set_diff(a, b, NULL));
+  /* identical sets -> 0 */
+  assert_int_equal(0, crdt_meshmap_set_diff(a, a, out));
+}
+
 int main(void)
 {
   const struct CMUnitTest tests[] = {
@@ -265,6 +286,7 @@ int main(void)
     cmocka_unit_test(test_spanning_parent_depth_order),
     cmocka_unit_test(test_crossedges_triangle),
     cmocka_unit_test(test_crossedges_diamond_and_truncation),
+    cmocka_unit_test(test_set_diff),
   };
   return cmocka_run_group_tests(tests, NULL, NULL);
 }
