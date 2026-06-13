@@ -923,11 +923,18 @@ void crdt_shadow_verify(struct Client *to)
               real_users, crdt_users);
   }
 
-  /* Phase 4c: report LOCALLY-reachable CRDT-aware servers (reachability is local
-   * now, not a replicated map) — drops on a partition, restores on relink. */
-  for (acptr = GlobalClientList; acptr; acptr = cli_next(acptr))
-    if (IsServer(acptr) && IsCrdtAware(acptr))
-      crdt_srvs++;
+  /* Tier-2 S2 (was Phase 4c P10 count): report MESH-reachable CRDT servers via the
+   * BEACON SET — S1 proved the beacon set is the presence oracle (BFS == beacon)
+   * and that it LEADS the P10 IsCrdtAware count on a silent split (the old count
+   * lagged to ping-timeout). Count beacon-fresh numerics + ourself. */
+  {
+    unsigned int ournum = (unsigned int)base64toint(cli_yxx(&me));
+    int bi;
+    for (bi = 0; bi < CRDT_MAX_SERVERS; bi++)
+      if ((unsigned int)bi != ournum && crdt_beacon[bi].recv_ts &&
+          (CurrentTime - crdt_beacon[bi].recv_ts) <= CRDT_BEACON_STALE)
+        crdt_srvs++;
+  }
 
   verify_emit(to,
             "CRDT shadow verify: %u channels, %u/%u users, %u servers, %u mismatch(es) "
