@@ -563,6 +563,56 @@ int crdt_shadow_mesh_reachable(struct Client *srv)
   }
 }
 
+/* S4/R7a (SQUIT-only): gate (+ shadow-measure) the P10 SQUIT for `subject` toward
+ * the directly-linked peer `peer`.  Among CRDT-aware-both-ends peers a departure
+ * rides the CR H beacon set instead — the beacon goes stale and the keep-gate
+ * (crdt_shadow_mesh_reachable) + the staleness sweep retire the server, so the
+ * up-front SQUIT is redundant.
+ *
+ * R7b (SERVER-intro retirement) was attempted and REVERTED: P10 is a flat server
+ * namespace with hierarchical delivery, so a relayed SERVER carries a source-prefix
+ * that every downstream server must already know.  Suppressing a CRDT server's own
+ * SERVER intro orphans everything sourced through it — notably legacy servers
+ * relayed INTO the mesh (e.g. x3.services behind hub2): a leaf with no direct P10
+ * link to the suppressed introducer drops the ':introducer SERVER <legacy>' line and
+ * can never materialize that server's users (legacy servers don't beacon, so the
+ * anchor fallback can't fire either).  Retiring SERVER needs mesh-native routing
+ * (flat presentation), not prefix-hiding — out of scope here.  Hence SQUIT only.
+ *
+ * Both-ends rule: a departure rides the beacon only when BOTH the receiver and the
+ * subject are CRDT-aware servers (a legacy subject has no beacon; a legacy peer
+ * never learns the beacon).  Flag-gated on FEAT_CRDT_MESHMAP_PRESENCE (shared with
+ * the S3 keep-gate) so default-off is inert.  While the flag is OFF but the both-
+ * ends candidate holds, emit one shadow line reporting the beacon presence/age and
+ * time-to-stale (the worst-case post-cutover detection gap).  `kind` is "SQUIT".
+ *
+ * Returns nonzero IFF the caller should SKIP the P10 SQUIT emit. */
+int crdt_tree_presence_suppress(struct Client *peer, struct Client *subject,
+                                const char *kind)
+{
+  int peer_aware, subj_aware, primary, suppress;
+  if (!shadow_on())
+    return 0;
+  peer_aware = peer && IsServer(peer) && IsCrdtAware(peer);
+  subj_aware = subject && IsServer(subject) && IsCrdtAware(subject);
+  primary    = feature_bool(FEAT_CRDT_PRIMARY);
+  suppress   = crdt_should_suppress_tree(feature_bool(FEAT_CRDT_MESHMAP_PRESENCE),
+                                         primary, peer_aware, subj_aware);
+  /* Shadow: flag still off but the candidate holds -> measure the beacon path. */
+  if (!suppress && crdt_should_suppress_tree(1, primary, peer_aware, subj_aware)) {
+    unsigned int n = (unsigned int)base64toint(cli_yxx(subject));
+    time_t recv = (n < CRDT_MAX_SERVERS) ? crdt_beacon[n].recv_ts : 0;
+    long age      = recv ? (long)(CurrentTime - recv) : -1;
+    long stale_in = recv ? (long)(CRDT_BEACON_STALE - (CurrentTime - recv)) : -1;
+    log_write(LS_SYSTEM, L_NOTICE, 0,
+              "R7-shadow %s subject=%s yxx=%s -> peer=%s : would-suppress; "
+              "beacon present=%d age=%lds stale_in=%lds",
+              kind ? kind : "?", cli_name(subject), cli_yxx(subject),
+              cli_name(peer), recv ? 1 : 0, age, stale_in);
+  }
+  return suppress;
+}
+
 /* R6c: does this node have a directly-linked LEGACY (non-CRDT) P10 peer to present to? */
 static int crdt_gateway_has_legacy_peer(void)
 {

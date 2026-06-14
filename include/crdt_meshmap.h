@@ -102,4 +102,16 @@ int crdt_meshmap_crossedges(const struct CrdtMeshMap *m, time_t now, time_t stal
                             const int16_t *parent,
                             uint16_t *out_u, uint16_t *out_v, int max);
 
+/** S4/R7a pure suppression truth-table: should a P10 SQUIT (a server DEPARTURE)
+ *  for a subject server be SUPPRESSED toward a peer, letting the CR H beacon set
+ *  carry the departure instead (stale beacon + keep-gate + sweep)?  All four
+ *  inputs are 0/1: @a meshmap_on (FEAT_CRDT_MESHMAP_PRESENCE — the cutover flag,
+ *  shared with the S3 keep-gate), @a primary (FEAT_CRDT_PRIMARY), @a peer_aware
+ *  (the receiver is a CRDT-aware server), @a subject_aware (the subject server is
+ *  CRDT-aware — a legacy subject has no beacon, so it must NEVER be suppressed).
+ *  Suppress IFF all four hold.  Pure so the gate is TDD-pinned.  (SERVER-intro
+ *  retirement was found infeasible under P10 prefix routing — SQUIT only.) */
+int crdt_should_suppress_tree(int meshmap_on, int primary,
+                              int peer_aware, int subject_aware);
+
 #endif /* INCLUDED_crdt_meshmap_h */

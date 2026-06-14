@@ -89,6 +89,16 @@ void crdt_shadow_server_add(struct Client *srv);
  *  (so its users should be kept alive as a mesh stub rather than torn down). */
 int crdt_shadow_mesh_reachable(struct Client *srv);
 
+/** S4/R7a (SQUIT-only): gate (+ shadow-measure) the P10 SQUIT for @a subject toward
+ *  the directly-linked @a peer.  Non-zero IFF the caller should SKIP the SQUIT emit
+ *  (cutover flag on + both ends CRDT-aware — then the departure rides the CR H
+ *  beacon set: stale beacon + keep-gate + sweep retire the server).  While the flag
+ *  is off, a both-ends candidate emits one "R7-shadow" measurement line instead.
+ *  @a kind labels the log ("SQUIT").  NB: SERVER-intro retirement is NOT done — P10's
+ *  flat-namespace prefix routing makes it infeasible (see the .c definition). */
+int crdt_tree_presence_suppress(struct Client *peer, struct Client *subject,
+                                const char *kind);
+
 /** Tier2 T2-a/c: convert a (now-leaf) departed server into a STAT_MESH_SERVER
  *  dead-sink stub in place — its users stay live + addressable.  Call only after
  *  the caller has torn down any tree-downlinks (exit_client does this for T2-c). */

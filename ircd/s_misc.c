@@ -914,7 +914,12 @@ int exit_client(struct Client *cptr,
     if (victim != cli_from(killer)  /* The source knows already */
         && IsClient(victim))    /* Not a Ping struct or Log file */
     {
-      if (IsServer(victim) || IsHandshake(victim))
+      /* S4/R7 (Q-1, direct-to-victim): a CRDT-aware victim detects the cut via TCP
+       * close + beacon-staleness, so this P10 SQUIT to it is suppressed once the
+       * cutover flag flips (shadow-logs the gap until then).  A Handshake victim is
+       * not yet IsServer, so the both-ends predicate never suppresses it. */
+      if ((IsServer(victim) || IsHandshake(victim))
+          && !crdt_tree_presence_suppress(victim, victim, "SQUIT"))
 	sendcmdto_one(killer, CMD_SQUIT, victim, "%s 0 :%s", cli_name(&me), comment);
       if ((IsServer(victim) || IsHandshake(victim) || IsConnecting(victim)) &&
           (killer == &me || (IsServer(killer) &&
@@ -1052,9 +1057,15 @@ int exit_client(struct Client *cptr,
   for (dlp = cli_serv(&me)->down; dlp; dlp = dlp->next) {
     if (dlp->value.cptr != cli_from(killer) && dlp->value.cptr != victim)
     {
-      if (IsServer(victim))
-	sendcmdto_one(killer, CMD_SQUIT, dlp->value.cptr, "%s %Tu :%s",
-		      cli_name(victim), cli_serv(victim)->timestamp, comment);
+      if (IsServer(victim)) {
+	/* S4/R7 (Q-2, THE broadcast loop): among CRDT-aware-both-ends peers the
+	 * departure rides the CR H beacon, not this SQUIT.  crdt_tree_presence_
+	 * suppress shadow-logs the beacon detection gap while the flag is off and
+	 * returns nonzero (skip the emit) once the cutover flag flips. */
+	if (!crdt_tree_presence_suppress(dlp->value.cptr, victim, "SQUIT"))
+	  sendcmdto_one(killer, CMD_SQUIT, dlp->value.cptr, "%s %Tu :%s",
+			cli_name(victim), cli_serv(victim)->timestamp, comment);
+      }
       else if (IsUser(victim) && !HasFlag(victim, FLAG_KILLED)
                && !IsBouncerInternalDestroy(victim)
                && !IsBouncerAlias(victim)

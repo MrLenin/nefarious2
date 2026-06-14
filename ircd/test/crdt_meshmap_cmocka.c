@@ -273,6 +273,27 @@ static void test_set_diff(void **state)
   assert_int_equal(0, crdt_meshmap_set_diff(a, a, out));
 }
 
+/* S4/R7: the cutover suppression truth table.  Suppress a P10 SERVER/SQUIT
+ * primitive (let the beacon carry presence) IFF all four bits hold. */
+static void test_should_suppress_tree(void **state)
+{
+  int mm, pr, pa, sa;
+  (void)state;
+  /* exhaustive 16-row table: result == AND of all four inputs */
+  for (mm = 0; mm <= 1; mm++)
+    for (pr = 0; pr <= 1; pr++)
+      for (pa = 0; pa <= 1; pa++)
+        for (sa = 0; sa <= 1; sa++)
+          assert_int_equal(mm && pr && pa && sa,
+                           crdt_should_suppress_tree(mm, pr, pa, sa));
+  /* named anchors for the live scenarios */
+  assert_int_equal(1, crdt_should_suppress_tree(1, 1, 1, 1)); /* cutover, both-ends */
+  assert_int_equal(0, crdt_should_suppress_tree(0, 1, 1, 1)); /* flag off -> shadow */
+  assert_int_equal(0, crdt_should_suppress_tree(1, 0, 1, 1)); /* not CRDT-primary */
+  assert_int_equal(0, crdt_should_suppress_tree(1, 1, 0, 1)); /* legacy peer */
+  assert_int_equal(0, crdt_should_suppress_tree(1, 1, 1, 0)); /* legacy subject */
+}
+
 int main(void)
 {
   const struct CMUnitTest tests[] = {
@@ -287,6 +308,7 @@ int main(void)
     cmocka_unit_test(test_crossedges_triangle),
     cmocka_unit_test(test_crossedges_diamond_and_truncation),
     cmocka_unit_test(test_set_diff),
+    cmocka_unit_test(test_should_suppress_tree),
   };
   return cmocka_run_group_tests(tests, NULL, NULL);
 }

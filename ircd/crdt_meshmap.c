@@ -214,3 +214,13 @@ int crdt_meshmap_crossedges(const struct CrdtMeshMap *m, time_t now, time_t stal
   }
   return total;
 }
+
+/* S4/R7: the cutover suppression rule, isolated as a pure 4-bit AND so the
+ * truth table is cmocka-pinned (see crdt_should_suppress_tree in the header).
+ * The integration layer (crdt_tree_presence_suppress) feeds it the live feature
+ * flags + per-end IsCrdtAware bits. */
+int crdt_should_suppress_tree(int meshmap_on, int primary,
+                              int peer_aware, int subject_aware)
+{
+  return meshmap_on && primary && peer_aware && subject_aware;
+}
