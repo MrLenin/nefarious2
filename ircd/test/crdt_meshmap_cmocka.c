@@ -480,6 +480,49 @@ static void test_route_action(void **state)
   assert_int_equal(CRDT_ROUTE_FLOOD, crdt_route_action(0, 0, 32));
 }
 
+/* MR-2: tree-incident neighbours of a node in a canonical tree edge set. */
+static void test_tree_neighbors(void **state)
+{
+  uint16_t tu[3] = {1, 1, 2}, tv[3] = {2, 3, 4};   /* tree edges (1,2)(1,3)(2,4) */
+  uint16_t out[8];
+  int n;
+  (void)state;
+  n = crdt_meshmap_tree_neighbors(tu, tv, 3, 1, out, 8);  /* node 1 -> {2,3} */
+  assert_int_equal(2, n);
+  assert_true((out[0] == 2 && out[1] == 3) || (out[0] == 3 && out[1] == 2));
+  n = crdt_meshmap_tree_neighbors(tu, tv, 3, 2, out, 8);  /* node 2 -> {1,4} */
+  assert_int_equal(2, n);
+  n = crdt_meshmap_tree_neighbors(tu, tv, 3, 4, out, 8);  /* node 4 -> {2} */
+  assert_int_equal(1, n);
+  assert_int_equal(2, out[0]);
+  n = crdt_meshmap_tree_neighbors(tu, tv, 3, 9, out, 8);  /* not in tree -> 0 */
+  assert_int_equal(0, n);
+  /* truncation: total returned even though only max written */
+  n = crdt_meshmap_tree_neighbors(tu, tv, 3, 1, out, 1);
+  assert_int_equal(2, n);
+}
+
+/* MR-2: row change detection (structural change vs same-set refresh). */
+static void test_row_changed(void **state)
+{
+  struct CrdtMeshMap *m = new_map();
+  uint16_t p23[2] = {2, 3}, p24[2] = {2, 4}, p2[1] = {2}, p234[3] = {2, 3, 4};
+  uint16_t p6big[2] = {6, 9999};            /* 9999 >= CRDT_MAX_SERVERS -> filtered */
+  uint16_t p6[1] = {6};
+  (void)state;
+  assert_int_equal(1, crdt_meshmap_row_changed(m, 1, p23, 2));  /* absent -> changed */
+  row(m, 1, FRESH, 2, 2, 3);
+  assert_int_equal(0, crdt_meshmap_row_changed(m, 1, p23, 2));  /* same set */
+  assert_int_equal(1, crdt_meshmap_row_changed(m, 1, p24, 2));  /* value differs */
+  assert_int_equal(1, crdt_meshmap_row_changed(m, 1, p2,  1));  /* count differs */
+  assert_int_equal(1, crdt_meshmap_row_changed(m, 1, p234, 3)); /* count differs */
+  /* out-of-range neighbour filtered: stored {6} vs {6,9999} -> effective {6} == same */
+  row(m, 5, FRESH, 1, 6);
+  assert_int_equal(0, crdt_meshmap_row_changed(m, 5, p6big, 2));
+  assert_int_equal(0, crdt_meshmap_row_changed(m, 5, p6, 1));
+  free(m);
+}
+
 /* S4/R7: the cutover suppression truth table.  Suppress a P10 SERVER/SQUIT
  * primitive (let the beacon carry presence) IFF all four bits hold. */
 static void test_should_suppress_tree(void **state)
@@ -524,6 +567,8 @@ int main(void)
     cmocka_unit_test(test_canon_tree_k4_and_forest),
     cmocka_unit_test(test_canon_tree_stale_and_truncation),
     cmocka_unit_test(test_route_action),
+    cmocka_unit_test(test_tree_neighbors),
+    cmocka_unit_test(test_row_changed),
     cmocka_unit_test(test_should_suppress_tree),
   };
   return cmocka_run_group_tests(tests, NULL, NULL);

@@ -49,6 +49,14 @@ static struct Timer            g_verify_timer;
  * /CRDT status verify), NEVER materialization/routing.  See crdt_meshmap.h. */
 static struct CrdtMeshMap      g_meshmap;
 
+/* MR-2: timestamp of the last STRUCTURAL mesh-map change (a row's peer-set changed,
+ * not a same-set beacon refresh).  Broadcast tree-forwarding is gap-safe only when
+ * every node agrees on the canonical tree, which holds once adjacency has converged;
+ * during the lag after a change, nodes can disagree -> we flood instead (gap-free).
+ * crdt_shadow_mesh_bcast_stable() gates on (now - this) > the settle window. */
+static time_t                  g_mesh_changed_ts;
+#define CRDT_MESH_BCAST_STABLE 35      /* s; > the 30s beacon interval -> covers a round */
+
 /** Eager-push high-water mark: the highest own-origin op seq we have already
  *  pushed to peers via CR U. Bounds eager push to ops WE created since last time
  *  (relay of foreign-origin ops stays on the anti-entropy path), keeping it
@@ -121,6 +129,8 @@ int crdt_shadow_beacon_record(unsigned int num, time_t emit_ts,
           adj[n++] = (uint16_t)pn;
       }
     }
+    if (crdt_meshmap_row_changed(&g_meshmap, (uint16_t)num, adj, n))
+      g_mesh_changed_ts = CurrentTime;     /* MR-2: structural change -> flood window */
     crdt_meshmap_set(&g_meshmap, (uint16_t)num, adj, n, CurrentTime);
   }
   return 1;
@@ -167,6 +177,8 @@ int crdt_shadow_local_peers(char *out, size_t outsz)
   }
 
   /* our own row, recorded locally (single-writer: us) */
+  if (crdt_meshmap_row_changed(&g_meshmap, (uint16_t)base64toint(cli_yxx(&me)), adj, n))
+    g_mesh_changed_ts = CurrentTime;       /* MR-2: a local link formed/dropped */
   crdt_meshmap_set(&g_meshmap, (uint16_t)base64toint(cli_yxx(&me)), adj, n, CurrentTime);
 
   if (total > CRDT_MESH_MAXDEG)
@@ -180,6 +192,17 @@ int crdt_shadow_local_peers(char *out, size_t outsz)
 const struct CrdtMeshMap *crdt_shadow_meshmap(void)
 {
   return &g_meshmap;
+}
+
+/* MR-2: is the mesh-map settled enough to forward broadcast over the canonical
+ * tree (vs flood)?  True iff no structural change for CRDT_MESH_BCAST_STABLE s AND
+ * we actually have a CRDT peer (a lone node trivially "stable" has nothing to
+ * forward).  Conservative: any topology flux -> flood (gap-free) until it settles. */
+int crdt_shadow_mesh_bcast_stable(time_t now)
+{
+  if (g_mesh_changed_ts == 0)              /* pre-first-beacon cold start -> flood */
+    return 0;
+  return (now - g_mesh_changed_ts) > CRDT_MESH_BCAST_STABLE;
 }
 
 const char *crdt_shadow_beacon_name(unsigned int num)

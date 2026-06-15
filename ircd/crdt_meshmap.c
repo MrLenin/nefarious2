@@ -336,6 +336,58 @@ int crdt_meshmap_canon_tree(const struct CrdtMeshMap *m, time_t now, time_t stal
   return total;
 }
 
+int crdt_meshmap_tree_neighbors(const uint16_t *tu, const uint16_t *tv, int nedges,
+                                uint16_t node, uint16_t *out, int max)
+{
+  int i, total = 0;
+  if (!tu || !tv)
+    return 0;
+  for (i = 0; i < nedges; i++) {
+    uint16_t nbr;
+    if (tu[i] == node)      nbr = tv[i];
+    else if (tv[i] == node) nbr = tu[i];
+    else                    continue;
+    if (total < max && out)
+      out[total] = nbr;
+    total++;
+  }
+  return total;
+}
+
+int crdt_meshmap_row_changed(const struct CrdtMeshMap *m, uint16_t node,
+                             const uint16_t *peers, int n)
+{
+  int i, stored;
+  if (!m || node >= CRDT_MAX_SERVERS)
+    return 0;
+  if (!m->present[node])
+    return 1;                              /* new node -> changed */
+  stored = m->npeers[node];
+  /* count the entries crdt_meshmap_set WOULD store (in-range), to compare like
+   * for like (set skips out-of-range / NULL neighbours). */
+  {
+    int eff = 0;
+    for (i = 0; i < n && eff < CRDT_MESH_MAXDEG; i++)
+      if (peers && peers[i] < CRDT_MAX_SERVERS)
+        eff++;
+    if (eff != stored)
+      return 1;
+  }
+  /* same count: compare ordered values (a reorder = false-positive change =
+   * brief extra flood = safe). */
+  {
+    int j = 0;
+    for (i = 0; i < n && j < stored; i++) {
+      if (peers[i] >= CRDT_MAX_SERVERS)
+        continue;
+      if (m->peers[node][j] != peers[i])
+        return 1;
+      j++;
+    }
+  }
+  return 0;
+}
+
 /* MR-1: the unicast routing decision at a node, isolated as a pure function so the
  * deliver/route/flood-fallback/drop logic is cmocka-pinned.  The integration layer
  * (crdt_route_unicast + the ms_crdt M unicast relay) feeds it live Client/next-hop

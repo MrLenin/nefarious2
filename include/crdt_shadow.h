@@ -131,6 +131,10 @@ int crdt_shadow_local_peers(char *out, size_t outsz);
  *  declared so callers that only pass the pointer need not include crdt_meshmap.h. */
 struct CrdtMeshMap;
 const struct CrdtMeshMap *crdt_shadow_meshmap(void);
+/** MR-2: 1 if the mesh-map has been structurally stable long enough that every
+ *  node agrees on the canonical broadcast tree (safe to tree-forward); 0 during
+ *  the convergence-lag window after a topology change (-> flood, gap-free). */
+int crdt_shadow_mesh_bcast_stable(time_t now);
 
 /** Beacon-derived metadata for rendering a node by numeric. */
 const char *crdt_shadow_beacon_name(unsigned int num);  /**< "" if unknown */

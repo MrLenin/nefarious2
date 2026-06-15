@@ -221,22 +221,41 @@ static int crdt_m_seen_check_add(const char *msgid)
                               CRDT_M_SEEN_WINDOW);
 }
 
-/* Gossip a live message to a mesh-only target via ephemeral CR M.
- *   cmd    'P' (PRIVMSG) or 'N' (NOTICE)
+/* MR-2: forward a channel CR M along the canonical shared tree (declared here,
+ * defined below crdt_peer_by_num). @a except_num is the receive-edge peer numeric
+ * to skip (-1 at the origin). */
+static void crdt_tree_forward_chan(int except_num, const char *msgid, char cmd,
+                                   const char *srcfull, const char *target,
+                                   int ttl, const char *text);
+
+/* Gossip a live message via ephemeral CR M.
+ *   cmd    'P' (PRIVMSG) / 'N' (NOTICE) / 'T' (TAGMSG)
  *   target a 5-char user numeric (unicast) OR a #channel name
- * Wire: :<srv> CR M <msgid> <cmd> <srcYXX> <target> :<text> */
+ * Wire: :<srv> CR M <msgid> <cmd> <srcYXX> <target> <ttl> :<text>
+ * MR-2: a CHANNEL target forwards over the canonical mesh tree (N-1) when
+ * FEAT_CRDT_ROUTE_BCAST and the mesh is stable; otherwise (and for unicast, the
+ * MR-1 flood-fallback) it floods to all CRDT peers (TTL+dedup terminate it). */
 void crdt_gossip_message(struct Client *from, char cmd, const char *target,
                          const char *msgid, const char *text)
 {
   struct Client *acptr;
+  const char *mid;
   if (!crdt_shadow_active() || !from || !target || !text)
     return;
+  mid = (msgid && *msgid) ? msgid : "*";
   crdt_m_seen_check_add(msgid);        /* record so an echo/relay-back is deduped */
+
+  if ((target[0] == '#' || target[0] == '&') &&
+      feature_bool(FEAT_CRDT_ROUTE_BCAST) && crdt_shadow_mesh_bcast_stable(CurrentTime)) {
+    char srcfull[16];
+    ircd_snprintf(0, srcfull, sizeof srcfull, "%s%s", NumNick(from));
+    crdt_tree_forward_chan(-1, mid, cmd, srcfull, target, CRDT_M_TTL_DEFAULT, text);
+    return;
+  }
   for (acptr = GlobalClientList; acptr; acptr = cli_next(acptr))
     if (IsCrdtSyncTarget(acptr))
       sendcmdto_one(&me, CMD_CRDT_REPLICATION, acptr, "M %s %c %s%s %s %d :%s",
-                    msgid && *msgid ? msgid : "*", cmd,
-                    NumNick(from), target, CRDT_M_TTL_DEFAULT, text);
+                    mid, cmd, NumNick(from), target, CRDT_M_TTL_DEFAULT, text);
 }
 
 /* MR-1: the direct CRDT peer (server link or overlay) whose numeric == @a num,
@@ -249,6 +268,52 @@ static struct Client *crdt_peer_by_num(unsigned int num)
     if (IsCrdtSyncTarget(p) && (unsigned int)base64toint(cli_yxx(p)) == num)
       return p;
   return NULL;
+}
+
+/* MR-2: forward a channel CR M to this node's canonical-tree neighbours (the N-1
+ * broadcast), skipping @a except_num (the receive edge; -1 at the origin).  The
+ * caller has already gated on stability; here we just compute the shared tree and
+ * send.  Per-message canon_tree recompute is microseconds at PoC scale (cache opt
+ * deferred to scale). */
+static void crdt_tree_forward_chan(int except_num, const char *msgid, char cmd,
+                                   const char *srcfull, const char *target,
+                                   int ttl, const char *text)
+{
+  static uint16_t tu[CRDT_MAX_SERVERS], tv[CRDT_MAX_SERVERS];
+  static uint16_t nbrs[CRDT_MESH_MAXDEG];
+  static struct Client *resolved[CRDT_MESH_MAXDEG];
+  unsigned int ournum = (unsigned int)base64toint(cli_yxx(&me));
+  int nedges, nn, i, np = 0, gap = 0;
+  struct Client *p;
+
+  if (ttl <= 0)
+    return;
+  nedges = crdt_meshmap_canon_tree(crdt_shadow_meshmap(), CurrentTime,
+                                   crdt_shadow_beacon_stale_secs(),
+                                   tu, tv, CRDT_MAX_SERVERS);
+  nn = crdt_meshmap_tree_neighbors(tu, tv, nedges, (uint16_t)ournum,
+                                   nbrs, CRDT_MESH_MAXDEG);
+  /* resolve every tree-neighbour (except the receive edge) to a direct peer first.
+   * If any tree edge is NOT a directly-sendable link here (an asymmetric/stale
+   * adjacency the stability gate didn't catch), forwarding it would silently gap
+   * that subtree -> flood-fallback instead (dedup makes the redundancy harmless). */
+  for (i = 0; i < nn; i++) {
+    if ((int)nbrs[i] == except_num)
+      continue;
+    resolved[np] = crdt_peer_by_num(nbrs[i]);
+    if (!resolved[np]) { gap = 1; break; }
+    np++;
+  }
+  if (!gap) {
+    for (i = 0; i < np; i++)
+      sendcmdto_one(&me, CMD_CRDT_REPLICATION, resolved[i], "M %s %c %s %s %d :%s",
+                    msgid, cmd, srcfull, target, ttl, text);
+    return;
+  }
+  for (p = GlobalClientList; p; p = cli_next(p))     /* gap -> flood (gap-safe) */
+    if (IsCrdtSyncTarget(p) && (int)base64toint(cli_yxx(p)) != except_num)
+      sendcmdto_one(&me, CMD_CRDT_REPLICATION, p, "M %s %c %s %s %d :%s",
+                    msgid, cmd, srcfull, target, ttl, text);
 }
 
 /* MR-1: try to deliver a user-unicast over the CRDT mesh instead of the P10 tree.
@@ -568,11 +633,18 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
      * route is known, flood-fallback otherwise (the proven partition path / an
      * unknown next-hop), DROP on TTL exhaustion. */
     if (target[0] == '#' || target[0] == '&') {
-      if (ttl_next > 0)
-        for (p = GlobalClientList; p; p = cli_next(p))
-          if (p != cptr && IsCrdtSyncTarget(p))
-            sendcmdto_one(&me, CMD_CRDT_REPLICATION, p, "M %s %s %s %s %d :%s",
-                          m_msgid, m_cmd, srcyxx, target, ttl_next, m_text);
+      if (ttl_next > 0) {
+        /* MR-2: forward over the canonical mesh tree (N-1) when stable; else flood */
+        if (feature_bool(FEAT_CRDT_ROUTE_BCAST) &&
+            crdt_shadow_mesh_bcast_stable(CurrentTime))
+          crdt_tree_forward_chan((int)base64toint(cli_yxx(cptr)), m_msgid, m_cmd[0],
+                                 srcyxx, target, ttl_next, m_text);
+        else
+          for (p = GlobalClientList; p; p = cli_next(p))
+            if (p != cptr && IsCrdtSyncTarget(p))
+              sendcmdto_one(&me, CMD_CRDT_REPLICATION, p, "M %s %s %s %s %d :%s",
+                            m_msgid, m_cmd, srcyxx, target, ttl_next, m_text);
+      }
     } else {
       struct Client *tgt2 = findNUser(target);
       int owner_self = (tgt2 && MyConnect(tgt2));

@@ -131,6 +131,22 @@ int crdt_meshmap_nexthop(const struct CrdtMeshMap *m, uint16_t from,
 int crdt_meshmap_canon_tree(const struct CrdtMeshMap *m, time_t now, time_t stale,
                             uint16_t *tu, uint16_t *tv, int max);
 
+/** MR-2 broadcast: the tree-incident neighbours of @a node in a canonical tree
+ *  edge set (@a tu/@a tv, @a nedges, as returned by crdt_meshmap_canon_tree) —
+ *  i.e. the set @a node forwards a broadcast to (minus the edge it arrived on,
+ *  excluded by the caller).  Writes up to @a max neighbour numerics into @a out;
+ *  returns the TOTAL neighbour count (> @a max -> truncated).  Pure (cmocka). */
+int crdt_meshmap_tree_neighbors(const uint16_t *tu, const uint16_t *tv, int nedges,
+                                uint16_t node, uint16_t *out, int max);
+
+/** MR-2 stability: does @a node's stored row differ from the peer-set @a peers
+ *  (@a n entries)?  1 if @a node is absent or its stored peer count/ordered values
+ *  differ (a structural topology change), 0 if identical (a same-set beacon
+ *  refresh).  The integration bumps a "mesh changed" timestamp on a 1 so broadcast
+ *  flood-falls-back during the convergence-lag window.  Pure (cmocka). */
+int crdt_meshmap_row_changed(const struct CrdtMeshMap *m, uint16_t node,
+                             const uint16_t *peers, int n);
+
 /** MR-1 pure routing decision for a unicast CR frame at a node.  Inputs are 0/1
  *  except @a ttl_remaining (the frame's TTL as seen here, before decrement):
  *  @a owner_is_self (this node owns the target / the target is local here),
