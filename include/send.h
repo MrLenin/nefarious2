@@ -258,9 +258,11 @@ extern void sendcmdto_channel_butone_with_client_tags(struct Client *from,
 #define SKIP_CHGHOST	0x20	/**< skip users that have chghost capability */
 
 /* Send command to all users having a particular flag set */
-extern void sendwallto_group_butone(struct Client *from, int type, 
+extern void sendwallto_group_butone(struct Client *from, int type,
 				    struct Client *one, const char *pattern,
 				    ...);
+/* MR-2b: deliver a WALLOPS-class message to LOCAL +w opers only (mesh receiver). */
+extern void sendwallto_local(struct Client *from, int type, const char *text);
 
 #define WALL_DESYNCH	1       /**< send as a DESYNCH message */
 #define WALL_WALLOPS	2       /**< send to all +w opers */

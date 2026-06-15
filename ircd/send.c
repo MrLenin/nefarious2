@@ -30,6 +30,7 @@
 #include "class.h"
 #include "crdt_hlc.h"
 #include "client.h"
+#include "handlers.h"     /* MR-2b: crdt_gossip_message (WALLOPS over the mesh) */
 #include "hash.h"
 #include "ircd.h"
 #include "ircd_features.h"
@@ -3073,6 +3074,39 @@ void sendcmdto_channel_butone_with_client_tags(struct Client *from,
  * @param[in] one Client direction to skip (or NULL).
  * @param[in] pattern Format string for command arguments.
  */
+/* MR-2b: deliver a WALLOPS-class message to LOCAL +w/+g opers only (no server
+ * broadcast, no mesh re-emit) -- the receiver side of WALLOPS-over-the-mesh.  @a text
+ * is the already-formatted body; @a from is the (materialized) source for the prefix. */
+void sendwallto_local(struct Client *from, int type, const char *text)
+{
+  struct Client *cptr;
+  struct MsgBuf *mb;
+  const char *prefix;
+  int his_wallops, i;
+
+  switch (type) {
+    case WALL_DESYNCH:   prefix = "";   break;
+    case WALL_WALLOPS:   prefix = "* "; break;
+    case WALL_WALLUSERS: prefix = "$ "; break;
+    default:             return;
+  }
+  if (!from || !text)
+    return;
+  mb = msgq_make(0, "%:#C " MSG_WALLOPS " :%s%s", from, prefix, text);
+  his_wallops = feature_bool(FEAT_HIS_WALLOPS);
+  for (i = 0; i <= HighestFd; i++) {
+    if (!(cptr = LocalClientArray[i]) ||
+        (cli_fd(cli_from(cptr)) < 0) ||
+        (type == WALL_DESYNCH && !SendDebug(cptr)) ||
+        (type == WALL_WALLOPS &&
+         (!SendWallops(cptr) || (his_wallops && !IsAnOper(cptr)))) ||
+        (type == WALL_WALLUSERS && !SendWallops(cptr)))
+      continue;
+    send_buffer(cptr, mb, 1);
+  }
+  msgq_clean(mb);
+}
+
 void sendwallto_group_butone(struct Client *from, int type, struct Client *one,
 			     const char *pattern, ...)
 {
@@ -3084,6 +3118,19 @@ void sendwallto_group_butone(struct Client *from, int type, struct Client *one,
   char *tok=NULL;
   int his_wallops;
   int i;
+  /* MR-2b: route a user-sourced WALLOPS to CRDT-aware servers over the mesh instead
+   * of the P10 tree (the tree still carries it to legacy peers).  Server-sourced
+   * (cli_user==NULL) stays P10 this phase. */
+  int crdt_route = (type == WALL_WALLOPS && feature_bool(FEAT_CRDT_ROUTE_BCAST) &&
+                    from && cli_user(from));
+  char crdt_txt[512];
+
+  if (crdt_route) {
+    vd.vd_format = pattern;
+    va_start(vd.vd_args, pattern);
+    ircd_snprintf(0, crdt_txt, sizeof crdt_txt, "%v", &vd);  /* format the body once */
+    va_end(vd.vd_args);
+  }
 
   vd.vd_format = pattern;
 
@@ -3133,10 +3180,20 @@ void sendwallto_group_butone(struct Client *from, int type, struct Client *one,
   for (lp = cli_serv(&me)->down; lp; lp = lp->next) {
     if (one && lp->value.cptr == cli_from(one))
       continue;
+    if (crdt_route && IsServer(lp->value.cptr) && IsCrdtAware(lp->value.cptr))
+      continue;                  /* MR-2b: this CRDT-aware peer gets the mesh copy */
     send_buffer(lp->value.cptr, mb, 1);
   }
 
   msgq_clean(mb);
+
+  /* MR-2b: emit the mesh copy once (cmd 'W', all-server target '*') -- tree-forwarded
+   * to every CRDT node, each delivers to its local +w opers (ms_crdt cmd 'W'). */
+  if (crdt_route) {
+    char msgidbuf[64];
+    generate_msgid(msgidbuf, sizeof msgidbuf);
+    crdt_gossip_message(from, 'W', "*", msgidbuf, crdt_txt);
+  }
 }
 
 /** Send a (prefixed) command to all users matching \a to as \a who.

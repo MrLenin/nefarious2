@@ -245,7 +245,7 @@ void crdt_gossip_message(struct Client *from, char cmd, const char *target,
   mid = (msgid && *msgid) ? msgid : "*";
   crdt_m_seen_check_add(msgid);        /* record so an echo/relay-back is deduped */
 
-  if ((target[0] == '#' || target[0] == '&') &&
+  if ((target[0] == '#' || target[0] == '&' || target[0] == '*') &&
       feature_bool(FEAT_CRDT_ROUTE_BCAST) && crdt_shadow_mesh_bcast_stable(CurrentTime)) {
     char srcfull[16];
     ircd_snprintf(0, srcfull, sizeof srcfull, "%s%s", NumNick(from));
@@ -555,7 +555,11 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
      * from crdt_m_seen (the flood dedup at the top), which gates relay too; sharing it
      * would let a tree-first delivery suppress the CR-M relay and break the flood. */
     if (!crdt_shadow_chan_local_check_add(m_msgid)) {
-    if (target[0] == '#' || target[0] == '&') {           /* channel delivery */
+    if (m_cmd[0] == 'W') {                                /* MR-2b: all-server WALLOPS */
+      struct Client *wsrc = findNUser(srcyxx);
+      if (wsrc)
+        sendwallto_local(wsrc, WALL_WALLOPS, m_text);    /* deliver to local +w opers */
+    } else if (target[0] == '#' || target[0] == '&') {    /* channel delivery */
       struct Channel *ch = FindChannel(target);
       struct Membership *memb;
       if (ch)
@@ -627,12 +631,11 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
       }
     }
     }  /* R4a: end local-delivery dedup guard (the relay below always runs) */
-    /* MR-1 relay (TTL-bounded): a CHANNEL target is a broadcast -> flood onward
-     * (every member-bearing server; dedup + TTL terminate it); a UNICAST target
-     * is routed toward its owner -- next-hop when FEAT_CRDT_ROUTE_UNICAST and the
-     * route is known, flood-fallback otherwise (the proven partition path / an
-     * unknown next-hop), DROP on TTL exhaustion. */
-    if (target[0] == '#' || target[0] == '&') {
+    /* MR-1/MR-2 relay (TTL-bounded): a CHANNEL ('#'/'&') or all-server ('*', the
+     * MR-2b WALLOPS) target is a broadcast -> forward over the canonical tree when
+     * stable (N-1), else flood; a UNICAST target is routed next-hop toward its owner
+     * (flood-fallback), DROP on TTL exhaustion. */
+    if (target[0] == '#' || target[0] == '&' || target[0] == '*') {
       if (ttl_next > 0) {
         /* MR-2: forward over the canonical mesh tree (N-1) when stable; else flood */
         if (feature_bool(FEAT_CRDT_ROUTE_BCAST) &&
