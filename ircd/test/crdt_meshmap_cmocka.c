@@ -11,6 +11,9 @@
  *     disconnected-component-excluded, self-always-reachable
  *   - spanning tree: parent/depth/order, deterministic ascending order
  *   - cross-edges: triangle + diamond, truncation
+ *   - MR-0 next-hop: chain/star/diamond/leaf shortest-path first-hop, partition
+ *   - MR-0 canonical tree: triangle/diamond/K4/forest (root-free Kruskal-lex,
+ *     viewpoint-independent), stale prune, truncation
  */
 
 #include <stdarg.h>
@@ -47,6 +50,16 @@ static struct CrdtMeshMap *new_map(void)
   assert_non_null(m);
   crdt_meshmap_init(m);
   return m;
+}
+
+/* is undirected edge (a,b) in the (tu,tv) set?  canon_tree writes u<v */
+static int has_edge(const uint16_t *tu, const uint16_t *tv, int n, int a, int b)
+{
+  int lo = a < b ? a : b, hi = a < b ? b : a, i;
+  for (i = 0; i < n; i++)
+    if (tu[i] == lo && tv[i] == hi)
+      return 1;
+  return 0;
 }
 
 /* ---------------------------------------------------------------- */
@@ -273,6 +286,180 @@ static void test_set_diff(void **state)
   assert_int_equal(0, crdt_meshmap_set_diff(a, a, out));
 }
 
+/* ---- MR-0: unicast next-hop (per-viewpoint shortest path) ---------------- */
+
+static void test_nexthop_chain(void **state)
+{
+  struct CrdtMeshMap *m = new_map();
+  int16_t nh[CRDT_MAX_SERVERS];
+  (void)state;
+  /* 1-2-3-4 : everything from 1 leaves via 2 */
+  row(m, 1, FRESH, 1, 2);
+  row(m, 2, FRESH, 2, 1, 3);
+  row(m, 3, FRESH, 2, 2, 4);
+  row(m, 4, FRESH, 1, 3);
+  assert_int_equal(4, crdt_meshmap_nexthop(m, 1, NOW, STALE, nh));
+  assert_int_equal(-1, nh[1]);     /* self: no hop */
+  assert_int_equal(2, nh[2]);
+  assert_int_equal(2, nh[3]);
+  assert_int_equal(2, nh[4]);
+  free(m);
+}
+
+static void test_nexthop_star(void **state)
+{
+  struct CrdtMeshMap *m = new_map();
+  int16_t nh[CRDT_MAX_SERVERS];
+  (void)state;
+  /* hub 1 -> each spoke is its own next hop */
+  row(m, 1, FRESH, 3, 2, 3, 4);
+  row(m, 2, FRESH, 1, 1);
+  row(m, 3, FRESH, 1, 1);
+  row(m, 4, FRESH, 1, 1);
+  assert_int_equal(4, crdt_meshmap_nexthop(m, 1, NOW, STALE, nh));
+  assert_int_equal(2, nh[2]);
+  assert_int_equal(3, nh[3]);
+  assert_int_equal(4, nh[4]);
+  free(m);
+}
+
+static void test_nexthop_diamond_and_leaf(void **state)
+{
+  struct CrdtMeshMap *m = new_map();
+  int16_t nh[CRDT_MAX_SERVERS];
+  (void)state;
+  /* diamond: 1-{2,3}; 2-{1,4}; 3-{1,4}; 4-{2,3} */
+  row(m, 1, FRESH, 2, 2, 3);
+  row(m, 2, FRESH, 2, 1, 4);
+  row(m, 3, FRESH, 2, 1, 4);
+  row(m, 4, FRESH, 2, 2, 3);
+  assert_int_equal(4, crdt_meshmap_nexthop(m, 1, NOW, STALE, nh));
+  assert_int_equal(-1, nh[1]);
+  assert_int_equal(2, nh[2]);
+  assert_int_equal(3, nh[3]);
+  assert_int_equal(2, nh[4]);      /* 4 via 2 (2<3 tie-break, matches _spanning) */
+  /* from leaf 4: reach 1 via lower-numeric parent 2 */
+  assert_int_equal(4, crdt_meshmap_nexthop(m, 4, NOW, STALE, nh));
+  assert_int_equal(2, nh[1]);
+  assert_int_equal(2, nh[2]);
+  assert_int_equal(3, nh[3]);
+  assert_int_equal(-1, nh[4]);
+  free(m);
+}
+
+static void test_nexthop_partition(void **state)
+{
+  struct CrdtMeshMap *m = new_map();
+  int16_t nh[CRDT_MAX_SERVERS];
+  (void)state;
+  /* 1-2-3-4, node 3 stale -> 3,4 unreachable */
+  row(m, 1, FRESH, 1, 2);
+  row(m, 2, FRESH, 2, 1, 3);
+  row(m, 3, OLD,   2, 2, 4);
+  row(m, 4, FRESH, 1, 3);
+  assert_int_equal(2, crdt_meshmap_nexthop(m, 1, NOW, STALE, nh));
+  assert_int_equal(2, nh[2]);
+  assert_int_equal(-1, nh[3]);
+  assert_int_equal(-1, nh[4]);
+  free(m);
+}
+
+/* ---- MR-0: canonical (root-free, Kruskal-lex) broadcast tree ------------- */
+
+static void test_canon_tree_triangle(void **state)
+{
+  struct CrdtMeshMap *m = new_map();
+  uint16_t tu[16], tv[16];
+  int n;
+  (void)state;
+  row(m, 1, FRESH, 2, 2, 3);
+  row(m, 2, FRESH, 2, 1, 3);
+  row(m, 3, FRESH, 2, 1, 2);
+  n = crdt_meshmap_canon_tree(m, NOW, STALE, tu, tv, 16);
+  /* lex-min spanning tree = {(1,2),(1,3)} -- VIEWPOINT-INDEPENDENT, not a BFS-from-X */
+  assert_int_equal(2, n);
+  assert_true(has_edge(tu, tv, n, 1, 2));
+  assert_true(has_edge(tu, tv, n, 1, 3));
+  assert_false(has_edge(tu, tv, n, 2, 3));
+  free(m);
+}
+
+static void test_canon_tree_diamond(void **state)
+{
+  struct CrdtMeshMap *m = new_map();
+  uint16_t tu[16], tv[16];
+  int n;
+  (void)state;
+  row(m, 1, FRESH, 2, 2, 3);
+  row(m, 2, FRESH, 2, 1, 4);
+  row(m, 3, FRESH, 2, 1, 4);
+  row(m, 4, FRESH, 2, 2, 3);
+  n = crdt_meshmap_canon_tree(m, NOW, STALE, tu, tv, 16);
+  /* edges (1,2)(1,3)(2,4)(3,4); Kruskal adds first 3, (3,4) closes a cycle */
+  assert_int_equal(3, n);
+  assert_true(has_edge(tu, tv, n, 1, 2));
+  assert_true(has_edge(tu, tv, n, 1, 3));
+  assert_true(has_edge(tu, tv, n, 2, 4));
+  assert_false(has_edge(tu, tv, n, 3, 4));
+  free(m);
+}
+
+static void test_canon_tree_k4_and_forest(void **state)
+{
+  struct CrdtMeshMap *m = new_map();
+  uint16_t tu[16], tv[16];
+  int n;
+  (void)state;
+  /* K4: lex-min = star at the lowest numeric */
+  row(m, 1, FRESH, 3, 2, 3, 4);
+  row(m, 2, FRESH, 3, 1, 3, 4);
+  row(m, 3, FRESH, 3, 1, 2, 4);
+  row(m, 4, FRESH, 3, 1, 2, 3);
+  n = crdt_meshmap_canon_tree(m, NOW, STALE, tu, tv, 16);
+  assert_int_equal(3, n);
+  assert_true(has_edge(tu, tv, n, 1, 2));
+  assert_true(has_edge(tu, tv, n, 1, 3));
+  assert_true(has_edge(tu, tv, n, 1, 4));
+
+  /* disconnected forest {1,2}+{5,6} -> 2 trees */
+  crdt_meshmap_init(m);
+  row(m, 1, FRESH, 1, 2);
+  row(m, 2, FRESH, 1, 1);
+  row(m, 5, FRESH, 1, 6);
+  row(m, 6, FRESH, 1, 5);
+  n = crdt_meshmap_canon_tree(m, NOW, STALE, tu, tv, 16);
+  assert_int_equal(2, n);
+  assert_true(has_edge(tu, tv, n, 1, 2));
+  assert_true(has_edge(tu, tv, n, 5, 6));
+  free(m);
+}
+
+static void test_canon_tree_stale_and_truncation(void **state)
+{
+  struct CrdtMeshMap *m = new_map();
+  uint16_t tu[16], tv[16];
+  int n;
+  (void)state;
+  /* chain 1-2-3-4 with 3 stale -> only edge (1,2) (both endpoints fresh) */
+  row(m, 1, FRESH, 1, 2);
+  row(m, 2, FRESH, 2, 1, 3);
+  row(m, 3, OLD,   2, 2, 4);
+  row(m, 4, FRESH, 1, 3);
+  n = crdt_meshmap_canon_tree(m, NOW, STALE, tu, tv, 16);
+  assert_int_equal(1, n);
+  assert_true(has_edge(tu, tv, n, 1, 2));
+
+  /* truncation: K4 tree has 3 edges; cap at 1 -> returns total 3, writes 1 */
+  crdt_meshmap_init(m);
+  row(m, 1, FRESH, 3, 2, 3, 4);
+  row(m, 2, FRESH, 3, 1, 3, 4);
+  row(m, 3, FRESH, 3, 1, 2, 4);
+  row(m, 4, FRESH, 3, 1, 2, 3);
+  n = crdt_meshmap_canon_tree(m, NOW, STALE, tu, tv, 1);
+  assert_int_equal(3, n);
+  free(m);
+}
+
 /* S4/R7: the cutover suppression truth table.  Suppress a P10 SERVER/SQUIT
  * primitive (let the beacon carry presence) IFF all four bits hold. */
 static void test_should_suppress_tree(void **state)
@@ -308,6 +495,14 @@ int main(void)
     cmocka_unit_test(test_crossedges_triangle),
     cmocka_unit_test(test_crossedges_diamond_and_truncation),
     cmocka_unit_test(test_set_diff),
+    cmocka_unit_test(test_nexthop_chain),
+    cmocka_unit_test(test_nexthop_star),
+    cmocka_unit_test(test_nexthop_diamond_and_leaf),
+    cmocka_unit_test(test_nexthop_partition),
+    cmocka_unit_test(test_canon_tree_triangle),
+    cmocka_unit_test(test_canon_tree_diamond),
+    cmocka_unit_test(test_canon_tree_k4_and_forest),
+    cmocka_unit_test(test_canon_tree_stale_and_truncation),
     cmocka_unit_test(test_should_suppress_tree),
   };
   return cmocka_run_group_tests(tests, NULL, NULL);

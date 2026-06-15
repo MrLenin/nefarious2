@@ -177,6 +177,16 @@ void crdt_shadow_verify(struct Client *to);
  *  a Client -> NOTICE (/CRDT status). */
 void crdt_shadow_presence_diff(struct Client *to);
 
+/** MR-0 ROUTING SHADOW ORACLE (log-only, mutates nothing): for every CRDT-aware
+ *  destination server, diff the derived mesh next-hop (crdt_meshmap_nexthop from
+ *  this node) against the P10 tree's actual next-hop (cli_from), and report the
+ *  per-destination agreement: agree / mismatch / meshOnly (mesh routes it, the
+ *  tree doesn't — overlay/stub win) / p10Only (tree reaches it, the mesh has no
+ *  path — an adjacency gap to close before MR-1 trusts the table).  Measures the
+ *  routing table before anything routes over it.  @a to == NULL -> system log
+ *  (verify timer); a Client -> NOTICE (/CRDT route). */
+void crdt_shadow_route_diff(struct Client *to);
+
 /** Phase 3b dry-run: walk the doc and confirm every entity could be rebuilt
  *  from it with field-for-field fidelity against live state. Logs reconstruction
  *  gaps; mutates nothing. No-op unless FEAT_CRDT_ENABLED. */

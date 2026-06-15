@@ -38,6 +38,12 @@
  *  silent cap).  Only affects the diagram, never routing. */
 #define CRDT_MESH_MAXDEG 32
 
+/** Max undirected edges the canonical-tree builder materializes before Kruskal.
+ *  Bounds the static edge scratch; a mesh's edge count is tiny in practice
+ *  (degree is small).  Exceeding it truncates the edge set fed to Kruskal — the
+ *  integration layer logs it (no silent cap).  Only affects the broadcast tree. */
+#define CRDT_MESH_MAXEDGES (CRDT_MAX_SERVERS * 4)
+
 /** Direct-indexed by server numeric (like crdt_beacon[]).  ~size:
  *  CRDT_MAX_SERVERS * (CRDT_MESH_MAXDEG*2 + ...) — a single static instance. */
 struct CrdtMeshMap {
@@ -101,6 +107,29 @@ int crdt_meshmap_set_diff(const uint8_t *a, const uint8_t *b, uint8_t *out);
 int crdt_meshmap_crossedges(const struct CrdtMeshMap *m, time_t now, time_t stale,
                             const int16_t *parent,
                             uint16_t *out_u, uint16_t *out_v, int max);
+
+/** MR-0 unicast next-hop: for each destination, the direct neighbour of @a from
+ *  on the shortest (BFS) path toward it.  @a nexthop is int16_t[CRDT_MAX_SERVERS]:
+ *  nexthop[d] = that neighbour numeric, or -1 for @a from itself and for any
+ *  unreachable d.  Neighbours are expanded in ascending numeric order, so the
+ *  first-hop choice is deterministic and matches crdt_meshmap_spanning's parent
+ *  tie-break.  Returns the reachable count (>=1, includes @a from).  This is the
+ *  per-viewpoint routing table mesh-native unicast (MR-1) will consult; MR-0 only
+ *  derives + measures it (no routing).  Pure (cmocka-pinned). */
+int crdt_meshmap_nexthop(const struct CrdtMeshMap *m, uint16_t from,
+                         time_t now, time_t stale, int16_t *nexthop);
+
+/** MR-0 canonical broadcast tree: the VIEWPOINT-INDEPENDENT spanning forest over
+ *  FRESH edges, built by Kruskal over undirected edges keyed (min,max) ascending
+ *  with union-find — a pure function of the fresh-edge set, so EVERY node derives
+ *  the SAME tree (the shared-tree prerequisite for loop-free mesh broadcast, MR-2;
+ *  scope §4.1, root-free preferred).  An edge {u,v} (u<v) exists iff both are fresh
+ *  and (v in peers[u] OR u in peers[v]) — symmetric closure, robust to the
+ *  one-sided warmup window.  Writes up to @a max tree edges as (u<v) into @a tu /
+ *  @a tv; returns the TOTAL tree-edge count (> @a max -> truncated, like
+ *  crdt_meshmap_crossedges).  Pure (cmocka-pinned). */
+int crdt_meshmap_canon_tree(const struct CrdtMeshMap *m, time_t now, time_t stale,
+                            uint16_t *tu, uint16_t *tv, int max);
 
 /** S4/R7a pure suppression truth-table: should a P10 SQUIT (a server DEPARTURE)
  *  for a subject server be SUPPRESSED toward a peer, letting the CR H beacon set

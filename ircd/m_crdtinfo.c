@@ -1,7 +1,7 @@
 /*
  * IRC - Internet Relay Chat, ircd/m_crdtinfo.c
  *
- * Oper-facing CRDT mesh introspection: /CRDT [map|peers|status].
+ * Oper-facing CRDT mesh introspection: /CRDT [map|peers|status|route].
  *
  * Reads the gossiped mesh-topology map (crdt_meshmap, fed by CR H beacon
  * adjacency) plus locally-known server state.  Observability-only — it inspects,
@@ -16,6 +16,9 @@
  *                   direct peers); shows true mesh cross-links a tree can't.
  *   /CRDT status  - on-demand shadow-verify line + server-role census +
  *                   partition state.
+ *   /CRDT route   - MR-0 routing table: unicast next-hop per destination + the
+ *                   canonical (root-free) broadcast tree + the routing
+ *                   shadow-oracle (derived mesh next-hop vs the P10 tree).
  *
  * Reachability here is DERIVED locally (BFS over single-writer adjacency rows,
  * pruning beacon-stale nodes) — never replicated.  See crdt_meshmap.h.
@@ -224,9 +227,53 @@ static void render_status(struct Client *to)
   sendcmdto_one(&me, CMD_NOTICE, to, "%C :End of /CRDT status", to);
 }
 
+/* MR-0 routing-table view: the unicast next-hop table + the canonical broadcast
+ * tree (the inputs mesh-native routing will run on) + the routing shadow-oracle.
+ * Observability-only — derives, measures, routes nothing. */
+static void render_route(struct Client *to)
+{
+  static int16_t nh[CRDT_MAX_SERVERS];
+  static uint8_t reach[CRDT_MAX_SERVERS];
+  const struct CrdtMeshMap *mm = crdt_shadow_meshmap();
+  unsigned int ournum = (unsigned int)base64toint(cli_yxx(&me));
+  time_t now = CurrentTime, stale = crdt_shadow_beacon_stale_secs();
+  uint16_t tu[64], tv[64];
+  char buf[400];
+  int nt, i, rc, w;
+
+  /* unicast next-hop table (per-viewpoint shortest path — the MR-1 input) */
+  rc = crdt_meshmap_nexthop(mm, (uint16_t)ournum, now, stale, nh);
+  crdt_meshmap_reachable(mm, (uint16_t)ournum, now, stale, reach);
+  sendcmdto_one(&me, CMD_NOTICE, to,
+                "%C :CRDT unicast routes from %s (%d dest%s):",
+                to, cli_name(&me), rc - 1, (rc - 1 == 1) ? "" : "s");
+  for (i = 0; i < CRDT_MAX_SERVERS; i++) {
+    if (!reach[i] || (unsigned int)i == ournum)
+      continue;
+    sendcmdto_one(&me, CMD_NOTICE, to, "%C :  %s  via %s",
+                  to, name_of((unsigned int)i, ournum),
+                  (nh[i] >= 0) ? name_of((unsigned int)nh[i], ournum) : "-");
+  }
+
+  /* canonical broadcast tree (root-free Kruskal-lex — IDENTICAL on every node;
+   * the MR-2 input).  Rendered as the edge set so it is directly diffable. */
+  nt = crdt_meshmap_canon_tree(mm, now, stale, tu, tv, 64);
+  w = 0; buf[0] = '\0';
+  for (i = 0; i < nt && i < 64; i++)
+    w += ircd_snprintf(0, buf + w, sizeof buf - w, "%s%s-%s", w ? " " : "",
+                       name_of(tu[i], ournum), name_of(tv[i], ournum));
+  sendcmdto_one(&me, CMD_NOTICE, to,
+                "%C :CRDT broadcast tree (canonical, %d edge%s): %s%s",
+                to, nt, (nt == 1) ? "" : "s", buf[0] ? buf : "(none)",
+                (nt > 64) ? " ..." : "");
+
+  crdt_shadow_route_diff(to);            /* mesh next-hop vs P10 tree (oracle) */
+  sendcmdto_one(&me, CMD_NOTICE, to, "%C :End of /CRDT route", to);
+}
+
 /* --- handler ---------------------------------------------------------- */
 
-/** mo_crdt - oper /CRDT [map|peers|status] mesh introspection.
+/** mo_crdt - oper /CRDT [map|peers|status|route] mesh introspection.
  * parv[1] = optional subcommand (first letter dispatched; default map). */
 int mo_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
 {
@@ -245,6 +292,7 @@ int mo_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
   switch (c) {
     case 'p': render_peers(sptr);  break;
     case 's': render_status(sptr); break;
+    case 'r': render_route(sptr);  break;
     case 'm':
     default:  render_map(sptr);    break;
   }

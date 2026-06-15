@@ -13,6 +13,7 @@
 
 #include "crdt_meshmap.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 void crdt_meshmap_init(struct CrdtMeshMap *m)
@@ -211,6 +212,126 @@ int crdt_meshmap_crossedges(const struct CrdtMeshMap *m, time_t now, time_t stal
       }
       total++;
     }
+  }
+  return total;
+}
+
+/* ---- MR-0 routing primitives (pure, cmocka-pinned) --------------------- */
+
+int crdt_meshmap_nexthop(const struct CrdtMeshMap *m, uint16_t from,
+                         time_t now, time_t stale, int16_t *nexthop)
+{
+  static uint16_t queue[CRDT_MAX_SERVERS];
+  static uint8_t  seen[CRDT_MAX_SERVERS];
+  int head = 0, tail = 0, count = 0;
+  uint16_t u;
+  int i;
+
+  if (!m || !nexthop || from >= CRDT_MAX_SERVERS)
+    return 0;
+
+  memset(seen, 0, sizeof seen);
+  for (i = 0; i < CRDT_MAX_SERVERS; i++)
+    nexthop[i] = -1;                       /* self + unreachable -> -1 */
+
+  seen[from] = 1;
+  count = 1;
+  queue[tail++] = from;
+
+  /* same BFS as crdt_meshmap_spanning (ascending-neighbour tie-break), but we
+   * record the FIRST hop taken from `from` to reach each node instead of parent. */
+  while (head < tail) {
+    uint16_t nbr[CRDT_MESH_MAXDEG];
+    int nn = 0;
+    u = queue[head++];
+    if (!m->present[u])
+      continue;
+    for (i = 0; i < m->npeers[u]; i++) {
+      uint16_t v = m->peers[u][i];
+      if (v < CRDT_MAX_SERVERS && !seen[v] && crdt_meshmap_fresh(m, v, now, stale))
+        nbr[nn++] = v;
+    }
+    sort_u16(nbr, nn);
+    for (i = 0; i < nn; i++) {
+      uint16_t v = nbr[i];
+      if (seen[v])
+        continue;
+      seen[v] = 1;
+      nexthop[v] = (u == from) ? (int16_t)v : nexthop[u];  /* inherit u's first hop */
+      count++;
+      queue[tail++] = v;
+    }
+  }
+  return count;
+}
+
+/* ascending compare for the packed (a<<16)|b edge keys -> lex (a, then b) order */
+static int cmp_edge(const void *pa, const void *pb)
+{
+  uint32_t a = *(const uint32_t *)pa, b = *(const uint32_t *)pb;
+  return (a > b) - (a < b);
+}
+
+/* path-halving union-find find over server numerics */
+static uint16_t uf_find(uint16_t *parent, uint16_t x)
+{
+  while (parent[x] != x) {
+    parent[x] = parent[parent[x]];
+    x = parent[x];
+  }
+  return x;
+}
+
+int crdt_meshmap_canon_tree(const struct CrdtMeshMap *m, time_t now, time_t stale,
+                            uint16_t *tu, uint16_t *tv, int max)
+{
+  static uint32_t edge[CRDT_MESH_MAXEDGES];   /* packed (a<<16)|b, a<b */
+  static uint16_t parent[CRDT_MAX_SERVERS];
+  int ne = 0, total = 0;
+  int u, i;
+
+  if (!m)
+    return 0;
+
+  /* 1. materialize fresh undirected edges (symmetric closure: either endpoint
+   *    declaring the other counts).  fresh() folds in present + staleness. */
+  for (u = 0; u < CRDT_MAX_SERVERS; u++) {
+    if (!crdt_meshmap_fresh(m, (uint16_t)u, now, stale))
+      continue;
+    for (i = 0; i < m->npeers[u]; i++) {
+      uint16_t v = m->peers[u][i];
+      uint32_t a, b;
+      if (v >= CRDT_MAX_SERVERS || (int)v == u)
+        continue;
+      if (!crdt_meshmap_fresh(m, v, now, stale))
+        continue;
+      a = (uint32_t)(u < v ? u : v);
+      b = (uint32_t)(u < v ? v : u);
+      if (ne < CRDT_MESH_MAXEDGES)
+        edge[ne++] = (a << 16) | b;
+      /* else truncated -> integration layer logs (no silent cap) */
+    }
+  }
+
+  /* 2. sort lex; Kruskal scans in this canonical order (duplicates dedup for
+   *    free — a second copy of an edge finds its endpoints already unioned). */
+  qsort(edge, ne, sizeof edge[0], cmp_edge);
+
+  for (u = 0; u < CRDT_MAX_SERVERS; u++)
+    parent[u] = (uint16_t)u;
+
+  for (i = 0; i < ne; i++) {
+    uint16_t a = (uint16_t)(edge[i] >> 16);
+    uint16_t b = (uint16_t)(edge[i] & 0xFFFF);
+    uint16_t ra = uf_find(parent, a), rb = uf_find(parent, b);
+    if (ra == rb)
+      continue;                            /* cycle or duplicate */
+    parent[ra] = rb;
+    if (total < max && tu && tv) {
+      tu[total] = a;
+      tv[total] = b;
+    }
+    total++;
   }
   return total;
 }

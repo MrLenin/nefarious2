@@ -1079,6 +1079,71 @@ void crdt_shadow_presence_diff(struct Client *to)
               d_bb, bfs_only_b, beacon_only, d_bp, bfs_only_p, p10_only);
 }
 
+/* MR-0 routing shadow-oracle — see crdt_shadow.h.  Mirrors presence_diff: derive
+ * the mesh next-hop table from the mesh-map, build the P10 tree's next-hop table
+ * from cli_from, and diff them per CRDT-aware destination.  Log-only; mutates
+ * nothing.  The "measure first" artifact the routing layer needs before MR-1
+ * routes anything (scope §7a). */
+void crdt_shadow_route_diff(struct Client *to)
+{
+  static int16_t mesh_nh[CRDT_MAX_SERVERS];
+  static int16_t p10_nh[CRDT_MAX_SERVERS];
+  const struct CrdtMeshMap *mm = crdt_shadow_meshmap();
+  struct Client *acptr;
+  unsigned int ournum;
+  time_t now = CurrentTime, stale = CRDT_BEACON_STALE;
+  int agree = 0, mismatch = 0, mesh_only = 0, p10_only = 0;
+  int i;
+
+  if (!shadow_on() || !feature_bool(FEAT_CRDT_PRIMARY))
+    return;
+  ournum = (unsigned int)base64toint(cli_yxx(&me));
+
+  /* mesh next-hop: shortest-path first hop from us over the converged mesh-map */
+  crdt_meshmap_nexthop(mm, (uint16_t)ournum, now, stale, mesh_nh);
+
+  /* P10 next-hop: cli_from(d) is our direct neighbour toward d (== d if directly
+   * linked).  Only CRDT-aware, non-stub servers are comparable. */
+  for (i = 0; i < CRDT_MAX_SERVERS; i++)
+    p10_nh[i] = -1;
+  for (acptr = GlobalClientList; acptr; acptr = cli_next(acptr)) {
+    unsigned int dn;
+    struct Client *via;
+    if (!IsServer(acptr) || !IsCrdtAware(acptr) || IsMeshStub(acptr) || acptr == &me)
+      continue;
+    dn = (unsigned int)base64toint(cli_yxx(acptr));
+    if (dn >= CRDT_MAX_SERVERS)
+      continue;
+    via = cli_from(acptr);
+    if (via && IsServer(via)) {
+      unsigned int vn = (unsigned int)base64toint(cli_yxx(via));
+      p10_nh[dn] = (vn < CRDT_MAX_SERVERS) ? (int16_t)vn : (int16_t)dn;
+    } else {
+      p10_nh[dn] = (int16_t)dn;            /* directly attached */
+    }
+  }
+
+  for (i = 0; i < CRDT_MAX_SERVERS; i++) {
+    int hasm, hasp;
+    if ((unsigned int)i == ournum)
+      continue;
+    hasm = (mesh_nh[i] >= 0);
+    hasp = (p10_nh[i] >= 0);
+    if (hasm && hasp) {
+      if (mesh_nh[i] == p10_nh[i]) agree++;
+      else mismatch++;
+    }
+    else if (hasm)
+      mesh_only++;                         /* overlay/stub win (expected) */
+    else if (hasp)
+      p10_only++;                          /* adjacency gap to close before MR-1 */
+  }
+
+  verify_emit(to,
+              "CRDT route-diff: agree %d mismatch %d meshOnly %d p10Only %d",
+              agree, mismatch, mesh_only, p10_only);
+}
+
 /* ---- Phase 3b dry-run materialization check (doc -> live fidelity) ----
  * The inverse of crdt_shadow_verify (which walks live -> doc). For every entity
  * in the DOC, confirm a live entity exists with field-for-field fidelity over the
@@ -2671,6 +2736,7 @@ static void crdt_shadow_verify_cb(struct Event *ev)
    * retire (retire frees the stub + its users -> can't free a live iterator). */
   crdt_gossip_beacon();
   crdt_shadow_presence_diff(NULL);  /* Tier-2 S1 shadow oracle: log signal divergences (no mutation) */
+  crdt_shadow_route_diff(NULL);     /* MR-0 routing oracle: mesh next-hop vs P10 tree (no mutation) */
   {
     struct Client *acptr, *stale[16];
     int ns = 0, k;
