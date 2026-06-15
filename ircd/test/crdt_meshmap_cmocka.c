@@ -460,6 +460,26 @@ static void test_canon_tree_stale_and_truncation(void **state)
   free(m);
 }
 
+/* MR-1: the unicast routing decision (deliver / drop / next-hop / flood). */
+static void test_route_action(void **state)
+{
+  (void)state;
+  /* owner short-circuits regardless of ttl/nexthop */
+  assert_int_equal(CRDT_ROUTE_DELIVER, crdt_route_action(1, 0, 0));
+  assert_int_equal(CRDT_ROUTE_DELIVER, crdt_route_action(1, 1, 5));
+  assert_int_equal(CRDT_ROUTE_DELIVER, crdt_route_action(1, 0, -3));
+  /* not owner: ttl backstop fires before route/flood */
+  assert_int_equal(CRDT_ROUTE_DROP, crdt_route_action(0, 1, 0));
+  assert_int_equal(CRDT_ROUTE_DROP, crdt_route_action(0, 0, 0));
+  assert_int_equal(CRDT_ROUTE_DROP, crdt_route_action(0, 1, -1));
+  /* not owner, ttl left: next-hop known -> route */
+  assert_int_equal(CRDT_ROUTE_NEXTHOP, crdt_route_action(0, 1, 1));
+  assert_int_equal(CRDT_ROUTE_NEXTHOP, crdt_route_action(0, 1, 32));
+  /* not owner, ttl left, next-hop unknown -> flood fallback */
+  assert_int_equal(CRDT_ROUTE_FLOOD, crdt_route_action(0, 0, 1));
+  assert_int_equal(CRDT_ROUTE_FLOOD, crdt_route_action(0, 0, 32));
+}
+
 /* S4/R7: the cutover suppression truth table.  Suppress a P10 SERVER/SQUIT
  * primitive (let the beacon carry presence) IFF all four bits hold. */
 static void test_should_suppress_tree(void **state)
@@ -503,6 +523,7 @@ int main(void)
     cmocka_unit_test(test_canon_tree_diamond),
     cmocka_unit_test(test_canon_tree_k4_and_forest),
     cmocka_unit_test(test_canon_tree_stale_and_truncation),
+    cmocka_unit_test(test_route_action),
     cmocka_unit_test(test_should_suppress_tree),
   };
   return cmocka_run_group_tests(tests, NULL, NULL);

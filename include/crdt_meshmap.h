@@ -131,6 +131,24 @@ int crdt_meshmap_nexthop(const struct CrdtMeshMap *m, uint16_t from,
 int crdt_meshmap_canon_tree(const struct CrdtMeshMap *m, time_t now, time_t stale,
                             uint16_t *tu, uint16_t *tv, int max);
 
+/** MR-1 pure routing decision for a unicast CR frame at a node.  Inputs are 0/1
+ *  except @a ttl_remaining (the frame's TTL as seen here, before decrement):
+ *  @a owner_is_self (this node owns the target / the target is local here),
+ *  @a nexthop_known (the routing table has a next-hop toward the owner),
+ *  @a ttl_remaining.  Result:
+ *    CRDT_ROUTE_DELIVER  — target is here, hand to the local user (ttl/nexthop n/a).
+ *    CRDT_ROUTE_DROP     — ttl exhausted (the storm backstop; only when not owner).
+ *    CRDT_ROUTE_NEXTHOP  — forward to the single next-hop peer toward the owner.
+ *    CRDT_ROUTE_FLOOD    — next-hop unknown/stale -> flood-fallback (§4.1 robustness).
+ *  Pure so the decision is cmocka-pinned. */
+enum CrdtRouteAction {
+  CRDT_ROUTE_DELIVER = 0,
+  CRDT_ROUTE_DROP,
+  CRDT_ROUTE_NEXTHOP,
+  CRDT_ROUTE_FLOOD
+};
+int crdt_route_action(int owner_is_self, int nexthop_known, int ttl_remaining);
+
 /** S4/R7a pure suppression truth-table: should a P10 SQUIT (a server DEPARTURE)
  *  for a subject server be SUPPRESSED toward a peer, letting the CR H beacon set
  *  carry the departure instead (stale beacon + keep-gate + sweep)?  All four

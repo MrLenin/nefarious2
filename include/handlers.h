@@ -347,6 +347,12 @@ extern void crdt_send_snapshot(struct Client* to);
  *  (unicast) or a #channel name (deliver to local channel members). */
 extern void crdt_gossip_message(struct Client* from, char cmd, const char* target,
                                 const char* msgid, const char* text);
+/** MR-1: try to route a user-unicast over the CRDT mesh instead of the P10 tree.
+ *  Returns 1 if handled over CR (caller MUST skip the P10 send), 0 to use P10.
+ *  Mesh-stub target -> always CR (partition fallback); live CRDT-aware target ->
+ *  CR only under FEAT_CRDT_ROUTE_UNICAST.  @a cmd 'P'/'N'/'T'. */
+extern int crdt_route_unicast_try(struct Client* from, char cmd, struct Client* tgt,
+                                  const char* msgid, const char* text);
 /** Tier2 full-partition liveness: gossip an ephemeral CR H liveness beacon
  *  (CR H <ourYXX> <CurrentTime>) over every CRDT transport.  Receivers track
  *  the last beacon per server; a mesh stub whose beacon goes stale is retired. */

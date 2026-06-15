@@ -1369,6 +1369,7 @@ static struct FeatureDesc {
   F_I(CRDT_STALE_TIMEOUT, 0, 300, 0),
   F_I(CRDT_OPLOG_MAX, 0, 100000, 0),
   F_B(CRDT_MESHMAP_PRESENCE, 0, 0, 0),
+  F_B(CRDT_ROUTE_UNICAST, 0, 0, 0),
 
 #undef F_S
 #undef F_B

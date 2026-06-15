@@ -336,6 +336,22 @@ int crdt_meshmap_canon_tree(const struct CrdtMeshMap *m, time_t now, time_t stal
   return total;
 }
 
+/* MR-1: the unicast routing decision at a node, isolated as a pure function so the
+ * deliver/route/flood-fallback/drop logic is cmocka-pinned.  The integration layer
+ * (crdt_route_unicast + the ms_crdt M unicast relay) feeds it live Client/next-hop
+ * state.  Order matters: owner short-circuits (target is here regardless of ttl);
+ * then the ttl backstop; then route-vs-flood on next-hop knowledge. */
+int crdt_route_action(int owner_is_self, int nexthop_known, int ttl_remaining)
+{
+  if (owner_is_self)
+    return CRDT_ROUTE_DELIVER;
+  if (ttl_remaining <= 0)
+    return CRDT_ROUTE_DROP;
+  if (nexthop_known)
+    return CRDT_ROUTE_NEXTHOP;
+  return CRDT_ROUTE_FLOOD;
+}
+
 /* S4/R7: the cutover suppression rule, isolated as a pure 4-bit AND so the
  * truth table is cmocka-pinned (see crdt_should_suppress_tree in the header).
  * The integration layer (crdt_tree_presence_suppress) feeds it the live feature

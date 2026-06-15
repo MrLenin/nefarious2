@@ -23,6 +23,7 @@
 #include "ircd_alloc.h"
 #include "ircd_features.h"
 #include "ircd_log.h"
+#include "ircd_snprintf.h"  /* MR-1: ircd_snprintf (route target numeric) */
 #include "handlers.h"
 #include "msg.h"
 #include "numnicks.h"
@@ -33,6 +34,7 @@
 #include "hash.h"         /* Tier2 T2-b: FindChannel (CR M channel deliver) */
 
 #include "crdt_shadow.h"
+#include "crdt_meshmap.h"  /* MR-1: crdt_meshmap_nexthop + crdt_route_action */
 #include "crdt_wire.h"
 #include "s2s_chunk.h"
 
@@ -203,6 +205,15 @@ void crdt_send_snapshot(struct Client *to)
 #define CRDT_M_SEEN_WINDOW 90        /* s; > worst-case mesh propagation latency */
 static struct CrdtMsgidDedup crdt_m_seen;   /* static zero-init => all slots empty */
 
+/* MR-1: TTL/hop-limit on every routed CR M frame (the §0 prerequisite).  A
+ * storm-backstop, NOT a delivery limiter — set far above any realistic mesh
+ * diameter so no deliverable message is ever dropped; it only bounds a loop over a
+ * transiently-inconsistent next-hop graph (esp. msgid-less "*" unicast, which the
+ * dedup set cannot catch).  Carried as an optional positional before the trailing
+ * text: "M <msgid> <cmd> <src> <tgt> <ttl> :<text>" (parc>=8); an old-form frame
+ * (parc==7) has no ttl and defaults here, and an old relayer simply strips it. */
+#define CRDT_M_TTL_DEFAULT 32
+
 /* return 1 if msgid was already seen within the window (dup), else record it -> 0. */
 static int crdt_m_seen_check_add(const char *msgid)
 {
@@ -223,9 +234,89 @@ void crdt_gossip_message(struct Client *from, char cmd, const char *target,
   crdt_m_seen_check_add(msgid);        /* record so an echo/relay-back is deduped */
   for (acptr = GlobalClientList; acptr; acptr = cli_next(acptr))
     if (IsCrdtSyncTarget(acptr))
-      sendcmdto_one(&me, CMD_CRDT_REPLICATION, acptr, "M %s %c %s%s %s :%s",
+      sendcmdto_one(&me, CMD_CRDT_REPLICATION, acptr, "M %s %c %s%s %s %d :%s",
                     msgid && *msgid ? msgid : "*", cmd,
-                    NumNick(from), target, text);
+                    NumNick(from), target, CRDT_M_TTL_DEFAULT, text);
+}
+
+/* MR-1: the direct CRDT peer (server link or overlay) whose numeric == @a num,
+ * i.e. the link to forward a next-hop-routed frame on.  NULL if no such peer is
+ * currently a sync target (its link dropped -> caller flood-falls-back). */
+static struct Client *crdt_peer_by_num(unsigned int num)
+{
+  struct Client *p;
+  for (p = GlobalClientList; p; p = cli_next(p))
+    if (IsCrdtSyncTarget(p) && (unsigned int)base64toint(cli_yxx(p)) == num)
+      return p;
+  return NULL;
+}
+
+/* MR-1: try to deliver a user-unicast over the CRDT mesh instead of the P10 tree.
+ * Returns 1 if handled over CR (caller MUST skip the P10 send), 0 to use P10.
+ *  - target on a mesh STUB -> always over CR (its P10 path is a dead-sink): the
+ *    proven partition fallback, flag-independent.
+ *  - target on a live CRDT-aware server -> over CR only when FEAT_CRDT_ROUTE_UNICAST
+ *    (the MR-1 primary path); else 0 -> P10 (today's behaviour).
+ * Send shape: flag on -> next-hop toward the owner (crdt_meshmap_nexthop), the one
+ * peer, flood-fallback if the next-hop is unknown/stale; flag off (stub only) ->
+ * the proven flood.  @a cmd 'P'/'N'/'T'; @a text is the body (or client-tag string
+ * for 'T'). */
+int crdt_route_unicast_try(struct Client *from, char cmd, struct Client *tgt,
+                           const char *msgid, const char *text)
+{
+  static int16_t nh[CRDT_MAX_SERVERS];
+  struct Client *tsrv, *peer;
+  char tyxx[6];
+  const char *mid;
+  unsigned int owner, ournum;
+  int known = 0;
+
+  if (!crdt_shadow_active() || !from || !tgt || !cli_user(tgt) || !text)
+    return 0;
+  tsrv = cli_user(tgt)->server;
+  if (!tsrv)
+    return 0;
+  if (!IsMeshStub(tsrv) &&
+      !(feature_bool(FEAT_CRDT_ROUTE_UNICAST) && IsServer(tsrv) && IsCrdtAware(tsrv)))
+    return 0;                            /* live CRDT target + flag off -> use P10 */
+
+  ircd_snprintf(0, tyxx, sizeof tyxx, "%s%s", NumNick(tgt));
+  mid = (msgid && *msgid) ? msgid : "*";
+
+  /* flag off (only reachable for a mesh stub here) -> the proven flood */
+  if (!feature_bool(FEAT_CRDT_ROUTE_UNICAST)) {
+    crdt_gossip_message(from, cmd, tyxx, mid, text);
+    return 1;
+  }
+
+  /* flag on -> next-hop route toward the owner */
+  owner  = (unsigned int)base64toint(cli_yxx(tsrv));
+  ournum = (unsigned int)base64toint(cli_yxx(&me));
+  if (owner < CRDT_MAX_SERVERS) {
+    crdt_meshmap_nexthop(crdt_shadow_meshmap(), (uint16_t)ournum, CurrentTime,
+                         crdt_shadow_beacon_stale_secs(), nh);
+    known = (nh[owner] >= 0);
+  }
+  switch (crdt_route_action(owner == ournum, known, CRDT_M_TTL_DEFAULT)) {
+  case CRDT_ROUTE_NEXTHOP:
+    peer = crdt_peer_by_num((unsigned int)nh[owner]);
+    if (peer) {
+      crdt_m_seen_check_add(mid);        /* dedup our own relay-back */
+      sendcmdto_one(&me, CMD_CRDT_REPLICATION, peer, "M %s %c %s%s %s %d :%s",
+                    mid, cmd, NumNick(from), tyxx, CRDT_M_TTL_DEFAULT, text);
+      break;
+    }
+    /* fallthrough: next-hop peer vanished -> flood */
+  case CRDT_ROUTE_FLOOD:
+    crdt_gossip_message(from, cmd, tyxx, mid, text);
+    break;
+  case CRDT_ROUTE_DELIVER:              /* owner is us (remote target can't be) -> let the
+                                          caller deliver locally via the normal path */
+    return 0;
+  case CRDT_ROUTE_DROP:                 /* full TTL: never here */
+    break;
+  }
+  return 1;
 }
 
 /* Tier2 full-partition liveness: gossip our ephemeral liveness beacon
@@ -379,11 +470,15 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
     const char *m_msgid, *m_cmd, *srcyxx, *target, *m_text, *cmdstr;
     const struct CrdtUserRecord *src;
     struct Client *p;
-    int is_tag;
+    int is_tag, ttl, ttl_next;
     if (parc < 7)
       return 0;
     m_msgid = parv[2]; m_cmd = parv[3]; srcyxx = parv[4]; target = parv[5];
     m_text = parv[parc - 1];
+    /* MR-1: optional TTL positional before the trailing text (new form parc>=8);
+     * an old-form frame (parc==7) carries none and defaults. */
+    ttl = (parc >= 8) ? atoi(parv[6]) : CRDT_M_TTL_DEFAULT;
+    ttl_next = ttl - 1;
     if (crdt_m_seen_check_add(m_msgid))
       return 0;                        /* already handled via another mesh path */
     is_tag = (m_cmd[0] == 'T');
@@ -466,11 +561,58 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
           sendrawto_one(tgt, ":%s %s %s :%s", srcyxx, cmdstr, cli_name(tgt), m_text);
       }
     }
-    }  /* R4a: end local-delivery dedup guard (the flood relay below always runs) */
-    for (p = GlobalClientList; p; p = cli_next(p))   /* gossip relay (excl source) */
-      if (p != cptr && IsCrdtSyncTarget(p))
-        sendcmdto_one(&me, CMD_CRDT_REPLICATION, p, "M %s %s %s %s :%s",
-                      m_msgid, m_cmd, srcyxx, target, m_text);
+    }  /* R4a: end local-delivery dedup guard (the relay below always runs) */
+    /* MR-1 relay (TTL-bounded): a CHANNEL target is a broadcast -> flood onward
+     * (every member-bearing server; dedup + TTL terminate it); a UNICAST target
+     * is routed toward its owner -- next-hop when FEAT_CRDT_ROUTE_UNICAST and the
+     * route is known, flood-fallback otherwise (the proven partition path / an
+     * unknown next-hop), DROP on TTL exhaustion. */
+    if (target[0] == '#' || target[0] == '&') {
+      if (ttl_next > 0)
+        for (p = GlobalClientList; p; p = cli_next(p))
+          if (p != cptr && IsCrdtSyncTarget(p))
+            sendcmdto_one(&me, CMD_CRDT_REPLICATION, p, "M %s %s %s %s %d :%s",
+                          m_msgid, m_cmd, srcyxx, target, ttl_next, m_text);
+    } else {
+      struct Client *tgt2 = findNUser(target);
+      int owner_self = (tgt2 && MyConnect(tgt2));
+      int route_on = feature_bool(FEAT_CRDT_ROUTE_UNICAST);
+      int known = 0, do_flood = 0;
+      int16_t nhp = -1;
+      if (route_on && tgt2 && cli_user(tgt2) && cli_user(tgt2)->server) {
+        unsigned int owner = (unsigned int)base64toint(cli_yxx(cli_user(tgt2)->server));
+        unsigned int ournum = (unsigned int)base64toint(cli_yxx(&me));
+        if (owner < CRDT_MAX_SERVERS) {
+          static int16_t nh[CRDT_MAX_SERVERS];
+          crdt_meshmap_nexthop(crdt_shadow_meshmap(), (uint16_t)ournum, CurrentTime,
+                               crdt_shadow_beacon_stale_secs(), nh);
+          nhp = nh[owner]; known = (nhp >= 0);
+        }
+      }
+      /* flag off -> flood (today's proven partition path); flag on -> route_action */
+      switch (route_on ? crdt_route_action(owner_self, known, ttl_next)
+                       : (owner_self ? CRDT_ROUTE_DELIVER
+                                     : (ttl_next > 0 ? CRDT_ROUTE_FLOOD : CRDT_ROUTE_DROP))) {
+      case CRDT_ROUTE_NEXTHOP: {
+        struct Client *peer = crdt_peer_by_num((unsigned int)nhp);
+        if (peer && peer != cptr)
+          sendcmdto_one(&me, CMD_CRDT_REPLICATION, peer, "M %s %s %s %s %d :%s",
+                        m_msgid, m_cmd, srcyxx, target, ttl_next, m_text);
+        else if (!peer)
+          do_flood = 1;                  /* next-hop peer vanished -> flood */
+        break;
+      }
+      case CRDT_ROUTE_FLOOD:  do_flood = 1; break;
+      case CRDT_ROUTE_DELIVER:           /* owner is us: delivered locally above */
+      case CRDT_ROUTE_DROP:              /* TTL exhausted */
+        break;
+      }
+      if (do_flood)
+        for (p = GlobalClientList; p; p = cli_next(p))
+          if (p != cptr && IsCrdtSyncTarget(p))
+            sendcmdto_one(&me, CMD_CRDT_REPLICATION, p, "M %s %s %s %s %d :%s",
+                          m_msgid, m_cmd, srcyxx, target, ttl_next, m_text);
+    }
   } else if (sub[0] == 'H' && !sub[1]) {
     /* Tier2 full-partition liveness beacon — H <srvYXX> <emit_ts> [<nn_cap> :<name>].
      * Record + relay if FRESH (newer emit_ts); a dup/old beacon drops, terminating

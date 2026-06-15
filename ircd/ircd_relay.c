@@ -1430,20 +1430,12 @@ void relay_private_message(struct Client* sptr, const char* name, const char* te
                   (unsigned long)(tv.tv_usec / 1000));
   }
 
-  /* Tier2 T2-b: if the target lives on a mesh stub (its P10 tree path is down but
-   * it is mesh-reachable), the normal send resolves cli_from -> the dead-sink stub
-   * and drops.  Gossip via ephemeral CR M instead (delivered on the target's home
-   * server, deduped by msgid), then SKIP the dead-sink P10 send + bouncer forwards
-   * below — but still fall through to echo-message + history (delivery completeness
-   * for a mesh-only target). */
-  int mesh_delivered = 0;
-  if (cli_user(acptr) && cli_user(acptr)->server &&
-      IsMeshStub(cli_user(acptr)->server)) {
-    char tyxx[6];
-    ircd_snprintf(0, tyxx, sizeof tyxx, "%s%s", NumNick(acptr));
-    crdt_gossip_message(sptr, 'P', tyxx, pm_msgid, mytext);
-    mesh_delivered = 1;
-  }
+  /* Tier2 T2-b / MR-1: route the PM over the CRDT mesh instead of the P10 tree when
+   * the target is on a mesh stub (its P10 path is a dead-sink -> always) or, under
+   * FEAT_CRDT_ROUTE_UNICAST, on any live CRDT-aware server (the MR-1 primary path).
+   * Returns 1 -> handled over CR: SKIP the dead-sink/tree P10 send + bouncer forwards
+   * below, but still fall through to echo-message + history (delivery completeness). */
+  int mesh_delivered = crdt_route_unicast_try(sptr, 'P', acptr, pm_msgid, mytext);
 
   /* Alias source rewriting for S2S legacy compat.
    * If target is on the primary's server direction, keep alias numeric
@@ -1659,17 +1651,11 @@ void relay_private_notice(struct Client* sptr, const char* name, const char* tex
                   (unsigned long)(tv.tv_usec / 1000));
   }
 
-  /* Tier2 T2-b: NOTICE to a mesh-only user -> gossip via ephemeral CR M (the
-   * normal send would resolve cli_from -> the dead-sink stub and drop); skip the
-   * dead-sink send + bouncer forwards below but still echo + store history. */
-  int mesh_delivered = 0;
-  if (cli_user(acptr) && cli_user(acptr)->server &&
-      IsMeshStub(cli_user(acptr)->server)) {
-    char tyxx[6];
-    ircd_snprintf(0, tyxx, sizeof tyxx, "%s%s", NumNick(acptr));
-    crdt_gossip_message(sptr, 'N', tyxx, pm_msgid, mytext);
-    mesh_delivered = 1;
-  }
+  /* Tier2 T2-b / MR-1: route the NOTICE over the CRDT mesh instead of the P10 tree
+   * (mesh-stub target -> always; live CRDT-aware target -> under FEAT_CRDT_ROUTE_UNICAST).
+   * 1 -> handled over CR: skip the dead-sink/tree send + bouncer forwards below, still
+   * echo + store history. */
+  int mesh_delivered = crdt_route_unicast_try(sptr, 'N', acptr, pm_msgid, mytext);
 
   /* Alias source rewriting (see relay_private_message).
    * Skipped for a mesh-delivered target (gossiped via CR M above). */
@@ -1811,16 +1797,12 @@ void server_relay_private_message(struct Client* sptr, const char* name, const c
                   (unsigned long)(tv.tv_usec / 1000));
   }
 
-  /* Tier2 P2: remote-origin (server-relayed) PM to a mesh-only target (its P10 tree
-   * path is a dead-sink mesh stub/anchor) -> gossip over the mesh instead of the
-   * dropped forward; delivered + deduped on the target's home server. */
-  if (cli_user(acptr) && cli_user(acptr)->server &&
-      IsMeshStub(cli_user(acptr)->server)) {
-    char tyxx[6];
-    ircd_snprintf(0, tyxx, sizeof tyxx, "%s%s", NumNick(acptr));
-    crdt_gossip_message(from, 'P', tyxx, pm_msgid[0] ? pm_msgid : "*", text);
+  /* Tier2 P2 / MR-1: remote-origin (server-relayed) PM -> route over the CRDT mesh
+   * instead of the dropped dead-sink forward (mesh-stub target -> always; live
+   * CRDT-aware target -> under FEAT_CRDT_ROUTE_UNICAST); delivered + deduped on the
+   * owner. 1 -> handled over CR, done. */
+  if (crdt_route_unicast_try(from, 'P', acptr, pm_msgid, text))
     return;
-  }
 
   /* Per-target direction guard for split S2S delivery:
    * If target is behind the primary's server direction, keep alias numeric
@@ -1931,15 +1913,11 @@ void server_relay_private_notice(struct Client* sptr, const char* name, const ch
                   (unsigned long)(tv.tv_usec / 1000));
   }
 
-  /* Tier2 P2: remote-origin NOTICE to a mesh-only target -> gossip over the mesh
-   * instead of the dropped dead-sink forward. */
-  if (cli_user(acptr) && cli_user(acptr)->server &&
-      IsMeshStub(cli_user(acptr)->server)) {
-    char tyxx[6];
-    ircd_snprintf(0, tyxx, sizeof tyxx, "%s%s", NumNick(acptr));
-    crdt_gossip_message(from, 'N', tyxx, pm_msgid[0] ? pm_msgid : "*", text);
+  /* Tier2 P2 / MR-1: remote-origin NOTICE -> route over the CRDT mesh instead of the
+   * dropped dead-sink forward (mesh-stub -> always; live CRDT-aware -> under
+   * FEAT_CRDT_ROUTE_UNICAST). 1 -> handled over CR, done. */
+  if (crdt_route_unicast_try(from, 'N', acptr, pm_msgid, text))
     return;
-  }
 
   /* Per-target direction guard (see server_relay_private_message) */
   {

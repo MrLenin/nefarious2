@@ -365,17 +365,12 @@ int m_tagmsg(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
         }
       }
       else {
-        /* Remote user - forward to their server with tags */
-        if (cli_user(acptr) && cli_user(acptr)->server &&
-            IsMeshStub(cli_user(acptr)->server)) {
-          /* Tier2 T2-b: the target's P10 tree path is a dead-sink mesh stub, so the
-           * normal forward drops.  Gossip over the mesh instead (cmd 'T', client
-           * tags as payload), delivered on the target's home server, deduped by
-           * msgid. */
-          char tyxx[6];
-          ircd_snprintf(0, tyxx, sizeof tyxx, "%s%s", NumNick(acptr));
-          crdt_gossip_message(sptr, 'T', tyxx, dm_msgid, client_tags);
-        } else {
+        /* Remote user - forward to their server with tags.
+         * Tier2 T2-b / MR-1: route over the CRDT mesh (cmd 'T', client tags as
+         * payload) instead of the P10 tree when the target is on a mesh stub
+         * (dead-sink -> always) or, under FEAT_CRDT_ROUTE_UNICAST, a live CRDT-aware
+         * server; 1 -> handled over CR. */
+        if (!crdt_route_unicast_try(sptr, 'T', acptr, dm_msgid, client_tags)) {
           sendcmdto_set_s2s_tags(0, dm_msgid);
           sendcmdto_one(sptr, CMD_TAGMSG, acptr, "@%s %C",
                         client_tags, acptr);
@@ -539,20 +534,15 @@ int ms_tagmsg(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
       /* Note: If client doesn't support message-tags, TAGMSG is silently dropped */
     }
     else {
-      /* Remote user - forward to their server with tags */
-      if (cli_user(acptr) && cli_user(acptr)->server &&
-          IsMeshStub(cli_user(acptr)->server)) {
-        /* Tier2 P2: target's P10 tree path is a dead-sink mesh stub/anchor -> gossip
-         * over the mesh (cmd 'T', client tags) instead of the dropped forward. */
-        char tyxx[6];
-        ircd_snprintf(0, tyxx, sizeof tyxx, "%s%s", NumNick(acptr));
-        crdt_gossip_message(sptr, 'T', tyxx,
-                            cli_s2s_msgid(cptr)[0] ? cli_s2s_msgid(cptr) : "*",
-                            client_tags);
-      } else {
+      /* Remote user - forward to their server with tags.
+       * Tier2 P2 / MR-1: route over the CRDT mesh (cmd 'T', client tags) instead of
+       * the P10 tree when the target is on a mesh stub (dead-sink -> always) or,
+       * under FEAT_CRDT_ROUTE_UNICAST, a live CRDT-aware server. */
+      if (!crdt_route_unicast_try(sptr, 'T', acptr,
+                                  cli_s2s_msgid(cptr)[0] ? cli_s2s_msgid(cptr) : "*",
+                                  client_tags))
         sendcmdto_one(sptr, CMD_TAGMSG, acptr, "@%s %C",
                       client_tags, acptr);
-      }
     }
 
     sendcmdto_set_client_msgid(NULL);
