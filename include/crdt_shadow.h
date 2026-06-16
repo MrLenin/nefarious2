@@ -24,6 +24,7 @@
 
 struct Channel;
 struct Client;
+struct Gline;
 
 /** Initialise the shadow CRDT document for this server and arm the periodic
  *  verify timer. Idempotent; safe to call once at startup. */
@@ -163,6 +164,23 @@ void crdt_shadow_modes(struct Channel *chptr, struct Client *from);
  *  (called from modebuf_flush). @a from is the change's incoming link for the
  *  single-writer gate. */
 void crdt_shadow_lists(struct Channel *chptr, struct Client *from);
+
+/** Global-state track (GLINE step 2 shadow-write): mirror a global G-line into the
+ *  GLINES doc collection (keyed by its ban mask). Called from the canonical gline.c
+ *  state-change points (add/activate/deactivate/modify). @a from is the change's
+ *  incoming link (cptr / cli_from(sptr)); the single-writer gate skips when it is a
+ *  CRDT-aware peer (the mesh entry server owns the write, peers receive it via CR
+ *  sync). Local G-lines self-skip (they never replicate). SHADOW-ONLY: writes the
+ *  doc, no behavior change — live G-lines still propagate via P10. No-op unless
+ *  FEAT_CRDT_ENABLED. */
+void crdt_shadow_gline_add(struct Gline *gline, struct Client *from);
+
+/** Global-state track (GLINE step 2): tombstone a global G-line in the doc (called
+ *  before gline_free at the explicit-removal points — deactivate-that-frees /
+ *  gline_remove). Same single-writer gate + local self-skip as crdt_shadow_gline_add.
+ *  Expiry leaves the record (it carries its own lifetime; the materializer ignores
+ *  expired). No-op unless FEAT_CRDT_ENABLED. */
+void crdt_shadow_gline_remove(struct Gline *gline, struct Client *from);
 
 /** §17.7 birth-modes bridge (3j gap fix): emit to legacy the persistent modes of
  *  channels born from the doc THIS reconcile pass — called AFTER reconcile_members

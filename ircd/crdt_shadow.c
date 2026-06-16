@@ -16,6 +16,7 @@
 
 #include "channel.h"
 #include "client.h"
+#include "gline.h"           /* struct Gline + GlineIs* (GLINE step 2 shadow-write) */
 #include "hash.h"            /* FindChannel (Phase 3b dry-run lookup) */
 #include "list.h"            /* make_client / add_client_to_list (3c materialize) */
 #include "struct.h"          /* struct User (cli_user(c)->server) */
@@ -886,6 +887,67 @@ void crdt_shadow_lists(struct Channel *chptr, struct Client *from)
   reconcile_list(chptr->chname, 0, chptr->banlist);
   reconcile_list(chptr->chname, 1, chptr->exceptlist);
   crdt_sync_push();                    /* eager-propagate to CRDT peers */
+}
+
+/* ---- Global-state track: GLINEs as CRDT-native doc state (step 2 shadow-write) ---- */
+
+/* Build the doc key (ban mask) for a G-line into @a buf, or NULL if the gline must
+ * not enter the doc (local G-lines never replicate). The mask form mirrors
+ * gline_propagate's wire encoding: gl_user, plus "@gl_host" for host/IP G-lines
+ * ($R realname / $V version / #badchan carry their whole mask in gl_user, no host). */
+static const char *gline_doc_key(const struct Gline *gl, char *buf, size_t n)
+{
+  if (!gl || GlineIsLocal(gl))
+    return NULL;
+  if (gl->gl_host)
+    ircd_snprintf(0, buf, n, "%s@%s", gl->gl_user, gl->gl_host);
+  else
+    ircd_snprintf(0, buf, n, "%s", gl->gl_user);
+  return buf;
+}
+
+/* Fill a CrdtGlineRecord from a live Gline — the fields a cutover materialize needs
+ * to rebuild a faithful live G-line. gl_addr is copied raw (round-trips back). */
+static void gline_to_record(const struct Gline *gl, struct CrdtGlineRecord *rec)
+{
+  memset(rec, 0, sizeof *rec);
+  rec->expire   = (uint64_t)gl->gl_expire;
+  rec->lastmod  = (uint64_t)gl->gl_lastmod;
+  rec->lifetime = (uint64_t)gl->gl_lifetime;
+  rec->flags    = (uint32_t)gl->gl_flags;
+  if (GlineIsIpMask(gl)) {
+    memcpy(rec->addr, &gl->gl_addr, sizeof rec->addr);
+    rec->bits = gl->gl_bits;
+  }
+  ircd_strncpy(rec->reason, gl->gl_reason ? gl->gl_reason : "", sizeof rec->reason);
+}
+
+void crdt_shadow_gline_add(struct Gline *gl, struct Client *from)
+{
+  char key[CHANNELLEN + USERLEN + 4];   /* worst case: a #badchan mask */
+  struct CrdtGlineRecord rec;
+  if (!shadow_on())
+    return;
+  if (from_crdt_peer(from))             /* single-writer: mesh entry server owns it */
+    return;
+  if (!gline_doc_key(gl, key, sizeof key))
+    return;                             /* local G-line — never in the doc */
+  gline_to_record(gl, &rec);
+  crdt_gline_set(&g_crdt, key, &rec);
+  crdt_sync_push();                     /* eager-propagate to CRDT peers */
+}
+
+void crdt_shadow_gline_remove(struct Gline *gl, struct Client *from)
+{
+  char key[CHANNELLEN + USERLEN + 4];
+  if (!shadow_on())
+    return;
+  if (from_crdt_peer(from))
+    return;
+  if (!gline_doc_key(gl, key, sizeof key))
+    return;
+  crdt_gline_del(&g_crdt, key);
+  crdt_sync_push();
 }
 
 /* Emit one verify line either to the system log (timer path, @a to == NULL) or

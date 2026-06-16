@@ -26,6 +26,7 @@
 #include "gline.h"
 #include "channel.h"
 #include "client.h"
+#include "crdt_shadow.h"  /* GLINE step 2: mirror global G-lines into the CRDT doc */
 #include "ircd.h"
 #include "ircd_alloc.h"
 #include "ircd_features.h"
@@ -606,6 +607,8 @@ gline_add(struct Client *cptr, struct Client *sptr, char *userhost,
 
   gline_propagate(cptr, sptr, agline);
 
+  crdt_shadow_gline_add(agline, cptr); /* GLINE step 2: mirror into the CRDT doc */
+
   return do_gline(cptr, sptr, agline); /* knock off users if necessary */
 }
 
@@ -663,6 +666,8 @@ gline_activate(struct Client *cptr, struct Client *sptr, struct Gline *gline,
 
   if (!(flags & GLINE_LOCAL)) /* don't propagate local changes */
     gline_propagate(cptr, sptr, gline);
+
+  crdt_shadow_gline_add(gline, cptr); /* GLINE step 2: re-SET (now active) in doc */
 
   return do_gline(cptr, sptr, gline);
 }
@@ -733,8 +738,11 @@ gline_deactivate(struct Client *cptr, struct Client *sptr, struct Gline *gline,
     gline_propagate(cptr, sptr, gline);
 
   /* if it's a local gline or a Uworld gline (and not locally deactivated).. */
-  if (GlineIsLocal(gline) || (!gline->gl_lastmod && !(flags & GLINE_LOCAL)))
+  if (GlineIsLocal(gline) || (!gline->gl_lastmod && !(flags & GLINE_LOCAL))) {
+    crdt_shadow_gline_remove(gline, cptr); /* GLINE step 2: tombstone before free */
     gline_free(gline); /* get rid of it */
+  } else
+    crdt_shadow_gline_add(gline, cptr);    /* GLINE step 2: re-SET (now inactive) */
 
   return 0;
 }
@@ -938,6 +946,8 @@ gline_modify(struct Client *cptr, struct Client *sptr, struct Gline *gline,
 			  gline->gl_host ? gline->gl_host : "",
 			  gline->gl_expire - TStime(), gline->gl_lastmod,
 			  gline->gl_lifetime, gline->gl_reason);
+
+  crdt_shadow_gline_add(gline, cptr); /* GLINE step 2: re-SET modified record in doc */
 
   /* OK, let's do the G-line... */
   return do_gline(cptr, sptr, gline);
@@ -1308,6 +1318,10 @@ gline_remove(struct Client* sptr, char *userhost, char *reason)
 
       log_write(LS_GLINE, L_INFO, LOG_NOSNOTICE,
                 "%#C force removing GLINE for %s (%s)", sptr, uhmask, reason);
+
+      /* GLINE step 2: tombstone in the CRDT doc before free (single-writer gate on
+       * the incoming link, cli_from(sptr): origin deletes, CRDT peers receive it). */
+      crdt_shadow_gline_remove(gline, cli_from(sptr));
 
       gline_free(gline);
     }
