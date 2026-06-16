@@ -357,7 +357,12 @@ gline_propagate(struct Client *cptr, struct Client *sptr, struct Gline *gline)
 
   assert(gline->gl_lastmod);
 
-  sendcmdto_serv_butone(sptr, CMD_GLINE, cptr, "* %c%s%s%s %Tu %Tu %Tu :%s",
+  /* GLINE step 3 (3b): under cutover demote to legacy-only (forbid CRDT-aware) — CRDT
+   * peers get the gline via the doc. forbid=FLAG_LAST_FLAG when the flag is off means
+   * no filtering, i.e. identical to the old sendcmdto_serv_butone (behavior-neutral). */
+  sendcmdto_flag_serv_butone(sptr, CMD_GLINE, cptr, FLAG_LAST_FLAG,
+			feature_bool(FEAT_CRDT_GLINE_CUTOVER) ? FLAG_CRDT_AWARE : FLAG_LAST_FLAG,
+			"* %c%s%s%s %Tu %Tu %Tu :%s",
 			GlineIsRemActive(gline) ? '+' : '-', gline->gl_user,
 			gline->gl_host ? "@" : "",
 			gline->gl_host ? gline->gl_host : "",
@@ -939,7 +944,9 @@ gline_modify(struct Client *cptr, struct Client *sptr, struct Gline *gline,
    * the propagation syntax on future updates
    */
   if (action != GLINE_LOCAL_ACTIVATE && action != GLINE_LOCAL_DEACTIVATE)
-    sendcmdto_serv_butone(sptr, CMD_GLINE, cptr,
+    /* GLINE step 3 (3b): legacy-only under cutover (see gline_propagate). */
+    sendcmdto_flag_serv_butone(sptr, CMD_GLINE, cptr, FLAG_LAST_FLAG,
+			  feature_bool(FEAT_CRDT_GLINE_CUTOVER) ? FLAG_CRDT_AWARE : FLAG_LAST_FLAG,
 			  "* %s%s%s%s%s %Tu %Tu %Tu :%s",
 			  flags & GLINE_OPERFORCE ? "!" : "", op,
 			  gline->gl_user, gline->gl_host ? "@" : "",
@@ -1132,6 +1139,11 @@ gline_burst(struct Client *cptr)
   struct Gline *gline;
   struct Gline *sgline;
 
+  /* GLINE step 3 (3b): a CRDT-aware peer receives global G-lines via the CR snapshot/
+   * delta, not the P10 burst — skip the GL burst to it (the doc is the transport). */
+  if (feature_bool(FEAT_CRDT_GLINE_CUTOVER) && IsServer(cptr) && IsCrdtAware(cptr))
+    return;
+
   gliter(GlobalGlineList, gline, sgline) {
     if (!GlineIsLocal(gline) && gline->gl_lastmod)
       sendcmdto_one(&me, CMD_GLINE, cptr, "* %c%s%s%s %Tu %Tu %Tu :%s",
@@ -1160,6 +1172,10 @@ int
 gline_resend(struct Client *cptr, struct Gline *gline)
 {
   if (GlineIsLocal(gline) || !gline->gl_lastmod)
+    return 0;
+
+  /* GLINE step 3 (3b): CRDT peers get G-lines via the doc, not a P10 resend. */
+  if (feature_bool(FEAT_CRDT_GLINE_CUTOVER) && IsServer(cptr) && IsCrdtAware(cptr))
     return 0;
 
   sendcmdto_one(&me, CMD_GLINE, cptr, "* %c%s%s%s %Tu %Tu %Tu :%s",
