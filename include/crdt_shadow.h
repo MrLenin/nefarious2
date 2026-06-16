@@ -26,6 +26,7 @@ struct Channel;
 struct Client;
 struct Gline;
 struct Shun;
+struct Zline;
 
 /** Initialise the shadow CRDT document for this server and arm the periodic
  *  verify timer. Idempotent; safe to call once at startup. */
@@ -189,6 +190,11 @@ void crdt_shadow_gline_remove(struct Gline *gline, struct Client *from);
 void crdt_shadow_shun_add(struct Shun *shun, struct Client *from);
 void crdt_shadow_shun_remove(struct Shun *shun, struct Client *from);
 
+/** ZLINE (global-state track, GLINE/SHUN sibling): mirror a global Z-line into /
+ *  tombstone it in the ZLINES doc collection. Same gates as the gline/shun hooks. */
+void crdt_shadow_zline_add(struct Zline *zline, struct Client *from);
+void crdt_shadow_zline_remove(struct Zline *zline, struct Client *from);
+
 /** GLINE step 3 (cutover): drive live global G-lines FROM the doc GLINES collection +
  *  §17.7 gateway to legacy. ADD/heal/drift via gline_add/gline_modify (under a re-entrancy
  *  guard so the shadow hook self-skips — no doc re-mint); REMOVE any live global G-line the
@@ -200,6 +206,10 @@ void crdt_shadow_reconcile_glines(void);
 /** SHUN cutover (GLINE sibling): drive live global Shuns FROM the doc + §17.7 gateway.
  *  No-op unless FEAT_CRDT_SHUN_CUTOVER + FEAT_CRDT_PRIMARY. */
 void crdt_shadow_reconcile_shuns(void);
+
+/** ZLINE cutover (GLINE sibling): drive live global Z-lines FROM the doc + §17.7 gateway.
+ *  No-op unless FEAT_CRDT_ZLINE_CUTOVER + FEAT_CRDT_PRIMARY. */
+void crdt_shadow_reconcile_zlines(void);
 
 /** §17.7 birth-modes bridge (3j gap fix): emit to legacy the persistent modes of
  *  channels born from the doc THIS reconcile pass — called AFTER reconcile_members

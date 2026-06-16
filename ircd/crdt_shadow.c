@@ -18,6 +18,7 @@
 #include "client.h"
 #include "gline.h"           /* struct Gline + GlineIs* (GLINE step 2 shadow-write) */
 #include "shun.h"            /* struct Shun + ShunIs* (SHUN global-state track) */
+#include "zline.h"           /* struct Zline + ZlineIs* (ZLINE global-state track) */
 #include "hash.h"            /* FindChannel (Phase 3b dry-run lookup) */
 #include "list.h"            /* make_client / add_client_to_list (3c materialize) */
 #include "struct.h"          /* struct User (cli_user(c)->server) */
@@ -52,6 +53,7 @@ static struct Timer            g_verify_timer;
  * Synchronous — reconcile is never re-entrant. */
 static int                     g_gline_reconciling = 0;
 static int                     g_shun_reconciling = 0;   /* SHUN: same role as g_gline_reconciling */
+static int                     g_zline_reconciling = 0;  /* ZLINE: same role */
 
 /* Gossiped mesh-topology map: single-writer adjacency rows accumulated from CR H
  * beacons (each node declares only its own direct CRDT peers).  Ephemeral, NOT in
@@ -1218,6 +1220,141 @@ void crdt_shadow_reconcile_shuns(void)
   if (c.created || c.removed)
     log_write(LS_SYSTEM, L_NOTICE, 0,
               "CRDT shun-reconcile: drove %u, removed %u global Shun(s) from doc%s",
+              c.created, c.removed, capped ? " (remove capped; more next tick)" : "");
+}
+
+/* ---- ZLINE global-state track (GLINE sibling: single IP mask, no user@host) ---- */
+
+/* doc key for a Z-line: the single zl_mask. NULL for local Z-lines. */
+static const char *zline_doc_key(const struct Zline *zl, char *buf, size_t n)
+{
+  if (!zl || ZlineIsLocal(zl) || !zl->zl_mask)
+    return NULL;
+  ircd_snprintf(0, buf, n, "%s", zl->zl_mask);
+  return buf;
+}
+
+static void zline_to_record(const struct Zline *zl, struct CrdtZlineRecord *rec)
+{
+  memset(rec, 0, sizeof *rec);
+  rec->expire   = (uint64_t)zl->zl_expire;
+  rec->lastmod  = (uint64_t)zl->zl_lastmod;
+  rec->lifetime = (uint64_t)zl->zl_lifetime;
+  rec->flags    = (uint32_t)zl->zl_flags;
+  if (ZlineIsIpMask(zl)) {
+    memcpy(rec->addr, &zl->zl_addr, sizeof rec->addr);
+    rec->bits = zl->zl_bits;
+  }
+  ircd_strncpy(rec->reason, zl->zl_reason ? zl->zl_reason : "", sizeof rec->reason);
+}
+
+void crdt_shadow_zline_add(struct Zline *zl, struct Client *from)
+{
+  char key[HOSTLEN + 4];
+  struct CrdtZlineRecord rec;
+  if (!shadow_on())
+    return;
+  if (g_zline_reconciling)
+    return;
+  if (from_crdt_peer(from))
+    return;
+  if (!zline_doc_key(zl, key, sizeof key))
+    return;
+  zline_to_record(zl, &rec);
+  crdt_zline_set(&g_crdt, key, &rec);
+  crdt_sync_push();
+}
+
+void crdt_shadow_zline_remove(struct Zline *zl, struct Client *from)
+{
+  char key[HOSTLEN + 4];
+  if (!shadow_on())
+    return;
+  if (g_zline_reconciling)
+    return;
+  if (from_crdt_peer(from))
+    return;
+  if (!zline_doc_key(zl, key, sizeof key))
+    return;
+  crdt_zline_del(&g_crdt, key);
+  crdt_sync_push();
+}
+
+static void reconcile_zline_add_cb(const char *key, uint32_t key_len,
+                                   const struct CrdtLWWValue *val, void *ctx)
+{
+  struct reconcile_gline_ctx *c = ctx;
+  char mask[HOSTLEN + 4];
+  char reason[CRDT_ZLINEREASONLEN];
+  const struct CrdtZlineRecord *rec;
+  struct Zline *existing;
+  if (key_len >= sizeof mask || !val->data ||
+      val->data_len != sizeof(struct CrdtZlineRecord))
+    return;
+  rec = (const struct CrdtZlineRecord *)val->data;
+  if ((time_t)rec->expire <= TStime())
+    return;
+  memcpy(mask, key, key_len); mask[key_len] = '\0';
+  ircd_strncpy(reason, rec->reason, sizeof reason);
+  existing = zline_find(mask, ZLINE_GLOBAL | ZLINE_ANY | ZLINE_EXACT);
+  if (existing) {
+    int active_now = (existing->zl_flags & ZLINE_ACTIVE) ? 1 : 0;
+    int active_doc = (rec->flags & ZLINE_ACTIVE) ? 1 : 0;
+    if (active_now == active_doc &&
+        existing->zl_expire   == (time_t)rec->expire &&
+        existing->zl_lifetime == (time_t)rec->lifetime &&
+        !strcmp(existing->zl_reason ? existing->zl_reason : "", reason))
+      return;                            /* materially in sync — echo guard */
+    zline_modify(&me, &me, existing,
+                 active_doc ? ZLINE_ACTIVATE : ZLINE_DEACTIVATE, reason,
+                 (time_t)rec->expire, (time_t)rec->lastmod, (time_t)rec->lifetime,
+                 ZLINE_EXPIRE | ZLINE_LIFETIME | ZLINE_REASON | ZLINE_FORCE);
+  } else {
+    zline_add(&me, &me, mask, reason, (time_t)rec->expire, (time_t)rec->lastmod,
+              (time_t)rec->lifetime,
+              ZLINE_GLOBAL | ZLINE_FORCE | ((rec->flags & ZLINE_ACTIVE) ? ZLINE_ACTIVE : 0));
+  }
+  c->created++;
+}
+
+void crdt_shadow_reconcile_zlines(void)
+{
+  struct reconcile_gline_ctx c = { 0, 0 };
+  char masks[CRDT_GLINE_REMOVE_MAX][HOSTLEN + 4];
+  int nr = 0, i, capped = 0;
+  struct Zline *zl;
+  if (!shadow_on() || !feature_bool(FEAT_CRDT_ZLINE_CUTOVER) ||
+      !feature_bool(FEAT_CRDT_PRIMARY))
+    return;
+  g_zline_reconciling = 1;
+  crdt_lwwmap_foreach(&g_crdt.zlines, reconcile_zline_add_cb, &c);
+  for (zl = GlobalZlineList; zl; zl = zl->zl_next) {
+    char key[HOSTLEN + 4];
+    if (!zline_doc_key(zl, key, sizeof key))   /* skips local Z-lines */
+      continue;
+    if (!zl->zl_lastmod)
+      continue;
+    if (!crdt_zline_is_explicitly_removed(&g_crdt, key))
+      continue;
+    if (nr >= CRDT_GLINE_REMOVE_MAX) { capped = 1; break; }
+    ircd_strncpy(masks[nr], key, sizeof masks[nr]);
+    nr++;
+  }
+  for (i = 0; i < nr; i++) {
+    struct Zline *z = zline_find(masks[i], ZLINE_GLOBAL | ZLINE_ANY | ZLINE_EXACT);
+    if (!z)
+      continue;
+    sendcmdto_flag_serv_butone(&me, CMD_ZLINE, NULL, FLAG_LAST_FLAG, FLAG_CRDT_AWARE,
+                               "* -%s %Tu %Tu %Tu :%s", z->zl_mask,
+                               z->zl_expire - TStime(), z->zl_lastmod,
+                               z->zl_lifetime, z->zl_reason);
+    zline_free(z);
+    c.removed++;
+  }
+  g_zline_reconciling = 0;
+  if (c.created || c.removed)
+    log_write(LS_SYSTEM, L_NOTICE, 0,
+              "CRDT zline-reconcile: drove %u, removed %u global Z-line(s) from doc%s",
               c.created, c.removed, capped ? " (remove capped; more next tick)" : "");
 }
 
@@ -3085,6 +3222,7 @@ static void crdt_shadow_verify_cb(struct Event *ev)
   crdt_shadow_reconcile_user_removes(); /* Phase 3m: QUIT / delete-on-leave (after channel cleanup) */
   crdt_shadow_reconcile_glines();  /* GLINE step 3: drive global G-lines from doc (+gateway) */
   crdt_shadow_reconcile_shuns();   /* SHUN: drive global Shuns from doc (+gateway) */
+  crdt_shadow_reconcile_zlines();  /* ZLINE: drive global Z-lines from doc (+gateway) */
   crdt_sync_broadcast();   /* periodic anti-entropy: pull deltas from peers */
   crdt_shadow_gc();        /* reclaim causally-stable ops/tombstones */
 

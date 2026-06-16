@@ -110,6 +110,8 @@ enum ZlineAction {
 /** Return last modification time of a Z-line. */
 #define ZlineLastMod(z)		((z)->zl_lastmod)
 
+extern struct Zline* GlobalZlineList;	/**< List of Z-lines (CRDT reconcile walk). */
+
 extern int zline_add(struct Client *cptr, struct Client *sptr, char *ipmask,
 		     char *reason, time_t expire, time_t lastmod,
 		     time_t lifetime, unsigned int flags);

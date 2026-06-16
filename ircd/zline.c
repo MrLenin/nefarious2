@@ -26,6 +26,7 @@
 #include "zline.h"
 #include "channel.h"
 #include "client.h"
+#include "crdt_shadow.h"  /* ZLINE global-state track: mirror global Z-lines into the CRDT doc */
 #include "ircd.h"
 #include "ircd_alloc.h"
 #include "ircd_features.h"
@@ -287,7 +288,11 @@ zline_propagate(struct Client *cptr, struct Client *sptr, struct Zline *zline)
 
   assert(zline->zl_lastmod);
 
-  sendcmdto_serv_butone(sptr, CMD_ZLINE, cptr, "* %c%s %Tu %Tu %Tu :%s",
+  /* ZLINE cutover: legacy-only under FEAT_CRDT_ZLINE_CUTOVER (forbid CRDT-aware); forbid=
+   * FLAG_LAST_FLAG when off => no filter => identical to the old sendcmdto_serv_butone. */
+  sendcmdto_flag_serv_butone(sptr, CMD_ZLINE, cptr, FLAG_LAST_FLAG,
+			feature_bool(FEAT_CRDT_ZLINE_CUTOVER) ? FLAG_CRDT_AWARE : FLAG_LAST_FLAG,
+			"* %c%s %Tu %Tu %Tu :%s",
 			ZlineIsRemActive(zline) ? '+' : '-',
 			zline->zl_mask, zline->zl_expire - TStime(),
 			zline->zl_lastmod, zline->zl_lifetime, zline->zl_reason);
@@ -429,6 +434,8 @@ zline_add(struct Client *cptr, struct Client *sptr, char *ipmask,
 
   zline_propagate(cptr, sptr, azline);
 
+  crdt_shadow_zline_add(azline, cptr); /* ZLINE: mirror into the CRDT doc */
+
   return do_zline(cptr, sptr, azline); /* knock off users if necessary */
 }
 
@@ -480,6 +487,8 @@ zline_activate(struct Client *cptr, struct Client *sptr, struct Zline *zline,
 
   if (!(flags & ZLINE_LOCAL)) /* don't propagate local changes */
     zline_propagate(cptr, sptr, zline);
+
+  crdt_shadow_zline_add(zline, cptr); /* ZLINE: re-SET (now active) in doc */
 
   return do_zline(cptr, sptr, zline);
 }
@@ -544,8 +553,11 @@ zline_deactivate(struct Client *cptr, struct Client *sptr, struct Zline *zline,
     zline_propagate(cptr, sptr, zline);
 
   /* if it's a local zline or a Uworld zline (and not locally deactivated).. */
-  if (ZlineIsLocal(zline) || (!zline->zl_lastmod && !(flags & ZLINE_LOCAL)))
+  if (ZlineIsLocal(zline) || (!zline->zl_lastmod && !(flags & ZLINE_LOCAL))) {
+    crdt_shadow_zline_remove(zline, cptr); /* ZLINE: tombstone before free */
     zline_free(zline); /* get rid of it */
+  } else
+    crdt_shadow_zline_add(zline, cptr);    /* ZLINE: re-SET (now inactive) */
 
   return 0;
 }
@@ -736,11 +748,15 @@ zline_modify(struct Client *cptr, struct Client *sptr, struct Zline *zline,
    * the propagation syntax on future updates
    */
   if (action != ZLINE_LOCAL_ACTIVATE && action != ZLINE_LOCAL_DEACTIVATE)
-    sendcmdto_serv_butone(sptr, CMD_ZLINE, cptr,
+    /* ZLINE cutover: legacy-only under the flag (see zline_propagate). */
+    sendcmdto_flag_serv_butone(sptr, CMD_ZLINE, cptr, FLAG_LAST_FLAG,
+			  feature_bool(FEAT_CRDT_ZLINE_CUTOVER) ? FLAG_CRDT_AWARE : FLAG_LAST_FLAG,
 			  "* %s%s%s %Tu %Tu %Tu :%s",
 			  flags & ZLINE_OPERFORCE ? "!" : "", op,
 			  zline->zl_mask, zline->zl_expire - TStime(),
                           zline->zl_lastmod, zline->zl_lifetime, zline->zl_reason);
+
+  crdt_shadow_zline_add(zline, cptr); /* ZLINE: re-SET modified record in doc */
 
   /* OK, let's do the Z-line... */
   return do_zline(cptr, sptr, zline);
@@ -881,6 +897,10 @@ zline_burst(struct Client *cptr)
   struct Zline *zline;
   struct Zline *szline;
 
+  /* ZLINE cutover: a CRDT-aware peer gets Z-lines via the doc, not the P10 burst. */
+  if (feature_bool(FEAT_CRDT_ZLINE_CUTOVER) && IsServer(cptr) && IsCrdtAware(cptr))
+    return;
+
   zliter(GlobalZlineList, zline, szline) {
     if (!ZlineIsLocal(zline) && zline->zl_lastmod)
       sendcmdto_one(&me, CMD_ZLINE, cptr, "* %c%s %Tu %Tu %Tu :%s",
@@ -900,6 +920,10 @@ int
 zline_resend(struct Client *cptr, struct Zline *zline)
 {
   if (ZlineIsLocal(zline) || !zline->zl_lastmod)
+    return 0;
+
+  /* ZLINE cutover: CRDT peers get Z-lines via the doc, not a P10 resend. */
+  if (feature_bool(FEAT_CRDT_ZLINE_CUTOVER) && IsServer(cptr) && IsCrdtAware(cptr))
     return 0;
 
   sendcmdto_one(&me, CMD_ZLINE, cptr, "* %c%s %Tu %Tu %Tu :%s",
@@ -1028,6 +1052,9 @@ zline_remove(struct Client* sptr, char *ipmask, char *reason)
 
       log_write(LS_GLINE, L_INFO, LOG_NOSNOTICE,
                 "%#C force removing ZLINE for %s (%s)", sptr, imask, reason);
+
+      /* ZLINE: tombstone in the CRDT doc before free (gate cli_from(sptr)). */
+      crdt_shadow_zline_remove(zline, cli_from(sptr));
 
       zline_free(zline);
     }
