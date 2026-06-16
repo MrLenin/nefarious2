@@ -17,6 +17,7 @@
 #include "channel.h"
 #include "client.h"
 #include "gline.h"           /* struct Gline + GlineIs* (GLINE step 2 shadow-write) */
+#include "shun.h"            /* struct Shun + ShunIs* (SHUN global-state track) */
 #include "hash.h"            /* FindChannel (Phase 3b dry-run lookup) */
 #include "list.h"            /* make_client / add_client_to_list (3c materialize) */
 #include "struct.h"          /* struct User (cli_user(c)->server) */
@@ -50,6 +51,7 @@ static struct Timer            g_verify_timer;
  * (loop prevention; the analog of reconcile_topic_cb writing chptr->topic directly).
  * Synchronous — reconcile is never re-entrant. */
 static int                     g_gline_reconciling = 0;
+static int                     g_shun_reconciling = 0;   /* SHUN: same role as g_gline_reconciling */
 
 /* Gossiped mesh-topology map: single-writer adjacency rows accumulated from CR H
  * beacons (each node declares only its own direct CRDT peers).  Ephemeral, NOT in
@@ -1074,6 +1076,148 @@ void crdt_shadow_reconcile_glines(void)
   if (c.created || c.removed)
     log_write(LS_SYSTEM, L_NOTICE, 0,
               "CRDT gline-reconcile: drove %u, removed %u global G-line(s) from doc%s",
+              c.created, c.removed, capped ? " (remove capped; more next tick)" : "");
+}
+
+/* ---- SHUN global-state track (GLINE sibling: same template, no badchan) ---- */
+
+/* doc key for a Shun: sh_user[@sh_host] (mirrors shun_propagate's wire). NULL for
+ * local Shuns (they never replicate). No badchan -> no '#' masks. */
+static const char *shun_doc_key(const struct Shun *sh, char *buf, size_t n)
+{
+  if (!sh || ShunIsLocal(sh))
+    return NULL;
+  if (sh->sh_host)
+    ircd_snprintf(0, buf, n, "%s@%s", sh->sh_user, sh->sh_host);
+  else
+    ircd_snprintf(0, buf, n, "%s", sh->sh_user);
+  return buf;
+}
+
+static void shun_to_record(const struct Shun *sh, struct CrdtShunRecord *rec)
+{
+  memset(rec, 0, sizeof *rec);
+  rec->expire   = (uint64_t)sh->sh_expire;
+  rec->lastmod  = (uint64_t)sh->sh_lastmod;
+  rec->lifetime = (uint64_t)sh->sh_lifetime;
+  rec->flags    = (uint32_t)sh->sh_flags;
+  if (ShunIsIpMask(sh)) {
+    memcpy(rec->addr, &sh->sh_addr, sizeof rec->addr);
+    rec->bits = sh->sh_bits;
+  }
+  ircd_strncpy(rec->reason, sh->sh_reason ? sh->sh_reason : "", sizeof rec->reason);
+}
+
+void crdt_shadow_shun_add(struct Shun *sh, struct Client *from)
+{
+  char key[USERLEN + HOSTLEN + 4];
+  struct CrdtShunRecord rec;
+  if (!shadow_on())
+    return;
+  if (g_shun_reconciling)              /* doc-driven materialize — don't re-mint */
+    return;
+  if (from_crdt_peer(from))            /* single-writer: mesh entry server owns it */
+    return;
+  if (!shun_doc_key(sh, key, sizeof key))
+    return;                            /* local Shun — never in the doc */
+  shun_to_record(sh, &rec);
+  crdt_shun_set(&g_crdt, key, &rec);
+  crdt_sync_push();
+}
+
+void crdt_shadow_shun_remove(struct Shun *sh, struct Client *from)
+{
+  char key[USERLEN + HOSTLEN + 4];
+  if (!shadow_on())
+    return;
+  if (g_shun_reconciling)
+    return;
+  if (from_crdt_peer(from))
+    return;
+  if (!shun_doc_key(sh, key, sizeof key))
+    return;
+  crdt_shun_del(&g_crdt, key);
+  crdt_sync_push();
+}
+
+/* SHUN cutover (mirror reconcile_gline_add_cb). */
+static void reconcile_shun_add_cb(const char *key, uint32_t key_len,
+                                  const struct CrdtLWWValue *val, void *ctx)
+{
+  struct reconcile_gline_ctx *c = ctx;   /* same {created,removed} shape */
+  char mask[USERLEN + HOSTLEN + 4];
+  char reason[CRDT_SHUNREASONLEN];
+  const struct CrdtShunRecord *rec;
+  struct Shun *existing;
+  if (key_len >= sizeof mask || !val->data ||
+      val->data_len != sizeof(struct CrdtShunRecord))
+    return;
+  rec = (const struct CrdtShunRecord *)val->data;
+  if ((time_t)rec->expire <= TStime())
+    return;
+  memcpy(mask, key, key_len); mask[key_len] = '\0';
+  ircd_strncpy(reason, rec->reason, sizeof reason);
+  existing = shun_find(mask, SHUN_GLOBAL | SHUN_ANY | SHUN_EXACT);
+  if (existing) {
+    int active_now = (existing->sh_flags & SHUN_ACTIVE) ? 1 : 0;
+    int active_doc = (rec->flags & SHUN_ACTIVE) ? 1 : 0;
+    if (active_now == active_doc &&
+        existing->sh_expire   == (time_t)rec->expire &&
+        existing->sh_lifetime == (time_t)rec->lifetime &&
+        !strcmp(existing->sh_reason ? existing->sh_reason : "", reason))
+      return;                            /* materially in sync — echo guard */
+    shun_modify(&me, &me, existing,
+                active_doc ? SHUN_ACTIVATE : SHUN_DEACTIVATE, reason,
+                (time_t)rec->expire, (time_t)rec->lastmod, (time_t)rec->lifetime,
+                SHUN_EXPIRE | SHUN_LIFETIME | SHUN_REASON | SHUN_FORCE);
+  } else {
+    shun_add(&me, &me, mask, reason, (time_t)rec->expire, (time_t)rec->lastmod,
+             (time_t)rec->lifetime,
+             SHUN_GLOBAL | SHUN_FORCE | ((rec->flags & SHUN_ACTIVE) ? SHUN_ACTIVE : 0));
+  }
+  c->created++;
+}
+
+void crdt_shadow_reconcile_shuns(void)
+{
+  struct reconcile_gline_ctx c = { 0, 0 };
+  char masks[CRDT_GLINE_REMOVE_MAX][USERLEN + HOSTLEN + 4];
+  int nr = 0, i, capped = 0;
+  struct Shun *sh;
+  if (!shadow_on() || !feature_bool(FEAT_CRDT_SHUN_CUTOVER) ||
+      !feature_bool(FEAT_CRDT_PRIMARY))
+    return;
+  g_shun_reconciling = 1;
+  crdt_lwwmap_foreach(&g_crdt.shuns, reconcile_shun_add_cb, &c);
+  for (sh = GlobalShunList; sh; sh = sh->sh_next) {
+    char key[USERLEN + HOSTLEN + 4];
+    if (!shun_doc_key(sh, key, sizeof key))   /* skips local Shuns */
+      continue;
+    if (!sh->sh_lastmod)
+      continue;
+    if (!crdt_shun_is_explicitly_removed(&g_crdt, key))
+      continue;
+    if (nr >= CRDT_GLINE_REMOVE_MAX) { capped = 1; break; }
+    ircd_strncpy(masks[nr], key, sizeof masks[nr]);
+    nr++;
+  }
+  for (i = 0; i < nr; i++) {
+    struct Shun *s = shun_find(masks[i], SHUN_GLOBAL | SHUN_ANY | SHUN_EXACT);
+    if (!s)
+      continue;
+    sendcmdto_flag_serv_butone(&me, CMD_SHUN, NULL, FLAG_LAST_FLAG, FLAG_CRDT_AWARE,
+                               "* -%s%s%s %Tu %Tu %Tu :%s",
+                               s->sh_user, s->sh_host ? "@" : "",
+                               s->sh_host ? s->sh_host : "",
+                               s->sh_expire - TStime(), s->sh_lastmod,
+                               s->sh_lifetime, s->sh_reason);
+    shun_free(s);
+    c.removed++;
+  }
+  g_shun_reconciling = 0;
+  if (c.created || c.removed)
+    log_write(LS_SYSTEM, L_NOTICE, 0,
+              "CRDT shun-reconcile: drove %u, removed %u global Shun(s) from doc%s",
               c.created, c.removed, capped ? " (remove capped; more next tick)" : "");
 }
 
@@ -2940,6 +3084,7 @@ static void crdt_shadow_verify_cb(struct Event *ev)
   crdt_shadow_reconcile_bans();    /* Phase 3i: channel bans/excepts (+b/+e) */
   crdt_shadow_reconcile_user_removes(); /* Phase 3m: QUIT / delete-on-leave (after channel cleanup) */
   crdt_shadow_reconcile_glines();  /* GLINE step 3: drive global G-lines from doc (+gateway) */
+  crdt_shadow_reconcile_shuns();   /* SHUN: drive global Shuns from doc (+gateway) */
   crdt_sync_broadcast();   /* periodic anti-entropy: pull deltas from peers */
   crdt_shadow_gc();        /* reclaim causally-stable ops/tombstones */
 

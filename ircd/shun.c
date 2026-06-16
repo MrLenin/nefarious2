@@ -25,6 +25,7 @@
 
 #include "shun.h"
 #include "client.h"
+#include "crdt_shadow.h"  /* SHUN global-state track: mirror global Shuns into the CRDT doc */
 #include "ircd.h"
 #include "ircd_alloc.h"
 #include "ircd_features.h"
@@ -413,7 +414,11 @@ shun_propagate(struct Client *cptr, struct Client *sptr, struct Shun *shun)
 
   assert(shun->sh_lastmod);
 
-  sendcmdto_serv_butone(sptr, CMD_SHUN, cptr, "* %c%s%s%s %Tu %Tu %Tu :%s",
+  /* SHUN cutover: legacy-only under FEAT_CRDT_SHUN_CUTOVER (forbid CRDT-aware); forbid=
+   * FLAG_LAST_FLAG when off => no filter => identical to the old sendcmdto_serv_butone. */
+  sendcmdto_flag_serv_butone(sptr, CMD_SHUN, cptr, FLAG_LAST_FLAG,
+			feature_bool(FEAT_CRDT_SHUN_CUTOVER) ? FLAG_CRDT_AWARE : FLAG_LAST_FLAG,
+			"* %c%s%s%s %Tu %Tu %Tu :%s",
 			ShunIsRemActive(shun) ? '+' : '-', shun->sh_user,
 			shun->sh_host ? "@" : "",
 			shun->sh_host ? shun->sh_host : "",
@@ -645,6 +650,8 @@ shun_add(struct Client *cptr, struct Client *sptr, char *userhost,
 
   shun_propagate(cptr, sptr, ashun);
 
+  crdt_shadow_shun_add(ashun, cptr); /* SHUN: mirror into the CRDT doc */
+
   return do_shun(cptr, sptr, ashun); /* knock off users if necessary */
 }
 
@@ -701,6 +708,8 @@ shun_activate(struct Client *cptr, struct Client *sptr, struct Shun *shun,
 
   if (!(flags & SHUN_LOCAL)) /* don't propagate local changes */
     shun_propagate(cptr, sptr, shun);
+
+  crdt_shadow_shun_add(shun, cptr); /* SHUN: re-SET (now active) in doc */
 
   return do_shun(cptr, sptr, shun);
 }
@@ -770,8 +779,11 @@ shun_deactivate(struct Client *cptr, struct Client *sptr, struct Shun *shun,
     shun_propagate(cptr, sptr, shun);
 
   /* if it's a local shun or a Uworld shun (and not locally deactivated).. */
-  if (ShunIsLocal(shun) || (!shun->sh_lastmod && !(flags & SHUN_LOCAL)))
+  if (ShunIsLocal(shun) || (!shun->sh_lastmod && !(flags & SHUN_LOCAL))) {
+    crdt_shadow_shun_remove(shun, cptr); /* SHUN: tombstone before free */
     shun_free(shun); /* get rid of it */
+  } else
+    crdt_shadow_shun_add(shun, cptr);    /* SHUN: re-SET (now inactive) */
 
   return 0;
 }
@@ -964,13 +976,17 @@ shun_modify(struct Client *cptr, struct Client *sptr, struct Shun *shun,
    * the propagation syntax on future updates
    */
   if (action != SHUN_LOCAL_ACTIVATE && action != SHUN_LOCAL_DEACTIVATE)
-    sendcmdto_serv_butone(sptr, CMD_SHUN, cptr,
+    /* SHUN cutover: legacy-only under the flag (see shun_propagate). */
+    sendcmdto_flag_serv_butone(sptr, CMD_SHUN, cptr, FLAG_LAST_FLAG,
+			  feature_bool(FEAT_CRDT_SHUN_CUTOVER) ? FLAG_CRDT_AWARE : FLAG_LAST_FLAG,
 			  "* %s%s%s%s%s %Tu %Tu %Tu :%s",
 			  flags & SHUN_OPERFORCE ? "!" : "", op,
 			  shun->sh_user, shun->sh_host ? "@" : "",
 			  shun->sh_host ? shun->sh_host : "",
 			  shun->sh_expire - TStime(), shun->sh_lastmod,
 			  shun->sh_lifetime, shun->sh_reason);
+
+  crdt_shadow_shun_add(shun, cptr); /* SHUN: re-SET modified record in doc */
 
   /* OK, let's do the Shun... */
   return do_shun(cptr, sptr, shun);
@@ -1133,6 +1149,10 @@ shun_burst(struct Client *cptr)
   struct Shun *shun;
   struct Shun *sshun;
 
+  /* SHUN cutover: a CRDT-aware peer gets Shuns via the doc, not the P10 burst. */
+  if (feature_bool(FEAT_CRDT_SHUN_CUTOVER) && IsServer(cptr) && IsCrdtAware(cptr))
+    return;
+
   shiter(GlobalShunList, shun, sshun) {
     if (!ShunIsLocal(shun) && shun->sh_lastmod)
       sendcmdto_one(&me, CMD_SHUN, cptr, "* %c%s%s%s %Tu %Tu %Tu :%s",
@@ -1153,6 +1173,10 @@ int
 shun_resend(struct Client *cptr, struct Shun *shun)
 {
   if (ShunIsLocal(shun) || !shun->sh_lastmod)
+    return 0;
+
+  /* SHUN cutover: CRDT peers get Shuns via the doc, not a P10 resend. */
+  if (feature_bool(FEAT_CRDT_SHUN_CUTOVER) && IsServer(cptr) && IsCrdtAware(cptr))
     return 0;
 
   sendcmdto_one(&me, CMD_SHUN, cptr, "* %c%s%s%s %Tu %Tu %Tu :%s",
@@ -1308,6 +1332,9 @@ shun_remove(struct Client* sptr, char *userhost, char *reason)
 
       log_write(LS_GLINE, L_INFO, LOG_NOSNOTICE,
                 "%#C force removing SHUN for %s (%s)", sptr, uhmask, reason);
+
+      /* SHUN: tombstone in the CRDT doc before free (gate cli_from(sptr)). */
+      crdt_shadow_shun_remove(shun, cli_from(sptr));
 
       shun_free(shun);
     }

@@ -25,6 +25,7 @@
 struct Channel;
 struct Client;
 struct Gline;
+struct Shun;
 
 /** Initialise the shadow CRDT document for this server and arm the periodic
  *  verify timer. Idempotent; safe to call once at startup. */
@@ -182,6 +183,12 @@ void crdt_shadow_gline_add(struct Gline *gline, struct Client *from);
  *  expired). No-op unless FEAT_CRDT_ENABLED. */
 void crdt_shadow_gline_remove(struct Gline *gline, struct Client *from);
 
+/** SHUN (global-state track, GLINE sibling): mirror a global Shun into / tombstone it
+ *  in the SHUNS doc collection. Same single-writer gate + local self-skip + re-entrancy
+ *  guard as the gline hooks. No-op unless FEAT_CRDT_ENABLED. */
+void crdt_shadow_shun_add(struct Shun *shun, struct Client *from);
+void crdt_shadow_shun_remove(struct Shun *shun, struct Client *from);
+
 /** GLINE step 3 (cutover): drive live global G-lines FROM the doc GLINES collection +
  *  §17.7 gateway to legacy. ADD/heal/drift via gline_add/gline_modify (under a re-entrancy
  *  guard so the shadow hook self-skips — no doc re-mint); REMOVE any live global G-line the
@@ -189,6 +196,10 @@ void crdt_shadow_gline_remove(struct Gline *gline, struct Client *from);
  *  while P10 still delivers G-lines (field echo guard) — safe to enable before 3b P10-GL
  *  suppression. No-op unless FEAT_CRDT_GLINE_CUTOVER + FEAT_CRDT_PRIMARY. */
 void crdt_shadow_reconcile_glines(void);
+
+/** SHUN cutover (GLINE sibling): drive live global Shuns FROM the doc + §17.7 gateway.
+ *  No-op unless FEAT_CRDT_SHUN_CUTOVER + FEAT_CRDT_PRIMARY. */
+void crdt_shadow_reconcile_shuns(void);
 
 /** §17.7 birth-modes bridge (3j gap fix): emit to legacy the persistent modes of
  *  channels born from the doc THIS reconcile pass — called AFTER reconcile_members

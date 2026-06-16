@@ -119,6 +119,8 @@ enum ShunAction {
 /** Return last modification time of a Shun. */
 #define ShunLastMod(s)		((s)->sh_lastmod)
 
+extern struct Shun* GlobalShunList;	/**< List of Shuns (CRDT reconcile walk). */
+
 extern int shun_add(struct Client *cptr, struct Client *sptr, char *userhost,
 		     char *reason, time_t expire, time_t lastmod,
 		     time_t lifetime, unsigned int flags);

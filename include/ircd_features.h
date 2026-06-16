@@ -511,6 +511,7 @@ enum Feature {
   FEAT_CRDT_ROUTE_UNICAST,      /* MR-1: route CRDT-aware user-unicast over CR next-hop (not P10) */
   FEAT_CRDT_ROUTE_BCAST,        /* MR-2: forward channel broadcast over the canonical mesh tree */
   FEAT_CRDT_GLINE_CUTOVER,      /* GLINE step 3: doc is the transport for global G-lines among CRDT peers (reconcile-from-doc + §17.7 gateway + suppress P10 GL) */
+  FEAT_CRDT_SHUN_CUTOVER,       /* SHUN: doc is the transport for global Shuns among CRDT peers (reconcile-from-doc + §17.7 gateway + suppress P10 SU) */
 
   FEAT_LAST_F
 };

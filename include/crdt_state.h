@@ -118,6 +118,21 @@ struct CrdtGlineRecord {
   char     reason[CRDT_GLINEREASONLEN];
 };
 
+/** Global SHUN as CRDT-native doc state — the GLINE sibling (silence ban, P10 SU
+ *  token, no badchan).  Keyed by the ban mask (user@host / *@ip / $R realname /
+ *  $V version) in the SHUNS LWW-map; same fixed layout as CrdtGlineRecord. */
+#define CRDT_SHUNREASONLEN 256
+struct CrdtShunRecord {
+  uint64_t expire;                 /**< sh_expire */
+  uint64_t lastmod;                /**< sh_lastmod (P10 conflict ts, carried) */
+  uint64_t lifetime;               /**< sh_lifetime */
+  uint32_t flags;                  /**< sh_flags subset (active/ipmask/realname/version/...) */
+  uint8_t  addr[16];               /**< sh_addr (ip-shuns) */
+  uint8_t  bits;                   /**< sh_bits */
+  uint8_t  pad[3];                 /**< explicit pad -> stable layout for the digest */
+  char     reason[CRDT_SHUNREASONLEN];
+};
+
 /** Nick claim (proposal §17.5.1). */
 struct CrdtNickClaim {
   char       numeric[CRDT_NUMERICLEN];  /**< claiming user's numeric */
@@ -151,7 +166,8 @@ enum CrdtCollection {
   CRDT_COLL_CHAN_EXCEPTS,  /**< per-channel +e except masks (OR-Set) — Phase 3i */
   CRDT_COLL_CHAN_CTIME,    /**< per-channel creationtime (incarnation min-register) — Phase 3j */
   CRDT_COLL_KICK_INFO,     /**< chan\0numeric -> CrdtKickInfo (LWW) — Phase 3k */
-  CRDT_COLL_GLINES         /**< ban-mask -> CrdtGlineRecord (LWW) — global-state track */
+  CRDT_COLL_GLINES,        /**< ban-mask -> CrdtGlineRecord (LWW) — global-state track */
+  CRDT_COLL_SHUNS          /**< ban-mask -> CrdtShunRecord (LWW) — global-state track */
 };
 
 struct CrdtOp {
@@ -228,6 +244,7 @@ struct CrdtNetworkState {
   struct CrdtLWWMap       kick_info;    /**< chan\0numeric -> CrdtKickInfo (Phase 3k) */
   struct CrdtLWWMap       chanmeta;     /**< channel-name -> CrdtChanMeta */
   struct CrdtLWWMap       glines;       /**< ban-mask -> CrdtGlineRecord (global-state) */
+  struct CrdtLWWMap       shuns;        /**< ban-mask -> CrdtShunRecord (global-state) */
   struct CrdtChannel     *chan_buckets[CRDT_CHAN_BUCKETS];
 };
 
@@ -301,6 +318,14 @@ void crdt_gline_del(struct CrdtNetworkState *st, const char *mask);
  *  (gate for doc->live removal; never true for a merely-absent mask). */
 int crdt_gline_is_explicitly_removed(const struct CrdtNetworkState *st,
                                      const char *mask);
+/** SHUN (global-state track): set/remove a SHUN in the SHUNS LWW-map keyed by @a mask
+ *  (op-recording, mirrors crdt_gline_*). */
+void crdt_shun_set(struct CrdtNetworkState *st, const char *mask,
+                   const struct CrdtShunRecord *rec);
+void crdt_shun_del(struct CrdtNetworkState *st, const char *mask);
+/** 1 iff @a mask has an explicit shun delete-tombstone (gate for doc->live removal). */
+int crdt_shun_is_explicitly_removed(const struct CrdtNetworkState *st,
+                                    const char *mask);
 /** Phase 3k: set/get per-kick metadata (LWW, keyed chan\0numeric). set() records a
  *  SET op so it replicates via delta; get() returns the LWW value (NULL if absent)
  *  so callers can read both the CrdtKickInfo payload and its HLC (.ts) for the

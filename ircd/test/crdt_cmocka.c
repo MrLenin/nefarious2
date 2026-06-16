@@ -422,6 +422,72 @@ static void test_gline_op_replicates(void **state)
   crdt_state_clear(&s2);
 }
 
+/* SHUN doc collection (global-state track sibling of GLINE): set/update/delete via
+ * delta + digest converge + snapshot roundtrip + the explicit-removal gate. */
+static void test_shun_op_replicates(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s1, s2;
+  const char *M = "*!*@*.silence.example";
+  struct CrdtShunRecord rec;
+  const struct CrdtLWWValue *v;
+  uint32_t ml = (uint32_t)strlen(M);
+  uint8_t buf[8192];
+  int n;
+  crdt_state_init(&s1, 1);
+  crdt_state_init(&s2, 2);
+
+  memset(&rec, 0, sizeof rec);
+  rec.expire = 1000; rec.lastmod = 500; rec.lifetime = 9999; rec.flags = 1; rec.bits = 24;
+  strcpy(rec.reason, "noise");
+  crdt_shun_set(&s1, M, &rec);
+  crdt_state_sync(&s2, &s1);
+  v = crdt_lwwmap_get(&s2.shuns, M, ml);
+  assert_non_null(v);
+  assert_non_null(v->data);
+  assert_int_equal((int)sizeof(struct CrdtShunRecord), (int)v->data_len);
+  assert_int_equal(1000, (int)((const struct CrdtShunRecord *)v->data)->expire);
+  assert_string_equal("noise", ((const struct CrdtShunRecord *)v->data)->reason);
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+  assert_int_equal(0, crdt_shun_is_explicitly_removed(&s1, M));
+  assert_int_equal(0, crdt_shun_is_explicitly_removed(&s2, M));
+
+  /* update (newer ts) replicates + wins */
+  rec.expire = 2000; strcpy(rec.reason, "noise-updated");
+  crdt_shun_set(&s1, M, &rec);
+  crdt_state_sync(&s2, &s1);
+  v = crdt_lwwmap_get(&s2.shuns, M, ml);
+  assert_non_null(v); assert_non_null(v->data);
+  assert_int_equal(2000, (int)((const struct CrdtShunRecord *)v->data)->expire);
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+
+  /* snapshot roundtrip (pins the snap_put_lww shuns serialize line) */
+  {
+    struct CrdtNetworkState s3;
+    crdt_state_init(&s3, 3);
+    n = crdt_snapshot_encode(&s1, buf, sizeof buf);
+    assert_true(n > 0);
+    assert_true(crdt_snapshot_apply(&s3, buf, (size_t)n) >= 0);
+    v = crdt_lwwmap_get(&s3.shuns, M, ml);
+    assert_non_null(v); assert_non_null(v->data);
+    assert_int_equal(2000, (int)((const struct CrdtShunRecord *)v->data)->expire);
+    crdt_state_clear(&s3);
+  }
+
+  /* delete (tombstone) replicates -> gone + explicit-removal gate */
+  crdt_shun_del(&s1, M);
+  crdt_state_sync(&s2, &s1);
+  v = crdt_lwwmap_get(&s2.shuns, M, ml);
+  assert_true(v == NULL || v->data == NULL);
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+  assert_int_equal(1, crdt_shun_is_explicitly_removed(&s1, M));
+  assert_int_equal(1, crdt_shun_is_explicitly_removed(&s2, M));
+  assert_int_equal(0, crdt_shun_is_explicitly_removed(&s2, "*!*@never.set.example"));
+
+  crdt_state_clear(&s1);
+  crdt_state_clear(&s2);
+}
+
 /* ================================================================== */
 /* Phase 3j: per-channel creationtime is an incarnation MIN-register.
  * Concurrent creates converge to the LOWER TS (IRC lower-TS-wins, the safe
@@ -1711,6 +1777,7 @@ int main(void)
     cmocka_unit_test(test_orset_explicit_removal_gate),
     cmocka_unit_test(test_chan_ban_op_replicates),
     cmocka_unit_test(test_gline_op_replicates),
+    cmocka_unit_test(test_shun_op_replicates),
     cmocka_unit_test(test_chan_ctime_min_incarnation),
     cmocka_unit_test(test_kick_info_replicates_and_hlc_gates),
     cmocka_unit_test(test_E_squit_creates_no_membership_tombstones),
