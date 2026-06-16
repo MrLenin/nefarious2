@@ -44,6 +44,13 @@ static struct CrdtNetworkState g_crdt;
 static int                     g_inited = 0;
 static struct Timer            g_verify_timer;
 
+/* GLINE step 3 re-entrancy guard: set while crdt_shadow_reconcile_glines drives the
+ * live gline subsystem FROM the doc. The crdt_shadow_gline_add/_remove hooks self-skip
+ * when it is set, so a doc-driven materialize does NOT re-mint the op it came from
+ * (loop prevention; the analog of reconcile_topic_cb writing chptr->topic directly).
+ * Synchronous — reconcile is never re-entrant. */
+static int                     g_gline_reconciling = 0;
+
 /* Gossiped mesh-topology map: single-writer adjacency rows accumulated from CR H
  * beacons (each node declares only its own direct CRDT peers).  Ephemeral, NOT in
  * the digest -> cannot diverge.  Observability-only: feeds the /CRDT command (and
@@ -928,6 +935,8 @@ void crdt_shadow_gline_add(struct Gline *gl, struct Client *from)
   struct CrdtGlineRecord rec;
   if (!shadow_on())
     return;
+  if (g_gline_reconciling)              /* step 3: doc-driven materialize — don't re-mint */
+    return;
   if (from_crdt_peer(from))             /* single-writer: mesh entry server owns it */
     return;
   if (!gline_doc_key(gl, key, sizeof key))
@@ -942,12 +951,130 @@ void crdt_shadow_gline_remove(struct Gline *gl, struct Client *from)
   char key[CHANNELLEN + USERLEN + 4];
   if (!shadow_on())
     return;
+  if (g_gline_reconciling)              /* step 3: doc-driven materialize — don't re-mint */
+    return;
   if (from_crdt_peer(from))
     return;
   if (!gline_doc_key(gl, key, sizeof key))
     return;
   crdt_gline_del(&g_crdt, key);
   crdt_sync_push();
+}
+
+/* ---- GLINE step 3 (cutover): drive live global G-lines FROM the doc + §17.7 gateway ---- */
+
+#define CRDT_GLINE_REMOVE_MAX 64
+
+struct reconcile_gline_ctx { unsigned int created, removed; };
+
+/* ADD/heal + drift pass: for each PRESENT doc gline whose live copy is missing or
+ * materially stale, drive it live via gline_add/gline_modify under the re-entrancy
+ * guard (so the shadow hook self-skips — no doc re-mint). gline_add derives the
+ * variant ($R realname / $V version / # badchan / user@host IP) + the GLINE_*
+ * flags from the mask, so we pass only the mask + record fields; its (now legacy-only
+ * under FEAT_CRDT_GLINE_CUTOVER) gline_propagate IS the §17.7 gateway, and do_gline
+ * kicks matching local users. Echo-guarded by a field comparison (NOT lastmod) so it
+ * neither bounces a P10-delivered gline back nor churns on a lastmod-only bump. */
+static void reconcile_gline_add_cb(const char *key, uint32_t key_len,
+                                   const struct CrdtLWWValue *val, void *ctx)
+{
+  struct reconcile_gline_ctx *c = ctx;
+  char mask[CHANNELLEN + USERLEN + 4];
+  char reason[CRDT_GLINEREASONLEN];
+  const struct CrdtGlineRecord *rec;
+  struct Gline *existing;
+  if (key_len >= sizeof mask || !val->data ||
+      val->data_len != sizeof(struct CrdtGlineRecord))
+    return;                              /* tombstone / partial record */
+  rec = (const struct CrdtGlineRecord *)val->data;
+  if ((time_t)rec->expire <= TStime())
+    return;                              /* never materialize an expired record (HQ4) */
+  memcpy(mask, key, key_len); mask[key_len] = '\0';
+  ircd_strncpy(reason, rec->reason, sizeof reason);
+  existing = gline_find(mask, GLINE_GLOBAL | GLINE_ANY | GLINE_EXACT);
+  if (existing) {
+    int active_now = (existing->gl_flags & GLINE_ACTIVE) ? 1 : 0;
+    int active_doc = (rec->flags & GLINE_ACTIVE) ? 1 : 0;
+    if (active_now == active_doc &&
+        existing->gl_expire   == (time_t)rec->expire &&
+        existing->gl_lifetime == (time_t)rec->lifetime &&
+        !strcmp(existing->gl_reason ? existing->gl_reason : "", reason))
+      return;                            /* materially in sync — echo guard (no churn) */
+    /* doc is newer/different: drive the drift (active state + expire/lifetime/reason).
+     * Carry rec->lastmod (NOT TStime) so legacy ordering holds + no ping-pong (HQ1). */
+    gline_modify(&me, &me, existing,
+                 active_doc ? GLINE_ACTIVATE : GLINE_DEACTIVATE, reason,
+                 (time_t)rec->expire, (time_t)rec->lastmod, (time_t)rec->lifetime,
+                 GLINE_EXPIRE | GLINE_LIFETIME | GLINE_REASON | GLINE_FORCE);
+  } else {
+    /* not live: materialize. GLINE_FORCE bypasses the expire-window check; the variant
+     * + ACTIVE flags ride in (gline_add ORs the mask-derived variant bits). */
+    gline_add(&me, &me, mask, reason, (time_t)rec->expire, (time_t)rec->lastmod,
+              (time_t)rec->lifetime,
+              GLINE_GLOBAL | GLINE_FORCE |
+              ((rec->flags & GLINE_ACTIVE) ? GLINE_ACTIVE : 0));
+  }
+  c->created++;
+}
+
+/* GLINE step 3: drive live global G-lines FROM the doc (+ §17.7 gateway to legacy).
+ * ADD/heal/drift via the foreach above; REMOVE: free any live global G-line the doc
+ * has EXPLICITLY tombstoned (crdt_gline_is_explicitly_removed — NEVER on mere absence,
+ * the sync-lag safety) + gateway a `-mask` to legacy. Collect-then-act (gline_free
+ * unlinks; never free mid-walk). Idempotent + a no-op while P10 still delivers G-lines
+ * (the field echo guard), so it is safe to enable before P10 GL suppression (3b). The
+ * whole pass runs under g_gline_reconciling so no doc op is re-minted. No-op unless
+ * FEAT_CRDT_GLINE_CUTOVER + FEAT_CRDT_PRIMARY. */
+void crdt_shadow_reconcile_glines(void)
+{
+  struct reconcile_gline_ctx c = { 0, 0 };
+  char masks[CRDT_GLINE_REMOVE_MAX][CHANNELLEN + USERLEN + 4];
+  int nr = 0, i, capped = 0;
+  struct Gline *gl;
+  struct Gline *lists[2];
+  int li;
+  if (!shadow_on() || !feature_bool(FEAT_CRDT_GLINE_CUTOVER) ||
+      !feature_bool(FEAT_CRDT_PRIMARY))
+    return;
+  g_gline_reconciling = 1;
+  crdt_lwwmap_foreach(&g_crdt.glines, reconcile_gline_add_cb, &c);
+  /* REMOVE pass — collect masks the doc tombstoned that are still live (both lists). */
+  lists[0] = GlobalGlineList;
+  lists[1] = BadChanGlineList;
+  for (li = 0; li < 2 && !capped; li++) {
+    for (gl = lists[li]; gl; gl = gl->gl_next) {
+      char key[CHANNELLEN + USERLEN + 4];
+      if (!gline_doc_key(gl, key, sizeof key))   /* skips local G-lines */
+        continue;
+      if (!gl->gl_lastmod)
+        continue;
+      if (!crdt_gline_is_explicitly_removed(&g_crdt, key))
+        continue;                        /* present / absent / lagging — leave it */
+      if (nr >= CRDT_GLINE_REMOVE_MAX) { capped = 1; break; }
+      ircd_strncpy(masks[nr], key, sizeof masks[nr]);
+      nr++;
+    }
+  }
+  for (i = 0; i < nr; i++) {
+    struct Gline *g = gline_find(masks[i], GLINE_GLOBAL | GLINE_ANY | GLINE_EXACT);
+    if (!g)
+      continue;                          /* already gone (e.g. P10 removed it) */
+    /* §17.7 gateway: tell legacy to drop it (-mask, legacy-only). Byte-shape mirrors
+     * gline_propagate. gline_free has no shadow hook -> no re-mint. */
+    sendcmdto_flag_serv_butone(&me, CMD_GLINE, NULL, FLAG_LAST_FLAG, FLAG_CRDT_AWARE,
+                               "* -%s%s%s %Tu %Tu %Tu :%s",
+                               g->gl_user, g->gl_host ? "@" : "",
+                               g->gl_host ? g->gl_host : "",
+                               g->gl_expire - TStime(), g->gl_lastmod,
+                               g->gl_lifetime, g->gl_reason);
+    gline_free(g);
+    c.removed++;
+  }
+  g_gline_reconciling = 0;
+  if (c.created || c.removed)
+    log_write(LS_SYSTEM, L_NOTICE, 0,
+              "CRDT gline-reconcile: drove %u, removed %u global G-line(s) from doc%s",
+              c.created, c.removed, capped ? " (remove capped; more next tick)" : "");
 }
 
 /* Emit one verify line either to the system log (timer path, @a to == NULL) or
@@ -2812,6 +2939,7 @@ static void crdt_shadow_verify_cb(struct Event *ev)
   crdt_shadow_reconcile_member_status(); /* Phase 3h: per-member status (+o/+v/+h) */
   crdt_shadow_reconcile_bans();    /* Phase 3i: channel bans/excepts (+b/+e) */
   crdt_shadow_reconcile_user_removes(); /* Phase 3m: QUIT / delete-on-leave (after channel cleanup) */
+  crdt_shadow_reconcile_glines();  /* GLINE step 3: drive global G-lines from doc (+gateway) */
   crdt_sync_broadcast();   /* periodic anti-entropy: pull deltas from peers */
   crdt_shadow_gc();        /* reclaim causally-stable ops/tombstones */
 

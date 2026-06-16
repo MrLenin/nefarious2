@@ -122,6 +122,9 @@ enum GlineAction {
 /** Return last modification time of a G-line. */
 #define GlineLastMod(g)		((g)->gl_lastmod)
 
+extern struct Gline* GlobalGlineList;	/**< List of user G-lines (GLINE step 3 reconcile walk). */
+extern struct Gline* BadChanGlineList;	/**< List of BadChan G-lines. */
+
 extern int gline_add(struct Client *cptr, struct Client *sptr, char *userhost,
 		     char *reason, time_t expire, time_t lastmod,
 		     time_t lifetime, unsigned int flags);

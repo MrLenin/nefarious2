@@ -1371,6 +1371,7 @@ static struct FeatureDesc {
   F_B(CRDT_MESHMAP_PRESENCE, 0, 0, 0),
   F_B(CRDT_ROUTE_UNICAST, 0, 0, 0),
   F_B(CRDT_ROUTE_BCAST, 0, 0, 0),
+  F_B(CRDT_GLINE_CUTOVER, 0, 0, 0),
 
 #undef F_S
 #undef F_B

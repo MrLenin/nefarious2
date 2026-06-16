@@ -678,6 +678,15 @@ void crdt_gline_del(struct CrdtNetworkState *st, const char *mask)
   record(st, op);
 }
 
+/* GLINE step 3: 1 iff this mask has an explicit gline delete-tombstone in the doc
+ * (the gate for doc->live removal; never fires on mere absence — sync-lag safety,
+ * mirrors crdt_user_is_explicitly_removed). */
+int crdt_gline_is_explicitly_removed(const struct CrdtNetworkState *st,
+                                     const char *mask)
+{
+  return crdt_lwwmap_is_deleted(&st->glines, mask, (uint32_t)strlen(mask));
+}
+
 /* ------------------------------------------------------------------ */
 /* sync / merge                                                       */
 /* ------------------------------------------------------------------ */

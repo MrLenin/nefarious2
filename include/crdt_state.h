@@ -297,6 +297,10 @@ void crdt_chanmeta_set(struct CrdtNetworkState *st, const char *chan,
 void crdt_gline_set(struct CrdtNetworkState *st, const char *mask,
                     const struct CrdtGlineRecord *rec);
 void crdt_gline_del(struct CrdtNetworkState *st, const char *mask);
+/** GLINE step 3: 1 iff @a mask has an explicit gline delete-tombstone in the doc
+ *  (gate for doc->live removal; never true for a merely-absent mask). */
+int crdt_gline_is_explicitly_removed(const struct CrdtNetworkState *st,
+                                     const char *mask);
 /** Phase 3k: set/get per-kick metadata (LWW, keyed chan\0numeric). set() records a
  *  SET op so it replicates via delta; get() returns the LWW value (NULL if absent)
  *  so callers can read both the CrdtKickInfo payload and its HLC (.ts) for the

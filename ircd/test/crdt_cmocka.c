@@ -379,6 +379,9 @@ static void test_gline_op_replicates(void **state)
   assert_int_equal(24,   ((const struct CrdtGlineRecord *)v->data)->bits);
   assert_string_equal("spam", ((const struct CrdtGlineRecord *)v->data)->reason);
   assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+  /* step 3 removal gate: a PRESENT gline is not "explicitly removed" on either replica */
+  assert_int_equal(0, crdt_gline_is_explicitly_removed(&s1, M));
+  assert_int_equal(0, crdt_gline_is_explicitly_removed(&s2, M));
 
   /* update (newer ts) replicates + wins */
   rec.expire = 2000; strcpy(rec.reason, "spam-updated");
@@ -408,6 +411,12 @@ static void test_gline_op_replicates(void **state)
   v = crdt_lwwmap_get(&s2.glines, M, ml);
   assert_true(v == NULL || v->data == NULL);
   assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+  /* step 3 removal gate: the tombstone makes the mask "explicitly removed" on BOTH
+   * replicas (the doc->live remove driver gates on this, never on mere absence) */
+  assert_int_equal(1, crdt_gline_is_explicitly_removed(&s1, M));
+  assert_int_equal(1, crdt_gline_is_explicitly_removed(&s2, M));
+  /* a mask that was NEVER set is absent, NOT explicitly removed (sync-lag safety) */
+  assert_int_equal(0, crdt_gline_is_explicitly_removed(&s2, "*!*@never.set.example"));
 
   crdt_state_clear(&s1);
   crdt_state_clear(&s2);
