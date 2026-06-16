@@ -310,6 +310,7 @@ int crdt_snapshot_encode(const struct CrdtNetworkState *st,
   snap_put_lww(&w, &st->members_status, (uint8_t)CRDT_COLL_MEMBER_STATUS, &lww_total);
   snap_put_lww(&w, &st->kick_info, (uint8_t)CRDT_COLL_KICK_INFO, &lww_total);
   snap_put_lww(&w, &st->chanmeta, (uint8_t)CRDT_COLL_CHANMETA, &lww_total);
+  snap_put_lww(&w, &st->glines, (uint8_t)CRDT_COLL_GLINES, &lww_total);
   wpatch_u32(&w, lww_off, lww_total);
 
   /* channels: members / bans / excepts */

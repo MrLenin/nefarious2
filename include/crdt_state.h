@@ -101,6 +101,23 @@ struct CrdtChanMeta {
   char     topic_nick[CRDT_TOPICNICKLEN];
 };
 
+/** Global G-line as CRDT-native doc state (global-state-into-doc track).  Keyed by
+ *  the ban mask (user@host / *@ip / realname / badchan) in the GLINES LWW-map; this
+ *  fixed-layout record carries the fields for faithful materialization back to a live
+ *  G-line at cutover.  Timestamps are uint64 (not time_t) for wire stability; LWW in
+ *  the doc is by HLC (the op ts), while gl_lastmod rides as a field. */
+#define CRDT_GLINEREASONLEN 256
+struct CrdtGlineRecord {
+  uint64_t expire;                 /**< gl_expire */
+  uint64_t lastmod;                /**< gl_lastmod (P10 conflict ts, carried) */
+  uint64_t lifetime;               /**< gl_lifetime */
+  uint32_t flags;                  /**< gl_flags subset (active/ipmask/badchan/...) */
+  uint8_t  addr[16];               /**< gl_addr (ip-glines) */
+  uint8_t  bits;                   /**< gl_bits */
+  uint8_t  pad[3];                 /**< explicit pad -> stable layout for the digest */
+  char     reason[CRDT_GLINEREASONLEN];
+};
+
 /** Nick claim (proposal §17.5.1). */
 struct CrdtNickClaim {
   char       numeric[CRDT_NUMERICLEN];  /**< claiming user's numeric */
@@ -133,7 +150,8 @@ enum CrdtCollection {
   CRDT_COLL_CHAN_BANS,     /**< per-channel +b ban masks (OR-Set) — Phase 3i */
   CRDT_COLL_CHAN_EXCEPTS,  /**< per-channel +e except masks (OR-Set) — Phase 3i */
   CRDT_COLL_CHAN_CTIME,    /**< per-channel creationtime (incarnation min-register) — Phase 3j */
-  CRDT_COLL_KICK_INFO      /**< chan\0numeric -> CrdtKickInfo (LWW) — Phase 3k */
+  CRDT_COLL_KICK_INFO,     /**< chan\0numeric -> CrdtKickInfo (LWW) — Phase 3k */
+  CRDT_COLL_GLINES         /**< ban-mask -> CrdtGlineRecord (LWW) — global-state track */
 };
 
 struct CrdtOp {
@@ -209,6 +227,7 @@ struct CrdtNetworkState {
   struct CrdtLWWMap       members_status; /**< chan\0numeric -> CrdtMemberRecord */
   struct CrdtLWWMap       kick_info;    /**< chan\0numeric -> CrdtKickInfo (Phase 3k) */
   struct CrdtLWWMap       chanmeta;     /**< channel-name -> CrdtChanMeta */
+  struct CrdtLWWMap       glines;       /**< ban-mask -> CrdtGlineRecord (global-state) */
   struct CrdtChannel     *chan_buckets[CRDT_CHAN_BUCKETS];
 };
 
@@ -272,6 +291,12 @@ void crdt_member_status_set(struct CrdtNetworkState *st, const char *chan,
 /** Set per-channel metadata (creationtime/topic provenance, LWW). Records a SET. */
 void crdt_chanmeta_set(struct CrdtNetworkState *st, const char *chan,
                        const struct CrdtChanMeta *meta);
+/** Global-state track: set/remove a G-line in the GLINES LWW-map keyed by @a mask.
+ *  set() records a SET op (op-recording -> replicates via delta, not just snapshot);
+ *  del() records a DELETE tombstone. */
+void crdt_gline_set(struct CrdtNetworkState *st, const char *mask,
+                    const struct CrdtGlineRecord *rec);
+void crdt_gline_del(struct CrdtNetworkState *st, const char *mask);
 /** Phase 3k: set/get per-kick metadata (LWW, keyed chan\0numeric). set() records a
  *  SET op so it replicates via delta; get() returns the LWW value (NULL if absent)
  *  so callers can read both the CrdtKickInfo payload and its HLC (.ts) for the
