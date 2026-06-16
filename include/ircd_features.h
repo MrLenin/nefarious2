@@ -513,6 +513,7 @@ enum Feature {
   FEAT_CRDT_GLINE_CUTOVER,      /* GLINE step 3: doc is the transport for global G-lines among CRDT peers (reconcile-from-doc + §17.7 gateway + suppress P10 GL) */
   FEAT_CRDT_SHUN_CUTOVER,       /* SHUN: doc is the transport for global Shuns among CRDT peers (reconcile-from-doc + §17.7 gateway + suppress P10 SU) */
   FEAT_CRDT_ZLINE_CUTOVER,      /* ZLINE: doc is the transport for global Z-lines among CRDT peers (reconcile-from-doc + §17.7 gateway + suppress P10 ZL) */
+  FEAT_CRDT_JUPE_CUTOVER,       /* JUPE: doc is the transport for global server jupes among CRDT peers (reconcile-from-doc + §17.7 gateway + suppress P10 JU) */
 
   FEAT_LAST_F
 };

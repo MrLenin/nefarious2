@@ -68,6 +68,8 @@ struct Jupe {
 /** Get the last modification time for \a j. */
 #define JupeLastMod(j)		((j)->ju_lastmod)
 
+extern struct Jupe* GlobalJupeList;	/**< List of jupes (CRDT reconcile walk). */
+
 extern int jupe_add(struct Client *cptr, struct Client *sptr, char *server,
 		    char *reason, time_t expire, time_t lastmod,
 		    unsigned int flags);

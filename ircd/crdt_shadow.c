@@ -19,6 +19,7 @@
 #include "gline.h"           /* struct Gline + GlineIs* (GLINE step 2 shadow-write) */
 #include "shun.h"            /* struct Shun + ShunIs* (SHUN global-state track) */
 #include "zline.h"           /* struct Zline + ZlineIs* (ZLINE global-state track) */
+#include "jupe.h"            /* struct Jupe + JupeIs* (JUPE global-state track) */
 #include "hash.h"            /* FindChannel (Phase 3b dry-run lookup) */
 #include "list.h"            /* make_client / add_client_to_list (3c materialize) */
 #include "struct.h"          /* struct User (cli_user(c)->server) */
@@ -54,6 +55,7 @@ static struct Timer            g_verify_timer;
 static int                     g_gline_reconciling = 0;
 static int                     g_shun_reconciling = 0;   /* SHUN: same role as g_gline_reconciling */
 static int                     g_zline_reconciling = 0;  /* ZLINE: same role */
+static int                     g_jupe_reconciling = 0;   /* JUPE: same role */
 
 /* Gossiped mesh-topology map: single-writer adjacency rows accumulated from CR H
  * beacons (each node declares only its own direct CRDT peers).  Ephemeral, NOT in
@@ -1355,6 +1357,137 @@ void crdt_shadow_reconcile_zlines(void)
   if (c.created || c.removed)
     log_write(LS_SYSTEM, L_NOTICE, 0,
               "CRDT zline-reconcile: drove %u, removed %u global Z-line(s) from doc%s",
+              c.created, c.removed, capped ? " (remove capped; more next tick)" : "");
+}
+
+/* ---- JUPE global-state track (NOT a ban: a juped SERVER NAME; adapted template) ----
+ * Differences from gline/shun/zline: keyed by server name; no lifetime/addr; jupe has
+ * NO modify -> drift is handled by recreate (jupe_free + jupe_add); jupe_add takes
+ * expire as a DURATION relative to CurrentTime (not absolute/TStime); do_jupe SQUITs a
+ * matching locally-linked server. A global jupe is "removed" by DEACTIVATION (a SET of
+ * an inactive record), never a tombstone -> the remove pass below is dormant for global
+ * jupes (kept for symmetry / a future jupe_destroy). */
+
+static const char *jupe_doc_key(const struct Jupe *ju, char *buf, size_t n)
+{
+  if (!ju || JupeIsLocal(ju) || !ju->ju_server)
+    return NULL;
+  ircd_snprintf(0, buf, n, "%s", ju->ju_server);
+  return buf;
+}
+
+static void jupe_to_record(const struct Jupe *ju, struct CrdtJupeRecord *rec)
+{
+  memset(rec, 0, sizeof *rec);
+  rec->expire  = (uint64_t)ju->ju_expire;     /* absolute, CurrentTime-based */
+  rec->lastmod = (uint64_t)ju->ju_lastmod;
+  rec->flags   = (uint32_t)ju->ju_flags;
+  ircd_strncpy(rec->reason, ju->ju_reason ? ju->ju_reason : "", sizeof rec->reason);
+}
+
+void crdt_shadow_jupe_add(struct Jupe *ju, struct Client *from)
+{
+  char key[HOSTLEN + 4];
+  struct CrdtJupeRecord rec;
+  if (!shadow_on())
+    return;
+  if (g_jupe_reconciling)
+    return;
+  if (from_crdt_peer(from))
+    return;
+  if (!jupe_doc_key(ju, key, sizeof key))
+    return;
+  jupe_to_record(ju, &rec);
+  crdt_jupe_set(&g_crdt, key, &rec);
+  crdt_sync_push();
+}
+
+void crdt_shadow_jupe_remove(struct Jupe *ju, struct Client *from)
+{
+  char key[HOSTLEN + 4];
+  if (!shadow_on())
+    return;
+  if (g_jupe_reconciling)
+    return;
+  if (from_crdt_peer(from))
+    return;
+  if (!jupe_doc_key(ju, key, sizeof key))
+    return;
+  crdt_jupe_del(&g_crdt, key);
+  crdt_sync_push();
+}
+
+static void reconcile_jupe_add_cb(const char *key, uint32_t key_len,
+                                  const struct CrdtLWWValue *val, void *ctx)
+{
+  struct reconcile_gline_ctx *c = ctx;
+  char server[HOSTLEN + 4];
+  char reason[CRDT_JUPEREASONLEN];
+  const struct CrdtJupeRecord *rec;
+  struct Jupe *existing;
+  int active_doc;
+  if (key_len >= sizeof server || !val->data ||
+      val->data_len != sizeof(struct CrdtJupeRecord))
+    return;
+  rec = (const struct CrdtJupeRecord *)val->data;
+  if ((time_t)rec->expire <= CurrentTime)
+    return;                              /* expired (jupe_add would reject too) */
+  memcpy(server, key, key_len); server[key_len] = '\0';
+  ircd_strncpy(reason, rec->reason, sizeof reason);
+  active_doc = (rec->flags & JUPE_ACTIVE) ? 1 : 0;
+  existing = jupe_find(server);
+  if (existing) {
+    int active_now = JupeIsRemActive(existing) ? 1 : 0;
+    if (active_now == active_doc &&
+        existing->ju_expire == (time_t)rec->expire &&
+        !strcmp(existing->ju_reason ? existing->ju_reason : "", reason))
+      return;                            /* materially in sync — echo guard */
+    jupe_free(existing);                 /* jupe has no modify -> recreate from doc */
+  }
+  /* (re)create: jupe_add wants a DURATION; carries rec->lastmod (no ping-pong). */
+  jupe_add(&me, &me, server, reason, (time_t)rec->expire - CurrentTime,
+           (time_t)rec->lastmod, active_doc ? JUPE_ACTIVE : 0);
+  c->created++;
+}
+
+void crdt_shadow_reconcile_jupes(void)
+{
+  struct reconcile_gline_ctx c = { 0, 0 };
+  char names[CRDT_GLINE_REMOVE_MAX][HOSTLEN + 4];
+  int nr = 0, i, capped = 0;
+  struct Jupe *ju;
+  if (!shadow_on() || !feature_bool(FEAT_CRDT_JUPE_CUTOVER) ||
+      !feature_bool(FEAT_CRDT_PRIMARY))
+    return;
+  g_jupe_reconciling = 1;
+  crdt_lwwmap_foreach(&g_crdt.jupes, reconcile_jupe_add_cb, &c);
+  /* REMOVE pass (dormant for global jupes — they deactivate, never tombstone). */
+  for (ju = GlobalJupeList; ju; ju = ju->ju_next) {
+    char key[HOSTLEN + 4];
+    if (!jupe_doc_key(ju, key, sizeof key))   /* skips local jupes */
+      continue;
+    if (!ju->ju_lastmod)
+      continue;
+    if (!crdt_jupe_is_explicitly_removed(&g_crdt, key))
+      continue;
+    if (nr >= CRDT_GLINE_REMOVE_MAX) { capped = 1; break; }
+    ircd_strncpy(names[nr], key, sizeof names[nr]);
+    nr++;
+  }
+  for (i = 0; i < nr; i++) {
+    struct Jupe *j = jupe_find(names[i]);
+    if (!j)
+      continue;
+    sendcmdto_flag_serv_butone(&me, CMD_JUPE, NULL, FLAG_LAST_FLAG, FLAG_CRDT_AWARE,
+                               "* -%s %Tu %Tu :%s", j->ju_server,
+                               j->ju_expire - CurrentTime, j->ju_lastmod, j->ju_reason);
+    jupe_free(j);
+    c.removed++;
+  }
+  g_jupe_reconciling = 0;
+  if (c.created || c.removed)
+    log_write(LS_SYSTEM, L_NOTICE, 0,
+              "CRDT jupe-reconcile: drove %u, removed %u juped server(s) from doc%s",
               c.created, c.removed, capped ? " (remove capped; more next tick)" : "");
 }
 
@@ -3223,6 +3356,7 @@ static void crdt_shadow_verify_cb(struct Event *ev)
   crdt_shadow_reconcile_glines();  /* GLINE step 3: drive global G-lines from doc (+gateway) */
   crdt_shadow_reconcile_shuns();   /* SHUN: drive global Shuns from doc (+gateway) */
   crdt_shadow_reconcile_zlines();  /* ZLINE: drive global Z-lines from doc (+gateway) */
+  crdt_shadow_reconcile_jupes();   /* JUPE: drive juped servers from doc (+gateway) */
   crdt_sync_broadcast();   /* periodic anti-entropy: pull deltas from peers */
   crdt_shadow_gc();        /* reclaim causally-stable ops/tombstones */
 

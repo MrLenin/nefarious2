@@ -148,6 +148,19 @@ struct CrdtZlineRecord {
   char     reason[CRDT_ZLINEREASONLEN];
 };
 
+/** Global JUPE as CRDT-native doc state — the global-state-track sibling that is NOT
+ *  a ban: a juped SERVER NAME (P10 JU token).  Keyed by the server name in the JUPES
+ *  LWW-map.  Simpler than the ban records: no lifetime, no addr/bits, no realname/
+ *  version.  ju_expire is absolute (CurrentTime-based, NOT TStime). */
+#define CRDT_JUPEREASONLEN 256
+struct CrdtJupeRecord {
+  uint64_t expire;                 /**< ju_expire (absolute, CurrentTime-based) */
+  uint64_t lastmod;                /**< ju_lastmod (P10 conflict ts, carried) */
+  uint32_t flags;                  /**< ju_flags subset (active/...) */
+  uint8_t  pad[4];                 /**< explicit pad -> stable layout for the digest */
+  char     reason[CRDT_JUPEREASONLEN];
+};
+
 /** Nick claim (proposal §17.5.1). */
 struct CrdtNickClaim {
   char       numeric[CRDT_NUMERICLEN];  /**< claiming user's numeric */
@@ -183,7 +196,8 @@ enum CrdtCollection {
   CRDT_COLL_KICK_INFO,     /**< chan\0numeric -> CrdtKickInfo (LWW) — Phase 3k */
   CRDT_COLL_GLINES,        /**< ban-mask -> CrdtGlineRecord (LWW) — global-state track */
   CRDT_COLL_SHUNS,         /**< ban-mask -> CrdtShunRecord (LWW) — global-state track */
-  CRDT_COLL_ZLINES         /**< ip-mask -> CrdtZlineRecord (LWW) — global-state track */
+  CRDT_COLL_ZLINES,        /**< ip-mask -> CrdtZlineRecord (LWW) — global-state track */
+  CRDT_COLL_JUPES          /**< server-name -> CrdtJupeRecord (LWW) — global-state track */
 };
 
 struct CrdtOp {
@@ -262,6 +276,7 @@ struct CrdtNetworkState {
   struct CrdtLWWMap       glines;       /**< ban-mask -> CrdtGlineRecord (global-state) */
   struct CrdtLWWMap       shuns;        /**< ban-mask -> CrdtShunRecord (global-state) */
   struct CrdtLWWMap       zlines;       /**< ip-mask -> CrdtZlineRecord (global-state) */
+  struct CrdtLWWMap       jupes;        /**< server-name -> CrdtJupeRecord (global-state) */
   struct CrdtChannel     *chan_buckets[CRDT_CHAN_BUCKETS];
 };
 
@@ -351,6 +366,15 @@ void crdt_zline_del(struct CrdtNetworkState *st, const char *mask);
 /** 1 iff @a mask has an explicit zline delete-tombstone (gate for doc->live removal). */
 int crdt_zline_is_explicitly_removed(const struct CrdtNetworkState *st,
                                      const char *mask);
+/** JUPE (global-state track): set/remove a juped server in the JUPES LWW-map keyed by
+ *  @a server name (op-recording). NB global-jupe "removal" is a deactivate (SET inactive),
+ *  not a tombstone — del is for symmetry / a future jupe_destroy. */
+void crdt_jupe_set(struct CrdtNetworkState *st, const char *server,
+                   const struct CrdtJupeRecord *rec);
+void crdt_jupe_del(struct CrdtNetworkState *st, const char *server);
+/** 1 iff @a server has an explicit jupe delete-tombstone (gate for doc->live removal). */
+int crdt_jupe_is_explicitly_removed(const struct CrdtNetworkState *st,
+                                    const char *server);
 /** Phase 3k: set/get per-kick metadata (LWW, keyed chan\0numeric). set() records a
  *  SET op so it replicates via delta; get() returns the LWW value (NULL if absent)
  *  so callers can read both the CrdtKickInfo payload and its HLC (.ts) for the

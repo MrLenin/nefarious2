@@ -147,6 +147,7 @@ void crdt_state_init(struct CrdtNetworkState *st, uint16_t my_numeric)
   crdt_lwwmap_init(&st->glines);
   crdt_lwwmap_init(&st->shuns);
   crdt_lwwmap_init(&st->zlines);
+  crdt_lwwmap_init(&st->jupes);
 }
 
 void crdt_state_clear(struct CrdtNetworkState *st)
@@ -164,6 +165,7 @@ void crdt_state_clear(struct CrdtNetworkState *st)
   crdt_lwwmap_clear(&st->glines);
   crdt_lwwmap_clear(&st->shuns);
   crdt_lwwmap_clear(&st->zlines);
+  crdt_lwwmap_clear(&st->jupes);
   for (int b = 0; b < CRDT_CHAN_BUCKETS; b++) {
     struct CrdtChannel *c = st->chan_buckets[b];
     while (c) {
@@ -777,6 +779,49 @@ int crdt_zline_is_explicitly_removed(const struct CrdtNetworkState *st,
   return crdt_lwwmap_is_deleted(&st->zlines, mask, (uint32_t)strlen(mask));
 }
 
+/* JUPE (global-state track): op-recording set/del/gate, keyed by server name. */
+void crdt_jupe_set(struct CrdtNetworkState *st, const char *server,
+                   const struct CrdtJupeRecord *rec)
+{
+  struct HLC ts = hlc_local_event(&st->clock);
+  uint32_t klen = (uint32_t)strlen(server);
+  uint64_t seq;
+  struct CrdtOp *op;
+  crdt_lwwmap_set(&st->jupes, server, klen, rec, sizeof(*rec),
+                  ts, st->my_numeric);
+  seq = st->next_seq++;
+  op = op_new(st->my_numeric, seq, CRDT_OP_SET, CRDT_COLL_JUPES);
+  op->key = memdup(server, klen);
+  op->key_len = klen;
+  op->val = memdup(rec, sizeof(*rec));
+  op->val_len = sizeof(*rec);
+  op->ts = ts;
+  op->writer = st->my_numeric;
+  record(st, op);
+}
+
+void crdt_jupe_del(struct CrdtNetworkState *st, const char *server)
+{
+  struct HLC ts = hlc_local_event(&st->clock);
+  uint32_t klen = (uint32_t)strlen(server);
+  uint64_t seq;
+  struct CrdtOp *op;
+  crdt_lwwmap_delete(&st->jupes, server, klen, ts, st->my_numeric);
+  seq = st->next_seq++;
+  op = op_new(st->my_numeric, seq, CRDT_OP_DELETE, CRDT_COLL_JUPES);
+  op->key = memdup(server, klen);
+  op->key_len = klen;
+  op->ts = ts;
+  op->writer = st->my_numeric;
+  record(st, op);
+}
+
+int crdt_jupe_is_explicitly_removed(const struct CrdtNetworkState *st,
+                                    const char *server)
+{
+  return crdt_lwwmap_is_deleted(&st->jupes, server, (uint32_t)strlen(server));
+}
+
 /* ------------------------------------------------------------------ */
 /* sync / merge                                                       */
 /* ------------------------------------------------------------------ */
@@ -796,6 +841,7 @@ static struct CrdtLWWMap *lww_for(struct CrdtNetworkState *st,
   case CRDT_COLL_GLINES:        return &st->glines;
   case CRDT_COLL_SHUNS:         return &st->shuns;
   case CRDT_COLL_ZLINES:        return &st->zlines;
+  case CRDT_COLL_JUPES:         return &st->jupes;
   default:                return NULL;
   }
 }
@@ -1043,6 +1089,7 @@ uint64_t crdt_state_digest(const struct CrdtNetworkState *st)
   acc = digest_lww(acc, &st->glines, 9);
   acc = digest_lww(acc, &st->shuns, 13);   /* salt 13: 1-9 LWW, 10-12 OR-Set */
   acc = digest_lww(acc, &st->zlines, 14);  /* salt 14 */
+  acc = digest_lww(acc, &st->jupes, 15);   /* salt 15 */
   for (bk = 0; bk < CRDT_CHAN_BUCKETS; bk++) {
     struct CrdtChannel *c;
     for (c = st->chan_buckets[bk]; c; c = c->next) {
@@ -1094,6 +1141,7 @@ uint64_t crdt_state_digest_materialized(const struct CrdtNetworkState *st)
   acc = digest_lww(acc, &st->glines, 9);
   acc = digest_lww(acc, &st->shuns, 13);   /* salt 13: 1-9 LWW, 10-12 OR-Set */
   acc = digest_lww(acc, &st->zlines, 14);  /* salt 14 */
+  acc = digest_lww(acc, &st->jupes, 15);   /* salt 15 */
   for (bk = 0; bk < CRDT_CHAN_BUCKETS; bk++) {
     struct CrdtChannel *c;
     for (c = st->chan_buckets[bk]; c; c = c->next) {

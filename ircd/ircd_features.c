@@ -1374,6 +1374,7 @@ static struct FeatureDesc {
   F_B(CRDT_GLINE_CUTOVER, 0, 0, 0),
   F_B(CRDT_SHUN_CUTOVER, 0, 0, 0),
   F_B(CRDT_ZLINE_CUTOVER, 0, 0, 0),
+  F_B(CRDT_JUPE_CUTOVER, 0, 0, 0),
 
 #undef F_S
 #undef F_B

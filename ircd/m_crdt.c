@@ -485,6 +485,7 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
           crdt_shadow_reconcile_glines();  /* GLINE step 3: drive global G-lines from doc (+gateway) */
           crdt_shadow_reconcile_shuns();   /* SHUN: drive global Shuns from doc (+gateway) */
           crdt_shadow_reconcile_zlines();  /* ZLINE: drive global Z-lines from doc (+gateway) */
+          crdt_shadow_reconcile_jupes();   /* JUPE: drive juped servers from doc (+gateway) */
         }
       }
       MyFree(bin);

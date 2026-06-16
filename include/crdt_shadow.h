@@ -27,6 +27,7 @@ struct Client;
 struct Gline;
 struct Shun;
 struct Zline;
+struct Jupe;
 
 /** Initialise the shadow CRDT document for this server and arm the periodic
  *  verify timer. Idempotent; safe to call once at startup. */
@@ -195,6 +196,11 @@ void crdt_shadow_shun_remove(struct Shun *shun, struct Client *from);
 void crdt_shadow_zline_add(struct Zline *zline, struct Client *from);
 void crdt_shadow_zline_remove(struct Zline *zline, struct Client *from);
 
+/** JUPE (global-state track): mirror a juped server into / tombstone it in the JUPES
+ *  doc collection. Same gates as the gline/shun/zline hooks. */
+void crdt_shadow_jupe_add(struct Jupe *jupe, struct Client *from);
+void crdt_shadow_jupe_remove(struct Jupe *jupe, struct Client *from);
+
 /** GLINE step 3 (cutover): drive live global G-lines FROM the doc GLINES collection +
  *  §17.7 gateway to legacy. ADD/heal/drift via gline_add/gline_modify (under a re-entrancy
  *  guard so the shadow hook self-skips — no doc re-mint); REMOVE any live global G-line the
@@ -210,6 +216,10 @@ void crdt_shadow_reconcile_shuns(void);
 /** ZLINE cutover (GLINE sibling): drive live global Z-lines FROM the doc + §17.7 gateway.
  *  No-op unless FEAT_CRDT_ZLINE_CUTOVER + FEAT_CRDT_PRIMARY. */
 void crdt_shadow_reconcile_zlines(void);
+
+/** JUPE cutover: drive live juped servers FROM the doc + §17.7 gateway. Recreate-on-drift
+ *  (jupe has no modify). No-op unless FEAT_CRDT_JUPE_CUTOVER + FEAT_CRDT_PRIMARY. */
+void crdt_shadow_reconcile_jupes(void);
 
 /** §17.7 birth-modes bridge (3j gap fix): emit to legacy the persistent modes of
  *  channels born from the doc THIS reconcile pass — called AFTER reconcile_members

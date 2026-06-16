@@ -26,6 +26,7 @@
 
 #include "jupe.h"
 #include "client.h"
+#include "crdt_shadow.h"  /* JUPE global-state track: mirror juped servers into the CRDT doc */
 #include "hash.h"
 #include "ircd.h"
 #include "ircd_alloc.h"
@@ -47,7 +48,7 @@
 #include <string.h>
 
 /** List of jupes. */
-static struct Jupe *GlobalJupeList = 0;
+struct Jupe *GlobalJupeList = 0;   /* non-static: CRDT reconcile walk (crdt_shadow.c) */
 
 /** Allocate a new jupe with the given parameters.
  * @param[in] server Server name to jupe.
@@ -114,7 +115,11 @@ propagate_jupe(struct Client *cptr, struct Client *sptr, struct Jupe *jupe)
   if (JupeIsLocal(jupe)) /* don't propagate local jupes */
     return;
 
-  sendcmdto_serv_butone(sptr, CMD_JUPE, cptr, "* %c%s %Tu %Tu :%s",
+  /* JUPE cutover: legacy-only under FEAT_CRDT_JUPE_CUTOVER (forbid CRDT-aware); forbid=
+   * FLAG_LAST_FLAG when off => no filter => identical to the old sendcmdto_serv_butone. */
+  sendcmdto_flag_serv_butone(sptr, CMD_JUPE, cptr, FLAG_LAST_FLAG,
+			feature_bool(FEAT_CRDT_JUPE_CUTOVER) ? FLAG_CRDT_AWARE : FLAG_LAST_FLAG,
+			"* %c%s %Tu %Tu :%s",
 			JupeIsRemActive(jupe) ? '+' : '-', jupe->ju_server,
 			jupe->ju_expire - CurrentTime, jupe->ju_lastmod,
 			jupe->ju_reason);
@@ -171,6 +176,8 @@ jupe_add(struct Client *cptr, struct Client *sptr, char *server, char *reason,
 
   propagate_jupe(cptr, sptr, ajupe);
 
+  crdt_shadow_jupe_add(ajupe, cptr); /* JUPE: mirror into the CRDT doc */
+
   return do_jupe(cptr, sptr, ajupe); /* remove server if necessary */
 }
 
@@ -222,6 +229,8 @@ jupe_activate(struct Client *cptr, struct Client *sptr, struct Jupe *jupe,
 
   if (!(flags & JUPE_LOCAL)) /* don't propagate local changes */
     propagate_jupe(cptr, sptr, jupe);
+
+  crdt_shadow_jupe_add(jupe, cptr); /* JUPE: re-SET (now active) in doc */
 
   return do_jupe(cptr, sptr, jupe);
 }
@@ -275,10 +284,14 @@ jupe_deactivate(struct Client *cptr, struct Client *sptr, struct Jupe *jupe,
 	    JupeIsLocal(jupe) ? "removing local" : "deactivating",
 	    jupe->ju_server, jupe->ju_expire + TSoffset, jupe->ju_reason);
 
-  if (JupeIsLocal(jupe))
+  if (JupeIsLocal(jupe)) {
+    crdt_shadow_jupe_remove(jupe, cptr); /* local jupe self-skips (never in doc) */
     jupe_free(jupe);
-  else if (!(flags & JUPE_LOCAL)) /* don't propagate local changes */
-    propagate_jupe(cptr, sptr, jupe);
+  } else {
+    if (!(flags & JUPE_LOCAL)) /* don't propagate local changes */
+      propagate_jupe(cptr, sptr, jupe);
+    crdt_shadow_jupe_add(jupe, cptr);    /* JUPE: re-SET (now-inactive) global jupe in doc */
+  }
 
   return 0;
 }
@@ -331,6 +344,10 @@ jupe_burst(struct Client *cptr)
   struct Jupe *jupe;
   struct Jupe *sjupe;
 
+  /* JUPE cutover: a CRDT-aware peer gets jupes via the doc, not the P10 burst. */
+  if (feature_bool(FEAT_CRDT_JUPE_CUTOVER) && IsServer(cptr) && IsCrdtAware(cptr))
+    return;
+
   for (jupe = GlobalJupeList; jupe; jupe = sjupe) { /* go through jupes */
     sjupe = jupe->ju_next;
 
@@ -352,6 +369,10 @@ int
 jupe_resend(struct Client *cptr, struct Jupe *jupe)
 {
   if (JupeIsLocal(jupe)) /* don't propagate local jupes */
+    return 0;
+
+  /* JUPE cutover: CRDT peers get jupes via the doc, not a P10 resend. */
+  if (feature_bool(FEAT_CRDT_JUPE_CUTOVER) && IsServer(cptr) && IsCrdtAware(cptr))
     return 0;
 
   sendcmdto_one(&me, CMD_JUPE, cptr, "* %c%s %Tu %Tu :%s",
