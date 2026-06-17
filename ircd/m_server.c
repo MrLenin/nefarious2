@@ -954,6 +954,10 @@ int ms_server(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
       continue;
     if (0 == match(cli_name(&me), cli_name(acptr)))
       continue;
+    /* MR-3c: suppress a LEGACY server's SERVER intro toward a CRDT-aware peer — it
+     * learns the legacy server via the proxy-beacon + Case-B anchor (MR-3a) instead. */
+    if (crdt_intro_presence_suppress(bcptr, acptr))
+      continue;
     sendcmdto_one(sptr, CMD_SERVER, bcptr, "%s %d 0 %s %s %s%s +%s%s%s%s%s%s%s :%s",
                   cli_name(acptr), hop + 1, parv[4], parv[5],
                   NumServCap(acptr), IsHub(acptr) ? "h" : "",

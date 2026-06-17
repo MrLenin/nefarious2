@@ -103,6 +103,13 @@ int crdt_shadow_mesh_reachable(struct Client *srv);
 int crdt_tree_presence_suppress(struct Client *peer, struct Client *subject,
                                 const char *kind);
 
+/** MR-3c: gate the P10 SERVER intro for a LEGACY @a subject toward a directly-linked
+ *  CRDT-aware @a peer (the CRDT peer learns it via the proxy-beacon + Case-B anchor,
+ *  MR-3a). Inverted subject-awareness vs crdt_tree_presence_suppress; NEVER suppresses
+ *  a CRDT subject or toward a legacy peer. Returns nonzero IFF the caller should SKIP
+ *  the SERVER emit. No-op unless FEAT_CRDT_LEGACY_PRESENCE + FEAT_CRDT_PRIMARY. */
+int crdt_intro_presence_suppress(struct Client *peer, struct Client *subject);
+
 /** Tier2 T2-a/c: convert a (now-leaf) departed server into a STAT_MESH_SERVER
  *  dead-sink stub in place — its users stay live + addressable.  Call only after
  *  the caller has torn down any tree-downlinks (exit_client does this for T2-c). */

@@ -650,6 +650,27 @@ int crdt_tree_presence_suppress(struct Client *peer, struct Client *subject,
   return suppress;
 }
 
+/* MR-3c: gate the P10 SERVER intro for a LEGACY @a subject toward a directly-linked
+ * CRDT-aware @a peer.  When FEAT_CRDT_LEGACY_PRESENCE is on, the CRDT peer learns the
+ * legacy server via the gateway's proxy-beacon + Case-B anchor (MR-3a), so its SERVER
+ * intro is redundant — and relaying it would defeat the cutover.  Inverted subject-
+ * awareness vs crdt_tree_presence_suppress: a LEGACY subject (no beacon of its own —
+ * the gateway proxy-beacons it) toward a CRDT peer.  NEVER suppresses a CRDT subject
+ * (the R7b-infeasible case) or toward a legacy peer (it needs the P10 tree).  Returns
+ * nonzero IFF the caller should SKIP the SERVER emit.  No-op unless FEAT_CRDT_LEGACY_
+ * PRESENCE + FEAT_CRDT_PRIMARY. */
+int crdt_intro_presence_suppress(struct Client *peer, struct Client *subject)
+{
+  int peer_aware, subj_aware;
+  if (!shadow_on())
+    return 0;
+  peer_aware = peer && IsServer(peer) && IsCrdtAware(peer);
+  subj_aware = subject && IsServer(subject) && IsCrdtAware(subject);
+  return crdt_should_suppress_intro(feature_bool(FEAT_CRDT_LEGACY_PRESENCE),
+                                    feature_bool(FEAT_CRDT_PRIMARY),
+                                    peer_aware, subj_aware);
+}
+
 /* R6c: does this node have a directly-linked LEGACY (non-CRDT) P10 peer to present to? */
 static int crdt_gateway_has_legacy_peer(void)
 {

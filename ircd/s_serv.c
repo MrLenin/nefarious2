@@ -201,6 +201,10 @@ int server_estab(struct Client *cptr, struct ConfItem *aconf)
       continue;
     if (!match(cli_name(&me), cli_name(cptr)))
       continue;
+    /* MR-3c: don't broadcast a newly-linked LEGACY server toward CRDT-aware peers
+     * (they learn it via the proxy-beacon + Case-B anchor, MR-3a). */
+    if (crdt_intro_presence_suppress(acptr, cptr))
+      continue;
     sendcmdto_one(&me, CMD_SERVER, acptr,
 		  "%s 2 0 %Tu J%02u %s%s +%s%s%s%s%s%s%s :%s", cli_name(cptr),
 		  cli_serv(cptr)->timestamp, Protocol(cptr), NumServCap(cptr),
@@ -277,6 +281,10 @@ int server_estab(struct Client *cptr, struct ConfItem *aconf)
         protocol_str = IsBurst(acptr) ? "J0" : "P0";
 
       if (0 == match(cli_name(&me), cli_name(acptr)))
+        continue;
+      /* MR-3c: don't introduce a LEGACY server toward a newly-linked CRDT-aware peer
+       * (it learns it via the proxy-beacon + Case-B anchor, MR-3a). */
+      if (crdt_intro_presence_suppress(cptr, acptr))
         continue;
       sendcmdto_one(cli_serv(acptr)->up, CMD_SERVER, cptr,
 		    "%s %d 0 %Tu %s%u %s%s +%s%s%s%s%s%s%s :%s", cli_name(acptr),
