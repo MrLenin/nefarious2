@@ -544,6 +544,25 @@ static void test_should_suppress_tree(void **state)
   assert_int_equal(0, crdt_should_suppress_tree(1, 1, 1, 0)); /* legacy subject */
 }
 
+static void test_should_suppress_intro(void **state)
+{
+  int lo, pr, pa, sa;
+  (void)state;
+  /* exhaustive 16-row table: result == legacy_on && primary && peer_aware && !subject_aware */
+  for (lo = 0; lo <= 1; lo++)
+    for (pr = 0; pr <= 1; pr++)
+      for (pa = 0; pa <= 1; pa++)
+        for (sa = 0; sa <= 1; sa++)
+          assert_int_equal(lo && pr && pa && !sa,
+                           crdt_should_suppress_intro(lo, pr, pa, sa));
+  /* named anchors */
+  assert_int_equal(1, crdt_should_suppress_intro(1, 1, 1, 0)); /* MR-3c: legacy subject -> CRDT peer */
+  assert_int_equal(0, crdt_should_suppress_intro(0, 1, 1, 0)); /* flag off -> shadow */
+  assert_int_equal(0, crdt_should_suppress_intro(1, 0, 1, 0)); /* not CRDT-primary */
+  assert_int_equal(0, crdt_should_suppress_intro(1, 1, 0, 0)); /* legacy peer needs the tree */
+  assert_int_equal(0, crdt_should_suppress_intro(1, 1, 1, 1)); /* CRDT subject (R7b-infeasible) */
+}
+
 int main(void)
 {
   const struct CMUnitTest tests[] = {
@@ -570,6 +589,7 @@ int main(void)
     cmocka_unit_test(test_tree_neighbors),
     cmocka_unit_test(test_row_changed),
     cmocka_unit_test(test_should_suppress_tree),
+    cmocka_unit_test(test_should_suppress_intro),
   };
   return cmocka_run_group_tests(tests, NULL, NULL);
 }

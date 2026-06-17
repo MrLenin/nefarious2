@@ -177,4 +177,15 @@ int crdt_route_action(int owner_is_self, int nexthop_known, int ttl_remaining);
 int crdt_should_suppress_tree(int meshmap_on, int primary,
                               int peer_aware, int subject_aware);
 
+/** MR-3: should the gateway suppress a server's SERVER *intro* toward a CRDT peer?
+ *  The mirror of crdt_should_suppress_tree with INVERTED subject-awareness: suppress
+ *  a LEGACY subject's intro toward a CRDT-aware peer (the leaf learns it via the
+ *  proxy-beacon + Case-B anchor instead), but NEVER a CRDT subject's intro (that is
+ *  the R7b-infeasible case) and NEVER toward a legacy peer (it needs the P10 tree).
+ *  @a legacy_on (FEAT_CRDT_LEGACY_PRESENCE), @a primary (FEAT_CRDT_PRIMARY), @a
+ *  peer_aware (receiver is CRDT-aware), @a subject_aware (subject is CRDT-aware).
+ *  Suppress IFF legacy_on && primary && peer_aware && !subject_aware. Pure / TDD-pinned. */
+int crdt_should_suppress_intro(int legacy_on, int primary,
+                               int peer_aware, int subject_aware);
+
 #endif /* INCLUDED_crdt_meshmap_h */

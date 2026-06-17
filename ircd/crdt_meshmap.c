@@ -413,3 +413,14 @@ int crdt_should_suppress_tree(int meshmap_on, int primary,
 {
   return meshmap_on && primary && peer_aware && subject_aware;
 }
+
+/* MR-3: suppress a LEGACY subject's SERVER intro toward a CRDT-aware peer (inverted
+ * subject-awareness vs crdt_should_suppress_tree — see the header). The leaf learns
+ * the legacy server via the gateway's proxy-beacon + Case-B anchor instead. NEVER
+ * suppress a CRDT subject's intro (R7b-infeasible) or toward a legacy peer (it needs
+ * the P10 tree). */
+int crdt_should_suppress_intro(int legacy_on, int primary,
+                               int peer_aware, int subject_aware)
+{
+  return legacy_on && primary && peer_aware && !subject_aware;
+}

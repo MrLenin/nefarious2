@@ -248,6 +248,12 @@ void crdt_shadow_presence_diff(struct Client *to);
  *  (verify timer); a Client -> NOTICE (/CRDT route). */
 void crdt_shadow_route_diff(struct Client *to);
 
+/** MR-3a SHADOW ORACLE (log-only): for every legacy (non-CRDT) server known via P10,
+ *  report whether a FRESH proxy-beacon for it has also reached us (Case-B anchorable).
+ *  The headline = a no-direct-link leaf showing beacon=FRESH for a legacy server it
+ *  reaches only via CR. No-op unless FEAT_CRDT_LEGACY_PRESENCE. @a to==NULL -> log. */
+void crdt_shadow_legacy_presence_diff(struct Client *to);
+
 /** Phase 3b dry-run: walk the doc and confirm every entity could be rebuilt
  *  from it with field-for-field fidelity against live state. Logs reconstruction
  *  gaps; mutates nothing. No-op unless FEAT_CRDT_ENABLED. */

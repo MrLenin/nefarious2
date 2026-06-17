@@ -1770,6 +1770,52 @@ void crdt_shadow_route_diff(struct Client *to)
               agree, mismatch, mesh_only, p10_only);
 }
 
+/* MR-3a SHADOW ORACLE (log-only, mutates nothing): for every legacy (non-CRDT)
+ * server this node knows via P10, report whether a FRESH proxy-beacon for it has
+ * also reached us (so a Case-B anchor could be built once the SERVER intro is
+ * suppressed at MR-3c). On the gateway every legacy server is P10-present (it owns
+ * the link); the headline is a no-direct-link LEAF showing beacon=FRESH for a
+ * legacy server it only reaches via CR — proof the proxy-beacon path works before
+ * anything is suppressed. No-op unless FEAT_CRDT_LEGACY_PRESENCE. @a to==NULL ->
+ * system log (verify timer); a Client -> NOTICE (/CRDT). */
+void crdt_shadow_legacy_presence_diff(struct Client *to)
+{
+  struct Client *L;
+  time_t now = CurrentTime, stale = crdt_shadow_beacon_stale_secs();
+  int total = 0, fresh = 0, stalecnt = 0, absent = 0;
+  if (!shadow_on() || !feature_bool(FEAT_CRDT_LEGACY_PRESENCE))
+    return;
+  for (L = GlobalClientList; L; L = cli_next(L)) {
+    unsigned int num;
+    time_t brecv;
+    struct Client *via;
+    if (!IsServer(L) || IsMe(L) || IsCrdtAware(L))
+      continue;                          /* legacy servers only */
+    num = (unsigned int)base64toint(cli_yxx(L));
+    brecv = crdt_shadow_beacon_recv(num);
+    via = cli_from(L);
+    total++;
+    if (brecv && (now - brecv) <= stale) {
+      fresh++;
+      verify_emit(to, "CRDT legacy-presence: %s P10=yes beacon=FRESH age=%lds via=%s",
+                  cli_name(L), (long)(now - brecv),
+                  (via && via != L) ? cli_name(via) : "direct");
+    } else if (brecv) {
+      stalecnt++;
+      verify_emit(to, "CRDT legacy-presence: %s P10=yes beacon=STALE age=%lds via=%s",
+                  cli_name(L), (long)(now - brecv),
+                  (via && via != L) ? cli_name(via) : "direct");
+    } else {
+      absent++;
+      verify_emit(to, "CRDT legacy-presence: %s P10=yes beacon=ABSENT via=%s",
+                  cli_name(L), (via && via != L) ? cli_name(via) : "direct");
+    }
+  }
+  if (total)
+    verify_emit(to, "CRDT legacy-presence: %d legacy server(s) — beacon fresh %d, stale %d, absent %d",
+                total, fresh, stalecnt, absent);
+}
+
 /* ---- Phase 3b dry-run materialization check (doc -> live fidelity) ----
  * The inverse of crdt_shadow_verify (which walks live -> doc). For every entity
  * in the DOC, confirm a live entity exists with field-for-field fidelity over the
@@ -3367,6 +3413,7 @@ static void crdt_shadow_verify_cb(struct Event *ev)
   crdt_gossip_beacon();
   crdt_shadow_presence_diff(NULL);  /* Tier-2 S1 shadow oracle: log signal divergences (no mutation) */
   crdt_shadow_route_diff(NULL);     /* MR-0 routing oracle: mesh next-hop vs P10 tree (no mutation) */
+  crdt_shadow_legacy_presence_diff(NULL); /* MR-3a oracle: legacy P10-present vs proxy-beacon-fresh */
   {
     struct Client *acptr, *stale[16];
     int ns = 0, k;
