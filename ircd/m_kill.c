@@ -83,6 +83,8 @@
 
 #include "bouncer_session.h"
 #include "client.h"
+#include "crdt_shadow.h"
+#include "handlers.h"
 #include "hash.h"
 #include "ircd.h"
 #include "ircd_features.h"
@@ -124,6 +126,25 @@ static int do_kill(struct Client* cptr, struct Client* sptr,
                        get_client_name(victim, SHOW_IP), cli_name(sptr),
                        inpath, path, msg);
   log_write_kill(victim, sptr, inpath, path, msg);
+
+  /* MR-4c: a KILL of a legacy user fronted via a CRDT anchor.  The victim's
+   * owning server is a synthetic mesh-stub anchor with no real P10 downlink, so
+   * the sendcmdto_serv_butone relay below would vanish into the dead sink AND
+   * the exit_client_msg at the bottom would ghost-kill only THIS materialized
+   * copy (diverging from the doc until the next reconcile re-materializes it).
+   * Instead route the KILL over the mesh to the gateway, which (under
+   * FEAT_CRDT_GATEWAY_BRIDGE) re-emits it as a real P10 KILL toward the legacy
+   * user; the resulting legacy QUIT comes back over the gateway's legacy link
+   * and the observe-and-mirror crdt_user_remove tombstones the user -> reconcile
+   * tears down every copy (the SOLE teardown authority — so we must NOT exit
+   * locally here).  Inert until the flag flips (then today's ghost-kill is fixed). */
+  if (!MyConnect(victim) && feature_bool(FEAT_CRDT_GATEWAY_BRIDGE) &&
+      crdt_user_is_mesh_only(victim)) {
+    char kmid[64];
+    generate_msgid(kmid, sizeof(kmid));
+    crdt_route_unicast_try(sptr, 'K', victim, kmid, msg);
+    return 0;
+  }
 
   /*
    * And pass on the message to other servers. Note, that if KILL
