@@ -213,6 +213,9 @@ static struct CrdtMsgidDedup crdt_m_seen;   /* static zero-init => all slots emp
  * drops.  MR-4b adds the bridge HERE; MR-4a just measures the gap so the live bed can
  * confirm the drop count (nef7 PM AuthServ -> bumps on the gateway nef3). */
 static unsigned long crdt_dead_sink_dropped = 0;
+/* MR-4b: the matching success counter — a CR-M unicast we re-emitted as real P10
+ * toward the fronted legacy user (the bridge fired). */
+static unsigned long crdt_cr_to_p10_bridged = 0;
 
 /* MR-1: TTL/hop-limit on every routed CR M frame (the §0 prerequisite).  A
  * storm-backstop, NOT a delivery limiter — set far above any realistic mesh
@@ -669,19 +672,39 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
         else
           sendrawto_one(tgt, ":%s %s %s :%s", srcyxx, cmdstr, cli_name(tgt), m_text);
       } else if (tgt && cli_user(tgt) && cli_user(tgt)->server) {
-        /* MR-4a (INERT): the CR-M -> legacy unicast dead-sink.  tgt resolved but is not
-         * local.  If it is a real legacy user THIS node fronts — its owning server is a
-         * non-CRDT P10 server reached over our OWN non-CRDT link (an anchor would be
-         * SetCrdtAware, so !IsCrdtAware excludes anchors) — then we are the gateway and
-         * the message is deliverable in principle, but the 'M' handler has no CR->P10
-         * re-emit yet, so it is silently dropped.  Count + log it; MR-4b bridges HERE. */
+        /* MR-4b: the CR-M -> legacy unicast bridge.  tgt resolved but is not local.  If
+         * it is a real legacy user THIS node fronts — its owning server is a non-CRDT P10
+         * server reached over our OWN non-CRDT link (an anchor would be SetCrdtAware, so
+         * !IsCrdtAware excludes anchors) — then we are the gateway and the message IS
+         * deliverable: re-emit the CR-M as a real P10 PRIVMSG/NOTICE toward the legacy
+         * user (the direct-message analog of the R6b channel bridge).  Source = the
+         * originating CRDT user; gated by crdt_user_is_mesh_only exactly as R6b (a
+         * partitioned mesh-only sender can't be placed by legacy -> drop, R6c).  Exactly
+         * once: only the fronting gateway passes !IsCrdtAware(tsrv), and crdt_m_seen has
+         * already deduped the flood per-node.  TAGMSG deferred (its @tags unicast legacy
+         * form differs).  When the bridge flag is off / source unplaceable, count the
+         * drop (the MR-4a behaviour) with the reason. */
         struct Client *tsrv = cli_user(tgt)->server;
         if (IsServer(tsrv) && !IsCrdtAware(tsrv) && cli_from(tsrv) &&
             !IsCrdtAware(cli_from(tsrv))) {
-          crdt_dead_sink_dropped++;
-          log_write(LS_SYSTEM, L_NOTICE, 0, "MR-4 dead-sink: CR-M %s for legacy user %s "
-                    "(on %s) dropped — no CR->P10 bridge yet (count=%lu)", cmdstr,
-                    cli_name(tgt), cli_name(tsrv), crdt_dead_sink_dropped);
+          struct Client *srcc = findNUser(srcyxx);
+          if (feature_bool(FEAT_CRDT_GATEWAY_BRIDGE) && !is_tag && srcc &&
+              !crdt_user_is_mesh_only(srcc)) {
+            sendcmdto_one(srcc, (m_cmd[0] == 'N') ? CMD_NOTICE : CMD_PRIVATE, tgt,
+                          "%C :%s", tgt, m_text);
+            crdt_cr_to_p10_bridged++;
+            log_write(LS_SYSTEM, L_DEBUG, 0, "MR-4 bridge: CR-M %s %s -> legacy user %s "
+                      "(on %s) re-emitted (count=%lu)", cmdstr, srcyxx, cli_name(tgt),
+                      cli_name(tsrv), crdt_cr_to_p10_bridged);
+          } else {
+            crdt_dead_sink_dropped++;
+            log_write(LS_SYSTEM, L_NOTICE, 0, "MR-4 dead-sink: CR-M %s for legacy user %s "
+                      "(on %s) dropped — %s (count=%lu)", cmdstr, cli_name(tgt),
+                      cli_name(tsrv),
+                      !feature_bool(FEAT_CRDT_GATEWAY_BRIDGE) ? "bridge off" :
+                      is_tag ? "TAGMSG deferred" : !srcc ? "source unknown" :
+                      "mesh-only source (R6c)", crdt_dead_sink_dropped);
+          }
         }
       }
     }

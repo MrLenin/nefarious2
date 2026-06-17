@@ -515,6 +515,7 @@ enum Feature {
   FEAT_CRDT_ZLINE_CUTOVER,      /* ZLINE: doc is the transport for global Z-lines among CRDT peers (reconcile-from-doc + §17.7 gateway + suppress P10 ZL) */
   FEAT_CRDT_JUPE_CUTOVER,       /* JUPE: doc is the transport for global server jupes among CRDT peers (reconcile-from-doc + §17.7 gateway + suppress P10 JU) */
   FEAT_CRDT_LEGACY_PRESENCE,    /* MR-3: gateway proxy-beacons legacy servers into the mesh; leaves anchor from beacon + suppress legacy SERVER intro toward CRDT peers */
+  FEAT_CRDT_GATEWAY_BRIDGE,     /* MR-4b: gateway re-emits a CR-M unicast addressed to a fronted legacy user as a real P10 PRIVMSG/NOTICE (the reverse-PM dead-sink fix) */
 
   FEAT_LAST_F
 };
