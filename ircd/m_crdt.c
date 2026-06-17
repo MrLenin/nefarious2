@@ -591,7 +591,7 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
       return 0;                        /* already handled via another mesh path */
     is_tag = (m_cmd[0] == 'T');
     cmdstr = (m_cmd[0] == 'N') ? "NOTICE" : (m_cmd[0] == 'K') ? "KILL"
-             : (is_tag ? "TAGMSG" : "PRIVMSG");
+             : (m_cmd[0] == 'I') ? "INVITE" : (is_tag ? "TAGMSG" : "PRIVMSG");
     src = crdt_shadow_user_record(srcyxx);
     /* R4a (channel-over-mesh): per-server local-delivery dedup.  If the TREE plane
      * already delivered this msgid to our locals (the channel relay marked it), skip the
@@ -656,7 +656,7 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
       }
     } else {                                              /* unicast delivery */
       struct Client *tgt = findNUser(target);
-      if (tgt && MyConnect(tgt) && m_cmd[0] != 'K') {      /* local CRDT user — deliver (messages only; a KILL is never routed over CR-M to a local target — crdt_route_unicast_try delivers those via P10) */
+      if (tgt && MyConnect(tgt) && m_cmd[0] != 'K' && m_cmd[0] != 'I') { /* local CRDT user — deliver (messages only; KILL/INVITE are never routed over CR-M to a local target — crdt_route_unicast_try delivers those via P10) */
         if (is_tag) {                  /* TAGMSG: @tags prefix, no body, cap-gated */
           if (CapActive(tgt, CAP_MSGTAGS)) {
             if (src && src->nick[0])
@@ -690,9 +690,10 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
             !IsCrdtAware(cli_from(tsrv))) {
           struct Client *srcc = findNUser(srcyxx);
           int is_kill = (m_cmd[0] == 'K');                 /* MR-4c */
+          int is_inv  = (m_cmd[0] == 'I');
           if (feature_bool(FEAT_CRDT_GATEWAY_BRIDGE) && srcc &&
               !crdt_user_is_mesh_only(srcc) &&
-              (m_cmd[0] == 'P' || m_cmd[0] == 'N' || is_kill)) {
+              (m_cmd[0] == 'P' || m_cmd[0] == 'N' || is_kill || is_inv)) {
             if (is_kill)
               /* MR-4c: re-emit a real P10 KILL toward the legacy user.  Path
                * mirrors do_kill's S2S relay (m_kill.c): <gateway>!<killer> <reason>.
@@ -701,7 +702,20 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
                * tears down every materialized copy (the single teardown authority). */
               sendcmdto_one(srcc, CMD_KILL, tgt, "%C :%s!%s %s", tgt,
                             cli_name(&me), cli_name(srcc), m_text);
-            else
+            else if (is_inv) {
+              /* MR-4c: re-emit a real P10 INVITE toward the legacy user.  m_text is
+               * the channel name; reconstruct %Tu from the gateway's OWN live channel
+               * (legacy's invite_ts > creationtime guard needs the gateway's view, not
+               * the originating leaf's).  If the channel isn't live here, fall back to
+               * the non-existent-channel form (mirrors ms_invite.c).  legacy's
+               * ms_invite runs add_invite since the target is local there. */
+              struct Channel *ichp = FindChannel(m_text);
+              if (ichp)
+                sendcmdto_one(srcc, CMD_INVITE, tgt, "%s %H %Tu", cli_name(tgt),
+                              ichp, ichp->creationtime);
+              else
+                sendcmdto_one(srcc, CMD_INVITE, tgt, "%C :%s", tgt, m_text);
+            } else
               sendcmdto_one(srcc, (m_cmd[0] == 'N') ? CMD_NOTICE : CMD_PRIVATE, tgt,
                             "%C :%s", tgt, m_text);
             crdt_cr_to_p10_bridged++;

@@ -84,6 +84,8 @@
 #include "capab.h"
 #include "channel.h"
 #include "client.h"
+#include "crdt_shadow.h"
+#include "handlers.h"
 #include "hash.h"
 #include "ircd.h"
 #include "ircd_features.h"
@@ -210,8 +212,20 @@ int m_invite(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
     add_invite(acptr, chptr);
     sendcmdto_one(sptr, CMD_INVITE, acptr, "%s %H", cli_name(acptr), chptr);
   } else if (!IsLocalChannel(chptr->chname)) {
-    sendcmdto_one(sptr, CMD_INVITE, acptr, "%s %H %Tu", cli_name(acptr), chptr,
-                  chptr->creationtime);
+    /* MR-4c: INVITE to a legacy user fronted via a CRDT anchor — the anchor has
+     * no real P10 downlink, so the sendcmdto_one below dead-sinks.  Route it over
+     * the mesh ('I') to the gateway, which (FEAT_CRDT_GATEWAY_BRIDGE) re-emits a
+     * real P10 INVITE toward the legacy user (reconstructing %Tu from its own live
+     * channel).  Only the anchor case is rerouted (crdt_user_is_mesh_only); a
+     * normal remote CRDT/legacy target still relays via P10 unchanged. */
+    if (feature_bool(FEAT_CRDT_GATEWAY_BRIDGE) && crdt_user_is_mesh_only(acptr)) {
+      char imid[64];
+      generate_msgid(imid, sizeof(imid));
+      crdt_route_unicast_try(sptr, 'I', acptr, imid, chptr->chname);
+    } else {
+      sendcmdto_one(sptr, CMD_INVITE, acptr, "%s %H %Tu", cli_name(acptr), chptr,
+                    chptr->creationtime);
+    }
   }
 
   if (!IsLocalChannel(chptr->chname) || MyConnect(acptr)) {
