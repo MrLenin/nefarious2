@@ -693,7 +693,7 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
             sendcmdto_one(srcc, (m_cmd[0] == 'N') ? CMD_NOTICE : CMD_PRIVATE, tgt,
                           "%C :%s", tgt, m_text);
             crdt_cr_to_p10_bridged++;
-            log_write(LS_SYSTEM, L_DEBUG, 0, "MR-4 bridge: CR-M %s %s -> legacy user %s "
+            log_write(LS_SYSTEM, L_INFO, 0, "MR-4 bridge: CR-M %s %s -> legacy user %s "
                       "(on %s) re-emitted (count=%lu)", cmdstr, srcyxx, cli_name(tgt),
                       cli_name(tsrv), crdt_cr_to_p10_bridged);
           } else {
