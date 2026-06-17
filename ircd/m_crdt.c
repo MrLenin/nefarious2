@@ -205,6 +205,15 @@ void crdt_send_snapshot(struct Client *to)
 #define CRDT_M_SEEN_WINDOW 90        /* s; > worst-case mesh propagation latency */
 static struct CrdtMsgidDedup crdt_m_seen;   /* static zero-init => all slots empty */
 
+/* MR-4a: the CR-M -> legacy unicast dead-sink counter (INERT instrumentation).  A
+ * CR-M unicast addressed to a legacy user that THIS node fronts (a real legacy user
+ * reached via our own non-CRDT link) cannot be delivered by the 'M' handler — it only
+ * delivers to MyConnect() targets, and there is no CR->P10 re-emit yet.  The flood
+ * still reaches this gateway, resolves the target via findNUser(), then silently
+ * drops.  MR-4b adds the bridge HERE; MR-4a just measures the gap so the live bed can
+ * confirm the drop count (nef7 PM AuthServ -> bumps on the gateway nef3). */
+static unsigned long crdt_dead_sink_dropped = 0;
+
 /* MR-1: TTL/hop-limit on every routed CR M frame (the §0 prerequisite).  A
  * storm-backstop, NOT a delivery limiter — set far above any realistic mesh
  * diameter so no deliverable message is ever dropped; it only bounds a loop over a
@@ -643,7 +652,7 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
       }
     } else {                                              /* unicast delivery */
       struct Client *tgt = findNUser(target);
-      if (tgt && MyConnect(tgt)) {
+      if (tgt && MyConnect(tgt)) {                         /* local CRDT user — deliver */
         if (is_tag) {                  /* TAGMSG: @tags prefix, no body, cap-gated */
           if (CapActive(tgt, CAP_MSGTAGS)) {
             if (src && src->nick[0])
@@ -659,6 +668,21 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
                         m_text);
         else
           sendrawto_one(tgt, ":%s %s %s :%s", srcyxx, cmdstr, cli_name(tgt), m_text);
+      } else if (tgt && cli_user(tgt) && cli_user(tgt)->server) {
+        /* MR-4a (INERT): the CR-M -> legacy unicast dead-sink.  tgt resolved but is not
+         * local.  If it is a real legacy user THIS node fronts — its owning server is a
+         * non-CRDT P10 server reached over our OWN non-CRDT link (an anchor would be
+         * SetCrdtAware, so !IsCrdtAware excludes anchors) — then we are the gateway and
+         * the message is deliverable in principle, but the 'M' handler has no CR->P10
+         * re-emit yet, so it is silently dropped.  Count + log it; MR-4b bridges HERE. */
+        struct Client *tsrv = cli_user(tgt)->server;
+        if (IsServer(tsrv) && !IsCrdtAware(tsrv) && cli_from(tsrv) &&
+            !IsCrdtAware(cli_from(tsrv))) {
+          crdt_dead_sink_dropped++;
+          log_write(LS_SYSTEM, L_NOTICE, 0, "MR-4 dead-sink: CR-M %s for legacy user %s "
+                    "(on %s) dropped — no CR->P10 bridge yet (count=%lu)", cmdstr,
+                    cli_name(tgt), cli_name(tsrv), crdt_dead_sink_dropped);
+        }
       }
     }
     }  /* R4a: end local-delivery dedup guard (the relay below always runs) */
