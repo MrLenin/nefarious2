@@ -693,7 +693,11 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
         if (ich) {
           add_invite(tgt, ich);
           sendcmdto_one(isrc ? isrc : &me, CMD_INVITE, tgt, "%s %H", cli_name(tgt), ich);
-        }
+        } else
+          /* audit-A2: invite to a non-existent channel (ms_invite :341 form) — no chptr to
+           * add_invite; relay the bare-name INVITE (legacy "allow invites to non existent
+           * channels"; mirrors the gateway 'I' re-emit fallback at the CR->P10 bridge). */
+          sendcmdto_one(isrc ? isrc : &me, CMD_INVITE, tgt, "%C :%s", tgt, m_text);
       } else if (tgt && MyConnect(tgt)) {            /* local CRDT user — message delivery (P/N/T) */
         if (is_tag) {                  /* TAGMSG: @tags prefix, no body, cap-gated */
           if (CapActive(tgt, CAP_MSGTAGS)) {

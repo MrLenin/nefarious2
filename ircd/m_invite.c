@@ -338,7 +338,14 @@ int ms_invite(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
      * allow invites to non existent channels, bleah
      * avoid JOIN, INVITE, PART abuse
      */
-    sendcmdto_one(sptr, CMD_INVITE, acptr, "%C :%s", acptr, parv[2]);
+    if (crdt_user_is_mesh_only(acptr)) {
+      /* audit-A2: mesh-only target -> route 'I' with the bare channel name (no chptr);
+       * the CR-M 'I' home handler relays the non-existent-channel INVITE form. */
+      char imid[64];
+      generate_msgid(imid, sizeof(imid));
+      crdt_route_unicast_try(sptr, 'I', acptr, imid, parv[2]);
+    } else
+      sendcmdto_one(sptr, CMD_INVITE, acptr, "%C :%s", acptr, parv[2]);
     return 0;
   }
 
@@ -365,6 +372,14 @@ int ms_invite(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
   if (MyConnect(acptr)) {
     add_invite(acptr, chptr);
     sendcmdto_one(sptr, CMD_INVITE, acptr, "%s %H", cli_name(acptr), chptr);
+  } else if (crdt_user_is_mesh_only(acptr)) {
+    /* audit-A2 (an MR-4c hole — the user-handler at :224 had this guard, this S2S relay
+     * site did not): a target reachable only via the mesh has no real P10 downlink, so the
+     * sendcmdto_one below would dead-sink the anchor.  Route 'I' over the mesh instead
+     * (delivered at the target's HOME).  Inert until an anchor exists (crdt_user_is_mesh_only). */
+    char imid[64];
+    generate_msgid(imid, sizeof(imid));
+    crdt_route_unicast_try(sptr, 'I', acptr, imid, chptr->chname);
   } else {
     sendcmdto_one(sptr, CMD_INVITE, acptr, "%s %H %Tu", cli_name(acptr), chptr,
                   chptr->creationtime);
