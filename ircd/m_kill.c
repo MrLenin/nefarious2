@@ -137,13 +137,18 @@ static int do_kill(struct Client* cptr, struct Client* sptr,
    * BRIDGE), a CRDT victim is delivered at its HOME (the CR-M 'M' handler), and in
    * both cases the removal propagates via the doc tombstone (the SOLE teardown
    * authority).  NOT gated on the bridge flag — routing to a mesh-only target is
-   * always required (P10 cannot reach it); crdt_user_is_mesh_only is only true when
-   * an anchor exists, so this is inert until MR-3/MR-5 create one. */
-  if (!MyConnect(victim) && crdt_user_is_mesh_only(victim)) {
+   * always required (P10 cannot reach it).  Mirror the PRIVMSG/INVITE path: try the mesh
+   * UNCONDITIONALLY for any non-local victim and, IFF it routed, skip the P10 relay + local
+   * exit (the doc tombstone is the sole teardown).  Do NOT gate on crdt_user_is_mesh_only —
+   * it is false for a GATEWAY-PRESENTED stub (IsMeshStub && !IsPresented), whose victim
+   * still dead-sinks on P10; crdt_route_unicast_try keys on IsMeshStub so it routes it.
+   * Returns 0 (no route) for a genuinely P10-routable victim -> fall through to do_kill.
+   * Inert until an anchor exists. */
+  if (!MyConnect(victim)) {
     char kmid[64];
     generate_msgid(kmid, sizeof(kmid));
-    crdt_route_unicast_try(sptr, 'K', victim, kmid, msg);
-    return 0;
+    if (crdt_route_unicast_try(sptr, 'K', victim, kmid, msg))
+      return 0;
   }
 
   /*

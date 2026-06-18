@@ -212,23 +212,23 @@ int m_invite(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
     add_invite(acptr, chptr);
     sendcmdto_one(sptr, CMD_INVITE, acptr, "%s %H", cli_name(acptr), chptr);
   } else if (!IsLocalChannel(chptr->chname)) {
-    /* MR-4c/MR-5-1: INVITE to a target whose owning server is reachable only via the
-     * mesh (a synthetic mesh-stub anchor — a fronted LEGACY user (MR-4c) OR a CRDT user
-     * on a now-anchored CRDT server once the SERVER intro is suppressed (MR-5)).  The
-     * anchor has no real P10 downlink, so the sendcmdto_one below dead-sinks; route 'I'
-     * over the mesh instead — a legacy target is re-emitted as P10 by the gateway, a CRDT
-     * target is delivered at its HOME (the CR-M 'M' handler reconstructs %Tu there).  NOT
-     * gated on the bridge flag (routing to a mesh-only target is always required);
-     * crdt_user_is_mesh_only is only true when an anchor exists, so it is inert until
-     * MR-3/MR-5 create one.  A normal remote CRDT/legacy target still relays via P10. */
-    if (crdt_user_is_mesh_only(acptr)) {
-      char imid[64];
-      generate_msgid(imid, sizeof(imid));
-      crdt_route_unicast_try(sptr, 'I', acptr, imid, chptr->chname);
-    } else {
+    /* MR-4c/MR-5-1 + presented-stub fix: INVITE to a target whose owning server is
+     * reachable only via the mesh (a synthetic mesh-stub anchor — a fronted LEGACY user
+     * (MR-4c) OR a CRDT user on a now-anchored CRDT server once the SERVER intro is
+     * suppressed (MR-5)).  The anchor has no real P10 downlink, so a P10 sendcmdto_one
+     * dead-sinks; route 'I' over the mesh instead (legacy target -> gateway re-emits P10;
+     * CRDT target -> delivered at its HOME, the CR-M 'M' handler reconstructs %Tu).
+     * Mirror the PRIVMSG path (ircd_relay.c relay_private_message): try the mesh
+     * UNCONDITIONALLY and fall back to P10 only when crdt_route_unicast_try returns 0
+     * (a genuinely P10-routable target).  Do NOT gate on crdt_user_is_mesh_only — that is
+     * false for a GATEWAY-PRESENTED stub (IsMeshStub && !IsPresented), yet such a target
+     * still dead-sinks on P10; crdt_route_unicast_try keys on IsMeshStub so it routes it.
+     * Inert until an anchor exists. */
+    char imid[64];
+    generate_msgid(imid, sizeof(imid));
+    if (!crdt_route_unicast_try(sptr, 'I', acptr, imid, chptr->chname))
       sendcmdto_one(sptr, CMD_INVITE, acptr, "%s %H %Tu", cli_name(acptr), chptr,
                     chptr->creationtime);
-    }
   }
 
   if (!IsLocalChannel(chptr->chname) || MyConnect(acptr)) {
@@ -338,14 +338,16 @@ int ms_invite(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
      * allow invites to non existent channels, bleah
      * avoid JOIN, INVITE, PART abuse
      */
-    if (crdt_user_is_mesh_only(acptr)) {
-      /* audit-A2: mesh-only target -> route 'I' with the bare channel name (no chptr);
-       * the CR-M 'I' home handler relays the non-existent-channel INVITE form. */
+    {
+      /* audit-A2 + presented-stub fix: try the mesh first with the bare channel name (no
+       * chptr); the CR-M 'I' home handler relays the non-existent-channel INVITE form.
+       * P10 fallback only when the target is genuinely routable (see the user-handler note
+       * — do NOT gate on crdt_user_is_mesh_only; it misses gateway-presented stubs). */
       char imid[64];
       generate_msgid(imid, sizeof(imid));
-      crdt_route_unicast_try(sptr, 'I', acptr, imid, parv[2]);
-    } else
-      sendcmdto_one(sptr, CMD_INVITE, acptr, "%C :%s", acptr, parv[2]);
+      if (!crdt_route_unicast_try(sptr, 'I', acptr, imid, parv[2]))
+        sendcmdto_one(sptr, CMD_INVITE, acptr, "%C :%s", acptr, parv[2]);
+    }
     return 0;
   }
 
@@ -372,17 +374,17 @@ int ms_invite(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
   if (MyConnect(acptr)) {
     add_invite(acptr, chptr);
     sendcmdto_one(sptr, CMD_INVITE, acptr, "%s %H", cli_name(acptr), chptr);
-  } else if (crdt_user_is_mesh_only(acptr)) {
-    /* audit-A2 (an MR-4c hole — the user-handler at :224 had this guard, this S2S relay
-     * site did not): a target reachable only via the mesh has no real P10 downlink, so the
-     * sendcmdto_one below would dead-sink the anchor.  Route 'I' over the mesh instead
-     * (delivered at the target's HOME).  Inert until an anchor exists (crdt_user_is_mesh_only). */
+  } else {
+    /* audit-A2 + presented-stub fix (an MR-4c hole — the user-handler had a guard here,
+     * this S2S relay site did not; both used the wrong predicate).  Try the mesh first;
+     * P10 fallback only when the target is genuinely routable.  Mirrors the PRIVMSG path —
+     * NOT gated on crdt_user_is_mesh_only (false for a gateway-presented stub, which still
+     * dead-sinks on P10; crdt_route_unicast_try keys on IsMeshStub and routes it). */
     char imid[64];
     generate_msgid(imid, sizeof(imid));
-    crdt_route_unicast_try(sptr, 'I', acptr, imid, chptr->chname);
-  } else {
-    sendcmdto_one(sptr, CMD_INVITE, acptr, "%s %H %Tu", cli_name(acptr), chptr,
-                  chptr->creationtime);
+    if (!crdt_route_unicast_try(sptr, 'I', acptr, imid, chptr->chname))
+      sendcmdto_one(sptr, CMD_INVITE, acptr, "%s %H %Tu", cli_name(acptr), chptr,
+                    chptr->creationtime);
   }
 
   {
