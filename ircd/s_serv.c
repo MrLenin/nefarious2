@@ -205,11 +205,11 @@ int server_estab(struct Client *cptr, struct ConfItem *aconf)
      * (they learn it via the proxy-beacon + Case-B anchor, MR-3a). */
     if (crdt_intro_presence_suppress(acptr, cptr))
       continue;
-    /* MR-5-0 (INERT shadow): observe whether this CRDT server's SERVER intro WOULD be
-     * suppressed toward a CRDT-aware peer (logs "MR-5-shadow SERVER … would-suppress …
-     * beacon present/age" while FEAT_CRDT_TREE_RETIRE is off).  Return DISCARDED —
-     * measure-first; MR-5-2 turns this into `if (...) continue;` (the real gate). */
-    (void)crdt_server_intro_suppress(acptr, cptr);
+    /* MR-5: suppress broadcasting this newly-linked CRDT server toward CRDT-aware peers
+     * (they learn it via its self-beacon + Case-B anchor).  Flag-gated FEAT_CRDT_TREE_
+     * RETIRE (off ⇒ 0 ⇒ SERVER still emitted = inert). */
+    if (crdt_server_intro_suppress(acptr, cptr))
+      continue;
     sendcmdto_one(&me, CMD_SERVER, acptr,
 		  "%s 2 0 %Tu J%02u %s%s +%s%s%s%s%s%s%s :%s", cli_name(cptr),
 		  cli_serv(cptr)->timestamp, Protocol(cptr), NumServCap(cptr),
@@ -291,9 +291,12 @@ int server_estab(struct Client *cptr, struct ConfItem *aconf)
        * (it learns it via the proxy-beacon + Case-B anchor, MR-3a). */
       if (crdt_intro_presence_suppress(cptr, acptr))
         continue;
-      /* MR-5-0 (INERT shadow): observe would-suppress for a CRDT subject toward the
-       * newly-linked CRDT peer (return discarded; MR-5-3 wires the real gate). */
-      (void)crdt_server_intro_suppress(cptr, acptr);
+      /* MR-5: suppress introducing an existing CRDT server toward the newly-linked CRDT
+       * peer (it learns it via the server's self-beacon + Case-B anchor).  This is the
+       * at-link burst — the path that delivers existing servers to a fresh leaf, so it
+       * MUST be gated for the leaf to anchor them.  Flag-gated FEAT_CRDT_TREE_RETIRE. */
+      if (crdt_server_intro_suppress(cptr, acptr))
+        continue;
       sendcmdto_one(cli_serv(acptr)->up, CMD_SERVER, cptr,
 		    "%s %d 0 %Tu %s%u %s%s +%s%s%s%s%s%s%s :%s", cli_name(acptr),
 		    cli_hopcount(acptr) + 1, cli_serv(acptr)->timestamp,

@@ -958,10 +958,11 @@ int ms_server(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
      * learns the legacy server via the proxy-beacon + Case-B anchor (MR-3a) instead. */
     if (crdt_intro_presence_suppress(bcptr, acptr))
       continue;
-    /* MR-5-0 (INERT shadow): observe whether this CRDT server's relayed SERVER intro
-     * WOULD be suppressed toward a CRDT-aware peer (logs "MR-5-shadow SERVER …"); return
-     * DISCARDED — measure-first; MR-5-2 turns this into the real gate (the relayed path). */
-    (void)crdt_server_intro_suppress(bcptr, acptr);
+    /* MR-5: suppress this CRDT server's relayed SERVER intro toward a CRDT-aware peer
+     * (it learns the server via its self-beacon + Case-B anchor instead).  Flag-gated on
+     * FEAT_CRDT_TREE_RETIRE (off ⇒ returns 0 ⇒ SERVER still emitted = inert). */
+    if (crdt_server_intro_suppress(bcptr, acptr))
+      continue;
     sendcmdto_one(sptr, CMD_SERVER, bcptr, "%s %d 0 %s %s %s%s +%s%s%s%s%s%s%s :%s",
                   cli_name(acptr), hop + 1, parv[4], parv[5],
                   NumServCap(acptr), IsHub(acptr) ? "h" : "",
