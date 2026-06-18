@@ -706,6 +706,43 @@ int crdt_intro_presence_suppress(struct Client *peer, struct Client *subject)
                                     peer_aware, subj_aware);
 }
 
+/* MR-5: suppress a CRDT @a subject's own SERVER intro toward a CRDT-aware @a peer (the
+ * SERVER half of tree-retirement; the SQUIT half is crdt_tree_presence_suppress).  The
+ * peer learns the CRDT server via ITS OWN self-liveness beacon + Case-B anchor (exactly
+ * how MR-3 does it for legacy servers — the difference from the R7b-infeasible era, when
+ * the orphaned subject didn't beacon).  Reuses the same both-ends pure gate
+ * crdt_should_suppress_tree, but on a SEPARATE flag FEAT_CRDT_TREE_RETIRE so the SERVER
+ * cutover is independently flippable from the already-live R7a SQUIT suppression
+ * (FEAT_CRDT_MESHMAP_PRESENCE) — a controlled rollout for the riskiest phase.  Returns
+ * nonzero IFF the caller should SKIP the SERVER emit.  While the flag is off it
+ * shadow-logs the would-suppress candidates + their beacon freshness (MR-5-0 measure-
+ * first), so a green board (every candidate has a fresh beacon) gates flipping it on. */
+int crdt_server_intro_suppress(struct Client *peer, struct Client *subject)
+{
+  int peer_aware, subj_aware, primary, suppress;
+  if (!shadow_on())
+    return 0;
+  peer_aware = peer && IsServer(peer) && IsCrdtAware(peer);
+  subj_aware = subject && IsServer(subject) && IsCrdtAware(subject);
+  primary    = feature_bool(FEAT_CRDT_PRIMARY);
+  suppress   = crdt_should_suppress_tree(feature_bool(FEAT_CRDT_TREE_RETIRE),
+                                         primary, peer_aware, subj_aware);
+  /* MR-5-0 shadow: SERVER-retire flag off but the both-ends candidate holds -> measure
+   * the subject's self-beacon path (the anchor fallback that replaces the SERVER intro). */
+  if (!suppress && crdt_should_suppress_tree(1, primary, peer_aware, subj_aware)) {
+    unsigned int n = (unsigned int)base64toint(cli_yxx(subject));
+    time_t recv = (n < CRDT_MAX_SERVERS) ? crdt_beacon[n].recv_ts : 0;
+    long age      = recv ? (long)(CurrentTime - recv) : -1;
+    long stale_in = recv ? (long)(CRDT_BEACON_STALE - (CurrentTime - recv)) : -1;
+    log_write(LS_SYSTEM, L_NOTICE, 0,
+              "MR-5-shadow SERVER subject=%s yxx=%s -> peer=%s : would-suppress; "
+              "beacon present=%d age=%lds stale_in=%lds",
+              cli_name(subject), cli_yxx(subject), cli_name(peer),
+              recv ? 1 : 0, age, stale_in);
+  }
+  return suppress;
+}
+
 /* R6c: does this node have a directly-linked LEGACY (non-CRDT) P10 peer to present to? */
 static int crdt_gateway_has_legacy_peer(void)
 {

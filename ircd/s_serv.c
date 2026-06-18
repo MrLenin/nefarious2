@@ -205,6 +205,11 @@ int server_estab(struct Client *cptr, struct ConfItem *aconf)
      * (they learn it via the proxy-beacon + Case-B anchor, MR-3a). */
     if (crdt_intro_presence_suppress(acptr, cptr))
       continue;
+    /* MR-5-0 (INERT shadow): observe whether this CRDT server's SERVER intro WOULD be
+     * suppressed toward a CRDT-aware peer (logs "MR-5-shadow SERVER … would-suppress …
+     * beacon present/age" while FEAT_CRDT_TREE_RETIRE is off).  Return DISCARDED —
+     * measure-first; MR-5-2 turns this into `if (...) continue;` (the real gate). */
+    (void)crdt_server_intro_suppress(acptr, cptr);
     sendcmdto_one(&me, CMD_SERVER, acptr,
 		  "%s 2 0 %Tu J%02u %s%s +%s%s%s%s%s%s%s :%s", cli_name(cptr),
 		  cli_serv(cptr)->timestamp, Protocol(cptr), NumServCap(cptr),
@@ -286,6 +291,9 @@ int server_estab(struct Client *cptr, struct ConfItem *aconf)
        * (it learns it via the proxy-beacon + Case-B anchor, MR-3a). */
       if (crdt_intro_presence_suppress(cptr, acptr))
         continue;
+      /* MR-5-0 (INERT shadow): observe would-suppress for a CRDT subject toward the
+       * newly-linked CRDT peer (return discarded; MR-5-3 wires the real gate). */
+      (void)crdt_server_intro_suppress(cptr, acptr);
       sendcmdto_one(cli_serv(acptr)->up, CMD_SERVER, cptr,
 		    "%s %d 0 %Tu %s%u %s%s +%s%s%s%s%s%s%s :%s", cli_name(acptr),
 		    cli_hopcount(acptr) + 1, cli_serv(acptr)->timestamp,

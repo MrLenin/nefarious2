@@ -98,8 +98,9 @@ int crdt_shadow_mesh_reachable(struct Client *srv);
  *  (cutover flag on + both ends CRDT-aware — then the departure rides the CR H
  *  beacon set: stale beacon + keep-gate + sweep retire the server).  While the flag
  *  is off, a both-ends candidate emits one "R7-shadow" measurement line instead.
- *  @a kind labels the log ("SQUIT").  NB: SERVER-intro retirement is NOT done — P10's
- *  flat-namespace prefix routing makes it infeasible (see the .c definition). */
+ *  @a kind labels the log ("SQUIT").  NB: this is the SQUIT half (R7a); the SERVER half
+ *  is crdt_server_intro_suppress (MR-5) — R7b's "infeasible" verdict was overturned once
+ *  legacy servers (MR-3a) AND CRDT servers (self-beacon) became anchorable. */
 int crdt_tree_presence_suppress(struct Client *peer, struct Client *subject,
                                 const char *kind);
 
@@ -109,6 +110,14 @@ int crdt_tree_presence_suppress(struct Client *peer, struct Client *subject,
  *  a CRDT subject or toward a legacy peer. Returns nonzero IFF the caller should SKIP
  *  the SERVER emit. No-op unless FEAT_CRDT_LEGACY_PRESENCE + FEAT_CRDT_PRIMARY. */
 int crdt_intro_presence_suppress(struct Client *peer, struct Client *subject);
+
+/** MR-5: suppress a CRDT @a subject's own SERVER intro toward a CRDT-aware @a peer (the
+ *  SERVER half of tree-retirement; the peer learns it via the subject's self-beacon +
+ *  Case-B anchor). Same both-ends gate as crdt_tree_presence_suppress but on a SEPARATE
+ *  flag FEAT_CRDT_TREE_RETIRE (controlled cutover, independent of the live R7a SQUIT
+ *  suppression). Returns nonzero IFF the caller should SKIP the SERVER emit; while the
+ *  flag is off it shadow-logs the would-suppress candidates ("MR-5-shadow SERVER"). */
+int crdt_server_intro_suppress(struct Client *peer, struct Client *subject);
 
 /** Tier2 T2-a/c: convert a (now-leaf) departed server into a STAT_MESH_SERVER
  *  dead-sink stub in place — its users stay live + addressable.  Call only after

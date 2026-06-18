@@ -516,6 +516,7 @@ enum Feature {
   FEAT_CRDT_JUPE_CUTOVER,       /* JUPE: doc is the transport for global server jupes among CRDT peers (reconcile-from-doc + §17.7 gateway + suppress P10 JU) */
   FEAT_CRDT_LEGACY_PRESENCE,    /* MR-3: gateway proxy-beacons legacy servers into the mesh; leaves anchor from beacon + suppress legacy SERVER intro toward CRDT peers */
   FEAT_CRDT_GATEWAY_BRIDGE,     /* MR-4b: gateway re-emits a CR-M unicast addressed to a fronted legacy user as a real P10 PRIVMSG/NOTICE (the reverse-PM dead-sink fix) */
+  FEAT_CRDT_TREE_RETIRE,        /* MR-5: suppress a CRDT server's SERVER intro among CRDT-both-ends peers (the SERVER half of tree-retirement; SQUIT half = FEAT_CRDT_MESHMAP_PRESENCE). Separate flag for a controlled cutover */
 
   FEAT_LAST_F
 };
