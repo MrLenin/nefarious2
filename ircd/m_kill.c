@@ -127,19 +127,19 @@ static int do_kill(struct Client* cptr, struct Client* sptr,
                        inpath, path, msg);
   log_write_kill(victim, sptr, inpath, path, msg);
 
-  /* MR-4c: a KILL of a legacy user fronted via a CRDT anchor.  The victim's
-   * owning server is a synthetic mesh-stub anchor with no real P10 downlink, so
-   * the sendcmdto_serv_butone relay below would vanish into the dead sink AND
-   * the exit_client_msg at the bottom would ghost-kill only THIS materialized
-   * copy (diverging from the doc until the next reconcile re-materializes it).
-   * Instead route the KILL over the mesh to the gateway, which (under
-   * FEAT_CRDT_GATEWAY_BRIDGE) re-emits it as a real P10 KILL toward the legacy
-   * user; the resulting legacy QUIT comes back over the gateway's legacy link
-   * and the observe-and-mirror crdt_user_remove tombstones the user -> reconcile
-   * tears down every copy (the SOLE teardown authority — so we must NOT exit
-   * locally here).  Inert until the flag flips (then today's ghost-kill is fixed). */
-  if (!MyConnect(victim) && feature_bool(FEAT_CRDT_GATEWAY_BRIDGE) &&
-      crdt_user_is_mesh_only(victim)) {
+  /* MR-4c/MR-5-1: a KILL of a victim whose owning server is reachable only via the
+   * mesh (a synthetic mesh-stub anchor — a fronted LEGACY user (MR-4c) OR, once the
+   * SERVER intro is suppressed, a CRDT user on a now-anchored CRDT server (MR-5)).
+   * The sendcmdto_serv_butone relay below would vanish into the dead sink, and the
+   * exit_client_msg at the bottom would ghost-kill only THIS materialized copy
+   * (diverging from the doc).  Route the KILL over the mesh instead + do NOT exit
+   * locally: a legacy victim is re-emitted as P10 by the gateway (FEAT_CRDT_GATEWAY_
+   * BRIDGE), a CRDT victim is delivered at its HOME (the CR-M 'M' handler), and in
+   * both cases the removal propagates via the doc tombstone (the SOLE teardown
+   * authority).  NOT gated on the bridge flag — routing to a mesh-only target is
+   * always required (P10 cannot reach it); crdt_user_is_mesh_only is only true when
+   * an anchor exists, so this is inert until MR-3/MR-5 create one. */
+  if (!MyConnect(victim) && crdt_user_is_mesh_only(victim)) {
     char kmid[64];
     generate_msgid(kmid, sizeof(kmid));
     crdt_route_unicast_try(sptr, 'K', victim, kmid, msg);

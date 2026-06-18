@@ -212,13 +212,16 @@ int m_invite(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
     add_invite(acptr, chptr);
     sendcmdto_one(sptr, CMD_INVITE, acptr, "%s %H", cli_name(acptr), chptr);
   } else if (!IsLocalChannel(chptr->chname)) {
-    /* MR-4c: INVITE to a legacy user fronted via a CRDT anchor — the anchor has
-     * no real P10 downlink, so the sendcmdto_one below dead-sinks.  Route it over
-     * the mesh ('I') to the gateway, which (FEAT_CRDT_GATEWAY_BRIDGE) re-emits a
-     * real P10 INVITE toward the legacy user (reconstructing %Tu from its own live
-     * channel).  Only the anchor case is rerouted (crdt_user_is_mesh_only); a
-     * normal remote CRDT/legacy target still relays via P10 unchanged. */
-    if (feature_bool(FEAT_CRDT_GATEWAY_BRIDGE) && crdt_user_is_mesh_only(acptr)) {
+    /* MR-4c/MR-5-1: INVITE to a target whose owning server is reachable only via the
+     * mesh (a synthetic mesh-stub anchor — a fronted LEGACY user (MR-4c) OR a CRDT user
+     * on a now-anchored CRDT server once the SERVER intro is suppressed (MR-5)).  The
+     * anchor has no real P10 downlink, so the sendcmdto_one below dead-sinks; route 'I'
+     * over the mesh instead — a legacy target is re-emitted as P10 by the gateway, a CRDT
+     * target is delivered at its HOME (the CR-M 'M' handler reconstructs %Tu there).  NOT
+     * gated on the bridge flag (routing to a mesh-only target is always required);
+     * crdt_user_is_mesh_only is only true when an anchor exists, so it is inert until
+     * MR-3/MR-5 create one.  A normal remote CRDT/legacy target still relays via P10. */
+    if (crdt_user_is_mesh_only(acptr)) {
       char imid[64];
       generate_msgid(imid, sizeof(imid));
       crdt_route_unicast_try(sptr, 'I', acptr, imid, chptr->chname);

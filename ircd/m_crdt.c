@@ -30,8 +30,9 @@
 #include "send.h"
 #include "crdt_state.h"   /* Tier2 T2-b: struct CrdtUserRecord (CR M source prefix) */
 #include "ircd_string.h"  /* Tier2 T2-b: ircd_strncpy (msgid dedup ring) */
-#include "channel.h"      /* Tier2 T2-b: Membership (CR M channel deliver) */
+#include "channel.h"      /* Tier2 T2-b: Membership (CR M channel deliver); MR-5-1 add_invite */
 #include "hash.h"         /* Tier2 T2-b: FindChannel (CR M channel deliver) */
+#include "s_misc.h"       /* MR-5-1: exit_client_msg (mesh-routed KILL home delivery) */
 
 #include "crdt_shadow.h"
 #include "crdt_meshmap.h"  /* MR-1: crdt_meshmap_nexthop + crdt_route_action */
@@ -663,7 +664,29 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
       }
     } else {                                              /* unicast delivery */
       struct Client *tgt = findNUser(target);
-      if (tgt && MyConnect(tgt) && m_cmd[0] != 'K' && m_cmd[0] != 'I') { /* local CRDT user — deliver (messages only; KILL/INVITE are never routed over CR-M to a local target — crdt_route_unicast_try delivers those via P10) */
+      if (tgt && MyConnect(tgt) && m_cmd[0] == 'K') {
+        /* MR-5-1: a mesh-routed KILL reached the victim's HOME -> execute it locally.
+         * Fires once a CRDT server is mesh-anchored (post-MR-5-2, so the KILL routes over
+         * CR-M instead of the now-suppressed P10 tree); a legacy victim takes the gateway
+         * re-emit branch below instead.  The resulting exit writes the doc tombstone, so
+         * the removal propagates to every materialized copy (the single teardown
+         * authority — same as the MR-4c gateway-KILL path). */
+        struct Client *ksrc = findNUser(srcyxx);
+        struct Client *ksh  = (feature_bool(FEAT_HIS_KILLWHO) || !ksrc) ? &me : ksrc;
+        const char *kn = feature_bool(FEAT_HIS_KILLWHO) ? feature_str(FEAT_HIS_SERVERNAME)
+                         : (ksrc ? cli_name(ksrc) : "mesh");
+        sendcmdto_one(ksh, CMD_KILL, tgt, "%C :%s %s", tgt, kn, m_text);
+        exit_client_msg(cptr, tgt, ksh, "Killed (%s %s)", kn, m_text);
+      } else if (tgt && MyConnect(tgt) && m_cmd[0] == 'I') {
+        /* MR-5-1: a mesh-routed INVITE reached the target's HOME -> add the invite + notify
+         * the local target (mirrors m_invite's MyConnect branch).  m_text = the channel. */
+        struct Client *isrc = findNUser(srcyxx);
+        struct Channel *ich = FindChannel(m_text);
+        if (ich) {
+          add_invite(tgt, ich);
+          sendcmdto_one(isrc ? isrc : &me, CMD_INVITE, tgt, "%s %H", cli_name(tgt), ich);
+        }
+      } else if (tgt && MyConnect(tgt)) {            /* local CRDT user — message delivery (P/N/T) */
         if (is_tag) {                  /* TAGMSG: @tags prefix, no body, cap-gated */
           if (CapActive(tgt, CAP_MSGTAGS)) {
             if (src && src->nick[0])
