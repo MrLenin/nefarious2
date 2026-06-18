@@ -356,6 +356,14 @@ int server_finish_burst(struct Client *cptr)
   struct Client *acptr;
   struct SLink *lp;
 
+  /* MR-5 event-driven beacon-burst: hand a freshly-linked CRDT peer the full current
+   * beacon set NOW so it can anchor the far servers (whose P10 SERVER intros tree-
+   * retirement suppresses) and materialize their users at link time, rather than going
+   * blind (the transient N/0 verify state) until the periodic 30s flood reaches it.
+   * Fires for both the CR F snapshot path below and the cold-boot BURST fallback. */
+  if (IsCrdtAware(cptr))
+    crdt_shadow_beacon_burst(cptr);
+
   /* Phase 3c cutover: a CRDT-aware peer with CRDT-primary mode gets the full
    * CRDT document (CR F snapshot) INSTEAD of the P10 user/session/channel BURST
    * — it materializes live state from the doc. The SERVER tree + glines/jupes

@@ -147,6 +147,13 @@ int crdt_shadow_beacon_record(unsigned int num, time_t emit_ts,
  *  election).  @a my_yxx = our own server numeric.  0 when we are the active emitter. */
 int crdt_shadow_should_standby(unsigned int num, const char *my_yxx);
 
+/** MR-5 event-driven beacon-burst: hand a freshly-linked CRDT @a peer the full current
+ *  beacon set at link time (our self + proxy-legacy beacons, plus a replay of every fresh
+ *  far-server beacon we hold), so it can anchor far servers + materialize their users at
+ *  once instead of waiting for the periodic flood.  Closes the cold-link bringup window
+ *  tree-retirement opened.  Call from server_finish_burst for any CRDT-aware peer. */
+void crdt_shadow_beacon_burst(struct Client *peer);
+
 /** Build this server's own direct-CRDT-peer set (comma-joined base64 numerics)
  *  into @a out for the CR H beacon AND record our own mesh-map row locally.
  *  Returns the peer count.  Observability-only (see crdt_meshmap.h). */

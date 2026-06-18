@@ -416,7 +416,7 @@ int crdt_route_unicast_try(struct Client *from, char cmd, struct Client *tgt,
  * legacy server has no CRDT peers; keeps it out of the mesh-map). Existing wire form
  * (the proxy-row lease marker is the MR-3c append-only addition). No-op unless
  * FEAT_CRDT_LEGACY_PRESENCE. */
-static void crdt_proxy_beacon_legacy(void)
+static void crdt_proxy_beacon_legacy_to(struct Client *only)
 {
   struct Client *L, *p;
   for (L = GlobalClientList; L; L = cli_next(L)) {
@@ -425,7 +425,7 @@ static void crdt_proxy_beacon_legacy(void)
     if (!cli_from(L) || IsCrdtAware(cli_from(L)))
       continue;                          /* reached via OUR legacy link only (single-writer) */
     for (p = GlobalClientList; p; p = cli_next(p))
-      if (IsCrdtSyncTarget(p))
+      if (IsCrdtSyncTarget(p) && (!only || p == only))
         /* MR-4d: append our own numeric as fronted_by (after peers, before name) so
          * leaves/peer-gateways learn WHICH CRDT node fronts this legacy server — the
          * double-delivery election input + the proxy-row marker.  Append-only: an old
@@ -436,7 +436,10 @@ static void crdt_proxy_beacon_legacy(void)
   }
 }
 
-void crdt_gossip_beacon(void)
+/* Emit our own liveness set.  @a only==NULL -> all CRDT sync targets (the periodic
+ * flood); @a only!=NULL -> just that one peer (the MR-5 event-driven beacon-burst at
+ * link time — see crdt_shadow_beacon_burst). */
+void crdt_gossip_beacon_to(struct Client *only)
 {
   struct Client *acptr;
   char peers[256];
@@ -447,12 +450,17 @@ void crdt_gossip_beacon(void)
   if (crdt_shadow_local_peers(peers, sizeof peers) == 0)
     strcpy(peers, "*");
   for (acptr = GlobalClientList; acptr; acptr = cli_next(acptr))
-    if (IsCrdtSyncTarget(acptr))
+    if (IsCrdtSyncTarget(acptr) && (!only || acptr == only))
       sendcmdto_one(&me, CMD_CRDT_REPLICATION, acptr, "H %s %ld %s %s :%s",
                     cli_yxx(&me), (long)CurrentTime,
                     cli_serv(&me)->nn_capacity, peers, cli_name(&me));
   if (feature_bool(FEAT_CRDT_LEGACY_PRESENCE))
-    crdt_proxy_beacon_legacy();          /* MR-3a: proxy-beacon our legacy subtree */
+    crdt_proxy_beacon_legacy_to(only);   /* MR-3a: proxy-beacon our legacy subtree */
+}
+
+void crdt_gossip_beacon(void)
+{
+  crdt_gossip_beacon_to(NULL);
 }
 
 int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])

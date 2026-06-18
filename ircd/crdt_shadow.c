@@ -185,6 +185,50 @@ int crdt_shadow_should_standby(unsigned int num, const char *my_yxx)
   return crdt_gateway_should_standby((int)base64toint(my_yxx), fronter_num, fresh);
 }
 
+/* MR-5 event-driven beacon-burst: when a CRDT peer links, hand it the full current
+ * beacon set at once, instead of making it wait up to a CRDT_BEACON_STALE window for the
+ * periodic 30s flood + eager relay to reach it.  Closes the cold-link "blind leaf" gap
+ * that tree-retirement (MR-5-2/5-3) opened: with the far CRDT/legacy servers' P10 SERVER
+ * intros suppressed, the new leaf learns those servers ONLY via beacons (Case-B anchors),
+ * so until the beacons arrive it cannot anchor them or materialize their users (the
+ * transient N/0 verify state observed at bringup).  Sends, targeted to the one new peer:
+ *   (a) our own self-beacon + (b) our proxy-legacy beacons (crdt_gossip_beacon_to), and
+ *   (c) a replay of every fresh beacon we currently hold for OTHER servers, so the peer
+ *       also learns servers 2+ hops away immediately (not just our direct neighbourhood).
+ * Steady state still belongs to the periodic flood; this is bringup latency only.  Each
+ * replayed (c) beacon carries peers="*" (no mesh-map adjacency) and omits fronted_by: the
+ * mesh-map + the MR-4d double-delivery election self-correct on the next real beacon tick
+ * (both observability-only).  Gated to FRESH (recv within the staleness window) so we never
+ * resurrect a server we ourselves already consider gone.  Loop-safe: the new peer relays
+ * onward (excluding us) and the emit_ts dedup terminates it exactly as the normal flood. */
+void crdt_shadow_beacon_burst(struct Client *peer)
+{
+  unsigned int me_num, num;
+  int replayed = 0;
+  if (!crdt_shadow_active() || !peer || !IsCrdtSyncTarget(peer))
+    return;
+  crdt_gossip_beacon_to(peer);             /* (a) our self-beacon + (b) our proxy-legacy beacons */
+  me_num = (unsigned int)base64toint(cli_yxx(&me));
+  for (num = 0; num < CRDT_MAX_SERVERS; num++) {  /* (c) replay fresh far-server beacons */
+    char yxx[4];
+    if (num == me_num)
+      continue;                            /* us -> already sent via (a) */
+    if (!crdt_beacon[num].emit_ts || !crdt_beacon[num].name[0] ||
+        !crdt_beacon[num].nn_cap[0])
+      continue;                            /* never fully seen this server */
+    if (CurrentTime - crdt_beacon[num].recv_ts > CRDT_BEACON_STALE)
+      continue;                            /* stale by our own reckoning -> don't resurrect */
+    inttobase64(yxx, num, 2);
+    sendcmdto_one(&me, CMD_CRDT_REPLICATION, peer, "H %s %ld %s %s :%s",
+                  yxx, (long)crdt_beacon[num].emit_ts,
+                  crdt_beacon[num].nn_cap, "*", crdt_beacon[num].name);
+    replayed++;
+  }
+  log_write(LS_SYSTEM, L_INFO, 0,
+            "MR-5 beacon-burst: handed %s our liveness set + %d replayed far-server "
+            "beacon(s) at link time (cold-link bringup)", cli_name(peer), replayed);
+}
+
 /* Build this server's own direct-CRDT-peer list (base64 numerics, comma-joined)
  * into @a out for the CR H beacon, AND record our own mesh-map row locally so the
  * map is populated before any beacon round-trips back.  A node's direct peers are

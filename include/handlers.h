@@ -357,6 +357,9 @@ extern int crdt_route_unicast_try(struct Client* from, char cmd, struct Client* 
  *  (CR H <ourYXX> <CurrentTime>) over every CRDT transport.  Receivers track
  *  the last beacon per server; a mesh stub whose beacon goes stale is retired. */
 extern void crdt_gossip_beacon(void);
+/** MR-5 beacon-burst: emit our liveness set to a single peer @a only (link-time
+ *  bringup), instead of the periodic all-peer flood.  @a only==NULL == the flood. */
+extern void crdt_gossip_beacon_to(struct Client *only);
 extern int ms_bouncer_transfer(struct Client*, struct Client*, int, char*[]);
 extern int m_persistence(struct Client*, struct Client*, int, char*[]);
 extern void persistence_send_status(struct Client *to);
