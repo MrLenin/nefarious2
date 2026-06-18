@@ -40,6 +40,7 @@
 #include "class.h"
 #include "dnsbl.h"
 #include "client.h"
+#include "handlers.h"          /* B0/MR-3d (LOC forward): crdt_route_services_try */
 #include "hash.h"
 #include "IPcheck.h"
 #include "ircd.h"
@@ -71,6 +72,7 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <stdarg.h>            /* B0/MR-3d (LOC forward): loc_forward varargs */
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -467,6 +469,26 @@ static void auth_complete_sasl(struct Client *client)
   abort_sasl(client, 0);
 }
 
+/* B0/MR-3d (LOC forward): tunnel a LOC ACCOUNT query to @a service over CR-X when its server
+ * is a mesh-only services anchor on this leaf (its P10 path dead-sinks under tree-retirement);
+ * else send normal P10.  Builds the body with the service's EXPLICIT full numeric (NumNick) so
+ * the S2S wire form is independent of dest context (the gateway re-emits it verbatim via %s) —
+ * matching the SASL forward (m_authenticate.c sasl_forward).  @a subfmt is the per-type LOC
+ * tail starting with the type char (S/H/C); the %s fallback body is byte-identical to the old
+ * "%C <tail>" P10 form (NumNick == %C's server-context expansion). */
+static void loc_forward(struct Client *service, const char *subfmt, ...)
+{
+  struct Client *dsrv = cli_user(service) ? cli_user(service)->server : NULL;
+  char sub[BUFSIZE], body[BUFSIZE];
+  va_list vl;
+  va_start(vl, subfmt);
+  ircd_vsnprintf(0, sub, sizeof sub, subfmt, vl);
+  va_end(vl);
+  ircd_snprintf(0, body, sizeof body, "%s%s %s", NumNick(service), sub);
+  if (!dsrv || !crdt_route_services_try(dsrv, 'C', body))
+    sendcmdto_one(&me, CMD_ACCOUNT, service, "%s", body);
+}
+
 static void auth_do_loc(struct Client *client, struct Client *service)
 {
   /* If a cookie already exists, we're already doing LOC */
@@ -493,20 +515,20 @@ static void auth_do_loc(struct Client *client, struct Client *service)
       ircd_strncpy(realhost, hoststr, sizeof(realhost));
 
     if (cli_sslclifp(client) && !EmptyString(cli_sslclifp(client)) && feature_bool(FEAT_LOC_SENDSSLFP)) {
-      sendcmdto_one(&me, CMD_ACCOUNT, service, "%C S .%u.%u %s@%s:%s %s %s :%s", service,
-                    cli_fd(client), cli_loc(client)->cookie, cli_username(client),
-                    realhost, cli_sock_ip(client), cli_sslclifp(client), cli_loc(client)->account,
-                    cli_loc(client)->password);
+      loc_forward(service, "S .%u.%u %s@%s:%s %s %s :%s",
+                  cli_fd(client), cli_loc(client)->cookie, cli_username(client),
+                  realhost, cli_sock_ip(client), cli_sslclifp(client), cli_loc(client)->account,
+                  cli_loc(client)->password);
     } else {
-      sendcmdto_one(&me, CMD_ACCOUNT, service, "%C H .%u.%u %s@%s:%s %s :%s", service,
-                    cli_fd(client), cli_loc(client)->cookie, cli_username(client),
-                    realhost, cli_sock_ip(client), cli_loc(client)->account,
-                    cli_loc(client)->password);
+      loc_forward(service, "H .%u.%u %s@%s:%s %s :%s",
+                  cli_fd(client), cli_loc(client)->cookie, cli_username(client),
+                  realhost, cli_sock_ip(client), cli_loc(client)->account,
+                  cli_loc(client)->password);
     }
   } else {
-    sendcmdto_one(&me, CMD_ACCOUNT, service, "%C C .%u.%u %s :%s", service,
-                  cli_fd(client), cli_loc(client)->cookie,
-                  cli_loc(client)->account, cli_loc(client)->password);
+    loc_forward(service, "C .%u.%u %s :%s",
+                cli_fd(client), cli_loc(client)->cookie,
+                cli_loc(client)->account, cli_loc(client)->password);
   }
 }
 

@@ -159,6 +159,17 @@ int crdt_shadow_should_standby(unsigned int num, const char *my_yxx);
  *  tree-retirement opened.  Call from server_finish_burst for any CRDT-aware peer. */
 void crdt_shadow_beacon_burst(struct Client *peer);
 
+/** B0/MR-3d: present every beacon-known CRDT MESH server to our legacy peer (MR-3's missing
+ *  OUT direction), so legacy/x3 learns the leaves and a services reply addressed to a leaf
+ *  routes naturally over P10 to this gateway (which tunnels CR-X onward).  Proactive full
+ *  sweep; gateway-only + FEAT_CRDT_LEGACY_PRESENCE-gated internally; idempotent.  Call from
+ *  the verify timer (backstop). */
+void crdt_shadow_present_mesh_servers(void);
+
+/** B0/MR-3d: present a single just-learned mesh server (CR-H ingest fast path) so a cold leaf
+ *  is presentable to legacy the moment its beacon arrives.  @a yxx = 2-char server numeric. */
+void crdt_shadow_present_one_num(const char *yxx);
+
 /** Build this server's own direct-CRDT-peer set (comma-joined base64 numerics)
  *  into @a out for the CR H beacon AND record our own mesh-map row locally.
  *  Returns the peer count.  Observability-only (see crdt_meshmap.h). */

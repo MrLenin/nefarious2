@@ -82,11 +82,13 @@
 
 #include "bouncer_session.h"
 #include "client.h"
+#include "handlers.h"           /* B0/MR-3d (LOC reverse): crdt_route_services_reply_try */
 #include "ircd.h"
 #include "ircd_alloc.h"
 #include "ircd_features.h"
 #include "ircd_log.h"
 #include "ircd_reply.h"
+#include "ircd_snprintf.h"      /* B0/MR-3d (LOC reverse): build the CR-X reply body */
 #include "ircd_string.h"
 #include "msg.h"
 #include "numnicks.h"
@@ -147,7 +149,10 @@ int ms_account(struct Client* cptr, struct Client* sptr, int parc,
   if (parc < 3)
     return need_more_params(sptr, "ACCOUNT");
 
-  if (!IsServer(sptr))
+  /* B0/MR-3d: accept IsMe too — the services-anchor bridge re-injects a tunneled LOC reply
+   * via ms_account(&me, &me, ...) on the destination leaf (sptr=&me, IsMe not IsServer).
+   * Safe: ms_account is a server-only handler (CR-X delivers it), unforgeable by a client. */
+  if (!IsServer(sptr) && !IsMe(sptr))
     return protocol_violation(cptr, "ACCOUNT from non-server %s",
 			      cli_name(sptr));
 
@@ -364,9 +369,21 @@ int ms_account(struct Client* cptr, struct Client* sptr, int parc,
         return need_more_params(sptr, "ACCOUNT");
 
       if (!IsMe(acptr)) {
-        /* in-transit message, forward it */
-        sendcmdto_one(sptr, CMD_ACCOUNT, acptr, "%s %s %s%s%s", parv[1], parv[2],
-                      parv[3], (parc > 4 ? " " : ""), (parc > 4 ? parv[4] : ""));
+        /* in-transit message, forward it.  B0/MR-3d (LOC reverse): the LOC origin (acptr) may
+         * be a presented mesh-only anchor on this gateway (its P10 path dead-sinks under
+         * tree-retirement) — tunnel the reply over CR-X instead.  Build the body in the shape
+         * ms_account re-parses (<srvnum> <type> <token> [<extra>]) — the SAME bytes the P10
+         * forward emits — so the leaf re-injects it verbatim; falls back to P10 when acptr is
+         * genuinely routable.  General reverse rule (subsumes the per-subsystem hooks): a reply
+         * destined for a presented mesh stub -> tunnel, don't P10-send. */
+        char body[BUFSIZE];
+        if (parc > 4)
+          ircd_snprintf(0, body, sizeof body, "%s %s %s %s", parv[1], parv[2], parv[3], parv[4]);
+        else
+          ircd_snprintf(0, body, sizeof body, "%s %s %s", parv[1], parv[2], parv[3]);
+        if (!crdt_route_services_reply_try(acptr, 'C', body))
+          sendcmdto_one(sptr, CMD_ACCOUNT, acptr, "%s %s %s%s%s", parv[1], parv[2],
+                        parv[3], (parc > 4 ? " " : ""), (parc > 4 ? parv[4] : ""));
         return 0;
       }
 

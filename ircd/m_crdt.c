@@ -1005,6 +1005,11 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
     if (!crdt_shadow_beacon_record((unsigned int)base64toint(parv[2]),
                                    (time_t)atol(parv[3]), bcap, bname, bpeers, bfronted))
       return 0;
+    /* B0/MR-3d fast path: a FRESH beacon for a mesh server just arrived -> if we're a
+     * gateway, present that leaf to legacy NOW (don't wait up to a verify interval), so x3
+     * knows it before a cold-leaf services-forward arrives under the 3s LOC budget.  Skips
+     * proxied-legacy rows + real servers internally; no-op off-gateway / flag-off. */
+    crdt_shadow_present_one_num(parv[2]);
     for (p = GlobalClientList; p; p = cli_next(p))
       if (p != cptr && IsCrdtSyncTarget(p)) {
         if (bname[0] && bpeers[0] && bfronted[0])

@@ -922,6 +922,73 @@ static struct Client *crdt_shadow_make_anchor(const char *srvnum)
   return nc;
 }
 
+/* B0/MR-3d: present ONE beacon-known CRDT mesh server (by numeric) to our legacy peer, so
+ * legacy/x3 learns the leaf and a services reply (SASL/LOC/...) addressed to it routes
+ * naturally over P10 to this gateway, which then tunnels CR-X to the leaf.  This is MR-3's
+ * missing OUT direction (MR-3 proxy-beacons legacy INTO the mesh; this presents CRDT servers
+ * OUT to legacy).  The presentation machinery is R6c's crdt_present_stub/make_anchor
+ * wholesale; the only NEW bit is this beacon-driven TRIGGER — present_stub otherwise fires
+ * only for a server the gateway materialized a USER for (convert_to_stub / make_anchor on a
+ * user-resolve miss), so a user-less leaf (the common case: services live on x3, not the
+ * leaves) was never presented and FindNServer(leaf) stayed NULL on the gateway -> the
+ * services re-emit fell back to :gateway and x3 replied to the gateway with no usable origin.
+ * Caller has checked the gate.  Skips: self; never-fully-seen + stale beacons; PROXIED-LEGACY
+ * rows (min_fronter set -> a legacy server fronted by a gateway; never re-present a legacy
+ * server toward legacy, MR-3's mirror hazard); and real STAT_SERVERs (legacy already knows
+ * them via normal relay -> presenting would be a duplicate-server).  present_stub is
+ * idempotent (FLAG_CRDT_PRESENTED) -> a cheap no-op once presented; its SERVER intro precedes
+ * the user NICKs the ambient reconcile (the verify timer, which calls the sweep before its
+ * reconcile suite) emits via the now-ungated §17.7 gates. */
+static void crdt_present_one(unsigned int num)
+{
+  struct Client *srv;
+  char yxx[4];
+  unsigned int me_num = (unsigned int)base64toint(cli_yxx(&me));
+  if (num >= CRDT_MAX_SERVERS || num == me_num)
+    return;
+  if (!crdt_beacon[num].emit_ts || !crdt_beacon[num].name[0] || !crdt_beacon[num].nn_cap[0])
+    return;                                /* never fully seen this server */
+  if (CurrentTime - crdt_beacon[num].recv_ts > CRDT_BEACON_STALE)
+    return;                                /* stale -> don't present a server we think is gone */
+  if (crdt_beacon[num].min_fronter[0])
+    return;                                /* a PROXIED LEGACY server -> never present toward legacy */
+  inttobase64(yxx, num, 2);
+  srv = FindNServer(yxx);
+  if (!srv)
+    crdt_shadow_make_anchor(yxx);          /* no anchor yet -> build one (it presents) */
+  else if (IsMeshStub(srv) && !IsPresented(srv))
+    crdt_present_stub(srv);                 /* anchor exists, unpresented -> present it */
+  /* real STAT_SERVER -> do nothing (legacy knows it via normal P10 relay) */
+}
+
+/* B0/MR-3d: proactive full sweep — present every eligible mesh server to legacy.  Proactive
+ * (not on-demand) so x3 already knows every leaf BEFORE the first services-forward arrives
+ * (LOC's FEAT_LOC_TIMEOUT=3 rules out presenting mid-handshake).  Gateway-only (a node with a
+ * direct legacy peer).  Called from the verify timer (backstop, before its reconcile suite so
+ * the presented stubs' users emit same-tick) + on CR-H beacon ingest (promptness).  Idempotent;
+ * reuses FEAT_CRDT_LEGACY_PRESENCE (MR-3's flag — this is its OUT counterpart). */
+void crdt_shadow_present_mesh_servers(void)
+{
+  unsigned int num;
+  if (!crdt_shadow_active() || !feature_bool(FEAT_CRDT_LEGACY_PRESENCE) ||
+      !crdt_gateway_has_legacy_peer())
+    return;
+  for (num = 0; num < CRDT_MAX_SERVERS; num++)
+    crdt_present_one(num);
+}
+
+/* B0/MR-3d: present a single just-learned mesh server (the CR-H ingest fast path), so a fresh
+ * leaf becomes presentable to legacy the moment its beacon arrives rather than up to one
+ * verify interval later (matters for the 3s LOC budget on a cold leaf).  @a yxx = the 2-char
+ * server numeric carried on the beacon. */
+void crdt_shadow_present_one_num(const char *yxx)
+{
+  if (!crdt_shadow_active() || !feature_bool(FEAT_CRDT_LEGACY_PRESENCE) ||
+      !crdt_gateway_has_legacy_peer() || !yxx)
+    return;
+  crdt_present_one((unsigned int)base64toint(yxx));
+}
+
 void crdt_shadow_topic(struct Channel *chptr, struct Client *from)
 {
   if (!shadow_on())
@@ -3518,6 +3585,10 @@ static void crdt_shadow_verify_cb(struct Event *ev)
    * (FindNServer at the materialize gate), not replicated doc state. */
   crdt_shadow_verify(NULL);         /* NULL -> the system log (timer path) */
   crdt_shadow_materialize_check();  /* Phase 3b dry-run: doc -> live fidelity */
+  /* B0/MR-3d: present every fresh mesh server to legacy BEFORE the reconcile suite, so the
+   * SERVER intros precede the user NICKs the now-ungated §17.7 gates emit below (same tick).
+   * Backstop for the CR-H ingest fast path; gateway-only + flag-gated internally. */
+  crdt_shadow_present_mesh_servers();
   /* Phase 3l: create+gateway users BEFORE materialize_live (the bulk path creates
    * users locally but never gateways; running reconcile_users first lets it §17.7-
    * introduce a not-yet-live user to legacy, after which materialize_live no-ops it).
