@@ -188,4 +188,13 @@ int crdt_should_suppress_tree(int meshmap_on, int primary,
 int crdt_should_suppress_intro(int legacy_on, int primary,
                                int peer_aware, int subject_aware);
 
+/** MR-4d: when multiple CRDT gateways front the same legacy server, only the
+ *  lowest-numeric one re-emits a CR-M unicast as P10 (else the legacy user gets it
+ *  twice).  Pure decision (agreement-by-rule over the converged beacon set): WE stand
+ *  down iff a FRESH competing proxy-beacon carries a strictly-lower fronting numeric.
+ *  @a my_num this gateway's server numeric; @a fronter_num the lowest OTHER fresh
+ *  fronter (-1 if none); @a fronter_fresh its beacon is within the staleness window
+ *  (stale ⇒ departed ⇒ we promote).  TDD-pinned. */
+int crdt_gateway_should_standby(int my_num, int fronter_num, int fronter_fresh);
+
 #endif /* INCLUDED_crdt_meshmap_h */

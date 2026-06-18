@@ -424,3 +424,17 @@ int crdt_should_suppress_intro(int legacy_on, int primary,
 {
   return legacy_on && primary && peer_aware && !subject_aware;
 }
+
+/* MR-4d: multi-gateway double-delivery election, isolated as a pure rule so the
+ * truth table is cmocka-pinned.  When two CRDT gateways both front the same legacy
+ * server, both pass the local re-emit gate and would each re-emit the CR-M as P10
+ * -> the legacy user receives it TWICE.  Resolve by agreement-by-rule (no consensus):
+ * only the lowest-numeric gateway re-emits; every node has the same converged beacon
+ * set, so each gateway computes the same winner.  WE stand down iff a FRESH competing
+ * proxy-beacon carries a strictly-lower fronting numeric.  fronter_num = the lowest
+ * OTHER fresh fronter's numeric (-1 if none seen); fronter_fresh = its beacon is
+ * within the staleness window (a stale fronter is treated as departed -> we promote). */
+int crdt_gateway_should_standby(int my_num, int fronter_num, int fronter_fresh)
+{
+  return fronter_fresh && fronter_num >= 0 && fronter_num < my_num;
+}

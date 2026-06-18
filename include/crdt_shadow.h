@@ -131,7 +131,12 @@ const struct CrdtUserRecord *crdt_shadow_user_record(const char *numeric);
  *  terminating the gossip flood). */
 int crdt_shadow_beacon_record(unsigned int num, time_t emit_ts,
                               const char *nn_cap, const char *name,
-                              const char *peers);
+                              const char *peers, const char *fronted_by);
+
+/** MR-4d: 1 if this gateway should STAND DOWN from re-emitting CR-M traffic for legacy
+ *  server @a num because a fresh lower-numeric gateway also fronts it (double-delivery
+ *  election).  @a my_yxx = our own server numeric.  0 when we are the active emitter. */
+int crdt_shadow_should_standby(unsigned int num, const char *my_yxx);
 
 /** Build this server's own direct-CRDT-peer set (comma-joined base64 numerics)
  *  into @a out for the CR H beacon AND record our own mesh-map row locally.

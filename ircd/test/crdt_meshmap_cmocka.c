@@ -563,6 +563,20 @@ static void test_should_suppress_intro(void **state)
   assert_int_equal(0, crdt_should_suppress_intro(1, 1, 1, 1)); /* CRDT subject (R7b-infeasible) */
 }
 
+static void test_gateway_should_standby(void **state)
+{
+  (void)state;
+  /* stand down IFF a FRESH fronter exists with a strictly-lower numeric than us. */
+  assert_int_equal(1, crdt_gateway_should_standby(5, 3, 1)); /* fresh lower gateway -> stand down */
+  assert_int_equal(0, crdt_gateway_should_standby(3, 5, 1)); /* fresh HIGHER -> we emit (lowest) */
+  assert_int_equal(0, crdt_gateway_should_standby(5, 5, 1)); /* tie (same node) -> we emit */
+  assert_int_equal(0, crdt_gateway_should_standby(5, 3, 0)); /* lower but STALE -> promote, we emit */
+  assert_int_equal(0, crdt_gateway_should_standby(5, -1, 1)); /* no fronter -> sole gateway, we emit */
+  assert_int_equal(0, crdt_gateway_should_standby(5, -1, 0)); /* none + stale -> we emit */
+  assert_int_equal(0, crdt_gateway_should_standby(0, 0, 1)); /* numeric 0 vs 0 tie -> we emit */
+  assert_int_equal(1, crdt_gateway_should_standby(1, 0, 1)); /* fresh fronter 0 < us 1 -> stand down */
+}
+
 int main(void)
 {
   const struct CMUnitTest tests[] = {
@@ -590,6 +604,7 @@ int main(void)
     cmocka_unit_test(test_row_changed),
     cmocka_unit_test(test_should_suppress_tree),
     cmocka_unit_test(test_should_suppress_intro),
+    cmocka_unit_test(test_gateway_should_standby),
   };
   return cmocka_run_group_tests(tests, NULL, NULL);
 }

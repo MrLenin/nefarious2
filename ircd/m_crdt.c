@@ -216,6 +216,9 @@ static unsigned long crdt_dead_sink_dropped = 0;
 /* MR-4b: the matching success counter — a CR-M unicast we re-emitted as real P10
  * toward the fronted legacy user (the bridge fired). */
 static unsigned long crdt_cr_to_p10_bridged = 0;
+/* MR-4d: a CR-M unicast we did NOT re-emit because a lower-numeric gateway also
+ * fronts the legacy server (the double-delivery election stood us down). */
+static unsigned long crdt_gateway_standby_suppressed = 0;
 
 /* MR-1: TTL/hop-limit on every routed CR M frame (the §0 prerequisite).  A
  * storm-backstop, NOT a delivery limiter — set far above any realistic mesh
@@ -422,9 +425,13 @@ static void crdt_proxy_beacon_legacy(void)
       continue;                          /* reached via OUR legacy link only (single-writer) */
     for (p = GlobalClientList; p; p = cli_next(p))
       if (IsCrdtSyncTarget(p))
-        sendcmdto_one(&me, CMD_CRDT_REPLICATION, p, "H %s %ld %s %s :%s",
+        /* MR-4d: append our own numeric as fronted_by (after peers, before name) so
+         * leaves/peer-gateways learn WHICH CRDT node fronts this legacy server — the
+         * double-delivery election input + the proxy-row marker.  Append-only: an old
+         * binary reads name=parv[parc-1] and ignores the extra positional. */
+        sendcmdto_one(&me, CMD_CRDT_REPLICATION, p, "H %s %ld %s %s %s :%s",
                       cli_yxx(L), (long)CurrentTime,
-                      cli_serv(L)->nn_capacity, "*", cli_name(L));
+                      cli_serv(L)->nn_capacity, "*", cli_yxx(&me), cli_name(L));
   }
 }
 
@@ -687,6 +694,18 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
          * drop (the MR-4a behaviour) with the reason. */
         struct Client *tsrv = cli_user(tgt)->server;
         if (IsServer(tsrv) && !IsCrdtAware(tsrv) && cli_from(tsrv) &&
+            !IsCrdtAware(cli_from(tsrv)) && feature_bool(FEAT_CRDT_GATEWAY_BRIDGE) &&
+            crdt_shadow_should_standby((unsigned int)base64toint(cli_yxx(tsrv)),
+                                       cli_yxx(&me))) {
+          /* MR-4d: a lower-numeric gateway also fronts this legacy server — stand down
+           * so only it re-emits (no double-delivery on legacy).  Not a loss: the active
+           * gateway delivers; if it departs, its beacon goes stale and we promote. */
+          crdt_gateway_standby_suppressed++;
+          log_write(LS_SYSTEM, L_INFO, 0, "MR-4d standby: CR-M %s for legacy user %s "
+                    "(on %s) NOT re-emitted — a lower-numeric gateway fronts it "
+                    "(count=%lu)", cmdstr, cli_name(tgt), cli_name(tsrv),
+                    crdt_gateway_standby_suppressed);
+        } else if (IsServer(tsrv) && !IsCrdtAware(tsrv) && cli_from(tsrv) &&
             !IsCrdtAware(cli_from(tsrv))) {
           struct Client *srcc = findNUser(srcyxx);
           int is_kill = (m_cmd[0] == 'K');                 /* MR-4c */
@@ -798,20 +817,25 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
      * the flood.  #3: nn_cap + name are append-only; an old-form beacon (parc==4)
      * omits them and is relayed in old form (mixed-version safe).  Ephemeral. */
     struct Client *p;
-    const char *bcap = "", *bname = "", *bpeers = "";
+    const char *bcap = "", *bname = "", *bpeers = "", *bfronted = "";
     if (parc < 4)
       return 0;
-    /* name is always the trailing param (parv[parc-1]); peers is the optional
-     * positional inserted before it (parc>=7), so an old binary's parc>=6 read of
-     * cap=parv[4]+name=parv[parc-1] stays correct and just ignores peers. */
+    /* name is always the trailing param (parv[parc-1]); peers (parc>=7) and the MR-4d
+     * fronted_by (parc>=8) are optional positionals inserted before it, so an old
+     * binary's read of cap=parv[4]+name=parv[parc-1] stays correct and just ignores
+     * the extras. */
     if (parc >= 6) { bcap = parv[4]; bname = parv[parc - 1]; }
     if (parc >= 7) { bpeers = parv[5]; }
+    if (parc >= 8) { bfronted = parv[6]; }
     if (!crdt_shadow_beacon_record((unsigned int)base64toint(parv[2]),
-                                   (time_t)atol(parv[3]), bcap, bname, bpeers))
+                                   (time_t)atol(parv[3]), bcap, bname, bpeers, bfronted))
       return 0;
     for (p = GlobalClientList; p; p = cli_next(p))
       if (p != cptr && IsCrdtSyncTarget(p)) {
-        if (bname[0] && bpeers[0])
+        if (bname[0] && bpeers[0] && bfronted[0])
+          sendcmdto_one(&me, CMD_CRDT_REPLICATION, p, "H %s %s %s %s %s :%s",
+                        parv[2], parv[3], bcap, bpeers, bfronted, bname);
+        else if (bname[0] && bpeers[0])
           sendcmdto_one(&me, CMD_CRDT_REPLICATION, p, "H %s %s %s %s :%s",
                         parv[2], parv[3], bcap, bpeers, bname);
         else if (bname[0])

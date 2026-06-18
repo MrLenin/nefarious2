@@ -101,6 +101,9 @@ static struct {
   time_t emit_ts; time_t recv_ts;
   char name[HOSTLEN + 1];           /* #3: real server name (for the synthetic anchor) */
   char nn_cap[4];                   /* #3: base64 client capacity -> right-sized anchor mask */
+  char min_fronter[4];              /* MR-4d: lowest-numeric gateway seen proxy-beaconing this
+                                       legacy server (the double-delivery election); "" = none */
+  time_t min_fronter_ts;            /* MR-4d: when min_fronter was last (re)set (freshness) */
 } crdt_beacon[CRDT_MAX_SERVERS];
 
 /* Record a beacon for server `num` emitted at `emit_ts`.  Returns 1 if FRESH
@@ -110,7 +113,7 @@ static struct {
  * beacon) -> left unchanged so a later full beacon can fill them. */
 int crdt_shadow_beacon_record(unsigned int num, time_t emit_ts,
                               const char *nn_cap, const char *name,
-                              const char *peers)
+                              const char *peers, const char *fronted_by)
 {
   if (num >= CRDT_MAX_SERVERS || emit_ts <= crdt_beacon[num].emit_ts)
     return 0;
@@ -120,6 +123,23 @@ int crdt_shadow_beacon_record(unsigned int num, time_t emit_ts,
     ircd_strncpy(crdt_beacon[num].nn_cap, nn_cap, sizeof crdt_beacon[num].nn_cap);
   if (name && name[0])
     ircd_strncpy(crdt_beacon[num].name, name, sizeof crdt_beacon[num].name);
+
+  /* MR-4d: track the lowest-numeric gateway proxy-beaconing this legacy server (the
+   * double-delivery election input).  fronted_by carries the FRONTING gateway's own
+   * numeric on a proxy beacon ("" on a self-beacon / old-form).  Keep the lowest; let
+   * a fresh higher one take over once the current min goes stale (departed-gateway
+   * promotion).  Two gateways' beacons alternate-pass the emit_ts gate over time, so
+   * the min converges within a staleness window. */
+  if (fronted_by && fronted_by[0]) {
+    int stale = !crdt_beacon[num].min_fronter[0] ||
+                (CurrentTime - crdt_beacon[num].min_fronter_ts
+                 > crdt_shadow_beacon_stale_secs());
+    if (stale || base64toint(fronted_by) <= base64toint(crdt_beacon[num].min_fronter)) {
+      ircd_strncpy(crdt_beacon[num].min_fronter, fronted_by,
+                   sizeof crdt_beacon[num].min_fronter);
+      crdt_beacon[num].min_fronter_ts = CurrentTime;
+    }
+  }
 
   /* Mesh-map: this node declared its own direct-peer set (single-writer per key).
    * peers is a comma-joined list of base64 server numerics; absent on an old-form
@@ -148,6 +168,21 @@ int crdt_shadow_beacon_record(unsigned int num, time_t emit_ts,
     crdt_meshmap_set(&g_meshmap, (uint16_t)num, adj, n, CurrentTime);
   }
   return 1;
+}
+
+/* MR-4d: should THIS gateway stand down from re-emitting CR-M traffic for legacy
+ * server `num` because a lower-numeric gateway also fronts it?  Consults the recorded
+ * min_fronter (lowest gateway seen beaconing `num`) + its freshness, then defers to
+ * the pure crdt_gateway_should_standby rule.  my_yxx = our own server numeric. */
+int crdt_shadow_should_standby(unsigned int num, const char *my_yxx)
+{
+  int fronter_num, fresh;
+  if (num >= CRDT_MAX_SERVERS || !crdt_beacon[num].min_fronter[0])
+    return 0;
+  fronter_num = (int)base64toint(crdt_beacon[num].min_fronter);
+  fresh = (CurrentTime - crdt_beacon[num].min_fronter_ts
+           <= crdt_shadow_beacon_stale_secs());
+  return crdt_gateway_should_standby((int)base64toint(my_yxx), fronter_num, fresh);
 }
 
 /* Build this server's own direct-CRDT-peer list (base64 numerics, comma-joined)
