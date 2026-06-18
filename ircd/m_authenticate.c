@@ -90,6 +90,7 @@
 #include "ircd_reply.h"
 #include "ircd_string.h"
 #include "ircd_snprintf.h"
+#include "handlers.h"          /* Tier B: crdt_route_services_try (services-anchor bridge) */
 #include "msg.h"
 #include "numeric.h"
 #include "numnicks.h"
@@ -100,9 +101,31 @@
 #include "s_user.h"
 #include "sasl_auth.h"
 
+#include <stdarg.h>            /* Tier B: sasl_forward varargs */
+
 /* #include <assert.h> -- Now using assert in ircd_log.h */
 
 static void sasl_timeout_callback(struct Event* ev);
+
+/* Tier B services-anchor bridge: emit one forward SASL line to the services agent @a acptr.
+ * Builds the P10 body `<agentYXX> <ourYXX>!fd.cookie <sub...>` with explicit numerics (so it
+ * matches the S2S wire exactly, independent of %C dest context), then either tunnels it over
+ * CR-X (when acptr is reachable only as a mesh anchor — a far CRDT leaf) or sends normal P10.
+ * @a subfmt builds the subcommand tail after the <srvnum>!fd.cookie token. */
+static void sasl_forward(struct Client* cptr, struct Client* acptr,
+                         const char* subfmt, ...)
+{
+  char sub[BUFSIZE];
+  char body[BUFSIZE];
+  va_list vl;
+  va_start(vl, subfmt);
+  ircd_vsnprintf(0, sub, sizeof sub, subfmt, vl);
+  va_end(vl);
+  ircd_snprintf(0, body, sizeof body, "%s %s!%u.%u %s", cli_yxx(acptr), cli_yxx(&me),
+                cli_fd(cptr), cli_saslcookie(cptr), sub);
+  if (!crdt_route_services_try(acptr, 'A', body))
+    sendcmdto_one(&me, CMD_SASL, acptr, "%s", body);
+}
 
 int m_authenticate(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
 {
@@ -279,20 +302,16 @@ int m_authenticate(struct Client* cptr, struct Client* sptr, int parc, char* par
     if (first) {
       if (*parv[1] == ':' || strchr(parv[1], ' '))
 		return exit_client(cptr, sptr, sptr, "Malformed AUTHENTICATE");
+      /* Tier B: sasl_forward tunnels over CR-X if acptr is a mesh-only services anchor. */
       if (!EmptyString(cli_sslclifp(cptr)))
-        sendcmdto_one(&me, CMD_SASL, acptr, "%C %C!%u.%u S %s :%s", acptr, &me,
-                      cli_fd(cptr), cli_saslcookie(cptr),
-                      parv[1], cli_sslclifp(cptr));
+        sasl_forward(cptr, acptr, "S %s :%s", parv[1], cli_sslclifp(cptr));
       else
-        sendcmdto_one(&me, CMD_SASL, acptr, "%C %C!%u.%u S :%s", acptr, &me,
-                      cli_fd(cptr), cli_saslcookie(cptr), parv[1]);
+        sasl_forward(cptr, acptr, "S :%s", parv[1]);
       if (feature_bool(FEAT_SASL_SENDHOST))
-        sendcmdto_one(&me, CMD_SASL, acptr, "%C %C!%u.%u H :%s@%s:%s", acptr, &me,
-                      cli_fd(cptr), cli_saslcookie(cptr), cli_username(cptr),
-                      realhost, cli_sock_ip(cptr));
+        sasl_forward(cptr, acptr, "H :%s@%s:%s", cli_username(cptr),
+                     realhost, cli_sock_ip(cptr));
     } else {
-      sendcmdto_one(&me, CMD_SASL, acptr, "%C %C!%u.%u C :%s", acptr, &me,
-                    cli_fd(cptr), cli_saslcookie(cptr), parv[1]);
+      sasl_forward(cptr, acptr, "C :%s", parv[1]);
     }
   } else {
     if (first) {

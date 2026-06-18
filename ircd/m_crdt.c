@@ -400,6 +400,146 @@ int crdt_route_unicast_try(struct Client *from, char cmd, struct Client *tgt,
   return 1;
 }
 
+/* ===== Tier B: the services-anchor bridge (CR X carrier) =====
+ * x3.services (and other services pseudo-servers) is reachable on a far CRDT leaf ONLY as a
+ * dead-sink anchor, so every P10 command to/from it drops.  CR X is a payload-agnostic,
+ * SERVER-numeric-routed opaque carrier (vs CR M's user-routed unicast): it tunnels the verbatim
+ * P10 body of a SASL/ACCOUNT/REGISTER/XQUERY/... command across the mesh.  STATELESS — the
+ * <srvnum>!fd.cookie auth token in the body already encodes origin+fd+cookie, so the bridge
+ * never parses auth.  Wire: `X <msgid> <dstSrvYXX> <p10cmd> <ttl> :<P10 body>`.  Flood + dedup
+ * (low-volume services traffic; flood is robust + avoids the next-hop-stale latency risk against
+ * FEAT_SASL_TIMEOUT).  See crdt-mesh-services-bridge.md. */
+
+/* Flood a CR X frame toward server numeric @a dstyxx, carrying the ORIGINATING server numeric
+ * @a srcyxx so the gateway re-emits to the service with that source (the service then replies
+ * to the real origin, not the gateway).  @a body = the verbatim P10 param tail (what
+ * sendcmdto_one would have produced after the routing target). */
+static void crdt_services_emit(const char *srcyxx, const char *dstyxx, char p10cmd,
+                               const char *body)
+{
+  struct Client *p;
+  char mid[64];
+  if (!crdt_shadow_active() || !srcyxx || !dstyxx || !body)
+    return;
+  generate_msgid(mid, sizeof mid);
+  crdt_m_seen_check_add(mid);             /* dedup our own relay-back */
+  for (p = GlobalClientList; p; p = cli_next(p))
+    if (IsCrdtSyncTarget(p))
+      sendcmdto_one(&me, CMD_CRDT_REPLICATION, p, "X %s %s %s %c %d :%s",
+                    mid, srcyxx, dstyxx, p10cmd, CRDT_M_TTL_DEFAULT, body);
+}
+
+/* FORWARD (leaf -> x3): route a services command over the mesh when its target SERVER is
+ * reachable only as an anchor (crdt_server_is_mesh_only — x3 is never presented on a leaf).
+ * Returns 1 if tunneled (caller skips the P10 send), 0 to fall back to P10. */
+int crdt_route_services_try(struct Client *dstsrv, char p10cmd, const char *body)
+{
+  log_write(LS_SYSTEM, L_INFO, 0,
+            "Tier B FWD-try: tgt=%s cmd=%c flag=%d meshstub=%d presented=%d",
+            dstsrv ? cli_name(dstsrv) : "(null)", p10cmd,
+            feature_bool(FEAT_CRDT_SERVICES_BRIDGE),
+            dstsrv ? IsMeshStub(dstsrv) : -1,
+            (dstsrv && IsMeshStub(dstsrv)) ? IsPresented(dstsrv) : -1);
+  if (!feature_bool(FEAT_CRDT_SERVICES_BRIDGE) || !dstsrv || !body ||
+      !crdt_server_is_mesh_only(dstsrv))
+    return 0;
+  crdt_services_emit(cli_yxx(&me), cli_yxx(dstsrv), p10cmd, body);  /* origin = us (the leaf) */
+  log_write(LS_SYSTEM, L_INFO, 0, "Tier B FWD: CR-X emitted dst=%s cmd=%c", cli_yxx(dstsrv), p10cmd);
+  return 1;
+}
+
+/* REVERSE (gateway: x3-reply -> originating leaf): the reply's target (@a tgt = a server, or a
+ * user/anchor on it) is mesh-only on the gateway, so a P10 send would dead-sink.  Tunnel CR X
+ * toward the owning server.  Uses IsMeshStub directly (NOT crdt_server_is_mesh_only): on the
+ * gateway a leaf stub may be PRESENTED, which still dead-sinks — the presented-stub trap from
+ * the INVITE fix.  Returns 1 if tunneled, 0 to fall back to P10. */
+int crdt_route_services_reply_try(struct Client *tgt, char p10cmd, const char *body)
+{
+  struct Client *owner;
+  if (!feature_bool(FEAT_CRDT_SERVICES_BRIDGE) || !tgt || !body)
+    return 0;
+  owner = (IsServer(tgt) || IsMeshStub(tgt)) ? tgt
+          : (cli_user(tgt) ? cli_user(tgt)->server : NULL);
+  log_write(LS_SYSTEM, L_INFO, 0,
+            "Tier B REV-try: tgt=%s owner=%s ownermeshstub=%d cmd=%c",
+            cli_name(tgt), owner ? cli_name(owner) : "(null)",
+            owner ? IsMeshStub(owner) : -1, p10cmd);
+  if (!owner || !IsMeshStub(owner))
+    return 0;
+  crdt_services_emit(cli_yxx(&me), cli_yxx(owner), p10cmd, body);  /* origin = us (the gateway) */
+  log_write(LS_SYSTEM, L_INFO, 0, "Tier B REV: CR-X emitted dst=%s cmd=%c", cli_yxx(owner), p10cmd);
+  return 1;
+}
+
+/* REVERSE by numeric (gateway-as-proxy): the services reply landed on THIS gateway (x3 only
+ * knows the gateway under tree-retirement) but its session token belongs to another server
+ * @a srvnum (the originating mesh-only leaf).  Tunnel CR-X toward srvnum.  Routes when srvnum
+ * is a mesh anchor here OR is unknown here (reachable only via the mesh); declines a real local
+ * P10 server.  Returns 1 if tunneled, 0 to fall through. */
+int crdt_route_services_reply_by_num(const char *srvnum, char p10cmd, const char *body)
+{
+  struct Client *owner;
+  if (!feature_bool(FEAT_CRDT_SERVICES_BRIDGE) || !srvnum || !body)
+    return 0;
+  owner = FindNServer(srvnum);
+  if (owner && !IsMeshStub(owner))
+    return 0;                            /* a real P10 server reachable here -> not our case */
+  crdt_services_emit(cli_yxx(&me), srvnum, p10cmd, body);
+  log_write(LS_SYSTEM, L_INFO, 0, "Tier B REV(num): CR-X emitted dst=%s cmd=%c", srvnum, p10cmd);
+  return 1;
+}
+
+/* Gateway: re-emit a tunneled services command as REAL P10 toward the live server @a dsrv
+ * (x3).  The body is the verbatim P10 param tail; %s passes it literally (auth payloads have
+ * no '%').  Dumb pipe — the auth handler on x3 parses it. */
+static void crdt_services_reemit(struct Client *srcsrv, struct Client *dsrv, char p10cmd,
+                                 const char *body)
+{
+  struct Client *src = srcsrv ? srcsrv : &me;   /* origin so the service replies to the real
+                                                   originating server, not this gateway */
+  switch (p10cmd) {
+    case 'A': sendcmdto_one(src, CMD_SASL,     dsrv, "%s", body); break;
+    case 'C': sendcmdto_one(src, CMD_ACCOUNT,  dsrv, "%s", body); break;
+    case 'G': sendcmdto_one(src, CMD_REGISTER, dsrv, "%s", body); break;
+    case 'V': sendcmdto_one(src, CMD_VERIFY,   dsrv, "%s", body); break;
+    case 'R': sendcmdto_one(src, CMD_REGREPLY, dsrv, "%s", body); break;
+    case 'Q': sendcmdto_one(src, CMD_XQUERY,   dsrv, "%s", body); break;
+    case 'Y': sendcmdto_one(src, CMD_XREPLY,   dsrv, "%s", body); break;
+    default: break;
+  }
+}
+
+/* Destination leaf: re-inject the tunneled body into the LOCAL services handler (the token in
+ * the body resolves the local client).  Splits @a body (mutated in place) into a parv — P10
+ * arg rules: space-separated, a leading ':' begins the trailing param (rest of line).  parv[0]
+ * is a prefix placeholder (the ms_ handlers route by the body, not the prefix). */
+static void crdt_services_reinject(char p10cmd, char *body)
+{
+  char *parv[MAXPARA + 3];
+  int parc = 0;
+  char *s = body;
+  parv[parc++] = cli_name(&me);
+  while (*s && parc < MAXPARA + 2) {
+    while (*s == ' ') *s++ = '\0';
+    if (!*s)
+      break;
+    if (*s == ':') { parv[parc++] = ++s; break; }   /* trailing param: rest of line verbatim */
+    parv[parc++] = s;
+    while (*s && *s != ' ')
+      s++;
+  }
+  parv[parc] = NULL;
+  switch (p10cmd) {
+    case 'A': ms_sasl(&me, &me, parc, parv); break;
+    case 'C': ms_account(&me, &me, parc, parv); break;
+    case 'R': ms_regreply(&me, &me, parc, parv); break;
+    case 'Q': ms_xquery(&me, &me, parc, parv); break;
+    case 'Y': ms_xreply(&me, &me, parc, parv); break;
+    /* 'G'/'V' (REGISTER/VERIFY) are forward-only to services -> never re-injected at a leaf */
+    default: break;
+  }
+}
+
 /* Tier2 full-partition liveness: gossip our ephemeral liveness beacon
  * (CR H <ourYXX> <CurrentTime> <nn_capacity> <peers> :<name>) to all CRDT
  * transports.  Receivers track the last beacon per server; a mesh stub whose
@@ -879,6 +1019,53 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
         else
           sendcmdto_one(&me, CMD_CRDT_REPLICATION, p, "H %s %s", parv[2], parv[3]);
       }
+  } else if (sub[0] == 'X' && !sub[1]) {
+    /* Tier B services-anchor bridge: `X <msgid> <srcSrvYXX> <dstSrvYXX> <p10cmd> <ttl> :<P10 body>`.
+     * Routed toward the SERVER numeric dstSrvYXX (flood + dedup); srcSrvYXX = the originating
+     * server (so the gateway re-emits to the service with that source -> the service replies to
+     * the origin, not the gateway).  Three outcomes:
+     *  (a) dstSrvYXX == us  -> re-inject the body into the local ms_ handler;
+     *  (b) we hold a LIVE legacy P10 link to dstSrvYXX (the gateway) -> re-emit real P10;
+     *  (c) else relay onward (TTL-bounded).  Dumb pipe; flag-gated FEAT_CRDT_SERVICES_BRIDGE. */
+    const char *x_msgid, *srcyxx, *dstyxx, *x_body;
+    char x_cmd;
+    int x_ttl;
+    unsigned int dstnum, ournum;
+    struct Client *dsrv, *ssrv, *p;
+    if (parc < 8 || !feature_bool(FEAT_CRDT_SERVICES_BRIDGE))
+      return 0;
+    x_msgid = parv[2]; srcyxx = parv[3]; dstyxx = parv[4]; x_cmd = parv[5][0];
+    x_ttl = atoi(parv[6]); x_body = parv[parc - 1];
+    if (crdt_m_seen_check_add(x_msgid))
+      return 0;                            /* already handled via another mesh path */
+    dstnum = (unsigned int)base64toint(dstyxx);
+    ournum = (unsigned int)base64toint(cli_yxx(&me));
+    dsrv = FindNServer(dstyxx);
+    log_write(LS_SYSTEM, L_INFO, 0,
+              "Tier B CR-X recv: src=%s dst=%s cmd=%c ttl=%d self=%d resolved=%s gwbridge=%d",
+              srcyxx, dstyxx, x_cmd, x_ttl, dstnum == ournum,
+              dsrv ? cli_name(dsrv) : "(none)", feature_bool(FEAT_CRDT_GATEWAY_BRIDGE));
+    if (dstnum == ournum) {                /* (a) we are the destination -> local re-inject */
+      char bodybuf[BUFSIZE];
+      ircd_strncpy(bodybuf, x_body, sizeof bodybuf);
+      crdt_services_reinject(x_cmd, bodybuf);
+      log_write(LS_SYSTEM, L_INFO, 0, "Tier B CR-X: re-injected locally cmd=%c", x_cmd);
+      return 0;
+    }
+    if (dsrv && IsServer(dsrv) && cli_from(dsrv) && !IsCrdtAware(cli_from(dsrv)) &&
+        feature_bool(FEAT_CRDT_GATEWAY_BRIDGE) &&
+        !crdt_shadow_should_standby(dstnum, cli_yxx(&me))) {
+      ssrv = FindNServer(srcyxx);          /* the originating server (anchor/real) for the source prefix */
+      crdt_services_reemit(ssrv, dsrv, x_cmd, x_body);   /* (b) gateway -> real P10 to the service */
+      log_write(LS_SYSTEM, L_INFO, 0, "Tier B CR-X: re-emitted P10 to %s (src %s) cmd=%c",
+                cli_name(dsrv), ssrv ? cli_name(ssrv) : "&me", x_cmd);
+      return 0;
+    }
+    if (x_ttl > 1)                          /* (c) relay onward (dedup above terminates loops) */
+      for (p = GlobalClientList; p; p = cli_next(p))
+        if (p != cptr && IsCrdtSyncTarget(p))
+          sendcmdto_one(&me, CMD_CRDT_REPLICATION, p, "X %s %s %s %c %d :%s",
+                        x_msgid, srcyxx, dstyxx, x_cmd, x_ttl - 1, x_body);
   }
   return 0;
 }

@@ -74,6 +74,11 @@ void crdt_shadow_user_remove(struct Client *cptr);
  *  returns when its server relinks.  (Defined in crdt_shadow.c.) */
 int crdt_user_is_mesh_only(struct Client *u);
 
+/** Tier B services-anchor bridge: 1 if SERVER @a srv is reachable ONLY via the mesh
+ *  (a STAT_MESH_SERVER anchor, no live P10 link) so a P10 send to it dead-sinks.  Used on
+ *  a LEAF to decide CR-X routing vs P10 for a services target.  (Defined in crdt_shadow.c.) */
+int crdt_server_is_mesh_only(struct Client *srv);
+
 /** R6c flood-on-partition: non-zero if this node currently holds any STAT_MESH_SERVER stub,
  *  i.e. it is (partially) partitioned and its live channel views may be missing members
  *  reachable only via the mesh/gateway — so it should flood channel traffic unconditionally.

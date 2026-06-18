@@ -384,6 +384,17 @@ int crdt_user_is_mesh_only(struct Client *u)
   return srv && IsMeshStub(srv) && !IsPresented(srv);
 }
 
+/* Tier B: is SERVER @a srv reachable ONLY via the mesh (a STAT_MESH_SERVER anchor with no
+ * live P10 link), so a P10 sendcmdto_one to it would dead-sink?  Used by the services-anchor
+ * bridge to decide CR-X routing vs P10 for a services target (x3.services).  On a LEAF, x3 is
+ * never presented, so the IsPresented term is correct there.  On the GATEWAY the reverse path
+ * must NOT use this predicate (a presented stub returns 0 yet still dead-sinks) — it uses the
+ * cli_from-dead test instead (the presented-stub trap from the INVITE fix). */
+int crdt_server_is_mesh_only(struct Client *srv)
+{
+  return srv && IsMeshStub(srv) && !IsPresented(srv);   /* IsMeshStub == STAT_MESH_SERVER (IsServer is false for it) */
+}
+
 /* R6c flood-on-partition: O(1) count of STAT_MESH_SERVER stubs this node holds (created in
  * crdt_shadow_convert_to_stub + crdt_shadow_make_anchor, freed in crdt_shadow_retire_mesh_stub
  * — the only 3 lifecycle sites).  >0 means this node is partitioned: some servers are reachable

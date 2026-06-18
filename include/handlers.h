@@ -353,6 +353,15 @@ extern void crdt_gossip_message(struct Client* from, char cmd, const char* targe
  *  CR only under FEAT_CRDT_ROUTE_UNICAST.  @a cmd 'P'/'N'/'T'. */
 extern int crdt_route_unicast_try(struct Client* from, char cmd, struct Client* tgt,
                                   const char* msgid, const char* text);
+/** Tier B services-anchor bridge (CR X carrier).  FORWARD: route a services command (SASL/
+ *  ACCOUNT/REGISTER/...) over the mesh when its target SERVER @a dstsrv is reachable only as a
+ *  dead-sink anchor; @a body = the verbatim P10 param tail.  REPLY: same, for the x3-reply
+ *  reverse leg on the gateway (target may be a user/anchor; uses IsMeshStub directly).  Each
+ *  returns 1 if tunneled (skip the P10 send) / 0 to fall back to P10.  @a p10cmd is the one-letter
+ *  code (A=SASL C=ACCOUNT G=REGISTER V=VERIFY R=REGREPLY Q=XQUERY Y=XREPLY). */
+extern int crdt_route_services_try(struct Client* dstsrv, char p10cmd, const char* body);
+extern int crdt_route_services_reply_try(struct Client* tgt, char p10cmd, const char* body);
+extern int crdt_route_services_reply_by_num(const char* srvnum, char p10cmd, const char* body);
 /** Tier2 full-partition liveness: gossip an ephemeral CR H liveness beacon
  *  (CR H <ourYXX> <CurrentTime>) over every CRDT transport.  Receivers track
  *  the last beacon per server; a mesh stub whose beacon goes stale is retired. */

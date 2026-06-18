@@ -88,7 +88,9 @@
 #include "ircd_features.h"
 #include "ircd_log.h"
 #include "ircd_reply.h"
+#include "ircd_snprintf.h"     /* Tier B: build the CR-X reply body */
 #include "ircd_string.h"
+#include "handlers.h"          /* Tier B: crdt_route_services_reply_try (services-anchor bridge) */
 #include "msg.h"
 #include "numeric.h"
 #include "numnicks.h"
@@ -146,18 +148,38 @@ int ms_sasl(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
 
     /* If it's not to us, forward the reply */
     if (!IsMe(acptr)) {
+      /* Tier B services-anchor bridge: the originating server (acptr) may be a mesh-only
+       * anchor on this gateway (its P10 path dead-sinks) — tunnel the reply over CR-X.
+       * Build the body with explicit numerics (S2S wire form) so the leaf re-injects it
+       * verbatim.  Falls back to P10 when acptr is genuinely routable. */
+      char body[BUFSIZE];
       if (ext != NULL)
-        sendcmdto_one(sptr, CMD_SASL, acptr, "%C %s %s %s :%s", acptr, token,
+        ircd_snprintf(0, body, sizeof body, "%s %s %s %s :%s", cli_yxx(acptr), token,
                       reply, data, ext);
       else
-        sendcmdto_one(sptr, CMD_SASL, acptr, "%C %s %s :%s", acptr, token,
+        ircd_snprintf(0, body, sizeof body, "%s %s %s :%s", cli_yxx(acptr), token,
                       reply, data);
+      if (!crdt_route_services_reply_try(acptr, 'A', body))
+        sendcmdto_one(sptr, CMD_SASL, acptr, "%s", body);
       return 0;
     }
   }
 
-  /* If token is not prefixed with my numnick then ignore */
+  /* If token is not prefixed with my numnick then ignore — UNLESS the services-anchor bridge
+   * can route it.  Tier B (REVERSE, gateway-as-proxy): under tree-retirement x3 only knows
+   * THIS gateway, so it replied here, but the session token belongs to another server (the
+   * originating mesh-only CRDT leaf).  Tunnel the reply over CR-X toward that server (token's
+   * first-2-char numeric); it re-injects + delivers to the local client.  Build the body in
+   * the same shape ms_sasl re-parses: <originSrv> <token> <reply> <data> [:ext]. */
   if (strncmp(cli_yxx(&me), token, 2)) {
+    char osrv[3] = { token[0], token[1], '\0' };
+    char body[BUFSIZE];
+    if (ext != NULL)
+      ircd_snprintf(0, body, sizeof body, "%s %s %s %s :%s", osrv, token, reply, data, ext);
+    else
+      ircd_snprintf(0, body, sizeof body, "%s %s %s :%s", osrv, token, reply, data);
+    if (crdt_route_services_reply_by_num(osrv, 'A', body))
+      return 0;
     log_write(LS_DEBUG, L_DEBUG, 0, "SASL: Token prefix mismatch - expected %s, got %.2s (from %C)",
               cli_yxx(&me), token, sptr);
     return 0;
@@ -210,8 +232,11 @@ int ms_sasl(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
 
   /* OK we now know who the message is for, let's deal with it! */
 
-  /* Validate the sender is a valid server (not dead/disconnecting) */
-  if (!IsServer(sptr) || IsDead(sptr)) {
+  /* Validate the sender is a valid server (not dead/disconnecting).  Tier B services-anchor
+   * bridge: a CR-X reverse re-inject arrives with sptr==&me (the reply was already mesh-
+   * validated and re-injected locally from the carrier) — accept IsMe too.  A client cannot
+   * forge sptr==&me (ms_sasl is a server-only handler), so this opens no injection hole. */
+  if ((!IsServer(sptr) && !IsMe(sptr)) || IsDead(sptr)) {
     log_write(LS_DEBUG, L_DEBUG, 0,
               "SASL: Response from invalid/dead server %C, ignoring", sptr);
     return 0;
