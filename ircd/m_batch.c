@@ -41,6 +41,7 @@
 #include "capab.h"
 #include "channel.h"
 #include "client.h"
+#include "handlers.h"   /* Tier C C1: crdt_route_unicast_try (multiline PM over CR-M) */
 #include "hash.h"
 #include "ircd.h"
 #include "ircd_alloc.h"
@@ -1408,7 +1409,21 @@ process_multiline_batch(struct Client *sptr)
       ircd_snprintf(0, s2s_batch_id, sizeof(s2s_batch_id), "%s%lu",
                     cli_yxx(sptr), (unsigned long)CurrentTime);
 
-      if (IsServer(target_server) && IsMultiline(target_server)) {
+      if (IsMeshStub(target_server)) {
+        /* Tier C C1: the target user is on a mesh-only leaf — its P10 route is a
+         * dead-sink anchor, so the BX M relay and the legacy PRIVMSG fallback below
+         * would both silently drop.  Deliver the multiline per-line over CR-M to the
+         * target user (full content; arrives as individual PRIVMSG/NOTICE on the leaf,
+         * not a grouped batch — no loss, no dead-sink).  crdt_route_unicast_try is the
+         * same proven MR-1 unicast path PRIVMSG uses (alias-correct, msgid NULL-safe). */
+        for (lp = con_ml_messages(con); lp; lp = lp->next) {
+          char *text = lp->value.cp + 1;
+          if (*text == '\0')
+            continue;
+          crdt_route_unicast_try(sptr, is_notice ? 'N' : 'P', acptr,
+                                 batch_base_msgid, text);
+        }
+      } else if (IsServer(target_server) && IsMultiline(target_server)) {
         /* Send ML tokens to capable server.
          * Set S2S tags on start token for unified msgid delivery. */
         first = 1;
