@@ -1981,6 +1981,9 @@ static struct FedRequest *start_fed_targets_query(
       if (!server || server == &me)
         continue;
 
+      if (IsMeshStub(server))   /* 5-5c: mesh-only anchor — P10 query dead-sinks; see count_storage_servers */
+        continue;
+
       if (is_ulined_server(server))
         continue;
 
@@ -3682,6 +3685,17 @@ static int count_storage_servers(const char *target, time_t query_time)
     if (!server || server == &me)
       continue;
 
+    /* 5-5c: skip mesh-only anchors (tree-retirement / partition). A STAT_MESH_SERVER
+     * is reachable only over the CR overlay, not P10, so a targeted `CH Q` to it
+     * dead-sinks — counting it inflates servers_pending and wedges the FedRequest on a
+     * reply that never comes until the full FEAT_CHATHISTORY_TIMEOUT. Skipping it lets
+     * the request complete as soon as the reachable servers reply (incomplete, but no
+     * latency wedge). MUST stay in lockstep with the dispatch loops (start_fed_query,
+     * start_fed_targets_query, the auto-replay loop). 5-5f replaces this skip with a
+     * CR-M tunnel toward the storage owner so anchored stores become reachable again. */
+    if (IsMeshStub(server))
+      continue;
+
     /* Skip U-lined servers (services) */
     if (is_ulined_server(server))
       continue;
@@ -3834,6 +3848,9 @@ static struct FedRequest *start_fed_query(struct Client *sptr, const char *targe
       inttobase64(dest_yxx, si, 2);
       server = FindNServer(dest_yxx);
       if (!server || server == &me)
+        continue;
+
+      if (IsMeshStub(server))   /* 5-5c: mesh-only anchor — P10 query dead-sinks; see count_storage_servers */
         continue;
 
       if (is_ulined_server(server))
@@ -4257,6 +4274,8 @@ static void autoreplay_next_channel(struct AutoReplayContext *ctx)
         inttobase64(dest_yxx, si, 2);
         server = FindNServer(dest_yxx);
         if (!server || server == &me)
+          continue;
+        if (IsMeshStub(server))   /* 5-5c: mesh-only anchor — P10 query dead-sinks; see count_storage_servers */
           continue;
         if (is_ulined_server(server))
           continue;
