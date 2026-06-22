@@ -2625,7 +2625,7 @@ static void crdt_gateway_user_intro(struct Client *nc)
                              NumNick(nc), cli_info(nc));
 }
 
-struct recon_user_ctx { unsigned int created; unsigned int renamed; unsigned int umoded; };
+struct recon_user_ctx { unsigned int created; unsigned int renamed; unsigned int umoded; unsigned int setnamed; };
 
 /* Build the +/- umode delta that transforms umode-letter set @from into @to.  Both
  * are umode_letters() forms (no leading sign), e.g. from="iw" to="ix" -> "+x-w". */
@@ -2697,6 +2697,19 @@ static void crdt_reconcile_user_update(struct Client *live,
       }
     }
   }
+  /* F1: realname (SETNAME) drift -> drive ms_setname with cptr = the CRDT uplink.  The
+   * real handler updates cli_info, notifies local SETNAME-cap channel members, and its
+   * now-legacy-only relay (skip_crdt one-shot) becomes the §17.7 gateway.  The
+   * crdt_shadow_user_add hook inside ms_setname self-skips (from_crdt_peer) -> no
+   * re-mint, no mid-walk doc mutation (same discipline as the nick/umode clauses). */
+  if (rec->realname[0] && ircd_strcmp(cli_info(live), rec->realname) != 0) {
+    char rn[REALLEN + 1], *pv[3];
+    ircd_strncpy(rn, rec->realname, sizeof rn);
+    pv[0] = cli_name(live); pv[1] = rn; pv[2] = NULL;
+    sendcmdto_set_skip_crdt_servers();  /* doc covers CRDT peers; gateway to legacy only */
+    ms_setname(cli_from(live), live, 2, pv);
+    c->setnamed++;
+  }
 }
 
 static void recon_user_cb(const char *key, uint32_t key_len,
@@ -2756,10 +2769,10 @@ void crdt_shadow_reconcile_users(void)
    * there (x3.services sits perpetually in burst; a global gate would wedge all
    * materialization). */
   crdt_lwwmap_foreach(&g_crdt.users, recon_user_cb, &c);
-  if (c.created || c.renamed || c.umoded)
+  if (c.created || c.renamed || c.umoded || c.setnamed)
     log_write(LS_SYSTEM, L_NOTICE, 0,
-              "CRDT user-reconcile: created %u, renamed %u, umode %u user(s) from doc",
-              c.created, c.renamed, c.umoded);
+              "CRDT user-reconcile: created %u, renamed %u, umode %u, setname %u user(s) from doc",
+              c.created, c.renamed, c.umoded, c.setnamed);
 }
 
 /* ---- Phase 3m: USER delete-on-leave (QUIT) via CRDT + §17.7 gateway ----

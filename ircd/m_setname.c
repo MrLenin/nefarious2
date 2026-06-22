@@ -81,6 +81,7 @@
 
 #include "capab.h"
 #include "client.h"
+#include "crdt_shadow.h" /* Tier C F1: crdt_shadow_user_add (push realname into the doc) */
 #include "ircd.h"
 #include "ircd_features.h"
 #include "ircd_log.h"
@@ -192,6 +193,11 @@ int m_setname(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
     sendcmdto_set_client_msgid(NULL);
   }
 
+  /* Tier C F1: push the realname change into the CRDT doc so it reaches mesh peers
+   * (the P10 SETNAME relay above islands under tree-retirement). Re-mints the whole
+   * user record via LWW; self-skips on from_crdt_peer. */
+  crdt_shadow_user_add(sptr);
+
   return 0;
 }
 
@@ -275,6 +281,11 @@ int ms_setname(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
 
     sendcmdto_set_client_msgid(NULL);
   }
+
+  /* Tier C F1: a P10-origin SETNAME (legacy / non-retired link) — push it into the
+   * CRDT doc so it reaches mesh peers.  Self-skips when sptr is reached via a CRDT
+   * peer (from_crdt_peer), i.e. the doc already owns this change. */
+  crdt_shadow_user_add(sptr);
 
   return 0;
 }
