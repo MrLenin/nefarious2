@@ -578,6 +578,8 @@ void crdt_shadow_user_add(struct Client *cptr)
   strncpy(rec.realname, cli_info(cptr), sizeof rec.realname - 1);
   strncpy(rec.account, cli_user(cptr)->account, sizeof rec.account - 1);
   strncpy(rec.swhois, cli_user(cptr)->swhois, sizeof rec.swhois - 1);
+  if (cli_user(cptr)->away)
+    strncpy(rec.away, cli_user(cptr)->away, sizeof rec.away - 1);
   umode_letters(rec.umodes, sizeof rec.umodes, umode_str(cptr));
   memcpy(rec.ip6, &cli_ip(cptr), sizeof rec.ip6);   /* struct irc_in_addr, 16B */
   rec.nick_ts = (uint64_t)cli_lastnick(cptr);
@@ -2073,6 +2075,7 @@ static void mat_user_cb(const char *key, uint32_t key_len,
   MCK(strcmp(rec->realname, cli_info(live)), "realname");
   MCK(strcmp(rec->account, cli_user(live)->account), "account");
   MCK(strcmp(rec->swhois, cli_user(live)->swhois), "swhois");
+  MCK(strcmp(rec->away, cli_user(live)->away ? cli_user(live)->away : ""), "away");
   MCK(memcmp(rec->ip6, &cli_ip(live), sizeof rec->ip6), "ip");
   MCK(rec->nick_ts != (uint64_t)cli_lastnick(live), "ts");
   { char letters[CRDT_UMODELEN];
@@ -2424,6 +2427,8 @@ static struct Client *crdt_materialize_one_user(const char *key, uint32_t key_le
   ircd_strncpy(cli_info(nc), rec->realname, REALLEN + 1);
   if (rec->swhois[0])
     ircd_strncpy(cli_user(nc)->swhois, rec->swhois, BUFSIZE + 1);
+  if (rec->away[0])
+    user_set_away(cli_user(nc), rec->away);
   if (rec->account[0]) {
     ircd_strncpy(cli_user(nc)->account, rec->account, ACCOUNTLEN + 1);
     cli_user(nc)->acc_create = (time_t)rec->acc_create;
@@ -2743,6 +2748,20 @@ static void crdt_reconcile_user_update(struct Client *live,
     sendcmdto_set_skip_crdt_servers();
     ms_swhois(cli_from(live), &me, pc, pv);
     c->attr++;
+  }
+  /* F1: away (AWAY) drift -> drive ms_away.  AWAY is USER-sourced -> sptr=live (#8-safe;
+   * contrast SVSIDENT/SWHOIS).  An empty rec->away clears (user came back).  skip_crdt
+   * one-shot = legacy-only gateway; the inner crdt_shadow_user_add self-skips. */
+  {
+    const char *liveaway = cli_user(live)->away ? cli_user(live)->away : "";
+    if (strcmp(liveaway, rec->away) != 0) {
+      char aw[CRDT_AWAYLEN], *pv[3];
+      ircd_strncpy(aw, rec->away, sizeof aw);
+      pv[0] = cli_name(live); pv[1] = aw; pv[2] = NULL;
+      sendcmdto_set_skip_crdt_servers();
+      ms_away(cli_from(live), live, 2, pv);
+      c->attr++;
+    }
   }
 }
 

@@ -84,6 +84,7 @@
 #include "bouncer_session.h"
 #include "capab.h"
 #include "client.h"
+#include "crdt_shadow.h" /* Tier C F1: crdt_shadow_user_add (push away into the doc) */
 #include "ircd.h"
 #include "ircd_alloc.h"
 #include "ircd_features.h"
@@ -339,6 +340,15 @@ int m_away(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
          * we actually broadcast. */
         ircd_strncpy(bsess->hs_effective_away_msg,
                      eff_msg ? eff_msg : "", AWAYLEN + 1);
+        /* Tier C F1: re-mint the session PRIMARY's CRDT record so the recomputed
+         * effective-away reaches mesh peers (the P10 AWAY relay above islands under
+         * tree-retirement). Only the holder writes (single-writer); self-skips on
+         * from_crdt_peer. */
+        {
+          struct Client *pri = bsess->hs_client ? bsess->hs_client : sptr;
+          if (pri && MyConnect(pri))
+            crdt_shadow_user_add(pri);
+        }
       }
       } /* end msg_changed scope */
       /* If effective state and message both unchanged: suppress broadcast */
@@ -383,6 +393,9 @@ int m_away(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
 
     sendcmdto_set_client_msgid(NULL);
   }
+  /* Tier C F1: push the away change into the CRDT doc (mesh peers). Self-skips on
+   * from_crdt_peer. Non-aggregated path -> sptr is the plain user. */
+  crdt_shadow_user_add(sptr);
   return 0;
 }
 
@@ -495,6 +508,10 @@ int ms_away(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
 
     sendcmdto_set_client_msgid(NULL);
   }
+  /* Tier C F1: a P10-origin AWAY (legacy/services / non-retired link) -> push into the
+   * doc so it reaches mesh peers. Self-skips when sptr is reached via a CRDT peer (the
+   * reconcile-driven case, where the doc already owns this change). */
+  crdt_shadow_user_add(sptr);
   return 0;
 }
 

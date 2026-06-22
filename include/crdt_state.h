@@ -29,6 +29,7 @@
 #define CRDT_SWHOISLEN  256   /* services WHOIS line (SWHOIS); the live field is
                                * BUFSIZE+1 but real swhois lines are short — a
                                * >255-char line truncates in the mesh doc (cosmetic) */
+#define CRDT_AWAYLEN    256   /* away message; live AWAYLEN=250 (+NUL fits) */
 #define CRDT_TOPICNICKLEN 120 /* >= NICKLEN+USERLEN+HOSTLEN+3 +1 */
 
 /* Compact per-member channel status bits (mapped from CHFL_* at the shadow
@@ -69,6 +70,7 @@ struct CrdtUserRecord {
   char     realname[CRDT_REALLEN];    /**< cli_info */
   char     account[CRDT_ACCOUNTLEN];  /**< "" if not logged in */
   char     swhois[CRDT_SWHOISLEN];    /**< services WHOIS line (SWHOIS); "" if none */
+  char     away[CRDT_AWAYLEN];        /**< away message ("" if not away) */
   char     umodes[CRDT_UMODELEN];     /**< umode_str() form, e.g. "+rix" */
   unsigned char ip6[16];              /**< struct irc_in_addr bytes (host order) */
   uint64_t nick_ts;                   /**< cli_lastnick (TS) */

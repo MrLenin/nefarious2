@@ -33,6 +33,7 @@
 #include "channel.h"
 #include "class.h"
 #include "client.h"
+#include "crdt_shadow.h" /* Tier C F1: crdt_shadow_user_add (effective-away into the doc) */
 #include "history.h"
 #include "ircd.h"
 #include "db_cursor.h"
@@ -9767,6 +9768,12 @@ void bounce_recompute_session_away(struct BouncerSession *session)
 
   session->hs_effective_away = new_effective;
   ircd_strncpy(session->hs_effective_away_msg, eff_msg, AWAYLEN + 1);
+
+  /* Tier C F1: alias add/drop re-aggregation also changes effective-away — re-mint the
+   * PRIMARY's CRDT record (reached here only on a real change, past the :9595 guard) so
+   * it reaches mesh peers. Only the holder writes; self-skips on from_crdt_peer. */
+  if (primary && MyConnect(primary))
+    crdt_shadow_user_add(primary);
 }
 
 /** Get the total number of connections for a session. */
