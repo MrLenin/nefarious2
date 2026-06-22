@@ -26,6 +26,9 @@
 #define CRDT_HOSTLEN     80   /* >= HOSTLEN(75)+1 */
 #define CRDT_REALLEN     56   /* >= REALLEN(50)+1 */
 #define CRDT_UMODELEN    32   /* umode_str() form, e.g. "+rix" */
+#define CRDT_SWHOISLEN  256   /* services WHOIS line (SWHOIS); the live field is
+                               * BUFSIZE+1 but real swhois lines are short — a
+                               * >255-char line truncates in the mesh doc (cosmetic) */
 #define CRDT_TOPICNICKLEN 120 /* >= NICKLEN+USERLEN+HOSTLEN+3 +1 */
 
 /* Compact per-member channel status bits (mapped from CHFL_* at the shadow
@@ -65,6 +68,7 @@ struct CrdtUserRecord {
                                        *   no legacy double-cloak). Host-rep parity. */
   char     realname[CRDT_REALLEN];    /**< cli_info */
   char     account[CRDT_ACCOUNTLEN];  /**< "" if not logged in */
+  char     swhois[CRDT_SWHOISLEN];    /**< services WHOIS line (SWHOIS); "" if none */
   char     umodes[CRDT_UMODELEN];     /**< umode_str() form, e.g. "+rix" */
   unsigned char ip6[16];              /**< struct irc_in_addr bytes (host order) */
   uint64_t nick_ts;                   /**< cli_lastnick (TS) */

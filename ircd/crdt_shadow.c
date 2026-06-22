@@ -577,6 +577,7 @@ void crdt_shadow_user_add(struct Client *cptr)
   strncpy(rec.realhost, cli_user(cptr)->realhost, sizeof rec.realhost - 1);
   strncpy(rec.realname, cli_info(cptr), sizeof rec.realname - 1);
   strncpy(rec.account, cli_user(cptr)->account, sizeof rec.account - 1);
+  strncpy(rec.swhois, cli_user(cptr)->swhois, sizeof rec.swhois - 1);
   umode_letters(rec.umodes, sizeof rec.umodes, umode_str(cptr));
   memcpy(rec.ip6, &cli_ip(cptr), sizeof rec.ip6);   /* struct irc_in_addr, 16B */
   rec.nick_ts = (uint64_t)cli_lastnick(cptr);
@@ -2071,6 +2072,7 @@ static void mat_user_cb(const char *key, uint32_t key_len,
   MCK(strcmp(rec->realhost, cli_user(live)->realhost), "realhost");
   MCK(strcmp(rec->realname, cli_info(live)), "realname");
   MCK(strcmp(rec->account, cli_user(live)->account), "account");
+  MCK(strcmp(rec->swhois, cli_user(live)->swhois), "swhois");
   MCK(memcmp(rec->ip6, &cli_ip(live), sizeof rec->ip6), "ip");
   MCK(rec->nick_ts != (uint64_t)cli_lastnick(live), "ts");
   { char letters[CRDT_UMODELEN];
@@ -2420,6 +2422,8 @@ static struct Client *crdt_materialize_one_user(const char *key, uint32_t key_le
   ircd_strncpy(cli_user(nc)->host, rec->host, HOSTLEN + 1);          /* displayed host */
   ircd_strncpy(cli_user(nc)->realhost, rec->realhost, HOSTLEN + 1);  /* real host (host-rep parity) */
   ircd_strncpy(cli_info(nc), rec->realname, REALLEN + 1);
+  if (rec->swhois[0])
+    ircd_strncpy(cli_user(nc)->swhois, rec->swhois, BUFSIZE + 1);
   if (rec->account[0]) {
     ircd_strncpy(cli_user(nc)->account, rec->account, ACCOUNTLEN + 1);
     cli_user(nc)->acc_create = (time_t)rec->acc_create;
@@ -2625,7 +2629,7 @@ static void crdt_gateway_user_intro(struct Client *nc)
                              NumNick(nc), cli_info(nc));
 }
 
-struct recon_user_ctx { unsigned int created; unsigned int renamed; unsigned int umoded; unsigned int setnamed; };
+struct recon_user_ctx { unsigned int created; unsigned int renamed; unsigned int umoded; unsigned int setnamed; unsigned int attr; };
 
 /* Build the +/- umode delta that transforms umode-letter set @from into @to.  Both
  * are umode_letters() forms (no leading sign), e.g. from="iw" to="ix" -> "+x-w". */
@@ -2710,6 +2714,36 @@ static void crdt_reconcile_user_update(struct Client *live,
     ms_setname(cli_from(live), live, 2, pv);
     c->setnamed++;
   }
+  /* F1: ident (SVSIDENT) drift -> drive ms_svsident.  SVSIDENT is SERVER-sourced (set
+   * by services), so drive with sptr=&me (the gateway re-originates) — NOT live, which
+   * would emit a user-sourced token legacy rejects.  skip_crdt one-shot = legacy-only
+   * relay; the inner crdt_shadow_user_add self-skips (from_crdt_peer). */
+  if (rec->ident[0] && ircd_strcmp(cli_user(live)->username, rec->ident) != 0) {
+    char nbi[CRDT_NUMERICLEN], id[CRDT_IDENTLEN], *pv[4];
+    ircd_strncpy(nbi, numbuf, sizeof nbi);
+    ircd_strncpy(id, rec->ident, sizeof id);
+    pv[0] = cli_name(&me); pv[1] = nbi; pv[2] = id; pv[3] = NULL;
+    sendcmdto_set_skip_crdt_servers();
+    ms_svsident(cli_from(live), &me, 3, pv);
+    c->attr++;
+  }
+  /* F1: swhois (SWHOIS) drift -> drive ms_swhois (also SERVER-sourced, sptr=&me).  An
+   * empty rec->swhois clears it (ms_swhois with parc==2). */
+  if (ircd_strcmp(cli_user(live)->swhois, rec->swhois) != 0) {
+    char nbs[CRDT_NUMERICLEN], sw[CRDT_SWHOISLEN], *pv[4];
+    int pc;
+    ircd_strncpy(nbs, numbuf, sizeof nbs);
+    pv[0] = cli_name(&me); pv[1] = nbs;
+    if (rec->swhois[0]) {
+      ircd_strncpy(sw, rec->swhois, sizeof sw);
+      pv[2] = sw; pv[3] = NULL; pc = 3;
+    } else {
+      pv[2] = NULL; pc = 2;
+    }
+    sendcmdto_set_skip_crdt_servers();
+    ms_swhois(cli_from(live), &me, pc, pv);
+    c->attr++;
+  }
 }
 
 static void recon_user_cb(const char *key, uint32_t key_len,
@@ -2769,10 +2803,10 @@ void crdt_shadow_reconcile_users(void)
    * there (x3.services sits perpetually in burst; a global gate would wedge all
    * materialization). */
   crdt_lwwmap_foreach(&g_crdt.users, recon_user_cb, &c);
-  if (c.created || c.renamed || c.umoded || c.setnamed)
+  if (c.created || c.renamed || c.umoded || c.setnamed || c.attr)
     log_write(LS_SYSTEM, L_NOTICE, 0,
-              "CRDT user-reconcile: created %u, renamed %u, umode %u, setname %u user(s) from doc",
-              c.created, c.renamed, c.umoded, c.setnamed);
+              "CRDT user-reconcile: created %u, renamed %u, umode %u, setname %u, attr %u user(s) from doc",
+              c.created, c.renamed, c.umoded, c.setnamed, c.attr);
 }
 
 /* ---- Phase 3m: USER delete-on-leave (QUIT) via CRDT + §17.7 gateway ----

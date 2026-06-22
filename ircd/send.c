@@ -1777,6 +1777,9 @@ void sendcmdto_serv_butone(struct Client *from, const char *cmd,
   struct DLink *lp;
   struct Client *alias_from = NULL;
   struct Client *primary_dir = NULL;
+  int skip_crdt = skip_crdt_servers_once;  /* F1/R6a: one-shot — skip CRDT-aware relay
+                                            * (the doc / CR plane already covers them) */
+  skip_crdt_servers_once = 0;
 
   /* Split S2S delivery for aliases: two modes.
    * 1) Explicit: caller set s2s_alias_source (JOIN/PART via joinbuf)
@@ -1892,6 +1895,9 @@ void sendcmdto_serv_butone(struct Client *from, const char *cmd,
        * sendcmdto_flag_serv_butone for the full rationale. */
       if (IsBurstGated(lp->value.cptr))
         continue;
+
+      if (skip_crdt && IsCrdtAware(lp->value.cptr))
+        continue;  /* F1/R6a: the doc / CR plane covers this CRDT peer */
 
       /* Pick tagged or legacy variant per-peer. */
       if (mb_legacy && !IsIRCv3Aware(lp->value.cptr)) {

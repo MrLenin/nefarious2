@@ -26,6 +26,7 @@
 #include "channel.h"
 #include "config.h"
 #include "client.h"
+#include "crdt_shadow.h" /* Tier C F1: crdt_shadow_user_add (push ident into the doc) */
 #include "handlers.h"
 #include "hash.h"
 #include "ircd.h"
@@ -102,6 +103,10 @@ int ms_svsident(struct Client* cptr, struct Client* sptr, int parc, char* parv[]
   bounce_emit_alias_update(acptr, "username", cli_username(acptr));
 
   sendcmdto_serv_butone(sptr, CMD_SVSIDENT, cptr, "%C %s", acptr, cli_username(acptr));
+
+  /* Tier C F1: push the ident change into the CRDT doc so it reaches mesh peers (the
+   * P10 relay above islands under tree-retirement). Self-skips on from_crdt_peer. */
+  crdt_shadow_user_add(acptr);
 
   return 0;
 }

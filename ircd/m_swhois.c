@@ -82,6 +82,7 @@
 #include "config.h"
 
 #include "client.h"
+#include "crdt_shadow.h" /* Tier C F1: crdt_shadow_user_add (push swhois into the doc) */
 #include "hash.h"
 #include "ircd.h"
 #include "ircd_log.h"
@@ -123,6 +124,10 @@ int ms_swhois(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
   } else {
     sendcmdto_serv_butone(sptr, CMD_SWHOIS, cptr, "%C", acptr);
   }
+
+  /* Tier C F1: push the swhois change into the CRDT doc so it reaches mesh peers (the
+   * P10 relay above islands under tree-retirement). Self-skips on from_crdt_peer. */
+  crdt_shadow_user_add(acptr);
 
   return 0;
 }

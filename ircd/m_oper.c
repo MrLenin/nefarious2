@@ -346,6 +346,10 @@ void do_oper(struct Client* cptr, struct Client* sptr, struct ConfItem* aconf, i
   {
     ircd_strncpy(cli_user(sptr)->swhois, aconf->swhois, BUFSIZE + 1);
     sendcmdto_serv_butone(&me, CMD_SWHOIS, NULL, "%C :%s", sptr, aconf->swhois);
+    /* Tier C F1: the oper {} swhois is set AFTER the umode crdt hook earlier in
+     * m_oper, so re-mint the doc record here to carry swhois to mesh peers (the P10
+     * SWHOIS relay above islands under tree-retirement). Self-skips on from_crdt_peer. */
+    crdt_shadow_user_add(sptr);
   }
 
   if (!(flags & OPER_FLAG_SILENT)) {
