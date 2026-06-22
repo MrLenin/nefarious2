@@ -41,7 +41,8 @@
 #include "capab.h"
 #include "channel.h"
 #include "client.h"
-#include "handlers.h"   /* Tier C C1: crdt_route_unicast_try (multiline PM over CR-M) */
+#include "crdt_shadow.h" /* Tier C C1: crdt_have_mesh_stub (channel multiline over CR) */
+#include "handlers.h"   /* Tier C C1: crdt_route_unicast_try / crdt_gossip_message */
 #include "hash.h"
 #include "ircd.h"
 #include "ircd_alloc.h"
@@ -1518,12 +1519,32 @@ process_multiline_batch(struct Client *sptr)
     char s2s_batch_id[16];
     int max_preview = feature_int(FEAT_MULTILINE_LEGACY_MAX_LINES);
     int total_lines = con_ml_msg_count(con);
+    int will_flood_cr = 0;   /* C1: 1 => CR carries this batch (partition/mesh-stub) */
 
     ircd_snprintf(0, s2s_batch_id, sizeof(s2s_batch_id), "%s%lu",
                   cli_yxx(sptr), (unsigned long)CurrentTime);
 
     /* Increment marker for this send cycle */
     s2s_relay_marker++;
+
+    /* Tier C C1 (channel): under tree-retirement a member can sit on a mesh-only
+     * anchor (not IsServer -> skipped by the loop below, so it would get nothing) or
+     * be reachable only via CR.  Mirror relay_channel_message's R4a/R6a design: when
+     * CR must carry this batch (a mesh-stub member, or this node is itself partitioned
+     * with a possibly-incomplete member view), flood each line over CR (below) and
+     * SUPPRESS the redundant P10 BX M to CRDT-aware directions (legacy peers still get
+     * the P10 relay).  A healthy non-partitioned mesh keeps grouped BX M -> no flood,
+     * no regression. */
+    if (feature_bool(FEAT_CRDT_PRIMARY)) {
+      will_flood_cr = crdt_have_mesh_stub();
+      for (member = chptr->members; !will_flood_cr && member;
+           member = member->next_member) {
+        struct Client *msrv = cli_user(member->user) ? cli_user(member->user)->server
+                                                     : NULL;
+        if (msrv && msrv != &me && IsMeshStub(msrv))
+          will_flood_cr = 1;
+      }
+    }
 
     /* Iterate channel members to find servers that need the message */
     for (member = chptr->members; member; member = member->next_member) {
@@ -1537,6 +1558,9 @@ process_multiline_batch(struct Client *sptr)
         continue;  /* Already sent to this server */
 
       cli_sentalong(server) = s2s_relay_marker;
+
+      if (will_flood_cr && IsCrdtAware(server))
+        continue;  /* C1: the CR-M flood below carries this to CRDT-aware peers */
 
       /* Split delivery: alias numeric toward primary's server direction
        * to avoid fake direction (primary's server would drop messages
@@ -1617,6 +1641,22 @@ process_multiline_batch(struct Client *sptr)
         }
       }
       } /* end split delivery block */
+    }
+
+    /* C1: flood each line over CR for mesh/CRDT delivery.  Arrives as an individual
+     * channel PRIVMSG/NOTICE on each CRDT peer (per-line, not a grouped batch — no
+     * loss, no dead-sink).  Mesh-stub members + the CRDT-aware peers suppressed from
+     * the P10 loop above are served here; legacy peers already got the P10 relay. */
+    if (will_flood_cr) {
+      for (lp = con_ml_messages(con); lp; lp = lp->next) {
+        char *text = lp->value.cp + 1;
+        char line_msgid[S2S_MSGID_BUFSIZE];
+        if (*text == '\0')
+          continue;
+        generate_msgid(line_msgid, sizeof(line_msgid));
+        crdt_gossip_message(sptr, is_notice ? 'N' : 'P', chptr->chname,
+                            line_msgid, text);
+      }
     }
   }
 
