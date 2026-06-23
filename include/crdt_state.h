@@ -414,6 +414,11 @@ const struct CrdtBouncerSession *crdt_bsess_get(const struct CrdtNetworkState *s
 /** 1 iff (account,sessid) has an explicit delete-tombstone (gate for doc->live removal). */
 int crdt_bsess_is_explicitly_removed(const struct CrdtNetworkState *st,
                                      const char *account, const char *sessid);
+/** 5-5e M3: the cross-sessid election winner = strcmp-lowest sessid among @a account's
+ *  LIVE bsessions records (matches bouncer_session.c's strcmp election). Writes the
+ *  NUL-terminated winner to @a out; returns out, or NULL if no live session in the doc. */
+const char *crdt_bsess_winner(const struct CrdtNetworkState *st, const char *account,
+                              char *out, size_t outsz);
 /** Phase 3k: set/get per-kick metadata (LWW, keyed chan\0numeric). set() records a
  *  SET op so it replicates via delta; get() returns the LWW value (NULL if absent)
  *  so callers can read both the CrdtKickInfo payload and its HLC (.ts) for the

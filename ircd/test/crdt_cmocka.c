@@ -498,6 +498,39 @@ static void test_bsess_op_replicates(void **state)
   crdt_state_clear(&s2);
 }
 
+/* 5-5e M3: crdt_bsess_winner derives the cross-sessid election winner (strcmp-lowest
+ * sessid among an account's LIVE records) — must match the live election + exclude a
+ * tombstoned (collapsed) loser, scoped per-account. */
+static void test_bsess_winner(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s;
+  struct CrdtBouncerSession rec;
+  char w[64];
+  crdt_state_init(&s, 1);
+  memset(&rec, 0, sizeof rec);
+  /* account "alice": two sessids, strcmp-min "Axxx" wins over "Bxxx" */
+  crdt_bsess_set(&s, "alice", "Bxxx", &rec);
+  crdt_bsess_set(&s, "alice", "Axxx", &rec);
+  crdt_bsess_set(&s, "bob",   "Czzz", &rec);   /* different account, must be ignored */
+
+  assert_non_null(crdt_bsess_winner(&s, "alice", w, sizeof w));
+  assert_string_equal("Axxx", w);              /* lex-min == the strcmp(<0) election */
+  assert_non_null(crdt_bsess_winner(&s, "bob", w, sizeof w));
+  assert_string_equal("Czzz", w);              /* per-account scoping */
+  assert_null(crdt_bsess_winner(&s, "nobody", w, sizeof w));
+
+  /* tombstone the winner -> the next-lowest LIVE sessid wins (collapsed loser excluded) */
+  crdt_bsess_del(&s, "alice", "Axxx");
+  assert_non_null(crdt_bsess_winner(&s, "alice", w, sizeof w));
+  assert_string_equal("Bxxx", w);
+  /* tombstone the last one -> no live session -> NULL */
+  crdt_bsess_del(&s, "alice", "Bxxx");
+  assert_null(crdt_bsess_winner(&s, "alice", w, sizeof w));
+
+  crdt_state_clear(&s);
+}
+
 /* SHUN doc collection (global-state track sibling of GLINE): set/update/delete via
  * delta + digest converge + snapshot roundtrip + the explicit-removal gate. */
 static void test_shun_op_replicates(void **state)
@@ -1984,6 +2017,7 @@ int main(void)
     cmocka_unit_test(test_chan_ban_op_replicates),
     cmocka_unit_test(test_gline_op_replicates),
     cmocka_unit_test(test_bsess_op_replicates),
+    cmocka_unit_test(test_bsess_winner),
     cmocka_unit_test(test_shun_op_replicates),
     cmocka_unit_test(test_zline_op_replicates),
     cmocka_unit_test(test_jupe_op_replicates),

@@ -623,6 +623,13 @@ void crdt_shadow_bsess_remove(const char *account, const char *sessid)
   crdt_sync_push();
 }
 
+const char *crdt_shadow_bsess_winner(const char *account, char *out, size_t outsz)
+{
+  if (!shadow_on())
+    return NULL;
+  return crdt_bsess_winner(&g_crdt, account, out, outsz);
+}
+
 /* Phase 4c: server reachability is a LOCAL determination, NOT replicated state.
  *
  * Phase 4a tried to replicate per-server ACTIVE/SPLIT in the convergent doc (a
@@ -2449,7 +2456,7 @@ static struct Client *crdt_materialize_one_user(const char *key, uint32_t key_le
   if (rec->swhois[0])
     ircd_strncpy(cli_user(nc)->swhois, rec->swhois, BUFSIZE + 1);
   if (rec->away[0])
-    user_set_away(cli_user(nc), rec->away);
+    user_set_away(cli_user(nc), (char *)rec->away);   /* user_set_away copies; safe */
   if (rec->account[0]) {
     ircd_strncpy(cli_user(nc)->account, rec->account, ACCOUNTLEN + 1);
     cli_user(nc)->acc_create = (time_t)rec->acc_create;

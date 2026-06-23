@@ -72,6 +72,8 @@ struct CrdtBouncerSession;
 void crdt_shadow_bsess_set(const char *account, const char *sessid,
                            const struct CrdtBouncerSession *rec);
 void crdt_shadow_bsess_remove(const char *account, const char *sessid);
+/** 5-5e M3: doc-derived cross-sessid election winner for @a account (NULL if none). */
+const char *crdt_shadow_bsess_winner(const char *account, char *out, size_t outsz);
 
 /** Tier2 P1: true if @a u is a "mesh-only" user — its owning server is a
  *  STAT_MESH_SERVER stub (tree-departed but mesh-reachable).  Legacy (non-CRDT)

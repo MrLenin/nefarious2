@@ -2001,6 +2001,18 @@ void bounce_crdt_bsess_sweep(void)
         rec.hold_override = (int8_t)s->hs_hold_override;
         crdt_shadow_bsess_set(s->hs_account, s->hs_sessid, &rec);
         n++;
+        /* M3 de-risk: the doc-derived election winner (strcmp-min sessid for the account)
+         * must match this live session's sessid — the live cross-sessid election already
+         * converged it.  A PERSISTENT mismatch is a real divergence; a transient one heals
+         * as the doc converges.  Shadow-only signal (nothing acts on it yet). */
+        {
+          char w[64];
+          if (crdt_shadow_bsess_winner(s->hs_account, w, sizeof w)
+              && 0 != strcmp(w, s->hs_sessid))
+            log_write(LS_SYSTEM, L_NOTICE, 0,
+                      "CRDT bsess M3: election divergence acct=%s live=%s doc-winner=%s",
+                      s->hs_account, s->hs_sessid, w);
+        }
       }
     }
   }

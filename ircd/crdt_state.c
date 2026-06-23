@@ -904,6 +904,61 @@ int crdt_bsess_is_explicitly_removed(const struct CrdtNetworkState *st,
   return crdt_lwwmap_is_deleted(&st->bsessions, key, klen);
 }
 
+/* 5-5e M3: derive the cross-sessid election winner from the converged doc — the
+ * strcmp-lowest sessid among @a account's LIVE (non-tombstoned) bsessions records.
+ * Matches the live election (bouncer_session.c: strcmp(sessid, local) < 0 -> lower
+ * wins); a denormalized min-register is unnecessary since the bsess set already
+ * converges, and deriving over live records correctly excludes a collapsed loser. */
+struct bsess_winner_ctx {
+  const char *account;
+  uint32_t    acclen;
+  char        best[64];   /* sessid <= BOUNCER_SESSID_LEN (40) */
+  int         found;
+};
+static void bsess_winner_cb(const char *key, uint32_t key_len,
+                            const struct CrdtLWWValue *val, void *ctx)
+{
+  struct bsess_winner_ctx *c = ctx;
+  uint32_t sidlen;
+  char sid[64];
+  if (!val->data || val->data_len != sizeof(struct CrdtBouncerSession))
+    return;                              /* tombstone / wrong size -> skip */
+  if (key_len <= c->acclen + 1)
+    return;
+  if (memcmp(key, c->account, c->acclen) != 0 || key[c->acclen] != '\0')
+    return;                              /* different account */
+  sidlen = key_len - c->acclen - 1;
+  if (sidlen >= sizeof sid)
+    return;
+  memcpy(sid, key + c->acclen + 1, sidlen);
+  sid[sidlen] = '\0';
+  if (!c->found || strcmp(sid, c->best) < 0) {
+    memcpy(c->best, sid, sidlen + 1);   /* sid is NUL-terminated; sidlen+1 <= sizeof best */
+    c->found = 1;
+  }
+}
+
+const char *crdt_bsess_winner(const struct CrdtNetworkState *st, const char *account,
+                              char *out, size_t outsz)
+{
+  struct bsess_winner_ctx c;
+  c.account = account;
+  c.acclen  = (uint32_t)strlen(account);
+  c.best[0] = '\0';
+  c.found   = 0;
+  crdt_lwwmap_foreach(&st->bsessions, bsess_winner_cb, &c);
+  if (!c.found)
+    return NULL;
+  if (outsz) {
+    size_t bl = strlen(c.best);
+    if (bl >= outsz)
+      bl = outsz - 1;
+    memcpy(out, c.best, bl);
+    out[bl] = '\0';
+  }
+  return out;
+}
+
 /* ------------------------------------------------------------------ */
 /* sync / merge                                                       */
 /* ------------------------------------------------------------------ */
