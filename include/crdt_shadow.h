@@ -66,6 +66,13 @@ void crdt_shadow_user_add(struct Client *cptr);
 /** Mirror a user removal (called from exit_one_client for IsUser clients). */
 void crdt_shadow_user_remove(struct Client *cptr);
 
+/** 5-5e M2 (doc-native bouncer, SHADOW): mirror/remove a bouncer-session record in the
+ *  BSESSIONS doc collection.  Callers enforce single-writer (primary holder). */
+struct CrdtBouncerSession;
+void crdt_shadow_bsess_set(const char *account, const char *sessid,
+                           const struct CrdtBouncerSession *rec);
+void crdt_shadow_bsess_remove(const char *account, const char *sessid);
+
 /** Tier2 P1: true if @a u is a "mesh-only" user — its owning server is a
  *  STAT_MESH_SERVER stub (tree-departed but mesh-reachable).  Legacy (non-CRDT)
  *  peers already received the SQUIT for its server and never got its NICK, so the

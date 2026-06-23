@@ -1376,4 +1376,9 @@ extern void bounce_db_shutdown(void);
  */
 extern void bounce_mark_dirty(struct Client *cptr);
 
+/** 5-5e M2 (doc-native bouncer, SHADOW): mirror every primary-holder session this node
+ *  owns into the CRDT BSESSIONS doc collection.  Called from the verify timer; single-
+ *  writer (only the primary holder writes its own sessions). Shadow-only (not read). */
+extern void bounce_crdt_bsess_sweep(void);
+
 #endif /* INCLUDED_bouncer_session_h */

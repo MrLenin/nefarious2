@@ -34,6 +34,7 @@
 #include "class.h"
 #include "client.h"
 #include "crdt_shadow.h" /* Tier C F1: crdt_shadow_user_add (effective-away into the doc) */
+#include "crdt_state.h"  /* 5-5e M2: struct CrdtBouncerSession (doc-native bouncer) */
 #include "history.h"
 #include "ircd.h"
 #include "db_cursor.h"
@@ -1820,6 +1821,12 @@ void bounce_destroy(struct BouncerSession *session)
 {
   assert(0 != session);
 
+  /* 5-5e M2: the primary holder tombstones its session record in the doc (before the
+   * account/sessid strings are torn down). Single-writer gate matches the sweep. */
+  if (feature_bool(FEAT_CRDT_PRIMARY) && session->hs_client
+      && MyConnect(session->hs_client))
+    crdt_shadow_bsess_remove(session->hs_account, session->hs_sessid);
+
   /* Cancel timers if active */
   if (t_active(&session->hs_hold_timer))
     timer_del(&session->hs_hold_timer);
@@ -1959,6 +1966,47 @@ int session_has_local_holder(struct BouncerSession *session)
   }
 
   return 0;
+}
+
+/* 5-5e M2 (doc-native bouncer, SHADOW): mirror every session this node is the PRIMARY
+ * holder of into the BSESSIONS doc collection.  Single-writer (primary holder only) ->
+ * no two nodes write the same record.  Shadow-only: the doc is written + converges +
+ * is digested, but nothing READS it for behavior yet (M6 cutover flips that).  Called
+ * each verify cycle, so it uniformly captures create/promote/hold/count changes without
+ * touching the ~10 scattered hs_state assignment sites in the battle-tested core. */
+void bounce_crdt_bsess_sweep(void)
+{
+  int i, n = 0;
+  if (!feature_bool(FEAT_CRDT_PRIMARY))
+    return;
+  for (i = 0; i < BOUNCE_ACCOUNT_HASHSIZE; i++) {
+    struct AccountSessions *as;
+    for (as = accountHash[i]; as; as = as->as_hnext) {
+      struct BouncerSession *s;
+      for (s = as->as_sessions; s; s = s->hs_anext) {
+        struct CrdtBouncerSession rec;
+        if (s->hs_state == BOUNCE_DESTROYING)
+          continue;
+        if (!(s->hs_client && MyConnect(s->hs_client)))
+          continue;                  /* single-writer = primary holder */
+        memset(&rec, 0, sizeof rec);
+        ircd_strncpy(rec.token, s->hs_token, sizeof rec.token);
+        ircd_strncpy(rec.name,  s->hs_name,  sizeof rec.name);
+        rec.created       = (uint64_t)s->hs_created;
+        rec.last_active   = (uint64_t)s->hs_last_active;
+        rec.total_active  = (uint64_t)s->hs_total_active;
+        rec.attach_count  = s->hs_attach_count;
+        rec.connect_count = s->hs_connect_count;
+        rec.state         = (uint8_t)s->hs_state;
+        rec.hold_override = (int8_t)s->hs_hold_override;
+        crdt_shadow_bsess_set(s->hs_account, s->hs_sessid, &rec);
+        n++;
+      }
+    }
+  }
+  if (n)
+    log_write(LS_SYSTEM, L_NOTICE, 0,
+              "CRDT bsess shadow: mirrored %d local-holder session(s) to doc", n);
 }
 
 /** Per redesign C.2 + design intent #135 + #254: do we have any

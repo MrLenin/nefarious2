@@ -16,6 +16,7 @@
 
 #include "channel.h"
 #include "client.h"
+#include "bouncer_session.h" /* 5-5e M2: bounce_crdt_bsess_sweep (doc-native bouncer shadow) */
 #include "gline.h"           /* struct Gline + GlineIs* (GLINE step 2 shadow-write) */
 #include "shun.h"            /* struct Shun + ShunIs* (SHUN global-state track) */
 #include "zline.h"           /* struct Zline + ZlineIs* (ZLINE global-state track) */
@@ -600,6 +601,26 @@ void crdt_shadow_user_remove(struct Client *cptr)
     return;
   crdt_user_remove(&g_crdt, user_numeric(cptr, num, sizeof num));
   crdt_sync_push();                    /* eager-propagate to CRDT peers */
+}
+
+/* 5-5e M2 (doc-native bouncer, SHADOW): thin wrappers so bouncer_session.c can mirror
+ * session state into the doc without reaching g_crdt directly.  Single-writer (primary
+ * holder) is enforced by the caller (bounce_crdt_bsess_sweep). */
+void crdt_shadow_bsess_set(const char *account, const char *sessid,
+                           const struct CrdtBouncerSession *rec)
+{
+  if (!shadow_on())
+    return;
+  crdt_bsess_set(&g_crdt, account, sessid, rec);
+  crdt_sync_push();
+}
+
+void crdt_shadow_bsess_remove(const char *account, const char *sessid)
+{
+  if (!shadow_on())
+    return;
+  crdt_bsess_del(&g_crdt, account, sessid);
+  crdt_sync_push();
 }
 
 /* Phase 4c: server reachability is a LOCAL determination, NOT replicated state.
@@ -3688,6 +3709,10 @@ static void crdt_shadow_verify_cb(struct Event *ev)
   crdt_shadow_reconcile_shuns();   /* SHUN: drive global Shuns from doc (+gateway) */
   crdt_shadow_reconcile_zlines();  /* ZLINE: drive global Z-lines from doc (+gateway) */
   crdt_shadow_reconcile_jupes();   /* JUPE: drive juped servers from doc (+gateway) */
+  bounce_crdt_bsess_sweep();       /* 5-5e M2: mirror local-holder bouncer sessions -> doc (shadow) */
+  { uint32_t bs = crdt_lwwmap_size(&g_crdt.bsessions);   /* M2 convergence signal: same on every node */
+    if (bs)
+      log_write(LS_SYSTEM, L_NOTICE, 0, "CRDT bsess doc total: %u entry(ies)", bs); }
   crdt_sync_broadcast();   /* periodic anti-entropy: pull deltas from peers */
   crdt_shadow_gc();        /* reclaim causally-stable ops/tombstones */
 
