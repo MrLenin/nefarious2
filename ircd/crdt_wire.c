@@ -314,6 +314,7 @@ int crdt_snapshot_encode(const struct CrdtNetworkState *st,
   snap_put_lww(&w, &st->shuns, (uint8_t)CRDT_COLL_SHUNS, &lww_total);
   snap_put_lww(&w, &st->zlines, (uint8_t)CRDT_COLL_ZLINES, &lww_total);
   snap_put_lww(&w, &st->jupes, (uint8_t)CRDT_COLL_JUPES, &lww_total);
+  snap_put_lww(&w, &st->bsessions, (uint8_t)CRDT_COLL_BSESSIONS, &lww_total); /* 5-5e */
   wpatch_u32(&w, lww_off, lww_total);
 
   /* channels: members / bans / excepts */

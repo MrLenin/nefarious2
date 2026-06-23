@@ -176,6 +176,26 @@ struct CrdtNickClaim {
   char       account[CRDT_ACCOUNTLEN];  /**< "" if unauthenticated */
 };
 
+#define CRDT_BSESS_NAMELEN   40   /* >= BOUNCER_NAME_LEN (32) */
+#define CRDT_BSESS_TOKENLEN  72   /* >= BOUNCER_TOKEN_LEN (64) + NUL */
+/** Bouncer session as CRDT-native doc state (5-5e doc-native track).  Keyed by
+ *  account\0sessid in the `bsessions` LWW-map; the HOLDER node is the single writer.
+ *  M2 = SHADOW only (mirrored + verified against live, NOT yet authoritative).
+ *  Timestamps are uint64 (not time_t) for wire stability; memset(0) before fill so
+ *  the trailing pad is stable for the digest (INVARIANT 4 field-by-field rule). */
+struct CrdtBouncerSession {
+  char     token[CRDT_BSESS_TOKENLEN];  /**< resume token */
+  char     name[CRDT_BSESS_NAMELEN];    /**< user-assigned session name */
+  uint64_t created;                     /**< hs_created (TS) */
+  uint64_t last_active;                 /**< hs_last_active (TS) */
+  uint64_t total_active;                /**< hs_total_active (seconds) */
+  uint32_t attach_count;                /**< hs_attach_count */
+  uint32_t connect_count;               /**< hs_connect_count */
+  uint8_t  state;                       /**< enum BouncerState (ACTIVE/HOLDING) */
+  int8_t   hold_override;               /**< -1=default / 0=no-hold / 1=hold */
+  uint8_t  pad[6];                      /**< explicit pad -> stable digest layout */
+};
+
 /*
  * Operation log — the unit of replication (proposal §17.1.5).
  */
@@ -203,7 +223,8 @@ enum CrdtCollection {
   CRDT_COLL_GLINES,        /**< ban-mask -> CrdtGlineRecord (LWW) — global-state track */
   CRDT_COLL_SHUNS,         /**< ban-mask -> CrdtShunRecord (LWW) — global-state track */
   CRDT_COLL_ZLINES,        /**< ip-mask -> CrdtZlineRecord (LWW) — global-state track */
-  CRDT_COLL_JUPES          /**< server-name -> CrdtJupeRecord (LWW) — global-state track */
+  CRDT_COLL_JUPES,         /**< server-name -> CrdtJupeRecord (LWW) — global-state track */
+  CRDT_COLL_BSESSIONS      /**< account\0sessid -> CrdtBouncerSession (LWW) — 5-5e doc-native bouncer */
 };
 
 struct CrdtOp {
@@ -283,6 +304,7 @@ struct CrdtNetworkState {
   struct CrdtLWWMap       shuns;        /**< ban-mask -> CrdtShunRecord (global-state) */
   struct CrdtLWWMap       zlines;       /**< ip-mask -> CrdtZlineRecord (global-state) */
   struct CrdtLWWMap       jupes;        /**< server-name -> CrdtJupeRecord (global-state) */
+  struct CrdtLWWMap       bsessions;    /**< account\0sessid -> CrdtBouncerSession (5-5e) */
   struct CrdtChannel     *chan_buckets[CRDT_CHAN_BUCKETS];
 };
 
@@ -381,6 +403,17 @@ void crdt_jupe_del(struct CrdtNetworkState *st, const char *server);
 /** 1 iff @a server has an explicit jupe delete-tombstone (gate for doc->live removal). */
 int crdt_jupe_is_explicitly_removed(const struct CrdtNetworkState *st,
                                     const char *server);
+/** 5-5e doc-native bouncer: set/del/get a session record in the BSESSIONS LWW-map keyed
+ *  by @a account \0 @a sessid (op-recording; the holder node is the single writer). */
+void crdt_bsess_set(struct CrdtNetworkState *st, const char *account,
+                    const char *sessid, const struct CrdtBouncerSession *rec);
+void crdt_bsess_del(struct CrdtNetworkState *st, const char *account,
+                    const char *sessid);
+const struct CrdtBouncerSession *crdt_bsess_get(const struct CrdtNetworkState *st,
+                                                const char *account, const char *sessid);
+/** 1 iff (account,sessid) has an explicit delete-tombstone (gate for doc->live removal). */
+int crdt_bsess_is_explicitly_removed(const struct CrdtNetworkState *st,
+                                     const char *account, const char *sessid);
 /** Phase 3k: set/get per-kick metadata (LWW, keyed chan\0numeric). set() records a
  *  SET op so it replicates via delta; get() returns the LWW value (NULL if absent)
  *  so callers can read both the CrdtKickInfo payload and its HLC (.ts) for the

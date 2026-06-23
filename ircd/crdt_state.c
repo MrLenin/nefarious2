@@ -148,6 +148,7 @@ void crdt_state_init(struct CrdtNetworkState *st, uint16_t my_numeric)
   crdt_lwwmap_init(&st->shuns);
   crdt_lwwmap_init(&st->zlines);
   crdt_lwwmap_init(&st->jupes);
+  crdt_lwwmap_init(&st->bsessions);
 }
 
 void crdt_state_clear(struct CrdtNetworkState *st)
@@ -166,6 +167,7 @@ void crdt_state_clear(struct CrdtNetworkState *st)
   crdt_lwwmap_clear(&st->shuns);
   crdt_lwwmap_clear(&st->zlines);
   crdt_lwwmap_clear(&st->jupes);
+  crdt_lwwmap_clear(&st->bsessions);
   for (int b = 0; b < CRDT_CHAN_BUCKETS; b++) {
     struct CrdtChannel *c = st->chan_buckets[b];
     while (c) {
@@ -822,6 +824,86 @@ int crdt_jupe_is_explicitly_removed(const struct CrdtNetworkState *st,
   return crdt_lwwmap_is_deleted(&st->jupes, server, (uint32_t)strlen(server));
 }
 
+/* 5-5e doc-native bouncer: op-recording set/del/get/gate, keyed by account\0sessid
+ * (embedded NUL like members_status' chan\0numeric — avoids delimiter collision). */
+static uint32_t bsess_key(const char *account, const char *sessid,
+                          char *out, size_t outsz)
+{
+  uint32_t al = (uint32_t)strlen(account);
+  uint32_t sl = (uint32_t)strlen(sessid);
+  if ((size_t)al + 1 + sl > outsz)
+    return 0;                      /* defensive: oversized key */
+  memcpy(out, account, al);
+  out[al] = '\0';
+  memcpy(out + al + 1, sessid, sl);
+  return al + 1 + sl;
+}
+
+void crdt_bsess_set(struct CrdtNetworkState *st, const char *account,
+                    const char *sessid, const struct CrdtBouncerSession *rec)
+{
+  struct HLC ts = hlc_local_event(&st->clock);
+  char key[128];
+  uint32_t klen = bsess_key(account, sessid, key, sizeof key);
+  uint64_t seq;
+  struct CrdtOp *op;
+  if (!klen)
+    return;
+  crdt_lwwmap_set(&st->bsessions, key, klen, rec, sizeof(*rec),
+                  ts, st->my_numeric);
+  seq = st->next_seq++;
+  op = op_new(st->my_numeric, seq, CRDT_OP_SET, CRDT_COLL_BSESSIONS);
+  op->key = memdup(key, klen);
+  op->key_len = klen;
+  op->val = memdup(rec, sizeof(*rec));
+  op->val_len = sizeof(*rec);
+  op->ts = ts;
+  op->writer = st->my_numeric;
+  record(st, op);
+}
+
+void crdt_bsess_del(struct CrdtNetworkState *st, const char *account,
+                    const char *sessid)
+{
+  struct HLC ts = hlc_local_event(&st->clock);
+  char key[128];
+  uint32_t klen = bsess_key(account, sessid, key, sizeof key);
+  uint64_t seq;
+  struct CrdtOp *op;
+  if (!klen)
+    return;
+  crdt_lwwmap_delete(&st->bsessions, key, klen, ts, st->my_numeric);
+  seq = st->next_seq++;
+  op = op_new(st->my_numeric, seq, CRDT_OP_DELETE, CRDT_COLL_BSESSIONS);
+  op->key = memdup(key, klen);
+  op->key_len = klen;
+  op->ts = ts;
+  op->writer = st->my_numeric;
+  record(st, op);
+}
+
+const struct CrdtBouncerSession *crdt_bsess_get(const struct CrdtNetworkState *st,
+                                                const char *account, const char *sessid)
+{
+  char key[128];
+  uint32_t klen = bsess_key(account, sessid, key, sizeof key);
+  const struct CrdtLWWValue *v;
+  if (!klen)
+    return NULL;
+  v = crdt_lwwmap_get(&st->bsessions, key, klen);
+  return v ? (const struct CrdtBouncerSession *)v->data : NULL;
+}
+
+int crdt_bsess_is_explicitly_removed(const struct CrdtNetworkState *st,
+                                     const char *account, const char *sessid)
+{
+  char key[128];
+  uint32_t klen = bsess_key(account, sessid, key, sizeof key);
+  if (!klen)
+    return 0;
+  return crdt_lwwmap_is_deleted(&st->bsessions, key, klen);
+}
+
 /* ------------------------------------------------------------------ */
 /* sync / merge                                                       */
 /* ------------------------------------------------------------------ */
@@ -842,6 +924,7 @@ static struct CrdtLWWMap *lww_for(struct CrdtNetworkState *st,
   case CRDT_COLL_SHUNS:         return &st->shuns;
   case CRDT_COLL_ZLINES:        return &st->zlines;
   case CRDT_COLL_JUPES:         return &st->jupes;
+  case CRDT_COLL_BSESSIONS:     return &st->bsessions;
   default:                return NULL;
   }
 }
@@ -1090,6 +1173,7 @@ uint64_t crdt_state_digest(const struct CrdtNetworkState *st)
   acc = digest_lww(acc, &st->shuns, 13);   /* salt 13: 1-9 LWW, 10-12 OR-Set */
   acc = digest_lww(acc, &st->zlines, 14);  /* salt 14 */
   acc = digest_lww(acc, &st->jupes, 15);   /* salt 15 */
+  acc = digest_lww(acc, &st->bsessions, 16); /* salt 16: 5-5e bouncer sessions */
   for (bk = 0; bk < CRDT_CHAN_BUCKETS; bk++) {
     struct CrdtChannel *c;
     for (c = st->chan_buckets[bk]; c; c = c->next) {
@@ -1142,6 +1226,7 @@ uint64_t crdt_state_digest_materialized(const struct CrdtNetworkState *st)
   acc = digest_lww(acc, &st->shuns, 13);   /* salt 13: 1-9 LWW, 10-12 OR-Set */
   acc = digest_lww(acc, &st->zlines, 14);  /* salt 14 */
   acc = digest_lww(acc, &st->jupes, 15);   /* salt 15 */
+  acc = digest_lww(acc, &st->bsessions, 16); /* salt 16: 5-5e bouncer sessions */
   for (bk = 0; bk < CRDT_CHAN_BUCKETS; bk++) {
     struct CrdtChannel *c;
     for (c = st->chan_buckets[bk]; c; c = c->next) {
