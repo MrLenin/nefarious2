@@ -196,6 +196,19 @@ struct CrdtBouncerSession {
   uint8_t  pad[6];                      /**< explicit pad -> stable digest layout */
 };
 
+/** Per-connection record (5-5e M4 doc-native bouncer).  Keyed by account\0sessid\0connnum
+ *  in the `bconns` LWW-map; the connection's HOST node is the single writer.  The session
+ *  roster = the live (non-tombstoned) entries for a given (account,sessid).  An LWWMap
+ *  (single-writer per connection) suffices — no OR-Set needed: only the host adds/removes
+ *  its own connection, so there is no concurrent add/remove to merge.  M4 = SHADOW only. */
+struct CrdtBouncerConn {
+  uint64_t last_active;                  /**< per-connection activity TS */
+  uint32_t caps;                        /**< BX_CAP_* bitmask (0 if unknown) */
+  uint16_t host;                        /**< owning server numeric (single-writer) */
+  uint8_t  is_primary;                  /**< 1 = primary connection, 0 = alias */
+  uint8_t  caps_known;                  /**< 0 if caps not yet learned */
+};
+
 /*
  * Operation log — the unit of replication (proposal §17.1.5).
  */
@@ -224,7 +237,8 @@ enum CrdtCollection {
   CRDT_COLL_SHUNS,         /**< ban-mask -> CrdtShunRecord (LWW) — global-state track */
   CRDT_COLL_ZLINES,        /**< ip-mask -> CrdtZlineRecord (LWW) — global-state track */
   CRDT_COLL_JUPES,         /**< server-name -> CrdtJupeRecord (LWW) — global-state track */
-  CRDT_COLL_BSESSIONS      /**< account\0sessid -> CrdtBouncerSession (LWW) — 5-5e doc-native bouncer */
+  CRDT_COLL_BSESSIONS,     /**< account\0sessid -> CrdtBouncerSession (LWW) — 5-5e doc-native bouncer */
+  CRDT_COLL_BCONNS         /**< account\0sessid\0connnum -> CrdtBouncerConn (LWW) — 5-5e M4 */
 };
 
 struct CrdtOp {
@@ -305,6 +319,7 @@ struct CrdtNetworkState {
   struct CrdtLWWMap       zlines;       /**< ip-mask -> CrdtZlineRecord (global-state) */
   struct CrdtLWWMap       jupes;        /**< server-name -> CrdtJupeRecord (global-state) */
   struct CrdtLWWMap       bsessions;    /**< account\0sessid -> CrdtBouncerSession (5-5e) */
+  struct CrdtLWWMap       bconns;       /**< account\0sessid\0connnum -> CrdtBouncerConn (5-5e M4) */
   struct CrdtChannel     *chan_buckets[CRDT_CHAN_BUCKETS];
 };
 
@@ -419,6 +434,23 @@ int crdt_bsess_is_explicitly_removed(const struct CrdtNetworkState *st,
  *  NUL-terminated winner to @a out; returns out, or NULL if no live session in the doc. */
 const char *crdt_bsess_winner(const struct CrdtNetworkState *st, const char *account,
                               char *out, size_t outsz);
+/** 5-5e M4: set/del/get a per-connection record in the BCONNS LWW-map keyed by
+ *  @a account \0 @a sessid \0 @a connnum (op-recording; the connection HOST is the
+ *  single writer). The session roster = the live entries for (account,sessid). */
+void crdt_bconn_set(struct CrdtNetworkState *st, const char *account,
+                    const char *sessid, const char *connnum,
+                    const struct CrdtBouncerConn *rec);
+void crdt_bconn_del(struct CrdtNetworkState *st, const char *account,
+                    const char *sessid, const char *connnum);
+const struct CrdtBouncerConn *crdt_bconn_get(const struct CrdtNetworkState *st,
+                                             const char *account, const char *sessid,
+                                             const char *connnum);
+int crdt_bconn_is_explicitly_removed(const struct CrdtNetworkState *st,
+                                     const char *account, const char *sessid,
+                                     const char *connnum);
+/** 5-5e M4: number of LIVE (non-tombstoned) connections in the (account,sessid) roster. */
+int crdt_bconn_roster_count(const struct CrdtNetworkState *st,
+                            const char *account, const char *sessid);
 /** Phase 3k: set/get per-kick metadata (LWW, keyed chan\0numeric). set() records a
  *  SET op so it replicates via delta; get() returns the LWW value (NULL if absent)
  *  so callers can read both the CrdtKickInfo payload and its HLC (.ts) for the

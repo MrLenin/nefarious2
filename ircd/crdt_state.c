@@ -149,6 +149,7 @@ void crdt_state_init(struct CrdtNetworkState *st, uint16_t my_numeric)
   crdt_lwwmap_init(&st->zlines);
   crdt_lwwmap_init(&st->jupes);
   crdt_lwwmap_init(&st->bsessions);
+  crdt_lwwmap_init(&st->bconns);
 }
 
 void crdt_state_clear(struct CrdtNetworkState *st)
@@ -168,6 +169,7 @@ void crdt_state_clear(struct CrdtNetworkState *st)
   crdt_lwwmap_clear(&st->zlines);
   crdt_lwwmap_clear(&st->jupes);
   crdt_lwwmap_clear(&st->bsessions);
+  crdt_lwwmap_clear(&st->bconns);
   for (int b = 0; b < CRDT_CHAN_BUCKETS; b++) {
     struct CrdtChannel *c = st->chan_buckets[b];
     while (c) {
@@ -959,6 +961,122 @@ const char *crdt_bsess_winner(const struct CrdtNetworkState *st, const char *acc
   return out;
 }
 
+/* 5-5e M4: per-connection records, keyed account\0sessid\0connnum (single-writer = the
+ * connection's host). Op-recording set/del/get/gate, mirroring the bsess pattern. */
+static uint32_t bconn_key(const char *account, const char *sessid, const char *connnum,
+                          char *out, size_t outsz)
+{
+  uint32_t al = (uint32_t)strlen(account);
+  uint32_t sl = (uint32_t)strlen(sessid);
+  uint32_t nl = (uint32_t)strlen(connnum);
+  if ((size_t)al + 1 + sl + 1 + nl > outsz)
+    return 0;
+  memcpy(out, account, al);            out[al] = '\0';
+  memcpy(out + al + 1, sessid, sl);    out[al + 1 + sl] = '\0';
+  memcpy(out + al + 1 + sl + 1, connnum, nl);
+  return al + 1 + sl + 1 + nl;
+}
+
+void crdt_bconn_set(struct CrdtNetworkState *st, const char *account,
+                    const char *sessid, const char *connnum,
+                    const struct CrdtBouncerConn *rec)
+{
+  struct HLC ts = hlc_local_event(&st->clock);
+  char key[160];
+  uint32_t klen = bconn_key(account, sessid, connnum, key, sizeof key);
+  uint64_t seq;
+  struct CrdtOp *op;
+  if (!klen)
+    return;
+  crdt_lwwmap_set(&st->bconns, key, klen, rec, sizeof(*rec), ts, st->my_numeric);
+  seq = st->next_seq++;
+  op = op_new(st->my_numeric, seq, CRDT_OP_SET, CRDT_COLL_BCONNS);
+  op->key = memdup(key, klen);
+  op->key_len = klen;
+  op->val = memdup(rec, sizeof(*rec));
+  op->val_len = sizeof(*rec);
+  op->ts = ts;
+  op->writer = st->my_numeric;
+  record(st, op);
+}
+
+void crdt_bconn_del(struct CrdtNetworkState *st, const char *account,
+                    const char *sessid, const char *connnum)
+{
+  struct HLC ts = hlc_local_event(&st->clock);
+  char key[160];
+  uint32_t klen = bconn_key(account, sessid, connnum, key, sizeof key);
+  uint64_t seq;
+  struct CrdtOp *op;
+  if (!klen)
+    return;
+  crdt_lwwmap_delete(&st->bconns, key, klen, ts, st->my_numeric);
+  seq = st->next_seq++;
+  op = op_new(st->my_numeric, seq, CRDT_OP_DELETE, CRDT_COLL_BCONNS);
+  op->key = memdup(key, klen);
+  op->key_len = klen;
+  op->ts = ts;
+  op->writer = st->my_numeric;
+  record(st, op);
+}
+
+const struct CrdtBouncerConn *crdt_bconn_get(const struct CrdtNetworkState *st,
+                                             const char *account, const char *sessid,
+                                             const char *connnum)
+{
+  char key[160];
+  uint32_t klen = bconn_key(account, sessid, connnum, key, sizeof key);
+  const struct CrdtLWWValue *v;
+  if (!klen)
+    return NULL;
+  v = crdt_lwwmap_get(&st->bconns, key, klen);
+  return v ? (const struct CrdtBouncerConn *)v->data : NULL;
+}
+
+int crdt_bconn_is_explicitly_removed(const struct CrdtNetworkState *st,
+                                     const char *account, const char *sessid,
+                                     const char *connnum)
+{
+  char key[160];
+  uint32_t klen = bconn_key(account, sessid, connnum, key, sizeof key);
+  if (!klen)
+    return 0;
+  return crdt_lwwmap_is_deleted(&st->bconns, key, klen);
+}
+
+/* Roster count: live (non-tombstoned) bconns entries for (account,sessid). Reuses the
+ * bsess_winner_ctx-style prefix scan but counts the (account\0sessid\0) prefix. */
+struct bconn_count_ctx { const char *prefix; uint32_t plen; int n; };
+static void bconn_count_cb(const char *key, uint32_t key_len,
+                           const struct CrdtLWWValue *val, void *ctx)
+{
+  struct bconn_count_ctx *c = ctx;
+  if (!val->data || val->data_len != sizeof(struct CrdtBouncerConn))
+    return;                              /* tombstone / wrong size */
+  if (key_len <= c->plen)
+    return;
+  if (memcmp(key, c->prefix, c->plen) == 0)
+    c->n++;
+}
+
+int crdt_bconn_roster_count(const struct CrdtNetworkState *st,
+                            const char *account, const char *sessid)
+{
+  struct bconn_count_ctx c;
+  char prefix[160];
+  uint32_t al = (uint32_t)strlen(account);
+  uint32_t sl = (uint32_t)strlen(sessid);
+  if ((size_t)al + 1 + sl + 1 > sizeof prefix)
+    return 0;
+  memcpy(prefix, account, al);          prefix[al] = '\0';
+  memcpy(prefix + al + 1, sessid, sl);  prefix[al + 1 + sl] = '\0';
+  c.prefix = prefix;
+  c.plen   = al + 1 + sl + 1;            /* account\0sessid\0 */
+  c.n      = 0;
+  crdt_lwwmap_foreach(&st->bconns, bconn_count_cb, &c);
+  return c.n;
+}
+
 /* ------------------------------------------------------------------ */
 /* sync / merge                                                       */
 /* ------------------------------------------------------------------ */
@@ -980,6 +1098,7 @@ static struct CrdtLWWMap *lww_for(struct CrdtNetworkState *st,
   case CRDT_COLL_ZLINES:        return &st->zlines;
   case CRDT_COLL_JUPES:         return &st->jupes;
   case CRDT_COLL_BSESSIONS:     return &st->bsessions;
+  case CRDT_COLL_BCONNS:        return &st->bconns;
   default:                return NULL;
   }
 }
@@ -1229,6 +1348,7 @@ uint64_t crdt_state_digest(const struct CrdtNetworkState *st)
   acc = digest_lww(acc, &st->zlines, 14);  /* salt 14 */
   acc = digest_lww(acc, &st->jupes, 15);   /* salt 15 */
   acc = digest_lww(acc, &st->bsessions, 16); /* salt 16: 5-5e bouncer sessions */
+  acc = digest_lww(acc, &st->bconns, 17);    /* salt 17: 5-5e M4 bouncer connections */
   for (bk = 0; bk < CRDT_CHAN_BUCKETS; bk++) {
     struct CrdtChannel *c;
     for (c = st->chan_buckets[bk]; c; c = c->next) {
@@ -1282,6 +1402,7 @@ uint64_t crdt_state_digest_materialized(const struct CrdtNetworkState *st)
   acc = digest_lww(acc, &st->zlines, 14);  /* salt 14 */
   acc = digest_lww(acc, &st->jupes, 15);   /* salt 15 */
   acc = digest_lww(acc, &st->bsessions, 16); /* salt 16: 5-5e bouncer sessions */
+  acc = digest_lww(acc, &st->bconns, 17);    /* salt 17: 5-5e M4 bouncer connections */
   for (bk = 0; bk < CRDT_CHAN_BUCKETS; bk++) {
     struct CrdtChannel *c;
     for (c = st->chan_buckets[bk]; c; c = c->next) {

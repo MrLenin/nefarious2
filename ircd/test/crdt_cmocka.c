@@ -531,6 +531,46 @@ static void test_bsess_winner(void **state)
   crdt_state_clear(&s);
 }
 
+/* 5-5e M4: per-connection bconns collection + roster count. Connections (primary +
+ * aliases) replicate via delta, the roster = live entries per (account,sessid), a
+ * removed connection drops the roster + flips the tombstone gate, digest converges. */
+static void test_bconn_roster(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s1, s2;
+  struct CrdtBouncerConn rec;
+  const struct CrdtBouncerConn *g;
+  crdt_state_init(&s1, 1);
+  crdt_state_init(&s2, 2);
+  memset(&rec, 0, sizeof rec);
+  rec.host = 1; rec.is_primary = 1; rec.caps = 0x5; rec.caps_known = 1;
+  crdt_bconn_set(&s1, "alice", "S1", "AAAAA", &rec);   /* primary */
+  rec.host = 2; rec.is_primary = 0; rec.caps = 0; rec.caps_known = 0;
+  crdt_bconn_set(&s1, "alice", "S1", "BBBBB", &rec);   /* alias */
+  crdt_bconn_set(&s1, "bob",   "S9", "CCCCC", &rec);   /* other account/session */
+  crdt_state_sync(&s2, &s1);
+
+  assert_int_equal(2, crdt_bconn_roster_count(&s2, "alice", "S1"));
+  assert_int_equal(1, crdt_bconn_roster_count(&s2, "bob", "S9"));
+  assert_int_equal(0, crdt_bconn_roster_count(&s2, "alice", "S2"));   /* no such session */
+  g = crdt_bconn_get(&s2, "alice", "S1", "AAAAA");
+  assert_non_null(g);
+  assert_int_equal(1, g->is_primary);
+  assert_int_equal(5, (int)g->caps);
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+
+  /* alias disconnects -> roster drops to 1, tombstone gate flips, primary unaffected */
+  crdt_bconn_del(&s1, "alice", "S1", "BBBBB");
+  crdt_state_sync(&s2, &s1);
+  assert_int_equal(1, crdt_bconn_roster_count(&s2, "alice", "S1"));
+  assert_int_equal(1, crdt_bconn_is_explicitly_removed(&s2, "alice", "S1", "BBBBB"));
+  assert_int_equal(0, crdt_bconn_is_explicitly_removed(&s2, "alice", "S1", "AAAAA"));
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+
+  crdt_state_clear(&s1);
+  crdt_state_clear(&s2);
+}
+
 /* SHUN doc collection (global-state track sibling of GLINE): set/update/delete via
  * delta + digest converge + snapshot roundtrip + the explicit-removal gate. */
 static void test_shun_op_replicates(void **state)
@@ -2018,6 +2058,7 @@ int main(void)
     cmocka_unit_test(test_gline_op_replicates),
     cmocka_unit_test(test_bsess_op_replicates),
     cmocka_unit_test(test_bsess_winner),
+    cmocka_unit_test(test_bconn_roster),
     cmocka_unit_test(test_shun_op_replicates),
     cmocka_unit_test(test_zline_op_replicates),
     cmocka_unit_test(test_jupe_op_replicates),
