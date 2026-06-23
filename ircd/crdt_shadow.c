@@ -630,6 +630,91 @@ const char *crdt_shadow_bsess_winner(const char *account, char *out, size_t outs
   return crdt_bsess_winner(&g_crdt, account, out, outsz);
 }
 
+/* 5-5e M4: per-connection roster wrappers + a reconcile-style reap. */
+void crdt_shadow_bconn_set(const char *account, const char *sessid,
+                           const char *connnum, const struct CrdtBouncerConn *rec)
+{
+  if (!shadow_on())
+    return;
+  crdt_bconn_set(&g_crdt, account, sessid, connnum, rec);
+  crdt_sync_push();
+}
+
+void crdt_shadow_bconn_remove(const char *account, const char *sessid,
+                              const char *connnum)
+{
+  if (!shadow_on())
+    return;
+  crdt_bconn_del(&g_crdt, account, sessid, connnum);
+  crdt_sync_push();
+}
+
+/* Reap stale connections THIS node owns: a bconn entry whose host is us but whose
+ * connnum no longer resolves to a live client (disconnected) is tombstoned, so the
+ * roster stays exact without hooking every connection-teardown site.  Single-writer:
+ * only entries with host==me are touched.  Collect-then-delete (no mutation mid-walk). */
+struct bconn_reap_ctx {
+  uint16_t me;
+  struct { char acc[ACCOUNTLEN + 1]; char sid[64]; char num[16]; } stale[64];
+  int count;
+};
+static void bconn_reap_cb(const char *key, uint32_t key_len,
+                          const struct CrdtLWWValue *val, void *ctx)
+{
+  struct bconn_reap_ctx *c = ctx;
+  const struct CrdtBouncerConn *rec;
+  const char *p1, *p2;          /* the two embedded NULs: account\0sessid\0connnum */
+  uint32_t alen, slen, nlen;
+  if (!val->data || val->data_len != sizeof(struct CrdtBouncerConn))
+    return;                              /* already a tombstone */
+  rec = (const struct CrdtBouncerConn *)val->data;
+  if (rec->host != c->me)
+    return;                              /* not ours (single-writer) */
+  if (c->count >= (int)(sizeof c->stale / sizeof c->stale[0]))
+    return;                              /* capped; remaining reaped next sweep */
+  p1 = memchr(key, '\0', key_len);
+  if (!p1) return;
+  alen = (uint32_t)(p1 - key);
+  p2 = memchr(p1 + 1, '\0', key_len - alen - 1);
+  if (!p2) return;
+  slen = (uint32_t)(p2 - (p1 + 1));
+  nlen = (uint32_t)(key_len - alen - 1 - slen - 1);
+  if (alen > ACCOUNTLEN || slen >= sizeof c->stale[0].sid ||
+      nlen == 0 || nlen >= sizeof c->stale[0].num)
+    return;
+  { char numbuf[16];
+    memcpy(numbuf, p2 + 1, nlen); numbuf[nlen] = '\0';
+    if (findNUser(numbuf))
+      return;                            /* still live -> keep */
+    memcpy(c->stale[c->count].acc, key, alen);  c->stale[c->count].acc[alen] = '\0';
+    memcpy(c->stale[c->count].sid, p1 + 1, slen); c->stale[c->count].sid[slen] = '\0';
+    memcpy(c->stale[c->count].num, numbuf, nlen + 1);
+    c->count++;
+  }
+}
+
+void crdt_shadow_bconn_reap(void)
+{
+  struct bconn_reap_ctx c;
+  int i;
+  if (!shadow_on())
+    return;
+  c.me = (uint16_t)base64toint(cli_yxx(&me));
+  c.count = 0;
+  crdt_lwwmap_foreach(&g_crdt.bconns, bconn_reap_cb, &c);
+  for (i = 0; i < c.count; i++)
+    crdt_bconn_del(&g_crdt, c.stale[i].acc, c.stale[i].sid, c.stale[i].num);
+  if (c.count)
+    crdt_sync_push();
+}
+
+int crdt_shadow_bconn_roster_count(const char *account, const char *sessid)
+{
+  if (!shadow_on())
+    return 0;
+  return crdt_bconn_roster_count(&g_crdt, account, sessid);
+}
+
 /* Phase 4c: server reachability is a LOCAL determination, NOT replicated state.
  *
  * Phase 4a tried to replicate per-server ACTIVE/SPLIT in the convergent doc (a
@@ -3718,8 +3803,10 @@ static void crdt_shadow_verify_cb(struct Event *ev)
   crdt_shadow_reconcile_jupes();   /* JUPE: drive juped servers from doc (+gateway) */
   bounce_crdt_bsess_sweep();       /* 5-5e M2: mirror local-holder bouncer sessions -> doc (shadow) */
   { uint32_t bs = crdt_lwwmap_size(&g_crdt.bsessions);   /* M2 convergence signal: same on every node */
-    if (bs)
-      log_write(LS_SYSTEM, L_NOTICE, 0, "CRDT bsess doc total: %u entry(ies)", bs); }
+    uint32_t bc = crdt_lwwmap_size(&g_crdt.bconns);      /* M4 convergence signal */
+    if (bs || bc)
+      log_write(LS_SYSTEM, L_NOTICE, 0,
+                "CRDT bouncer doc: %u session(s), %u connection(s)", bs, bc); }
   crdt_sync_broadcast();   /* periodic anti-entropy: pull deltas from peers */
   crdt_shadow_gc();        /* reclaim causally-stable ops/tombstones */
 

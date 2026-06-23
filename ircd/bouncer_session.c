@@ -1976,7 +1976,7 @@ int session_has_local_holder(struct BouncerSession *session)
  * touching the ~10 scattered hs_state assignment sites in the battle-tested core. */
 void bounce_crdt_bsess_sweep(void)
 {
-  int i, n = 0;
+  int i, n = 0, nc = 0;
   if (!feature_bool(FEAT_CRDT_PRIMARY))
     return;
   for (i = 0; i < BOUNCE_ACCOUNT_HASHSIZE; i++) {
@@ -1984,41 +1984,82 @@ void bounce_crdt_bsess_sweep(void)
     for (as = accountHash[i]; as; as = as->as_hnext) {
       struct BouncerSession *s;
       for (s = as->as_sessions; s; s = s->hs_anext) {
-        struct CrdtBouncerSession rec;
         if (s->hs_state == BOUNCE_DESTROYING)
           continue;
-        if (!(s->hs_client && MyConnect(s->hs_client)))
-          continue;                  /* single-writer = primary holder */
-        memset(&rec, 0, sizeof rec);
-        ircd_strncpy(rec.token, s->hs_token, sizeof rec.token);
-        ircd_strncpy(rec.name,  s->hs_name,  sizeof rec.name);
-        rec.created       = (uint64_t)s->hs_created;
-        rec.last_active   = (uint64_t)s->hs_last_active;
-        rec.total_active  = (uint64_t)s->hs_total_active;
-        rec.attach_count  = s->hs_attach_count;
-        rec.connect_count = s->hs_connect_count;
-        rec.state         = (uint8_t)s->hs_state;
-        rec.hold_override = (int8_t)s->hs_hold_override;
-        crdt_shadow_bsess_set(s->hs_account, s->hs_sessid, &rec);
-        n++;
-        /* M3 de-risk: the doc-derived election winner (strcmp-min sessid for the account)
-         * must match this live session's sessid — the live cross-sessid election already
-         * converged it.  A PERSISTENT mismatch is a real divergence; a transient one heals
-         * as the doc converges.  Shadow-only signal (nothing acts on it yet). */
-        {
+
+        /* M2/M3: the session record — single-writer = the PRIMARY holder. */
+        if (s->hs_client && MyConnect(s->hs_client)) {
+          struct CrdtBouncerSession rec;
           char w[64];
+          memset(&rec, 0, sizeof rec);
+          ircd_strncpy(rec.token, s->hs_token, sizeof rec.token);
+          ircd_strncpy(rec.name,  s->hs_name,  sizeof rec.name);
+          rec.created       = (uint64_t)s->hs_created;
+          rec.last_active   = (uint64_t)s->hs_last_active;
+          rec.total_active  = (uint64_t)s->hs_total_active;
+          rec.attach_count  = s->hs_attach_count;
+          rec.connect_count = s->hs_connect_count;
+          rec.state         = (uint8_t)s->hs_state;
+          rec.hold_override = (int8_t)s->hs_hold_override;
+          crdt_shadow_bsess_set(s->hs_account, s->hs_sessid, &rec);
+          n++;
+          /* M3 de-risk: doc-derived election winner must equal this live sessid. */
           if (crdt_shadow_bsess_winner(s->hs_account, w, sizeof w)
               && 0 != strcmp(w, s->hs_sessid))
             log_write(LS_SYSTEM, L_NOTICE, 0,
                       "CRDT bsess M3: election divergence acct=%s live=%s doc-winner=%s",
                       s->hs_account, s->hs_sessid, w);
         }
+
+        /* M4: connection roster — each node mirrors the connections IT hosts
+         * (single-writer per connection = its host). */
+        {
+          uint16_t myn = (uint16_t)base64toint(cli_yxx(&me));
+          const char *me_yxx = cli_yxx(&me);
+          int a;
+          if (s->hs_client && MyConnect(s->hs_client)) {
+            struct CrdtBouncerConn cr;
+            char pnum[16];
+            ircd_snprintf(0, pnum, sizeof pnum, "%s%s", NumNick(s->hs_client));
+            memset(&cr, 0, sizeof cr);
+            cr.host = myn;
+            cr.is_primary = 1;
+            cr.last_active = (uint64_t)s->hs_last_active;
+            crdt_shadow_bconn_set(s->hs_account, s->hs_sessid, pnum, &cr);
+            nc++;
+          }
+          for (a = 0; a < s->hs_alias_count; a++) {
+            struct CrdtBouncerConn cr;
+            if (0 != strcmp(s->hs_aliases[a].ba_server, me_yxx))
+              continue;              /* only the alias's host writes its entry */
+            memset(&cr, 0, sizeof cr);
+            cr.host = myn;
+            cr.is_primary = 0;
+            cr.caps = (uint32_t)s->hs_aliases[a].ba_caps;
+            cr.caps_known = s->hs_aliases[a].ba_caps_known ? 1 : 0;
+            crdt_shadow_bconn_set(s->hs_account, s->hs_sessid,
+                                  s->hs_aliases[a].ba_numeric, &cr);
+            nc++;
+          }
+          /* M4 de-risk: on the primary holder (which knows the full roster), the
+           * converged doc roster should equal 1 (primary) + alias_count. A transient
+           * mismatch heals as remote alias hosts' entries converge. */
+          if (s->hs_client && MyConnect(s->hs_client)) {
+            int doc  = crdt_shadow_bconn_roster_count(s->hs_account, s->hs_sessid);
+            int live = 1 + s->hs_alias_count;
+            if (doc != live)
+              log_write(LS_SYSTEM, L_NOTICE, 0,
+                        "CRDT bconn M4: roster mismatch acct=%s sid=%s live=%d doc=%d",
+                        s->hs_account, s->hs_sessid, live, doc);
+          }
+        }
       }
     }
   }
-  if (n)
+  crdt_shadow_bconn_reap();   /* M4: tombstone stale-owned connections (disconnected) */
+  if (n || nc)
     log_write(LS_SYSTEM, L_NOTICE, 0,
-              "CRDT bsess shadow: mirrored %d local-holder session(s) to doc", n);
+              "CRDT bsess shadow: mirrored %d session(s) + %d connection(s) to doc", n, nc);
 }
 
 /** Per redesign C.2 + design intent #135 + #254: do we have any

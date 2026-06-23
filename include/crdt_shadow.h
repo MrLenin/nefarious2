@@ -75,6 +75,15 @@ void crdt_shadow_bsess_remove(const char *account, const char *sessid);
 /** 5-5e M3: doc-derived cross-sessid election winner for @a account (NULL if none). */
 const char *crdt_shadow_bsess_winner(const char *account, char *out, size_t outsz);
 
+/** 5-5e M4: per-connection roster mirror/remove + reap of stale-owned connections. */
+struct CrdtBouncerConn;
+void crdt_shadow_bconn_set(const char *account, const char *sessid,
+                           const char *connnum, const struct CrdtBouncerConn *rec);
+void crdt_shadow_bconn_remove(const char *account, const char *sessid,
+                              const char *connnum);
+void crdt_shadow_bconn_reap(void);
+int crdt_shadow_bconn_roster_count(const char *account, const char *sessid);
+
 /** Tier2 P1: true if @a u is a "mesh-only" user — its owning server is a
  *  STAT_MESH_SERVER stub (tree-departed but mesh-reachable).  Legacy (non-CRDT)
  *  peers already received the SQUIT for its server and never got its NICK, so the
