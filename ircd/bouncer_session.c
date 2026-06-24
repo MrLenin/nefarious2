@@ -2150,6 +2150,58 @@ void bounce_crdt_bsess_sweep(void)
               n, nc, nl);
 }
 
+/** 5-5e M6a-3: the REMOVAL half of the doc->live materializer.
+ *
+ * crdt_shadow_reconcile_bouncer() builds replica sessions FROM the doc; this
+ * reap tears them DOWN once their owner tombstones the bsessions record.  It
+ * is the teardown counterpart that makes BS X suppression (M6b-1) correct:
+ * with the destroy relay suppressed toward CRDT peers, the doc tombstone is
+ * the SOLE teardown signal, and without this reap a destroyed session would
+ * linger forever as a stale replica on every peer.
+ *
+ * A doc replica is identified by the absence of a local primary socket
+ * (hs_client == NULL) — on a non-owner node every bouncer session is a
+ * replica.  An owner-side orphan (primary gone, session HOLDING) also has
+ * hs_client == NULL, but its doc record is still PRESENT (only an explicit
+ * destroy tombstones it), so the present-check spares it.  bounce_destroy on
+ * a replica does NOT re-tombstone the doc — it gates the write on
+ * MyConnect(hs_client), false here — so no write amplification and the
+ * single-writer invariant holds.  Collect-then-destroy: bounce_destroy
+ * unhashes + frees, so we must not free mid-walk.
+ */
+void bounce_crdt_replica_reap(void)
+{
+  enum { REAP_BATCH = 32 };
+  struct BouncerSession *doomed[REAP_BATCH];
+  int i, nd = 0;
+
+  if (!feature_bool(FEAT_CRDT_BOUNCER_DOC) || !feature_bool(FEAT_CRDT_PRIMARY))
+    return;
+
+  for (i = 0; i < BOUNCE_ACCOUNT_HASHSIZE && nd < REAP_BATCH; i++) {
+    struct AccountSessions *as;
+    for (as = accountHash[i]; as && nd < REAP_BATCH; as = as->as_hnext) {
+      struct BouncerSession *s;
+      for (s = as->as_sessions; s && nd < REAP_BATCH; s = s->hs_anext) {
+        if (s->hs_state == BOUNCE_DESTROYING)
+          continue;
+        if (s->hs_client != NULL)                       /* local primary -> not a replica */
+          continue;
+        if (crdt_shadow_bsess_present(s->hs_account, s->hs_sessid))
+          continue;                                     /* doc record still live -> keep */
+        doomed[nd++] = s;        /* tombstoned/absent + no local primary -> stale replica */
+      }
+    }
+  }
+
+  for (i = 0; i < nd; i++) {
+    log_write(LS_SYSTEM, L_NOTICE, 0,
+              "CRDT replica reap: removing stale session acct=%s sid=%s (doc tombstoned)",
+              doomed[i]->hs_account, doomed[i]->hs_sessid);
+    bounce_destroy(doomed[i]);
+  }
+}
+
 /** Per redesign C.2 + design intent #135 + #254: do we have any
  * locally-held bouncer sessions on this server?
  *
@@ -3902,6 +3954,11 @@ void bounce_broadcast(struct BouncerSession *session, char subcmd,
   switch (subcmd) {
   case 'C': /* Create */
     build_channel_string(session, chanbuf, sizeof(chanbuf));
+    /* 5-5e M6b-1: doc carries this ACTIVE create to CRDT peers (the
+     * sweep writes the MyConnect-active session; M6a materializes a
+     * replica) — relay to the legacy leg only, that leg IS the gateway. */
+    if (feature_bool(FEAT_CRDT_BOUNCER_DOC))
+      sendcmdto_set_skip_crdt_servers();
     sendcmdto_serv_butone_v3(&me, CMD_BOUNCER_SESSION,
                           NULL,
                           "C %s %s %s active %Tu %u %Tu :%s",
@@ -3955,6 +4012,12 @@ void bounce_broadcast(struct BouncerSession *session, char subcmd,
     break;
 
   case 'X': /* Destroy */
+    /* 5-5e M6b-1: bounce_destroy tombstones the bsessions doc record on
+     * the primary holder (single-writer); the tombstone carries the
+     * teardown to CRDT peers via the materializer's explicitly-removed
+     * gate.  Relay to the legacy leg only. */
+    if (feature_bool(FEAT_CRDT_BOUNCER_DOC))
+      sendcmdto_set_skip_crdt_servers();
     sendcmdto_serv_butone_v3(&me, CMD_BOUNCER_SESSION,
                           NULL,
                           "X %s %s",
@@ -4267,6 +4330,12 @@ bsc_forward:
                             attach_count, total_active,
                             channels ? channels : "");
     } else {
+      /* 5-5e M6b-1: ACTIVE create is doc-covered (origin server's sweep
+       * wrote it; M6a materializes the replica) — re-relay legacy-only.
+       * The holding branch above is NOT gated (HOLDING doc-coverage is
+       * deferred to M6b-1b pending the sweep MyConnect-gate verdict). */
+      if (feature_bool(FEAT_CRDT_BOUNCER_DOC))
+        sendcmdto_set_skip_crdt_servers();
       sendcmdto_serv_butone_v3(sptr, CMD_BOUNCER_SESSION,
                             cptr,
                             "C %s %s %s active %Tu %u %Tu :%s",
@@ -4482,7 +4551,10 @@ bsc_forward:
       bounce_destroy(session);
     }
 
-    /* Forward */
+    /* Forward — 5-5e M6b-1: destroy is doc-covered via the primary
+     * holder's bsessions tombstone; re-relay legacy-only. */
+    if (feature_bool(FEAT_CRDT_BOUNCER_DOC))
+      sendcmdto_set_skip_crdt_servers();
     sendcmdto_serv_butone_v3(sptr, CMD_BOUNCER_SESSION,
                           cptr,
                           "X %s %s",

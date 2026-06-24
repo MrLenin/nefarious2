@@ -1393,4 +1393,10 @@ extern void bounce_mark_dirty(struct Client *cptr);
  *  writer (only the primary holder writes its own sessions). Shadow-only (not read). */
 extern void bounce_crdt_bsess_sweep(void);
 
+/** 5-5e M6a-3: the REMOVAL half of the doc->live materializer — tears down a
+ *  replica session once its owner tombstones the bsessions doc record.  Makes
+ *  BS X suppression (M6b-1) correct: the doc tombstone is the sole teardown
+ *  signal toward CRDT peers.  Gated on FEAT_CRDT_BOUNCER_DOC. */
+extern void bounce_crdt_replica_reap(void);
+
 #endif /* INCLUDED_bouncer_session_h */

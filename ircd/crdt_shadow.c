@@ -630,6 +630,17 @@ const char *crdt_shadow_bsess_winner(const char *account, char *out, size_t outs
   return crdt_bsess_winner(&g_crdt, account, out, outsz);
 }
 
+/* 5-5e M6a-3: live-presence check on the bsessions doc record.  Returns 1
+ * iff a non-tombstone entry exists.  The replica reap uses this to tear a
+ * materialized replica down once its owner tombstones the record (the doc
+ * is the sole teardown signal once BS X relay is suppressed). */
+int crdt_shadow_bsess_present(const char *account, const char *sessid)
+{
+  if (!shadow_on())
+    return 0;
+  return crdt_bsess_get(&g_crdt, account, sessid) != NULL;
+}
+
 /* 5-5e M4: per-connection roster wrappers + a reconcile-style reap. */
 void crdt_shadow_bconn_set(const char *account, const char *sessid,
                            const char *connnum, const struct CrdtBouncerConn *rec)
@@ -866,6 +877,10 @@ void crdt_shadow_reconcile_bouncer(void)
     log_write(LS_SYSTEM, L_NOTICE, 0,
               "CRDT bouncer-reconcile: created %u replica session(s) + %u alias(es) from doc",
               cs.created, ca.created);
+  /* M6a-3: removal half — tear down replica sessions whose owner tombstoned
+   * their doc record (the teardown counterpart that makes BS X suppression
+   * correct).  Lives in bouncer_session.c (owns the session hashes). */
+  bounce_crdt_replica_reap();
 }
 
 /* Phase 4c: server reachability is a LOCAL determination, NOT replicated state.

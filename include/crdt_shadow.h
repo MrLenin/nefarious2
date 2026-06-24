@@ -74,6 +74,8 @@ void crdt_shadow_bsess_set(const char *account, const char *sessid,
 void crdt_shadow_bsess_remove(const char *account, const char *sessid);
 /** 5-5e M3: doc-derived cross-sessid election winner for @a account (NULL if none). */
 const char *crdt_shadow_bsess_winner(const char *account, char *out, size_t outsz);
+/** 5-5e M6a-3: 1 iff a non-tombstone bsessions doc record exists (replica-reap gate). */
+int crdt_shadow_bsess_present(const char *account, const char *sessid);
 
 /** 5-5e M4: per-connection roster mirror/remove + reap of stale-owned connections. */
 struct CrdtBouncerConn;
