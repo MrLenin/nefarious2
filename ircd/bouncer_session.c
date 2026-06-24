@@ -1209,6 +1209,68 @@ int bounce_auto_resume(struct Client *cptr, struct BouncerSession **out_session,
      * Client locality — primary is "remote" iff hs_client lives on
      * another server (or is NULL). */
     if (!session->hs_client || !MyConnect(session->hs_client)) {
+      /* 5-5e M6d: the doc liveness-lease makes the alias-vs-reclaim decision
+       * AUTHORITATIVE.  A doc-materialized replica has hs_client==NULL even when the
+       * real holder is ALIVE elsewhere, so the hs_client-keyed logic below would
+       * orphan-reclaim a live session => split-brain.  Consult the lease first:
+       *   holder beacon STALE -> REVIVE_LOCAL: take over (claim gen+1 + attach)
+       *   holder beacon FRESH -> alias onto the holder's live primary (never reclaim);
+       *                          if its primary isn't materialized here yet, reject the
+       *                          duplicate (a reclaim would split-brain; a defer would
+       *                          hang — no BS C arrives to drain it under doc transport). */
+      if (feature_bool(FEAT_CRDT_BOUNCER_DOC) && feature_bool(FEAT_CRDT_PRIMARY)) {
+        const struct CrdtBouncerLease *lease =
+            crdt_shadow_blease_get(account, session->hs_sessid);
+        uint16_t myn = (uint16_t)base64toint(cli_yxx(&me));
+        int holder_fresh = lease ? crdt_shadow_server_beacon_fresh(lease->host) : 0;
+        enum CrdtBLeaseAction act =
+            crdt_blease_action(lease, myn, holder_fresh, /*have_local_primary=*/0,
+                               /*want_revive=*/1);
+        log_write(LS_SYSTEM, L_NOTICE, 0,
+                  "Bouncer M6d resume-decision: acct=%s sid=%s lease=%s holder=%u "
+                  "fresh=%d hs_client=%p -> action=%d",
+                  account, session->hs_sessid, lease ? "yes" : "none",
+                  lease ? lease->host : 0, holder_fresh,
+                  (void*)session->hs_client, (int)act);
+        if (act == CRDT_BLEASE_REVIVE_LOCAL) {
+          /* stale/dead holder -> become primary; record us as the gen+1 host so the
+           * doc transfers the lease (the heal demote on the old holder keys off this). */
+          crdt_shadow_blease_claim(account, session->hs_sessid, myn,
+                                   lease->generation + 1, (uint64_t)CurrentTime);
+          if (bounce_attach(session, cptr) == 0) {
+            bounce_broadcast(session, 'A', cli_yxx(cptr));
+            *out_session = session;
+            log_write(LS_SYSTEM, L_NOTICE, 0,
+                      "Bouncer M6d: REVIVE_LOCAL took over session %s for %s "
+                      "(stale doc-holder %u -> claimed gen %u)",
+                      session->hs_sessid, account, lease->host,
+                      (unsigned)(lease->generation + 1));
+            return BOUNCE_RESUME_HELD;
+          }
+          /* attach failed -> fall through to the legacy logic below */
+        } else if (lease && holder_fresh && lease->host != myn
+                   && !session->hs_client) {
+          /* holder ALIVE elsewhere + only a doc replica here: resolve the holder's
+           * primary so the alias path has a target; reject if not yet materialized. */
+          char pnum[16];
+          struct Client *holder_primary = NULL;
+          if (crdt_shadow_bconn_primary(account, session->hs_sessid, pnum, sizeof pnum))
+            holder_primary = findNUser(pnum);
+          if (holder_primary && IsUser(holder_primary) && cli_user(holder_primary)) {
+            bounce_hs_client_assign_checked(session, holder_primary, "M6d alias-target");
+            /* hs_client now points at the live holder primary -> fall through to the
+             * existing ALIAS_REMOTE path. */
+          } else {
+            log_write(LS_SYSTEM, L_NOTICE, 0,
+                      "Bouncer M6d: holder %u fresh but primary unresolved -> reject dup "
+                      "(acct=%s sid=%s)", lease->host, account, session->hs_sessid);
+            *out_session = session;
+            return BOUNCE_RESUME_REJECT_DUPLICATE;
+          }
+        }
+        /* NOOP (lease mine / none) -> fall through: legitimate orphan or new session. */
+      }
+      {
       struct Client *managing_server = FindNServer(session->hs_origin);
       if (managing_server && session->hs_client
           && session->hs_alias_count < BOUNCER_MAX_ALIASES) {
@@ -1223,6 +1285,7 @@ int bounce_auto_resume(struct Client *cptr, struct BouncerSession **out_session,
                 "(managing_server=%p hs_client=%p alias_count=%u)",
                 account, (void*)managing_server,
                 (void*)session->hs_client, session->hs_alias_count);
+      }  /* 5-5e M6d: close the managing_server scope */
     }
     if (!session->hs_client) {
       /* Orphaned ACTIVE session — reclaim as primary */
@@ -2131,13 +2194,44 @@ void bounce_crdt_bsess_sweep(void)
                         "doc-holder=%u gen=%u", s->hs_account, s->hs_sessid,
                         cli_yxx(&me), cur->host, cur->generation);
           } else {
-            /* We hold a live primary but the doc says another FRESH node holds the lease:
-             * the split-brain the lease resolves.  At M6 this node demotes/yields. */
+            /* We hold a live primary but the doc says another FRESH node holds the
+             * lease — the split-brain the lease resolves.  5-5e M6d: stand down by
+             * DEMOTING our live primary to an alias of the winner.  The demote cascade
+             * IS the ghost-free heal handler: a normal QUIT ("Promoted to alias of …")
+             * to legacy + BX C to CRDT peers; the loser stays connected as a CHFL_ALIAS
+             * (inv #6/#7 — no exit_client, no suppression flag).  Self-disarms: post-
+             * demote hs_client is the remote winner, so MyConnect(hs_client) is false on
+             * the next sweep -> fires exactly once per heal. */
             log_write(LS_SYSTEM, L_NOTICE, 0,
-                      "CRDT blease M5: stand-down with live primary acct=%s sid=%s "
-                      "doc-holder=%u gen=%u (lease resolves at cutover)",
+                      "CRDT blease M6d: stand-down with live primary acct=%s sid=%s "
+                      "doc-holder=%u gen=%u -> demote to alias of winner",
                       s->hs_account, s->hs_sessid, cur ? cur->host : 0,
                       cur ? (unsigned)cur->generation : 0);
+            if (feature_bool(FEAT_CRDT_BOUNCER_DOC)) {
+              char pnum[16];
+              struct Client *winner = NULL;
+              if (crdt_shadow_bconn_primary(s->hs_account, s->hs_sessid, pnum, sizeof pnum))
+                winner = findNUser(pnum);
+              /* inv #8: peer_primary MUST be a real materialized Client (the transition
+               * derefs cli_user(peer_primary)->server).  Also require it to be NOT
+               * ourselves and to live on the LEASE-HOLDER server (cur->host) — the doc
+               * is_primary bconn can briefly lag and resolve to our own old primary
+               * before convergence; demoting to self would be wrong.  Skip-and-retry on
+               * the next sweep until the winner's primary has converged here. */
+              if (winner && winner != s->hs_client && IsUser(winner) && cli_user(winner)
+                  && cli_user(winner)->server
+                  && (uint16_t)base64toint(cli_yxx(cli_user(winner)->server)) == cur->host) {
+                struct bounce_transition_params p;
+                memset(&p, 0, sizeof p);
+                p.demoted_alias = s->hs_client;   /* our live local primary (MyConnect) */
+                p.peer_primary  = winner;
+                if (0 == bounce_session_transition(s, BST_DEMOTE_TO_ALIAS, &p))
+                  log_write(LS_SYSTEM, L_NOTICE, 0,
+                            "CRDT blease M6d: demoted local primary to alias of %s "
+                            "(acct=%s sid=%s)", pnum, s->hs_account, s->hs_sessid);
+                /* hs_client is now the remote winner; this branch won't re-fire. */
+              }
+            }
           }
         }
       }

@@ -641,6 +641,18 @@ int crdt_shadow_bsess_present(const char *account, const char *sessid)
   return crdt_bsess_get(&g_crdt, account, sessid) != NULL;
 }
 
+/* 5-5e M6d: the full P10 numeric of the doc-recorded PRIMARY connection for
+ * (account,sessid), or NULL if none in the doc.  Used by the lease-authoritative
+ * resume decision to resolve the live holder's primary Client (findNUser) when a
+ * fresh connection must alias onto a still-live holder rather than reclaim. */
+const char *crdt_shadow_bconn_primary(const char *account, const char *sessid,
+                                      char *out, size_t outsz)
+{
+  if (!shadow_on())
+    return NULL;
+  return crdt_bconn_primary(&g_crdt, account, sessid, out, outsz);
+}
+
 /* 5-5e M4: per-connection roster wrappers + a reconcile-style reap. */
 void crdt_shadow_bconn_set(const char *account, const char *sessid,
                            const char *connnum, const struct CrdtBouncerConn *rec)
