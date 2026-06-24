@@ -380,6 +380,14 @@ int server_finish_burst(struct Client *cptr)
     return 0;
   }
 
+  /* R6c gap fix: a freshly-linked LEGACY peer never received the present-stub
+   * SERVER intros — crdt_present_stub broadcasts them once at stub-detection
+   * time (before this peer existed), and presented stubs are excluded from the
+   * normal SERVER-tree burst above.  Backfill them now (targeted) so the N/BURST
+   * loops below can place their users.  No-op for CRDT-aware peers (they got the
+   * CR F snapshot) and for non-gateways. */
+  crdt_shadow_present_stubs_to(cptr);
+
   for (acptr = &me; acptr; acptr = cli_prev(acptr))
   {
     /* acptr->from == acptr for acptr == cptr */

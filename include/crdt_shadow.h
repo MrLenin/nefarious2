@@ -207,6 +207,12 @@ void crdt_shadow_present_mesh_servers(void);
  *  is presentable to legacy the moment its beacon arrives.  @a yxx = 2-char server numeric. */
 void crdt_shadow_present_one_num(const char *yxx);
 
+/** R6c gap fix: backfill presented mesh stubs to a freshly-linked LEGACY peer.
+ *  present_stub broadcasts at stub-detection time only, so a peer linking later
+ *  never learns the stub (its users then can't be placed).  Call at the top of
+ *  server_finish_burst's legacy path; targeted, so existing peers are untouched. */
+void crdt_shadow_present_stubs_to(struct Client *cptr);
+
 /** Build this server's own direct-CRDT-peer set (comma-joined base64 numerics)
  *  into @a out for the CR H beacon AND record our own mesh-map row locally.
  *  Returns the peer count.  Observability-only (see crdt_meshmap.h). */

@@ -1273,6 +1273,43 @@ void crdt_shadow_present_one_num(const char *yxx)
   crdt_present_one((unsigned int)base64toint(yxx));
 }
 
+/* R6c gap fix: backfill — present every currently-PRESENTED mesh stub to a
+ * FRESHLY-LINKED legacy peer @a cptr.  crdt_present_stub() emits the stub's
+ * SERVER intro only ONCE (FLAG_CRDT_PRESENTED) and as a BROADCAST to whatever
+ * legacy peers exist AT STUB-DETECTION TIME; presented stubs are also excluded
+ * from the normal SERVER-tree burst.  So a legacy peer that links LATER never
+ * learns the stub and cannot place its users.  This re-emits each presented
+ * stub's SERVER intro TARGETED to cptr (so already-present peers are untouched);
+ * called at the top of server_finish_burst's legacy path, it precedes the
+ * N/BURST loops, which then place the stub's users naturally.  Iterating
+ * IsPresented servers is precisely the right set: real STAT_SERVERs and
+ * proxied-legacy rows never receive FLAG_CRDT_PRESENTED.  Legacy-only — a
+ * CRDT-aware peer gets the CR F snapshot instead. */
+void crdt_shadow_present_stubs_to(struct Client *cptr)
+{
+  unsigned int num;
+  if (!cptr || IsCrdtAware(cptr) || !IsServer(cptr) ||
+      !crdt_shadow_active() || !feature_bool(FEAT_CRDT_LEGACY_PRESENCE) ||
+      !crdt_gateway_has_legacy_peer())
+    return;
+  for (num = 0; num < CRDT_MAX_SERVERS; num++) {
+    char yxx[4];
+    struct Client *srv;
+    inttobase64(yxx, num, 2);
+    srv = FindNServer(yxx);
+    if (!srv || !IsPresented(srv) || !cli_serv(srv))
+      continue;
+    sendcmdto_one(&me, CMD_SERVER, cptr,
+                  "%s 2 0 %Tu J%02u %s%s +%s%s :%s",
+                  cli_name(srv), cli_serv(srv)->timestamp, Protocol(srv),
+                  NumServCap(srv), IsHub(srv) ? "h" : "",
+                  IsIPv6(srv) ? "6" : "", cli_info(srv));
+    log_write(LS_SYSTEM, L_NOTICE, 0,
+              "CRDT mesh: backfilled presented stub %s to freshly-linked legacy %s (R6c)",
+              cli_name(srv), cli_name(cptr));
+  }
+}
+
 void crdt_shadow_topic(struct Channel *chptr, struct Client *from)
 {
   if (!shadow_on())
