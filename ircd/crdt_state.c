@@ -1158,6 +1158,25 @@ long crdt_blease_decide(const struct CrdtBouncerLease *cur, int cur_host_fresh,
   return (long)cur->generation + 1; /* prior holder stale -> revive (supersede) */
 }
 
+/* 5-5e M6d: the AUTHORITATIVE lease ACTION (pure; see header for the truth table). */
+enum CrdtBLeaseAction
+crdt_blease_action(const struct CrdtBouncerLease *cur, uint16_t me,
+                   int holder_beacon_fresh, int have_local_primary, int want_revive)
+{
+  if (!cur)
+    return CRDT_BLEASE_NOOP;          /* no lease yet: the claim path owns this */
+  if (cur->host == me)
+    return CRDT_BLEASE_NOOP;          /* I am the authoritative holder */
+  if (holder_beacon_fresh)
+    /* another LIVE holder owns it: a local primary here is the split-brain loser and
+     * stands down; a bare replica does nothing. */
+    return have_local_primary ? CRDT_BLEASE_DEMOTE_TO_ALIAS : CRDT_BLEASE_NOOP;
+  /* holder stale/gone */
+  if (want_revive)
+    return CRDT_BLEASE_REVIVE_LOCAL;  /* a fresh connection takes over a split-away holder */
+  return CRDT_BLEASE_NOOP;            /* not a revive site: the periodic claim supersedes it */
+}
+
 /* Merge an incoming lease into the bleases map. Order-independent in VALUE: the stored
  * entry always converges to the comparator-max of all claims seen, regardless of arrival
  * order (a join over the total order). Because the underlying LWW store gates writes by

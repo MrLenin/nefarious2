@@ -628,6 +628,44 @@ static void test_blease_decide(void **state)
   assert_int_equal(4, (int)crdt_blease_decide(&cur, 0, 5));   /* other stale -> revive gen+1 */
 }
 
+/* 5-5e M6d: the authoritative lease ACTION truth table — NOOP / REVIVE_LOCAL / DEMOTE_TO_ALIAS.
+ * Args: (lease, me, holder_beacon_fresh, have_local_primary, want_revive). */
+static void test_blease_action(void **state)
+{
+  (void)state;
+  struct CrdtBouncerLease cur;
+  memset(&cur, 0, sizeof cur);
+
+  /* no lease -> always NOOP (the claim path owns a fresh session) */
+  assert_int_equal(CRDT_BLEASE_NOOP, crdt_blease_action(NULL, 5, 0, 1, 1));
+
+  /* lease held by me -> NOOP regardless of the rest */
+  cur.host = 5; cur.generation = 2;
+  assert_int_equal(CRDT_BLEASE_NOOP, crdt_blease_action(&cur, 5, 1, 1, 1));
+  assert_int_equal(CRDT_BLEASE_NOOP, crdt_blease_action(&cur, 5, 0, 1, 1));
+
+  /* another holder, beacon FRESH (live elsewhere) */
+  cur.host = 9;
+  assert_int_equal(CRDT_BLEASE_DEMOTE_TO_ALIAS,            /* my live primary is the loser */
+                   crdt_blease_action(&cur, 5, 1, 1, 0));
+  assert_int_equal(CRDT_BLEASE_NOOP,                       /* bare replica: nothing to do */
+                   crdt_blease_action(&cur, 5, 1, 0, 0));
+  assert_int_equal(CRDT_BLEASE_NOOP,                       /* fresh holder beats want_revive */
+                   crdt_blease_action(&cur, 5, 1, 0, 1));
+  assert_int_equal(CRDT_BLEASE_DEMOTE_TO_ALIAS,            /* fresh holder: still demote, never revive */
+                   crdt_blease_action(&cur, 5, 1, 1, 1));
+
+  /* another holder, beacon STALE (split-away / dead) */
+  assert_int_equal(CRDT_BLEASE_REVIVE_LOCAL,              /* revive site takes over */
+                   crdt_blease_action(&cur, 5, 0, 0, 1));
+  assert_int_equal(CRDT_BLEASE_REVIVE_LOCAL,
+                   crdt_blease_action(&cur, 5, 0, 1, 1));
+  assert_int_equal(CRDT_BLEASE_NOOP,                      /* not a revive site: claim supersedes */
+                   crdt_blease_action(&cur, 5, 0, 1, 0));
+  assert_int_equal(CRDT_BLEASE_NOOP,
+                   crdt_blease_action(&cur, 5, 0, 0, 0));
+}
+
 /* 5-5e M5: the lease register converges to the comparator-winner regardless of order, the
  * revive (gen+1) supersedes a stale predecessor on heal, re-apply is idempotent, the
  * value-only digest agrees, and a tombstone is never resurrected. */
@@ -2222,6 +2260,7 @@ int main(void)
     cmocka_unit_test(test_bconn_roster),
     cmocka_unit_test(test_blease_compare),
     cmocka_unit_test(test_blease_decide),
+    cmocka_unit_test(test_blease_action),
     cmocka_unit_test(test_blease_converges),
     cmocka_unit_test(test_blease_symmetric_dual_revive),
     cmocka_unit_test(test_shun_op_replicates),

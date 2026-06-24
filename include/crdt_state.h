@@ -491,6 +491,25 @@ int crdt_blease_compare(const struct CrdtBouncerLease *a,
  *  beacon STALE -> revive at generation+1 (supersede); cur held by another and FRESH -> -1. */
 long crdt_blease_decide(const struct CrdtBouncerLease *cur, int cur_host_fresh,
                         uint16_t me);
+
+/** 5-5e M6d: the AUTHORITATIVE lease ACTION (PURE; cmocka-gated truth table).  Maps the
+ *  converged lease to the concrete bouncer operation THIS node must take, layering
+ *  have-local-primary + revive-site context onto crdt_blease_decide's generation math:
+ *    - no lease / lease is mine          -> NOOP (claim path owns it)
+ *    - other holder, beacon FRESH        -> DEMOTE_TO_ALIAS if I hold a live local primary
+ *                                           (split-brain loser stands down), else NOOP (replica)
+ *    - other holder, beacon STALE        -> REVIVE_LOCAL if this is a revive site (a fresh
+ *                                           connection resuming a split-away/dead holder), else
+ *                                           NOOP (the periodic claim supersedes the stale holder).
+ *  A FRESH holder always wins over want_revive (never revive a live holder). */
+enum CrdtBLeaseAction {
+  CRDT_BLEASE_NOOP = 0,
+  CRDT_BLEASE_REVIVE_LOCAL,
+  CRDT_BLEASE_DEMOTE_TO_ALIAS
+};
+enum CrdtBLeaseAction crdt_blease_action(const struct CrdtBouncerLease *cur, uint16_t me,
+                                         int holder_beacon_fresh, int have_local_primary,
+                                         int want_revive);
 /** 5-5e M5: claim/refresh the lease for (account,sessid) at @a generation, host @a host.
  *  Deterministic-merge: records + applies an op ONLY if the claim beats the current via the
  *  comparator (an idempotent re-affirm is a no-op -> no per-sweep op storm).  Never resurrects
