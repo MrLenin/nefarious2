@@ -96,6 +96,11 @@ void crdt_shadow_blease_claim(const char *account, const char *sessid, uint16_t 
 void crdt_shadow_blease_remove(const char *account, const char *sessid);
 int crdt_shadow_server_beacon_fresh(uint16_t num);
 
+/** 5-5e M6a (cutover): doc->live reconcile of bouncer session records — materialize a
+ *  replica BouncerSession on non-holder nodes from the converged doc.  Gated
+ *  FEAT_CRDT_BOUNCER_DOC; inert while BS/BX relay still flows (idempotent). */
+void crdt_shadow_reconcile_bouncer(void);
+
 /** Tier2 P1: true if @a u is a "mesh-only" user — its owning server is a
  *  STAT_MESH_SERVER stub (tree-departed but mesh-reachable).  Legacy (non-CRDT)
  *  peers already received the SQUIT for its server and never got its NICK, so the

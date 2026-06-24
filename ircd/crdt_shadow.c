@@ -755,6 +755,66 @@ int crdt_shadow_server_beacon_fresh(uint16_t num)
          (CurrentTime - crdt_beacon[num].recv_ts) <= CRDT_BEACON_STALE;
 }
 
+/* 5-5e M6a (doc-native bouncer cutover): doc->live reconcile of bouncer SESSION records.
+ * For each bsessions doc entry whose authoritative lease holder != us and for which we
+ * have no local session, materialize a REPLICA (bounce_create_replica_from_doc). This is
+ * the rebuild-from-doc that becomes load-bearing once M6b suppresses BS/BX relay among
+ * CRDT peers; while relay still flows it is INERT (bounce_find_by_token hits -> 0 creates
+ * at rest = the shadow-of-the-shadow proof). Gated FEAT_CRDT_BOUNCER_DOC (rolled
+ * node-by-node) + FEAT_CRDT_PRIMARY. M6a-2 will materialize the alias roster (bconns);
+ * this step does sessions only. */
+struct reconcile_bsess_ctx { unsigned created; };
+static void reconcile_bsess_cb(const char *key, uint32_t key_len,
+                               const struct CrdtLWWValue *val, void *ctx)
+{
+  struct reconcile_bsess_ctx *c = ctx;
+  const struct CrdtBouncerSession *rec;
+  const struct CrdtBouncerLease *lease;
+  const char *p;
+  uint32_t alen, slen;
+  char account[ACCOUNTLEN + 1], sessid[64], origin[4];
+  uint16_t myn;
+  if (!val->data || val->data_len != sizeof(struct CrdtBouncerSession))
+    return;                                   /* tombstone / wrong size */
+  rec = (const struct CrdtBouncerSession *)val->data;
+  p = memchr(key, '\0', key_len);             /* key = account\0sessid */
+  if (!p)
+    return;
+  alen = (uint32_t)(p - key);
+  slen = key_len - alen - 1;
+  if (alen > ACCOUNTLEN || slen == 0 || slen >= sizeof sessid)
+    return;
+  memcpy(account, key, alen);  account[alen] = '\0';
+  memcpy(sessid, p + 1, slen); sessid[slen] = '\0';
+  if (bounce_find_by_token(rec->token))
+    return;                                   /* already have it (relay or prior reconcile) */
+  lease = crdt_blease_get(&g_crdt, account, sessid);
+  if (!lease)
+    return;                                   /* no authoritative holder claimed yet */
+  myn = (uint16_t)base64toint(cli_yxx(&me));
+  if (lease->host == myn)
+    return;                                   /* I am the holder but have no local session — anomaly; skip */
+  inttobase64(origin, lease->host, 2);
+  origin[2] = '\0';
+  if (bounce_create_replica_from_doc(account, sessid, rec->token, origin,
+                                     (time_t)rec->created, (time_t)rec->last_active,
+                                     (time_t)rec->total_active, rec->attach_count,
+                                     (int)rec->state))
+    c->created++;
+}
+
+void crdt_shadow_reconcile_bouncer(void)
+{
+  struct reconcile_bsess_ctx c = { 0 };
+  if (!shadow_on() || !feature_bool(FEAT_CRDT_BOUNCER_DOC) ||
+      !feature_bool(FEAT_CRDT_PRIMARY))
+    return;
+  crdt_lwwmap_foreach(&g_crdt.bsessions, reconcile_bsess_cb, &c);
+  if (c.created)
+    log_write(LS_SYSTEM, L_NOTICE, 0,
+              "CRDT bouncer-reconcile: created %u replica session(s) from doc", c.created);
+}
+
 /* Phase 4c: server reachability is a LOCAL determination, NOT replicated state.
  *
  * Phase 4a tried to replicate per-server ACTIVE/SPLIT in the convergent doc (a
@@ -3842,6 +3902,7 @@ static void crdt_shadow_verify_cb(struct Event *ev)
   crdt_shadow_reconcile_zlines();  /* ZLINE: drive global Z-lines from doc (+gateway) */
   crdt_shadow_reconcile_jupes();   /* JUPE: drive juped servers from doc (+gateway) */
   bounce_crdt_bsess_sweep();       /* 5-5e M2: mirror local-holder bouncer sessions -> doc (shadow) */
+  crdt_shadow_reconcile_bouncer(); /* 5-5e M6a: doc -> live replica sessions (FEAT_CRDT_BOUNCER_DOC; inert while relay flows) */
   { uint32_t bs = crdt_lwwmap_size(&g_crdt.bsessions);   /* M2 convergence signal: same on every node */
     uint32_t bc = crdt_lwwmap_size(&g_crdt.bconns);      /* M4 convergence signal */
     uint32_t bl = crdt_lwwmap_size(&g_crdt.bleases);     /* M5 convergence signal (per-node, incl. non-holders) */

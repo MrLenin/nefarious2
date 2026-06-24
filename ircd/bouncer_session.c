@@ -1970,6 +1970,54 @@ int session_has_local_holder(struct BouncerSession *session)
   return 0;
 }
 
+/* 5-5e M6a (doc-native bouncer cutover): create a REPLICA BouncerSession from converged
+ * doc state on a node that is NOT the holder.  Byte-for-byte mirrors the BS-C "active"/
+ * "holding" replica path (bounce_handle_bs :4163-4211): hs_client=NULL, BOUNCE_ACTIVE/
+ * HOLDING, hs_origin = the lease holder's numeric, registered via token_hash_add +
+ * account_add_session, and CRUCIALLY no hold timer (the host owns the timer; a replica
+ * timer would race the host into premature destruction — invariant #1).  The caller
+ * (crdt_shadow_reconcile_bouncer) has already checked no local session exists for this
+ * token and that the lease holder != us.  Returns the new replica, or NULL on bad input.
+ * Channels/aliases are NOT populated here (M6a-2 materializes the alias roster). */
+struct BouncerSession *bounce_create_replica_from_doc(
+    const char *account, const char *sessid, const char *token,
+    const char *origin_yxx, time_t created, time_t last_active,
+    time_t total_active, unsigned int attach_count, int state)
+{
+  struct BouncerSession *session;
+  struct AccountSessions *as;
+  if (!account || !account[0] || !sessid || !sessid[0] || !token || !token[0])
+    return NULL;
+  session = (struct BouncerSession *)MyCalloc(1, sizeof(*session));
+  ircd_strncpy(session->hs_account, account, ACCOUNTLEN + 1);
+  ircd_strncpy(session->hs_sessid, sessid, BOUNCER_SESSID_LEN - 1);
+  ircd_strncpy(session->hs_token, token, BOUNCER_TOKEN_LEN + 1);
+  session->hs_name[0] = '\0';
+  session->hs_client = NULL;                 /* remote replica (no local socket) */
+  ircd_strncpy(session->hs_origin, origin_yxx, sizeof(session->hs_origin) - 1);
+  session->hs_origin[sizeof(session->hs_origin) - 1] = '\0';
+  session->hs_hold_override = -1;
+  session->hs_effective_away = 0;
+  session->hs_effective_away_msg[0] = '\0';
+  session->hs_created = created;
+  session->hs_last_active = last_active;
+  session->hs_total_active = total_active;
+  session->hs_attach_count = attach_count;
+  if (state == BOUNCE_HOLDING) {
+    session->hs_state = BOUNCE_HOLDING;
+    session->hs_enforced = 0;
+    session->hs_disconnect_time = CurrentTime;  /* host owns the authoritative timer */
+  } else {
+    session->hs_state = BOUNCE_ACTIVE;
+    session->hs_disconnect_time = 0;
+  }
+  /* NO hold timer on a replica — host-only (invariant #1). */
+  token_hash_add(session);
+  as = account_sessions_get(session->hs_account, 1);
+  account_add_session(as, session);
+  return session;
+}
+
 /* 5-5e M2 (doc-native bouncer, SHADOW): mirror every session this node is the PRIMARY
  * holder of into the BSESSIONS doc collection.  Single-writer (primary holder only) ->
  * no two nodes write the same record.  Shadow-only: the doc is written + converges +

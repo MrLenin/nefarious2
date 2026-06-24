@@ -485,6 +485,12 @@ extern int bounce_create(struct Client *cptr, struct BouncerSession **session);
  */
 extern struct BouncerSession *bounce_find_by_token(const char *token);
 
+/* 5-5e M6a: create a replica BouncerSession from converged doc state (non-holder node). */
+extern struct BouncerSession *bounce_create_replica_from_doc(
+    const char *account, const char *sessid, const char *token,
+    const char *origin_yxx, time_t created, time_t last_active,
+    time_t total_active, unsigned int attach_count, int state);
+
 /** Look up sessions for an account.
  * @param[in] account Account name.
  * @return AccountSessions pointer, or NULL if no sessions.

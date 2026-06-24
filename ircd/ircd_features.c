@@ -1379,6 +1379,7 @@ static struct FeatureDesc {
   F_B(CRDT_GATEWAY_BRIDGE, 0, 0, 0),
   F_B(CRDT_TREE_RETIRE, 0, 0, 0),
   F_B(CRDT_SERVICES_BRIDGE, 0, 0, 0),
+  F_B(CRDT_BOUNCER_DOC, 0, 0, 0),
 
 #undef F_S
 #undef F_B

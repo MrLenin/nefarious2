@@ -518,6 +518,7 @@ enum Feature {
   FEAT_CRDT_GATEWAY_BRIDGE,     /* MR-4b: gateway re-emits a CR-M unicast addressed to a fronted legacy user as a real P10 PRIVMSG/NOTICE (the reverse-PM dead-sink fix) */
   FEAT_CRDT_TREE_RETIRE,        /* MR-5: suppress a CRDT server's SERVER intro among CRDT-both-ends peers (the SERVER half of tree-retirement; SQUIT half = FEAT_CRDT_MESHMAP_PRESENCE). Separate flag for a controlled cutover */
   FEAT_CRDT_SERVICES_BRIDGE,    /* Tier B: route SASL/ACCOUNT/REGISTER/XQUERY/etc. to/from x3.services over the mesh (CR X carrier) when x3 is reachable only as a dead-sink anchor. Gates the leaf CR-X emit + the gateway reverse-tunnel; the gateway P10 re-emit reuses FEAT_CRDT_GATEWAY_BRIDGE */
+  FEAT_CRDT_BOUNCER_DOC,        /* 5-5e M6: the CRDT doc is the AUTHORITATIVE transport for bouncer session/connection/lease state among CRDT peers (reconcile-from-doc drives live state + suppress P10 BS/BX relay toward CRDT peers + §17.7 gateway synthesizes legacy BS/BX). Default off, rolled node-by-node. The M2-M5 shadow mirror stays under FEAT_CRDT_PRIMARY; this flag flips read/authority on. */
 
   FEAT_LAST_F
 };
