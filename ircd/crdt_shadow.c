@@ -715,6 +715,46 @@ int crdt_shadow_bconn_roster_count(const char *account, const char *sessid)
   return crdt_bconn_roster_count(&g_crdt, account, sessid);
 }
 
+/* 5-5e M5: liveness-lease wrappers + the beacon-freshness liveness signal. */
+const struct CrdtBouncerLease *crdt_shadow_blease_get(const char *account,
+                                                      const char *sessid)
+{
+  if (!shadow_on())
+    return NULL;
+  return crdt_blease_get(&g_crdt, account, sessid);
+}
+
+void crdt_shadow_blease_claim(const char *account, const char *sessid, uint16_t host,
+                              uint32_t generation, uint64_t claim_ms)
+{
+  if (!shadow_on())
+    return;
+  crdt_blease_claim(&g_crdt, account, sessid, host, generation, claim_ms);
+  crdt_sync_push();
+}
+
+void crdt_shadow_blease_remove(const char *account, const char *sessid)
+{
+  if (!shadow_on())
+    return;
+  crdt_blease_del(&g_crdt, account, sessid);
+  crdt_sync_push();
+}
+
+/* Locally-derived liveness (HARD-INVARIANT-10): a server is "live" to us iff its CR-H
+ * self-beacon is FRESH (within the staleness window).  Our OWN numeric is always live.
+ * This is the signal the revive gate uses to decide a split holder has gone away — never
+ * a shared/replicated value. */
+int crdt_shadow_server_beacon_fresh(uint16_t num)
+{
+  if (num == (uint16_t)base64toint(cli_yxx(&me)))
+    return 1;
+  if (num >= CRDT_MAX_SERVERS)
+    return 0;
+  return crdt_beacon[num].recv_ts != 0 &&
+         (CurrentTime - crdt_beacon[num].recv_ts) <= CRDT_BEACON_STALE;
+}
+
 /* Phase 4c: server reachability is a LOCAL determination, NOT replicated state.
  *
  * Phase 4a tried to replicate per-server ACTIVE/SPLIT in the convergent doc (a
@@ -3804,9 +3844,10 @@ static void crdt_shadow_verify_cb(struct Event *ev)
   bounce_crdt_bsess_sweep();       /* 5-5e M2: mirror local-holder bouncer sessions -> doc (shadow) */
   { uint32_t bs = crdt_lwwmap_size(&g_crdt.bsessions);   /* M2 convergence signal: same on every node */
     uint32_t bc = crdt_lwwmap_size(&g_crdt.bconns);      /* M4 convergence signal */
-    if (bs || bc)
+    uint32_t bl = crdt_lwwmap_size(&g_crdt.bleases);     /* M5 convergence signal (per-node, incl. non-holders) */
+    if (bs || bc || bl)
       log_write(LS_SYSTEM, L_NOTICE, 0,
-                "CRDT bouncer doc: %u session(s), %u connection(s)", bs, bc); }
+                "CRDT bouncer doc: %u session(s), %u connection(s), %u lease(s)", bs, bc, bl); }
   crdt_sync_broadcast();   /* periodic anti-entropy: pull deltas from peers */
   crdt_shadow_gc();        /* reclaim causally-stable ops/tombstones */
 

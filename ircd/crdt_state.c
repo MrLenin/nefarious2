@@ -150,6 +150,7 @@ void crdt_state_init(struct CrdtNetworkState *st, uint16_t my_numeric)
   crdt_lwwmap_init(&st->jupes);
   crdt_lwwmap_init(&st->bsessions);
   crdt_lwwmap_init(&st->bconns);
+  crdt_lwwmap_init(&st->bleases);
 }
 
 void crdt_state_clear(struct CrdtNetworkState *st)
@@ -170,6 +171,7 @@ void crdt_state_clear(struct CrdtNetworkState *st)
   crdt_lwwmap_clear(&st->jupes);
   crdt_lwwmap_clear(&st->bsessions);
   crdt_lwwmap_clear(&st->bconns);
+  crdt_lwwmap_clear(&st->bleases);
   for (int b = 0; b < CRDT_CHAN_BUCKETS; b++) {
     struct CrdtChannel *c = st->chan_buckets[b];
     while (c) {
@@ -1078,6 +1080,139 @@ int crdt_bconn_roster_count(const struct CrdtNetworkState *st,
 }
 
 /* ------------------------------------------------------------------ */
+/* 5-5e M5: liveness lease — a deterministic-merge (comparator) register */
+/* ------------------------------------------------------------------ */
+
+/* PURE comparator (cmocka-gated). Total order: higher generation wins; tie -> lower
+ * host numeric. Returns >0 (a wins), <0 (b wins), 0 (identical authority). claim_ms
+ * is deliberately NOT consulted — (generation,host) is already total since numerics
+ * are unique, so the register is a clean join-semilattice. */
+int crdt_blease_compare(const struct CrdtBouncerLease *a,
+                        const struct CrdtBouncerLease *b)
+{
+  if (a->generation != b->generation)
+    return (a->generation > b->generation) ? 1 : -1;
+  if (a->host != b->host)
+    return (a->host < b->host) ? 1 : -1;
+  return 0;
+}
+
+/* PURE claim decision (cmocka-gated truth table). See header. */
+long crdt_blease_decide(const struct CrdtBouncerLease *cur, int cur_host_fresh,
+                        uint16_t me)
+{
+  if (!cur)
+    return 0;                       /* fresh session: me becomes the gen-0 holder */
+  if (cur->host == me)
+    return (long)cur->generation;   /* re-affirm my own claim (idempotent) */
+  if (cur_host_fresh)
+    return -1;                      /* another fresh holder -> stand down */
+  return (long)cur->generation + 1; /* prior holder stale -> revive (supersede) */
+}
+
+/* Merge an incoming lease into the bleases map. Order-independent in VALUE: the stored
+ * entry always converges to the comparator-max of all claims seen, regardless of arrival
+ * order (a join over the total order). Because the underlying LWW store gates writes by
+ * HLC, the comparator-winner is written with an HLC synthesized to strictly beat the
+ * stored one; the digest hashes the VALUE (host,generation) only, so the synthetic HLC
+ * never causes false divergence (mirrors the ctime register). A tombstoned key is never
+ * resurrected — a sessid is single-use, so any later SET to it is a stale re-delivery.
+ * Returns 1 if the stored value changed (used to suppress no-op ops locally). */
+static int blease_merge(struct CrdtNetworkState *st, const char *key, uint32_t klen,
+                        const struct CrdtBouncerLease *incoming, uint16_t writer,
+                        struct HLC fresh_ts)
+{
+  const struct CrdtLWWValue *cur;
+  struct HLC ts;
+  if (crdt_lwwmap_is_deleted(&st->bleases, key, klen))
+    return 0;                       /* session ended: lease key is single-use, never revive */
+  cur = crdt_lwwmap_get(&st->bleases, key, klen);
+  if (cur && cur->data && cur->data_len == sizeof(*incoming)) {
+    if (crdt_blease_compare(incoming, (const struct CrdtBouncerLease *)cur->data) <= 0)
+      return 0;                     /* current wins or identical -> no-op (idempotent) */
+    ts = cur->ts;                   /* synth an HLC strictly > the stored write so it sticks */
+    if (++ts.logical == 0)
+      ts.physical_ms++;
+  } else {
+    ts = fresh_ts;
+  }
+  crdt_lwwmap_set(&st->bleases, key, klen, incoming, sizeof(*incoming), ts, writer);
+  return 1;
+}
+
+void crdt_blease_claim(struct CrdtNetworkState *st, const char *account,
+                       const char *sessid, uint16_t host, uint32_t generation,
+                       uint64_t claim_ms)
+{
+  struct HLC ts = hlc_local_event(&st->clock);
+  char key[128];
+  uint32_t klen = bsess_key(account, sessid, key, sizeof key);  /* same account\0sessid shape */
+  struct CrdtBouncerLease rec;
+  uint64_t seq;
+  struct CrdtOp *op;
+  if (!klen)
+    return;
+  memset(&rec, 0, sizeof rec);      /* zero pad -> stable digest/wire layout */
+  rec.host       = host;
+  rec.generation = generation;
+  rec.claim_ms   = claim_ms;
+  if (!blease_merge(st, key, klen, &rec, st->my_numeric, ts))
+    return;                         /* no change (re-affirm / lost) -> no op storm */
+  seq = st->next_seq++;
+  op = op_new(st->my_numeric, seq, CRDT_OP_SET, CRDT_COLL_BLEASES);
+  op->key = memdup(key, klen);
+  op->key_len = klen;
+  op->val = memdup(&rec, sizeof rec);
+  op->val_len = sizeof rec;
+  op->ts = ts;
+  op->writer = st->my_numeric;
+  record(st, op);
+}
+
+void crdt_blease_del(struct CrdtNetworkState *st, const char *account,
+                     const char *sessid)
+{
+  struct HLC ts = hlc_local_event(&st->clock);
+  char key[128];
+  uint32_t klen = bsess_key(account, sessid, key, sizeof key);
+  uint64_t seq;
+  struct CrdtOp *op;
+  if (!klen)
+    return;
+  crdt_lwwmap_delete(&st->bleases, key, klen, ts, st->my_numeric);
+  seq = st->next_seq++;
+  op = op_new(st->my_numeric, seq, CRDT_OP_DELETE, CRDT_COLL_BLEASES);
+  op->key = memdup(key, klen);
+  op->key_len = klen;
+  op->ts = ts;
+  op->writer = st->my_numeric;
+  record(st, op);
+}
+
+/* Snapshot-apply entry point (crdt_wire.c): MERGE an incoming lease blob via the
+ * comparator (NOT a generic LWW assign, which would pick by HLC and break the register).
+ * Exposed parallel to crdt_chan_ctime_merge. */
+void crdt_blease_merge_snapshot(struct CrdtNetworkState *st, const char *key,
+                                uint32_t klen, const struct CrdtBouncerLease *rec,
+                                uint16_t writer, struct HLC ts)
+{
+  blease_merge(st, key, klen, rec, writer, ts);
+}
+
+const struct CrdtBouncerLease *crdt_blease_get(const struct CrdtNetworkState *st,
+                                               const char *account, const char *sessid)
+{
+  char key[128];
+  uint32_t klen = bsess_key(account, sessid, key, sizeof key);
+  const struct CrdtLWWValue *v;
+  if (!klen)
+    return NULL;
+  v = crdt_lwwmap_get(&st->bleases, key, klen);
+  return (v && v->data && v->data_len == sizeof(struct CrdtBouncerLease))
+           ? (const struct CrdtBouncerLease *)v->data : NULL;
+}
+
+/* ------------------------------------------------------------------ */
 /* sync / merge                                                       */
 /* ------------------------------------------------------------------ */
 
@@ -1099,6 +1234,7 @@ static struct CrdtLWWMap *lww_for(struct CrdtNetworkState *st,
   case CRDT_COLL_JUPES:         return &st->jupes;
   case CRDT_COLL_BSESSIONS:     return &st->bsessions;
   case CRDT_COLL_BCONNS:        return &st->bconns;
+  case CRDT_COLL_BLEASES:       return &st->bleases;
   default:                return NULL;
   }
 }
@@ -1136,6 +1272,14 @@ void crdt_state_apply_op(struct CrdtNetworkState *st, const struct CrdtOp *op)
                             pl->set_hlc, pl->del_hlc);
       hlc_receive(&st->clock, &pl->set_hlc);       /* advance our clock */
     }
+  } else if (op->coll == CRDT_COLL_BLEASES) {  /* 5-5e M5 comparator-merge register */
+    if (op->type == CRDT_OP_SET && op->val &&
+        op->val_len == sizeof(struct CrdtBouncerLease))
+      blease_merge(st, op->key, op->key_len,
+                   (const struct CrdtBouncerLease *)op->val, op->writer, op->ts);
+    else if (op->type == CRDT_OP_DELETE)
+      crdt_lwwmap_delete(&st->bleases, op->key, op->key_len, op->ts, op->writer);
+    hlc_receive(&st->clock, &op->ts);            /* advance our clock */
   } else {
     struct CrdtLWWMap *map = lww_for(st, op->coll);
     if (op->type == CRDT_OP_SET)
@@ -1300,6 +1444,32 @@ static uint64_t digest_ctime(uint64_t acc, const struct CrdtChannel *c)
   return acc;
 }
 
+/* 5-5e M5: hash the lease's AUTHORITY value (host,generation) only — NOT the synthetic
+ * write HLC/writer (which legitimately differ per node after a comparator-merge), and NOT
+ * claim_ms (observability only). Mirrors digest_ctime's value-only convergence. Tombstones
+ * are hashed by key+deleted so a converged tombstone matches. */
+static uint64_t digest_blease(uint64_t acc, const struct CrdtLWWMap *m, uint8_t ns)
+{
+  uint32_t b;
+  for (b = 0; b < m->nbuckets; b++) {
+    struct CrdtLWWEntry *e;
+    for (e = m->buckets[b]; e; e = e->ht_next) {
+      uint64_t h = FNV64_OFFSET;
+      h = fnv64(h, &ns, 1);
+      h = fnv64(h, e->key, e->key_len);
+      h = fnv64(h, &e->deleted, sizeof e->deleted);
+      if (!e->deleted && e->val.data &&
+          e->val.data_len == sizeof(struct CrdtBouncerLease)) {
+        const struct CrdtBouncerLease *l = e->val.data;
+        h = fnv64(h, &l->host, sizeof l->host);
+        h = fnv64(h, &l->generation, sizeof l->generation);
+      }
+      acc ^= h;
+    }
+  }
+  return acc;
+}
+
 static uint64_t digest_orset(uint64_t acc, const struct CrdtORSet *s,
                              const char *cname, uint32_t cnlen, uint8_t ns)
 {
@@ -1349,6 +1519,7 @@ uint64_t crdt_state_digest(const struct CrdtNetworkState *st)
   acc = digest_lww(acc, &st->jupes, 15);   /* salt 15 */
   acc = digest_lww(acc, &st->bsessions, 16); /* salt 16: 5-5e bouncer sessions */
   acc = digest_lww(acc, &st->bconns, 17);    /* salt 17: 5-5e M4 bouncer connections */
+  acc = digest_blease(acc, &st->bleases, 18);/* salt 18: 5-5e M5 lease (value-only) */
   for (bk = 0; bk < CRDT_CHAN_BUCKETS; bk++) {
     struct CrdtChannel *c;
     for (c = st->chan_buckets[bk]; c; c = c->next) {
@@ -1403,6 +1574,7 @@ uint64_t crdt_state_digest_materialized(const struct CrdtNetworkState *st)
   acc = digest_lww(acc, &st->jupes, 15);   /* salt 15 */
   acc = digest_lww(acc, &st->bsessions, 16); /* salt 16: 5-5e bouncer sessions */
   acc = digest_lww(acc, &st->bconns, 17);    /* salt 17: 5-5e M4 bouncer connections */
+  acc = digest_blease(acc, &st->bleases, 18);/* salt 18: 5-5e M5 lease (value-only) */
   for (bk = 0; bk < CRDT_CHAN_BUCKETS; bk++) {
     struct CrdtChannel *c;
     for (c = st->chan_buckets[bk]; c; c = c->next) {

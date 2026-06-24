@@ -316,6 +316,7 @@ int crdt_snapshot_encode(const struct CrdtNetworkState *st,
   snap_put_lww(&w, &st->jupes, (uint8_t)CRDT_COLL_JUPES, &lww_total);
   snap_put_lww(&w, &st->bsessions, (uint8_t)CRDT_COLL_BSESSIONS, &lww_total); /* 5-5e */
   snap_put_lww(&w, &st->bconns, (uint8_t)CRDT_COLL_BCONNS, &lww_total);       /* 5-5e M4 */
+  snap_put_lww(&w, &st->bleases, (uint8_t)CRDT_COLL_BLEASES, &lww_total);     /* 5-5e M5 */
   wpatch_u32(&w, lww_off, lww_total);
 
   /* channels: members / bans / excepts */
@@ -415,6 +416,12 @@ int crdt_snapshot_apply(struct CrdtNetworkState *st,
     if (map) {
       if (deleted)
         crdt_lwwmap_delete(map, key ? key : "", klen, ts, writer);
+      else if (coll == (uint8_t)CRDT_COLL_BLEASES &&
+               vlen == sizeof(struct CrdtBouncerLease))
+        /* 5-5e M5: comparator-merge, NOT a generic HLC-LWW assign (which would regress
+         * the lease to a clock-skewed loser on snapshot catch-up). Mirrors ctime. */
+        crdt_blease_merge_snapshot(st, key ? key : "", klen,
+                                   (const struct CrdtBouncerLease *)val, writer, ts);
       else
         crdt_lwwmap_set(map, key ? key : "", klen, val, vlen, ts, writer);
     }

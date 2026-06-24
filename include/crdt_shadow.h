@@ -84,6 +84,18 @@ void crdt_shadow_bconn_remove(const char *account, const char *sessid,
 void crdt_shadow_bconn_reap(void);
 int crdt_shadow_bconn_roster_count(const char *account, const char *sessid);
 
+/** 5-5e M5 (liveness lease, SHADOW): claim/refresh, tombstone, and read the per-session
+ *  liveness lease in the BLEASES comparator-merge register.  crdt_shadow_blease_get returns
+ *  the converged lease (NULL if none); crdt_shadow_server_beacon_fresh reports whether a
+ *  server's CR-H beacon is FRESH (the locally-derived liveness signal the revive gate uses). */
+struct CrdtBouncerLease;
+const struct CrdtBouncerLease *crdt_shadow_blease_get(const char *account,
+                                                      const char *sessid);
+void crdt_shadow_blease_claim(const char *account, const char *sessid, uint16_t host,
+                              uint32_t generation, uint64_t claim_ms);
+void crdt_shadow_blease_remove(const char *account, const char *sessid);
+int crdt_shadow_server_beacon_fresh(uint16_t num);
+
 /** Tier2 P1: true if @a u is a "mesh-only" user — its owning server is a
  *  STAT_MESH_SERVER stub (tree-departed but mesh-reachable).  Legacy (non-CRDT)
  *  peers already received the SQUIT for its server and never got its NICK, so the

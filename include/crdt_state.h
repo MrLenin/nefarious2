@@ -209,6 +209,24 @@ struct CrdtBouncerConn {
   uint8_t  caps_known;                  /**< 0 if caps not yet learned */
 };
 
+/** Per-session liveness lease (5-5e M5 doc-native bouncer — THE GATE).  Keyed by
+ *  account\0sessid in the `bleases` LWW-map (one entry per session).  Unlike a plain LWW
+ *  value, the lease is a DETERMINISTIC-MERGE (comparator) register — structurally the
+ *  Phase-3j ctime min-register clone — so the authoritative live-socket holder converges
+ *  regardless of clock skew or op order: the claim with the HIGHER generation wins (a revive
+ *  supersedes a stale predecessor); a tie in generation breaks to the LOWER host numeric (the
+ *  symmetric-dual-revive collapse to primary+alias).  Generation is a LOGICAL counter (immune
+ *  to clock skew, unlike naive HLC-LWW which the abandoned Phase-4a servers-map proved
+ *  diverges).  HARD-INVARIANT-10: liveness is single-writer-per-claimant + LOCALLY-DERIVED
+ *  (beacon-gated revive), never naive shared LWW.  M5 = SHADOW only (computed/logged, NOT
+ *  authoritative; M6 cutover flips that). */
+struct CrdtBouncerLease {
+  uint16_t host;        /**< claiming server numeric (the live-socket holder) */
+  uint8_t  pad[2];      /**< explicit pad -> stable digest layout */
+  uint32_t generation;  /**< supersession counter; bumped on takeover-from-stale */
+  uint64_t claim_ms;    /**< wall-clock of the claim (observability; NOT in compare/digest) */
+};
+
 /*
  * Operation log — the unit of replication (proposal §17.1.5).
  */
@@ -238,7 +256,8 @@ enum CrdtCollection {
   CRDT_COLL_ZLINES,        /**< ip-mask -> CrdtZlineRecord (LWW) — global-state track */
   CRDT_COLL_JUPES,         /**< server-name -> CrdtJupeRecord (LWW) — global-state track */
   CRDT_COLL_BSESSIONS,     /**< account\0sessid -> CrdtBouncerSession (LWW) — 5-5e doc-native bouncer */
-  CRDT_COLL_BCONNS         /**< account\0sessid\0connnum -> CrdtBouncerConn (LWW) — 5-5e M4 */
+  CRDT_COLL_BCONNS,        /**< account\0sessid\0connnum -> CrdtBouncerConn (LWW) — 5-5e M4 */
+  CRDT_COLL_BLEASES        /**< account\0sessid -> CrdtBouncerLease (comparator-merge) — 5-5e M5 */
 };
 
 struct CrdtOp {
@@ -320,6 +339,7 @@ struct CrdtNetworkState {
   struct CrdtLWWMap       jupes;        /**< server-name -> CrdtJupeRecord (global-state) */
   struct CrdtLWWMap       bsessions;    /**< account\0sessid -> CrdtBouncerSession (5-5e) */
   struct CrdtLWWMap       bconns;       /**< account\0sessid\0connnum -> CrdtBouncerConn (5-5e M4) */
+  struct CrdtLWWMap       bleases;      /**< account\0sessid -> CrdtBouncerLease (5-5e M5) */
   struct CrdtChannel     *chan_buckets[CRDT_CHAN_BUCKETS];
 };
 
@@ -451,6 +471,38 @@ int crdt_bconn_is_explicitly_removed(const struct CrdtNetworkState *st,
 /** 5-5e M4: number of LIVE (non-tombstoned) connections in the (account,sessid) roster. */
 int crdt_bconn_roster_count(const struct CrdtNetworkState *st,
                             const char *account, const char *sessid);
+/** 5-5e M5: the liveness-lease comparator (PURE; the riskiest single piece — cmocka-gated).
+ *  Returns >0 if @a a is the authoritative claim, <0 if @a b, 0 if identical.  Order: higher
+ *  generation wins; tie -> lower host numeric wins.  A TOTAL order (host numerics unique), so
+ *  the register merge keeping the comparator-max is a join-semilattice -> converges regardless
+ *  of op/delivery order or clock skew. */
+int crdt_blease_compare(const struct CrdtBouncerLease *a,
+                        const struct CrdtBouncerLease *b);
+/** 5-5e M5: the beacon-gated claim DECISION (PURE; cmocka-gated truth table).  Given the
+ *  current converged lease @a cur (NULL if none), whether @a cur's host beacon is FRESH, and
+ *  this node's numeric @a me, returns the generation @a me should claim, or -1 to STAND DOWN
+ *  (another fresh holder already holds, so this node must not claim).  No lease -> claim gen 0;
+ *  cur held by me -> re-affirm @a cur's generation (idempotent); cur held by another but its
+ *  beacon STALE -> revive at generation+1 (supersede); cur held by another and FRESH -> -1. */
+long crdt_blease_decide(const struct CrdtBouncerLease *cur, int cur_host_fresh,
+                        uint16_t me);
+/** 5-5e M5: claim/refresh the lease for (account,sessid) at @a generation, host @a host.
+ *  Deterministic-merge: records + applies an op ONLY if the claim beats the current via the
+ *  comparator (an idempotent re-affirm is a no-op -> no per-sweep op storm).  Never resurrects
+ *  a tombstoned (session-ended) lease key — sessid is single-use. */
+void crdt_blease_claim(struct CrdtNetworkState *st, const char *account,
+                       const char *sessid, uint16_t host, uint32_t generation,
+                       uint64_t claim_ms);
+/** 5-5e M5: tombstone the lease (session destroyed). */
+void crdt_blease_del(struct CrdtNetworkState *st, const char *account,
+                     const char *sessid);
+/** 5-5e M5: the current converged lease for (account,sessid), or NULL if none/tombstoned. */
+const struct CrdtBouncerLease *crdt_blease_get(const struct CrdtNetworkState *st,
+                                               const char *account, const char *sessid);
+/** 5-5e M5: snapshot-apply MERGE of a lease blob via the comparator (crdt_wire.c). */
+void crdt_blease_merge_snapshot(struct CrdtNetworkState *st, const char *key,
+                                uint32_t klen, const struct CrdtBouncerLease *rec,
+                                uint16_t writer, struct HLC ts);
 /** Phase 3k: set/get per-kick metadata (LWW, keyed chan\0numeric). set() records a
  *  SET op so it replicates via delta; get() returns the LWW value (NULL if absent)
  *  so callers can read both the CrdtKickInfo payload and its HLC (.ts) for the

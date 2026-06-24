@@ -571,6 +571,159 @@ static void test_bconn_roster(void **state)
   crdt_state_clear(&s2);
 }
 
+/* 5-5e M5: the liveness-lease comparator (PURE) — the riskiest single piece of logic.
+ * Total order: higher generation wins; tie -> lower host numeric. Antisymmetric; identical
+ * authority -> 0 (so the register merge no-ops on a re-affirm = idempotent). */
+static void test_blease_compare(void **state)
+{
+  (void)state;
+  struct CrdtBouncerLease a, b;
+  memset(&a, 0, sizeof a); memset(&b, 0, sizeof b);
+
+  /* higher generation wins regardless of host */
+  a.host = 9; a.generation = 2;
+  b.host = 1; b.generation = 1;
+  assert_true(crdt_blease_compare(&a, &b) > 0);
+  assert_true(crdt_blease_compare(&b, &a) < 0);   /* antisymmetric */
+
+  /* same generation -> LOWER host numeric wins (symmetric-dual-revive collapse) */
+  a.host = 7; a.generation = 5;
+  b.host = 3; b.generation = 5;
+  assert_true(crdt_blease_compare(&a, &b) < 0);    /* host 7 loses to host 3 */
+  assert_true(crdt_blease_compare(&b, &a) > 0);
+
+  /* identical authority (host+gen) -> 0, even if claim_ms differs (not consulted) */
+  a.host = 4; a.generation = 8; a.claim_ms = 1000;
+  b.host = 4; b.generation = 8; b.claim_ms = 9999;
+  assert_int_equal(0, crdt_blease_compare(&a, &b));
+}
+
+/* 5-5e M5: the beacon-gated claim DECISION (PURE) truth table:
+ *   no lease            -> claim gen 0
+ *   I already hold       -> re-affirm my generation (idempotent)
+ *   other holds, FRESH   -> stand down (-1)
+ *   other holds, STALE   -> revive at generation+1 (supersede) */
+static void test_blease_decide(void **state)
+{
+  (void)state;
+  struct CrdtBouncerLease cur;
+  memset(&cur, 0, sizeof cur);
+
+  assert_int_equal(0, (int)crdt_blease_decide(NULL, 0, 5));   /* fresh session */
+
+  cur.host = 5; cur.generation = 3;
+  assert_int_equal(3, (int)crdt_blease_decide(&cur, 1, 5));   /* my own claim -> re-affirm */
+  assert_int_equal(3, (int)crdt_blease_decide(&cur, 0, 5));   /* (freshness irrelevant when mine) */
+
+  cur.host = 9; cur.generation = 3;
+  assert_int_equal(-1, (int)crdt_blease_decide(&cur, 1, 5));  /* other fresh -> stand down */
+  assert_int_equal(4, (int)crdt_blease_decide(&cur, 0, 5));   /* other stale -> revive gen+1 */
+}
+
+/* 5-5e M5: the lease register converges to the comparator-winner regardless of order, the
+ * revive (gen+1) supersedes a stale predecessor on heal, re-apply is idempotent, the
+ * value-only digest agrees, and a tombstone is never resurrected. */
+static void test_blease_converges(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s1, s2;
+  const char *ACC = "alice", *SID = "AZ7cJWoJ-uuid-v7-22ch";
+  const struct CrdtBouncerLease *g;
+  crdt_state_init(&s1, 1);
+  crdt_state_init(&s2, 2);
+
+  /* node 1 is the original holder (gen 0) */
+  crdt_blease_claim(&s1, ACC, SID, 1, 0, 1000);
+  crdt_state_sync(&s2, &s1);
+  g = crdt_blease_get(&s2, ACC, SID);
+  assert_non_null(g);
+  assert_int_equal(1, g->host);
+  assert_int_equal(0, (int)g->generation);
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+
+  /* re-affirm on the holder is a no-op (no op storm) -> still converged, no change */
+  crdt_blease_claim(&s1, ACC, SID, 1, 0, 2000);
+  crdt_state_sync(&s2, &s1);
+  assert_int_equal(1, crdt_blease_get(&s2, ACC, SID)->host);
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+
+  /* PARTITION + REVIVE: node 2 sees node-1 stale, revives at gen+1 (decide -> 1) */
+  {
+    const struct CrdtBouncerLease *cur = crdt_blease_get(&s2, ACC, SID);
+    long gen = crdt_blease_decide(cur, 0 /*node1 beacon STALE*/, 2);
+    assert_int_equal(1, (int)gen);
+    crdt_blease_claim(&s2, ACC, SID, 2, (uint32_t)gen, 3000);
+  }
+  /* HEAL: exchange both ways -> both converge to host=2 gen=1 (the reviver supersedes) */
+  crdt_state_sync(&s1, &s2);
+  crdt_state_sync(&s2, &s1);
+  g = crdt_blease_get(&s1, ACC, SID);
+  assert_non_null(g);
+  assert_int_equal(2, g->host);
+  assert_int_equal(1, (int)g->generation);
+  assert_int_equal(2, crdt_blease_get(&s2, ACC, SID)->host);
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+
+  /* node-1 (the OLD holder) on return decides to stand down (other fresh, higher gen) */
+  assert_int_equal(-1, (int)crdt_blease_decide(crdt_blease_get(&s1, ACC, SID), 1, 1));
+
+  /* idempotent: re-syncing applies nothing new, digest stable */
+  crdt_state_sync(&s1, &s2);
+  assert_int_equal(2, crdt_blease_get(&s1, ACC, SID)->host);
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+
+  /* destroy -> tombstone; a stale lower-gen re-delivery must NOT resurrect it */
+  crdt_blease_del(&s1, ACC, SID);
+  crdt_state_sync(&s2, &s1);
+  assert_null(crdt_blease_get(&s2, ACC, SID));
+  {
+    struct CrdtNetworkState s3;          /* a node that still has the old gen-0 claim */
+    crdt_state_init(&s3, 3);
+    crdt_blease_claim(&s3, ACC, SID, 3, 0, 500);
+    crdt_state_sync(&s2, &s3);            /* deliver the stale claim to the tombstoned node */
+    assert_null(crdt_blease_get(&s2, ACC, SID));   /* tombstone holds (single-use sessid) */
+    crdt_state_clear(&s3);
+  }
+
+  crdt_state_clear(&s1);
+  crdt_state_clear(&s2);
+}
+
+/* 5-5e M5: order-independence + symmetric dual-revive. Two nodes both revive the SAME
+ * session at gen 1 during a mesh split (hosts 4 and 6); on heal the merge collapses to the
+ * LOWER host (4) on EVERY replica, regardless of which claim each saw first. */
+static void test_blease_symmetric_dual_revive(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s4, s6, obs;
+  const char *ACC = "bob", *SID = "S-dual";
+  crdt_state_init(&s4, 4);
+  crdt_state_init(&s6, 6);
+  crdt_state_init(&obs, 9);
+
+  /* both independently revive at gen 1 (each saw the original gen-0 holder go stale) */
+  crdt_blease_claim(&s4, ACC, SID, 4, 1, 100);
+  crdt_blease_claim(&s6, ACC, SID, 6, 1, 100);
+
+  /* observer sees host 6 FIRST, then host 4 -> must still end on host 4 (lower wins) */
+  crdt_state_sync(&obs, &s6);
+  assert_int_equal(6, crdt_blease_get(&obs, ACC, SID)->host);
+  crdt_state_sync(&obs, &s4);
+  assert_int_equal(4, crdt_blease_get(&obs, ACC, SID)->host);   /* comparator-max */
+
+  /* the reverse arrival order on s4/s6 themselves converges identically */
+  crdt_state_sync(&s4, &s6);   /* s4 sees host-6 claim -> 6 loses to its own 4 */
+  crdt_state_sync(&s6, &s4);   /* s6 sees host-4 claim -> supersedes its own 6 */
+  assert_int_equal(4, crdt_blease_get(&s4, ACC, SID)->host);
+  assert_int_equal(4, crdt_blease_get(&s6, ACC, SID)->host);
+  assert_true(crdt_state_digest(&s4) == crdt_state_digest(&s6));
+  assert_true(crdt_state_digest(&s4) == crdt_state_digest(&obs));
+
+  crdt_state_clear(&s4);
+  crdt_state_clear(&s6);
+  crdt_state_clear(&obs);
+}
+
 /* SHUN doc collection (global-state track sibling of GLINE): set/update/delete via
  * delta + digest converge + snapshot roundtrip + the explicit-removal gate. */
 static void test_shun_op_replicates(void **state)
@@ -2059,6 +2212,10 @@ int main(void)
     cmocka_unit_test(test_bsess_op_replicates),
     cmocka_unit_test(test_bsess_winner),
     cmocka_unit_test(test_bconn_roster),
+    cmocka_unit_test(test_blease_compare),
+    cmocka_unit_test(test_blease_decide),
+    cmocka_unit_test(test_blease_converges),
+    cmocka_unit_test(test_blease_symmetric_dual_revive),
     cmocka_unit_test(test_shun_op_replicates),
     cmocka_unit_test(test_zline_op_replicates),
     cmocka_unit_test(test_jupe_op_replicates),

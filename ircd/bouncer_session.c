@@ -1824,8 +1824,10 @@ void bounce_destroy(struct BouncerSession *session)
   /* 5-5e M2: the primary holder tombstones its session record in the doc (before the
    * account/sessid strings are torn down). Single-writer gate matches the sweep. */
   if (feature_bool(FEAT_CRDT_PRIMARY) && session->hs_client
-      && MyConnect(session->hs_client))
+      && MyConnect(session->hs_client)) {
     crdt_shadow_bsess_remove(session->hs_account, session->hs_sessid);
+    crdt_shadow_blease_remove(session->hs_account, session->hs_sessid);  /* M5 */
+  }
 
   /* Cancel timers if active */
   if (t_active(&session->hs_hold_timer))
@@ -1976,7 +1978,7 @@ int session_has_local_holder(struct BouncerSession *session)
  * touching the ~10 scattered hs_state assignment sites in the battle-tested core. */
 void bounce_crdt_bsess_sweep(void)
 {
-  int i, n = 0, nc = 0;
+  int i, n = 0, nc = 0, nl = 0;
   if (!feature_bool(FEAT_CRDT_PRIMARY))
     return;
   for (i = 0; i < BOUNCE_ACCOUNT_HASHSIZE; i++) {
@@ -2053,13 +2055,51 @@ void bounce_crdt_bsess_sweep(void)
                         s->hs_account, s->hs_sessid, live, doc);
           }
         }
+
+        /* M5 (liveness lease, SHADOW — THE GATE): beacon-backed host claim.  The PRIMARY
+         * holder claims/refreshes the session's lease; the claim generation is decided by
+         * the locally-derived liveness of the current doc holder (HARD-INVARIANT-10), so a
+         * node reviving a split-away session bumps the generation only when the prior
+         * holder's beacon is stale.  Shadow-only: nothing READS the lease for behavior yet
+         * (M6 cutover flips that) — we only mirror + emit a de-risk line that, at rest,
+         * the converged lease holder equals the live local holder, and on a partition/heal
+         * surfaces the transfer (a stand-down with a live primary = the loser the lease
+         * picks; on heal it must match the legacy BS T transfer). */
+        if (s->hs_client && MyConnect(s->hs_client)) {
+          uint16_t myn = (uint16_t)base64toint(cli_yxx(&me));
+          const struct CrdtBouncerLease *cur =
+              crdt_shadow_blease_get(s->hs_account, s->hs_sessid);
+          int cur_fresh = cur ? crdt_shadow_server_beacon_fresh(cur->host) : 0;
+          long gen = crdt_blease_decide(cur, cur_fresh, myn);
+          nl++;
+          if (gen >= 0) {
+            crdt_shadow_blease_claim(s->hs_account, s->hs_sessid, myn,
+                                     (uint32_t)gen, (uint64_t)CurrentTime);
+            cur = crdt_shadow_blease_get(s->hs_account, s->hs_sessid);
+            if (cur && cur->host != myn &&
+                crdt_shadow_server_beacon_fresh(cur->host))
+              log_write(LS_SYSTEM, L_NOTICE, 0,
+                        "CRDT blease M5: lease divergence acct=%s sid=%s live-holder=%s "
+                        "doc-holder=%u gen=%u", s->hs_account, s->hs_sessid,
+                        cli_yxx(&me), cur->host, cur->generation);
+          } else {
+            /* We hold a live primary but the doc says another FRESH node holds the lease:
+             * the split-brain the lease resolves.  At M6 this node demotes/yields. */
+            log_write(LS_SYSTEM, L_NOTICE, 0,
+                      "CRDT blease M5: stand-down with live primary acct=%s sid=%s "
+                      "doc-holder=%u gen=%u (lease resolves at cutover)",
+                      s->hs_account, s->hs_sessid, cur ? cur->host : 0,
+                      cur ? (unsigned)cur->generation : 0);
+          }
+        }
       }
     }
   }
   crdt_shadow_bconn_reap();   /* M4: tombstone stale-owned connections (disconnected) */
-  if (n || nc)
+  if (n || nc || nl)
     log_write(LS_SYSTEM, L_NOTICE, 0,
-              "CRDT bsess shadow: mirrored %d session(s) + %d connection(s) to doc", n, nc);
+              "CRDT bsess shadow: mirrored %d session(s) + %d connection(s) + %d lease(s) to doc",
+              n, nc, nl);
 }
 
 /** Per redesign C.2 + design intent #135 + #254: do we have any
