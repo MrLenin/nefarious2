@@ -490,6 +490,12 @@ extern struct BouncerSession *bounce_create_replica_from_doc(
     const char *account, const char *sessid, const char *token,
     const char *origin_yxx, time_t created, time_t last_active,
     time_t total_active, unsigned int attach_count, int state);
+/* 5-5e M6a-2: materialize a remote alias (host != me) from doc state by driving the real
+ * BX-C handler.  Returns 1 if a create/convert happened, 0 if a no-op (already linked /
+ * primary or host not yet resolvable). */
+extern int bounce_materialize_alias_from_doc(const char *account, const char *sessid,
+                                             const char *primary_num,
+                                             const char *alias_num);
 
 /** Look up sessions for an account.
  * @param[in] account Account name.

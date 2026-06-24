@@ -763,6 +763,12 @@ int crdt_shadow_server_beacon_fresh(uint16_t num)
  * at rest = the shadow-of-the-shadow proof). Gated FEAT_CRDT_BOUNCER_DOC (rolled
  * node-by-node) + FEAT_CRDT_PRIMARY. M6a-2 will materialize the alias roster (bconns);
  * this step does sessions only. */
+/* NB (M6a-2): no re-entrancy guard is needed here.  Driving bounce_alias_create from the
+ * reconcile triggers no doc re-mint because every minting hook it could reach self-skips an
+ * alias: crdt_shadow_join returns on CHFL_ALIAS (:476), crdt_shadow_user_add returns on
+ * IsBouncerAlias (:570), and the bconn sweep only mints entries whose ba_server==me (a
+ * materialized remote alias has ba_server=its host != me).  So the materialize is mint-free. */
+
 struct reconcile_bsess_ctx { unsigned created; };
 static void reconcile_bsess_cb(const char *key, uint32_t key_len,
                                const struct CrdtLWWValue *val, void *ctx)
@@ -803,16 +809,63 @@ static void reconcile_bsess_cb(const char *key, uint32_t key_len,
     c->created++;
 }
 
+/* M6a-2: materialize remote aliases (bconns host != me, is_primary=0) by driving the real
+ * BX-C path. Idempotent — at rest (relay flowing) every alias is already linked so this is
+ * a pure no-op (the inert proof); it becomes load-bearing only once M6b suppresses relay. */
+struct reconcile_bconn_ctx { unsigned created; };
+static void reconcile_bconn_cb(const char *key, uint32_t key_len,
+                               const struct CrdtLWWValue *val, void *ctx)
+{
+  struct reconcile_bconn_ctx *c = ctx;
+  const struct CrdtBouncerConn *rec;
+  const char *p1, *p2;
+  uint32_t alen, slen, nlen;
+  char account[ACCOUNTLEN + 1], sessid[64], aliasn[16], primary[16];
+  uint16_t myn;
+  if (!val->data || val->data_len != sizeof(struct CrdtBouncerConn))
+    return;                                   /* tombstone */
+  rec = (const struct CrdtBouncerConn *)val->data;
+  if (rec->is_primary)
+    return;                                   /* primary = a real user (reconcile_users), not an alias */
+  myn = (uint16_t)base64toint(cli_yxx(&me));
+  if (rec->host == myn)
+    return;                                   /* real local fd alias — never materialize our own */
+  /* key = account\0sessid\0connnum */
+  p1 = memchr(key, '\0', key_len);
+  if (!p1) return;
+  alen = (uint32_t)(p1 - key);
+  p2 = memchr(p1 + 1, '\0', key_len - alen - 1);
+  if (!p2) return;
+  slen = (uint32_t)(p2 - (p1 + 1));
+  nlen = (uint32_t)(key_len - alen - 1 - slen - 1);
+  if (alen > ACCOUNTLEN || slen == 0 || slen >= sizeof sessid ||
+      nlen == 0 || nlen >= sizeof aliasn)
+    return;
+  memcpy(account, key, alen);       account[alen] = '\0';
+  memcpy(sessid, p1 + 1, slen);     sessid[slen] = '\0';
+  memcpy(aliasn, p2 + 1, nlen);     aliasn[nlen] = '\0';
+  if (!crdt_bconn_primary(&g_crdt, account, sessid, primary, sizeof primary))
+    return;                                   /* no primary in doc yet — retry next cycle */
+  if (bounce_materialize_alias_from_doc(account, sessid, primary, aliasn))
+    c->created++;
+}
+
 void crdt_shadow_reconcile_bouncer(void)
 {
-  struct reconcile_bsess_ctx c = { 0 };
+  struct reconcile_bsess_ctx cs = { 0 };
+  struct reconcile_bconn_ctx ca = { 0 };
   if (!shadow_on() || !feature_bool(FEAT_CRDT_BOUNCER_DOC) ||
       !feature_bool(FEAT_CRDT_PRIMARY))
     return;
-  crdt_lwwmap_foreach(&g_crdt.bsessions, reconcile_bsess_cb, &c);
-  if (c.created)
+  /* sessions first (the replica record must exist before its aliases attach), then
+   * aliases (their primary user must already be materialized by reconcile_users, which
+   * runs before this in the verify timer). */
+  crdt_lwwmap_foreach(&g_crdt.bsessions, reconcile_bsess_cb, &cs);
+  crdt_lwwmap_foreach(&g_crdt.bconns, reconcile_bconn_cb, &ca);
+  if (cs.created || ca.created)
     log_write(LS_SYSTEM, L_NOTICE, 0,
-              "CRDT bouncer-reconcile: created %u replica session(s) from doc", c.created);
+              "CRDT bouncer-reconcile: created %u replica session(s) + %u alias(es) from doc",
+              cs.created, ca.created);
 }
 
 /* Phase 4c: server reachability is a LOCAL determination, NOT replicated state.

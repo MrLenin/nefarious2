@@ -471,6 +471,11 @@ int crdt_bconn_is_explicitly_removed(const struct CrdtNetworkState *st,
 /** 5-5e M4: number of LIVE (non-tombstoned) connections in the (account,sessid) roster. */
 int crdt_bconn_roster_count(const struct CrdtNetworkState *st,
                             const char *account, const char *sessid);
+/** 5-5e M6a-2: the PRIMARY connection's numeric for (account,sessid) (the is_primary
+ *  bconn). Writes NUL-terminated to @a out; returns out, or NULL if no primary in doc. */
+const char *crdt_bconn_primary(const struct CrdtNetworkState *st,
+                               const char *account, const char *sessid,
+                               char *out, size_t outsz);
 /** 5-5e M5: the liveness-lease comparator (PURE; the riskiest single piece — cmocka-gated).
  *  Returns >0 if @a a is the authoritative claim, <0 if @a b, 0 if identical.  Order: higher
  *  generation wins; tie -> lower host numeric wins.  A TOTAL order (host numerics unique), so

@@ -1079,6 +1079,54 @@ int crdt_bconn_roster_count(const struct CrdtNetworkState *st,
   return c.n;
 }
 
+/* 5-5e M6a-2: the PRIMARY connection's numeric for (account,sessid) — the is_primary
+ * bconn entry. Writes the NUL-terminated connnum to @a out; returns out, or NULL if the
+ * session has no primary connection in the doc. Prefix-scan over (account\0sessid\0). */
+struct bconn_primary_ctx { const char *prefix; uint32_t plen; char *out; size_t outsz; int found; };
+static void bconn_primary_cb(const char *key, uint32_t key_len,
+                             const struct CrdtLWWValue *val, void *ctx)
+{
+  struct bconn_primary_ctx *c = ctx;
+  const struct CrdtBouncerConn *rec;
+  uint32_t nlen;
+  if (c->found)
+    return;
+  if (!val->data || val->data_len != sizeof(struct CrdtBouncerConn))
+    return;
+  if (key_len <= c->plen || memcmp(key, c->prefix, c->plen) != 0)
+    return;
+  rec = (const struct CrdtBouncerConn *)val->data;
+  if (!rec->is_primary)
+    return;
+  nlen = key_len - c->plen;                 /* connnum = the suffix after account\0sessid\0 */
+  if (nlen == 0 || nlen >= c->outsz)
+    return;
+  memcpy(c->out, key + c->plen, nlen);
+  c->out[nlen] = '\0';
+  c->found = 1;
+}
+
+const char *crdt_bconn_primary(const struct CrdtNetworkState *st,
+                               const char *account, const char *sessid,
+                               char *out, size_t outsz)
+{
+  struct bconn_primary_ctx c;
+  char prefix[160];
+  uint32_t al = (uint32_t)strlen(account);
+  uint32_t sl = (uint32_t)strlen(sessid);
+  if ((size_t)al + 1 + sl + 1 > sizeof prefix || outsz == 0)
+    return NULL;
+  memcpy(prefix, account, al);          prefix[al] = '\0';
+  memcpy(prefix + al + 1, sessid, sl);  prefix[al + 1 + sl] = '\0';
+  c.prefix = prefix;
+  c.plen   = al + 1 + sl + 1;
+  c.out    = out;
+  c.outsz  = outsz;
+  c.found  = 0;
+  crdt_lwwmap_foreach(&st->bconns, bconn_primary_cb, &c);
+  return c.found ? out : NULL;
+}
+
 /* ------------------------------------------------------------------ */
 /* 5-5e M5: liveness lease — a deterministic-merge (comparator) register */
 /* ------------------------------------------------------------------ */

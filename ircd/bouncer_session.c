@@ -8167,6 +8167,67 @@ forward:
   return 0;
 }
 
+/* 5-5e M6a-2 (doc-native bouncer cutover): materialize a remote alias from doc state by
+ * driving the REAL BX-C handler (bounce_alias_create) — the §17.7 template.  Synthesizes a
+ * BX C frame from the doc (primary + alias numerics + account + sessid + the primary's live
+ * channel list) and drives it with cptr = the CRDT uplink toward the alias's host server,
+ * so the proven alias create/convert + hs_aliases[] tracking + CHFL_ALIAS channel join all
+ * run, and (under M6b) its onward relay becomes the legacy gateway.  Idempotent: returns 0
+ * (no-op) if the alias is already linked, the primary isn't materialized yet, or the alias
+ * server/uplink isn't resolvable (next reconcile retries).  Returns 1 on a create/convert.
+ * Hazard guards (analyst): primary must be a real live user; alias_server must be a real
+ * server or mesh stub with a valid uplink (inv #8 — no NULL deref). */
+int bounce_materialize_alias_from_doc(const char *account, const char *sessid,
+                                      const char *primary_num, const char *alias_num)
+{
+  struct Client *alias, *primary, *alias_server, *uplink;
+  char svr[3];
+  char chanbuf[512];
+  char *parv[8];
+  if (!account || !sessid || !primary_num || !alias_num || !alias_num[0])
+    return 0;
+  alias = findNUser(alias_num);
+  if (alias && IsBouncerAlias(alias))
+    return 0;                                 /* already linked — inert (relay/prior did it) */
+  primary = findNUser(primary_num);
+  if (!primary || !IsUser(primary))
+    return 0;                                 /* primary not materialized yet — retry next cycle */
+  svr[0] = alias_num[0]; svr[1] = alias_num[1]; svr[2] = '\0';
+  alias_server = FindNServer(svr);
+  if (!alias_server || (!IsServer(alias_server) && !IsMeshStub(alias_server)))
+    return 0;                                 /* alias's host not known here yet */
+  uplink = cli_from(alias_server);
+  if (!uplink)
+    return 0;                                 /* no route to the host (inv #8 — never NULL-drive) */
+  /* Build the primary's current channel list (#chan1 #chan2 …) so the materialized alias
+   * inherits CHFL_ALIAS memberships — matches what the BX C wire would have carried. */
+  chanbuf[0] = '\0';
+  {
+    struct Membership *lp;
+    size_t off = 0;
+    for (lp = cli_user(primary)->channel; lp; lp = lp->next_channel) {
+      const char *cn = lp->channel->chname;
+      size_t need = strlen(cn) + 1;
+      if (off + need >= sizeof chanbuf)
+        break;
+      if (off)
+        chanbuf[off++] = ' ';
+      memcpy(chanbuf + off, cn, strlen(cn));
+      off += strlen(cn);
+      chanbuf[off] = '\0';
+    }
+  }
+  parv[0] = (char *)"BX";
+  parv[1] = (char *)"C";
+  parv[2] = (char *)primary_num;
+  parv[3] = (char *)alias_num;
+  parv[4] = (char *)account;
+  parv[5] = (char *)sessid;
+  parv[6] = chanbuf;                          /* old-format BX C: parc 7, channels last */
+  bounce_alias_create(uplink, alias_server, 7, parv);
+  return 1;
+}
+
 /* ---------------------------------------------------------------- */
 /* BX X: Destroy alias                                               */
 /* ---------------------------------------------------------------- */

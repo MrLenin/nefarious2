@@ -559,6 +559,14 @@ static void test_bconn_roster(void **state)
   assert_int_equal(5, (int)g->caps);
   assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
 
+  /* M6a-2: the primary connnum is derivable from the roster (is_primary entry) */
+  {
+    char pn[16];
+    assert_non_null(crdt_bconn_primary(&s2, "alice", "S1", pn, sizeof pn));
+    assert_string_equal("AAAAA", pn);             /* the is_primary=1 entry */
+    assert_null(crdt_bconn_primary(&s2, "bob", "S9", pn, sizeof pn)); /* all aliases -> none */
+  }
+
   /* alias disconnects -> roster drops to 1, tombstone gate flips, primary unaffected */
   crdt_bconn_del(&s1, "alice", "S1", "BBBBB");
   crdt_state_sync(&s2, &s1);
