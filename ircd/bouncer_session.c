@@ -4086,6 +4086,12 @@ void bounce_broadcast(struct BouncerSession *session, char subcmd,
         }
       }
     }
+    /* 5-5e M6b-1b: the ATTACH (HOLDING->ACTIVE) is doc-covered — the doc-path
+     * state-apply (reconcile_bsess_cb) flips a replica to ACTIVE, last_active
+     * rides the bsess record, caps is home-only (synthetic remote alias has no
+     * socket).  Relay to the legacy leg only (that leg IS the gateway). */
+    if (feature_bool(FEAT_CRDT_BOUNCER_DOC))
+      sendcmdto_set_skip_crdt_servers();
     sendcmdto_serv_butone_v3(&me, CMD_BOUNCER_SESSION,
                           NULL,
                           "A %s %s %s %lu %x",
@@ -4097,6 +4103,15 @@ void bounce_broadcast(struct BouncerSession *session, char subcmd,
 
   case 'D': /* Detach */
     build_channel_string(session, chanbuf, sizeof(chanbuf));
+    /* 5-5e M6b-1b: the DETACH (ACTIVE->HOLDING) is doc-covered — the sweep
+     * writes state=HOLDING (the held ghost keeps hs_client MyConnect), the
+     * doc-path state-apply flips replicas, and the held channel set rides the
+     * Phase-3 member collection (CHFL_HOLDING memberships are NOT removed from
+     * the doc).  disconnect_time on a replica is host-approximate (the state-
+     * apply stamps CurrentTime, within one verify cycle — fine for replay
+     * "since").  Relay to the legacy leg only. */
+    if (feature_bool(FEAT_CRDT_BOUNCER_DOC))
+      sendcmdto_set_skip_crdt_servers();
     sendcmdto_serv_butone_v3(&me, CMD_BOUNCER_SESSION,
                           NULL,
                           "D %s %s %s %Tu :%s",
@@ -4417,6 +4432,13 @@ bsc_forward:
     /* Forward to other servers — preserve all parameters verbatim so
      * downstream servers get full metadata (attach_count, total_active). */
     if (is_holding) {
+      /* 5-5e M6b-1b: HOLDING create is now doc-covered too — the held ghost
+       * keeps hs_client MyConnect so the origin sweep writes state=HOLDING,
+       * M6a materializes the HOLDING replica, the doc-path state-apply keeps
+       * it in sync, and held channels ride the Phase-3 member collection.
+       * Re-relay legacy-only (gateway leg). */
+      if (feature_bool(FEAT_CRDT_BOUNCER_DOC))
+        sendcmdto_set_skip_crdt_servers();
       sendcmdto_serv_butone_v3(sptr, CMD_BOUNCER_SESSION,
                             cptr,
                             "C %s %s %s holding %Tu %Tu %u %Tu :%s",
@@ -4426,9 +4448,7 @@ bsc_forward:
                             channels ? channels : "");
     } else {
       /* 5-5e M6b-1: ACTIVE create is doc-covered (origin server's sweep
-       * wrote it; M6a materializes the replica) — re-relay legacy-only.
-       * The holding branch above is NOT gated (HOLDING doc-coverage is
-       * deferred to M6b-1b pending the sweep MyConnect-gate verdict). */
+       * wrote it; M6a materializes the replica) — re-relay legacy-only. */
       if (feature_bool(FEAT_CRDT_BOUNCER_DOC))
         sendcmdto_set_skip_crdt_servers();
       sendcmdto_serv_butone_v3(sptr, CMD_BOUNCER_SESSION,
@@ -4543,7 +4563,11 @@ bsc_forward:
       session->hs_disconnect_time = 0;
     }
 
-    /* Forward — preserve extended fields when present (per C.3) */
+    /* Forward — preserve extended fields when present (per C.3).
+     * 5-5e M6b-1b: ATTACH is doc-covered (state-apply flips replicas to
+     * ACTIVE) — re-relay legacy-only. */
+    if (feature_bool(FEAT_CRDT_BOUNCER_DOC))
+      sendcmdto_set_skip_crdt_servers();
     if (parc >= 7) {
       sendcmdto_serv_butone_v3(sptr, CMD_BOUNCER_SESSION,
                             cptr,
@@ -4627,7 +4651,11 @@ bsc_forward:
      * timer and sends BS X when it expires.  Running a local timer risks
      * premature replica destruction (race with managing server). */
 
-    /* Forward */
+    /* Forward — 5-5e M6b-1b: DETACH is doc-covered (state-apply flips replicas
+     * to HOLDING; held channels ride the member collection) — re-relay
+     * legacy-only. */
+    if (feature_bool(FEAT_CRDT_BOUNCER_DOC))
+      sendcmdto_set_skip_crdt_servers();
     sendcmdto_serv_butone_v3(sptr, CMD_BOUNCER_SESSION,
                           cptr,
                           "D %s %s %s %Tu :%s",
