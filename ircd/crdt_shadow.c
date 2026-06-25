@@ -885,7 +885,7 @@ int crdt_shadow_server_beacon_fresh(uint16_t num)
  * IsBouncerAlias (:570), and the bconn sweep only mints entries whose ba_server==me (a
  * materialized remote alias has ba_server=its host != me).  So the materialize is mint-free. */
 
-struct reconcile_bsess_ctx { unsigned created; };
+struct reconcile_bsess_ctx { unsigned created; unsigned state_applied; };
 static void reconcile_bsess_cb(const char *key, uint32_t key_len,
                                const struct CrdtLWWValue *val, void *ctx)
 {
@@ -908,8 +908,43 @@ static void reconcile_bsess_cb(const char *key, uint32_t key_len,
     return;
   memcpy(account, key, alen);  account[alen] = '\0';
   memcpy(sessid, p + 1, slen); sessid[slen] = '\0';
-  if (bounce_find_by_token(rec->token))
-    return;                                   /* already have it (relay or prior reconcile) */
+  {
+    struct BouncerSession *existing = bounce_find_by_token(rec->token);
+    if (existing) {
+      /* M6b-1b (HOLDING doc-coverage): the BS A/D equivalent on the doc path.
+       * reconcile_bsess was CREATE-only; once BS A/D relay is suppressed among
+       * CRDT peers, a replica materialized ACTIVE would never flip to HOLDING
+       * (or back) -> silent stale state.  So flip an existing REPLICA's
+       * HOLDING<->ACTIVE from the converged doc record here.  INERT at rest:
+       * with relay still flowing the BS A/D handler already flipped the replica
+       * before this runs, so state_applied stays ~0 (the shadow-of-the-shadow
+       * proof); it becomes load-bearing only once M6b-1b suppresses A/D.
+       * Single-writer: NEVER touch the authoritative local holder (a MyConnect
+       * hs_client) — its sweep owns the doc write.  inv#1: NEVER start a hold
+       * timer on a replica.  inv#8: hs_client may be NULL — do not deref it. */
+      if (existing->hs_client && MyConnect(existing->hs_client))
+        return;                                 /* local holder = single-writer */
+      if (rec->state != BOUNCE_HOLDING && rec->state != BOUNCE_ACTIVE)
+        return;                                 /* destroy rides the X tombstone, not here */
+      if ((int)existing->hs_state != (int)rec->state) {
+        if (rec->state == BOUNCE_HOLDING) {
+          existing->hs_state = BOUNCE_HOLDING;
+          existing->hs_enforced = 0;
+          if (existing->hs_disconnect_time == 0)
+            existing->hs_disconnect_time = CurrentTime;  /* approx; host owns the real timer */
+        } else {
+          existing->hs_state = BOUNCE_ACTIVE;
+          existing->hs_disconnect_time = 0;
+        }
+        c->state_applied++;
+        log_write(LS_SYSTEM, L_NOTICE, 0,
+                  "CRDT bsess M6b-1b: replica acct=%s sid=%s state -> %s (doc-apply)",
+                  account, sessid,
+                  rec->state == BOUNCE_HOLDING ? "HOLDING" : "ACTIVE");
+      }
+      return;                                   /* already materialized; state reconciled above */
+    }
+  }
   lease = crdt_blease_get(&g_crdt, account, sessid);
   if (!lease)
     return;                                   /* no authoritative holder claimed yet */
@@ -978,10 +1013,11 @@ void crdt_shadow_reconcile_bouncer(void)
    * runs before this in the verify timer). */
   crdt_lwwmap_foreach(&g_crdt.bsessions, reconcile_bsess_cb, &cs);
   crdt_lwwmap_foreach(&g_crdt.bconns, reconcile_bconn_cb, &ca);
-  if (cs.created || ca.created)
+  if (cs.created || ca.created || cs.state_applied)
     log_write(LS_SYSTEM, L_NOTICE, 0,
-              "CRDT bouncer-reconcile: created %u replica session(s) + %u alias(es) from doc",
-              cs.created, ca.created);
+              "CRDT bouncer-reconcile: created %u replica session(s) + %u alias(es), "
+              "%u state-apply (M6b-1b) from doc",
+              cs.created, ca.created, cs.state_applied);
   /* M6a-3: removal half — tear down replica sessions whose owner tombstoned
    * their doc record (the teardown counterpart that makes BS X suppression
    * correct).  Lives in bouncer_session.c (owns the session hashes). */
