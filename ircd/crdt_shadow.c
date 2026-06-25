@@ -885,6 +885,42 @@ int crdt_shadow_server_beacon_fresh(uint16_t num)
  * IsBouncerAlias (:570), and the bconn sweep only mints entries whose ba_server==me (a
  * materialized remote alias has ba_server=its host != me).  So the materialize is mint-free. */
 
+static int crdt_gateway_has_legacy_peer(void);  /* defined below; used by the M6c-1 hooks */
+
+/* M6c-1 (gateway doc->legacy BS/BX synthesis), Increment 0 helper: build the
+ * channel string for a doc session from its MATERIALIZED primary client's LIVE
+ * memberships — NOT the replica's hs_channels[] (which is empty; that is also the
+ * latent bounce_burst replica defect).  Returns the client, or NULL if it is not
+ * materialized yet (reconcile orders users before bouncer, so the first cycle may
+ * be PENDING — inv#8: caller MUST tolerate NULL, never deref).  Mirrors the proven
+ * bounce_materialize_alias_from_doc channel-build (walk cli_user(primary)->channel). */
+static struct Client *crdt_m6c1_session_chans(const char *account, const char *sessid,
+                                              char *out, size_t outlen)
+{
+  char pnum[16];
+  struct Client *uc;
+  struct Membership *lp;
+  size_t off = 0;
+  out[0] = '\0';
+  if (!crdt_bconn_primary(&g_crdt, account, sessid, pnum, sizeof pnum))
+    return NULL;
+  uc = findNUser(pnum);
+  if (!uc || !IsUser(uc) || !cli_user(uc))
+    return NULL;                          /* not materialized yet (inv#8: no deref) */
+  for (lp = cli_user(uc)->channel; lp; lp = lp->next_channel) {
+    const char *cn = lp->channel->chname;
+    size_t need = strlen(cn) + 1;
+    if (off + need >= outlen)
+      break;
+    if (off)
+      out[off++] = ' ';
+    memcpy(out + off, cn, strlen(cn));
+    off += strlen(cn);
+    out[off] = '\0';
+  }
+  return uc;
+}
+
 struct reconcile_bsess_ctx { unsigned created; unsigned state_applied; };
 static void reconcile_bsess_cb(const char *key, uint32_t key_len,
                                const struct CrdtLWWValue *val, void *ctx)
@@ -941,6 +977,20 @@ static void reconcile_bsess_cb(const char *key, uint32_t key_len,
                   "CRDT bsess M6b-1b: replica acct=%s sid=%s state -> %s (doc-apply)",
                   account, sessid,
                   rec->state == BOUNCE_HOLDING ? "HOLDING" : "ACTIVE");
+        /* M6c-1 Increment 0 (detect-and-log, NO emit): on a transition the
+         * gateway WOULD synthesize BS A (HOLDING->ACTIVE) / BS D (ACTIVE->
+         * HOLDING) toward its legacy downlinks (the originating leaf's BS was
+         * suppressed + the leaf has no legacy downlink).  Log what it would
+         * emit incl. the channel string from live memberships, to prove the
+         * trigger + channels resolution + inv#8 null-check before any wire emit. */
+        if (crdt_gateway_has_legacy_peer()) {
+          char chans[512];
+          struct Client *uc = crdt_m6c1_session_chans(account, sessid, chans, sizeof chans);
+          log_write(LS_SYSTEM, L_NOTICE, 0,
+                    "CRDT M6c-1 would-synth: BS %s acct=%s sid=%s client=%s chans=[%s]",
+                    rec->state == BOUNCE_HOLDING ? "D" : "A", account, sessid,
+                    uc ? "materialized" : "PENDING", chans);
+        }
       }
       return;                                   /* already materialized; state reconciled above */
     }
@@ -956,8 +1006,23 @@ static void reconcile_bsess_cb(const char *key, uint32_t key_len,
   if (bounce_create_replica_from_doc(account, sessid, rec->token, origin,
                                      (time_t)rec->created, (time_t)rec->last_active,
                                      (time_t)rec->total_active, rec->attach_count,
-                                     (int)rec->state))
+                                     (int)rec->state)) {
     c->created++;
+    /* M6c-1 Increment 0 (detect-and-log, NO emit): a doc-origin replica just
+     * materialized on the gateway; it WOULD synthesize BS C toward legacy (the
+     * originating leaf's BS C died — leaf has no legacy downlink).  Log the
+     * would-be emit + the channel string from live memberships (proves the
+     * trigger fires once-per-create + the channels resolution + inv#8). */
+    if (crdt_gateway_has_legacy_peer()) {
+      char chans[512];
+      struct Client *uc = crdt_m6c1_session_chans(account, sessid, chans, sizeof chans);
+      log_write(LS_SYSTEM, L_NOTICE, 0,
+                "CRDT M6c-1 would-synth: BS C acct=%s sid=%s state=%s client=%s chans=[%s]",
+                account, sessid,
+                rec->state == BOUNCE_HOLDING ? "holding" : "active",
+                uc ? "materialized" : "PENDING", chans);
+    }
+  }
 }
 
 /* M6a-2: materialize remote aliases (bconns host != me, is_primary=0) by driving the real
