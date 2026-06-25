@@ -738,6 +738,99 @@ int crdt_shadow_bconn_roster_count(const char *account, const char *sessid)
   return crdt_bconn_roster_count(&g_crdt, account, sessid);
 }
 
+/* Dead-node doc-residue reap — INCREMENT 0: DETECT-AND-LOG ONLY (no delete).
+ *
+ * When a CRDT node dies (crash / hard SQUIT, no clean teardown) its single-writer
+ * doc records (bconns host=dead, the matching user records) have no live writer to
+ * tombstone them, so they linger and re-materialize as GHOST users on restart.  This
+ * scan walks the bconn collection for entries owned by a FOREIGN host whose self-
+ * beacon has gone STALE (a dead/partitioned candidate) and logs the full reap
+ * predicate WITHOUT deleting, so we can confirm on a real bed that the predicate
+ * fires on a truly-dead node (docker kill) and STAYS SILENT for a partitioned-but-
+ * healing node (netns cut + heal), before any destructive non-owner tombstone exists.
+ *
+ * The lease (CRDT_COLL_BLEASES) is the partition-vs-death oracle.  Two candidate
+ * predicates are logged so the live tests can decide which is safe:
+ *   would_reap_A (partition-SAFE) = grace && lease_MOVED off host && no live client
+ *       — a revive elsewhere bumped the lease generation; a partition never moves it.
+ *         Covers the revive/transfer case (the OBSERVED revtest/demtest ghost).
+ *   would_reap_B (broader)        = grace && (lease_moved || lease_holder_beacon_dead
+ *         || no_lease) && no live client — also covers a pure crash with no revive,
+ *         but the lease_dead/no_lease arms can FALSE-POSITIVE on a full partition
+ *         (the partitioned holder's beacon is stale everywhere).  The netns test is
+ *         the oracle for whether B is usable or must wait for a longer grace / Opt B
+ *         (lowest-numeric survivor) election.
+ * findNUser(connnum)==NULL = no live client here (mesh-stub-retire already exited it);
+ * user_in_doc = the doc still carries the user record (== the leak to also tombstone). */
+#define CRDT_ORPHAN_REAP_GRACE 60   /* seconds past beacon-stale before reap-eligible */
+struct orphan_scan_ctx { uint16_t me; int candidates; };
+static void orphan_scan_cb(const char *key, uint32_t key_len,
+                           const struct CrdtLWWValue *val, void *ctx)
+{
+  struct orphan_scan_ctx *c = ctx;
+  const struct CrdtBouncerConn *rec;
+  const struct CrdtBouncerLease *lease;
+  const char *p1, *p2;
+  uint32_t alen, slen, nlen;
+  char acc[ACCOUNTLEN + 1], sid[64], num[16];
+  time_t age;
+  uint16_t host, lease_host;
+  int no_lease, lease_moved, lease_dead, live_client, user_in_doc;
+  int grace_ok, would_reap_A, would_reap_B;
+
+  if (!val->data || val->data_len != sizeof(struct CrdtBouncerConn))
+    return;                                  /* tombstone */
+  rec = (const struct CrdtBouncerConn *)val->data;
+  host = rec->host;
+  if (host == c->me || host >= CRDT_MAX_SERVERS)
+    return;                                  /* ours -> M4 owner-reap; or out of range */
+  if (crdt_shadow_server_beacon_fresh(host))
+    return;                                  /* owner alive -> normal foreign bconn */
+
+  /* key = account\0sessid\0connnum */
+  p1 = memchr(key, '\0', key_len); if (!p1) return;
+  alen = (uint32_t)(p1 - key);
+  p2 = memchr(p1 + 1, '\0', key_len - alen - 1); if (!p2) return;
+  slen = (uint32_t)(p2 - (p1 + 1));
+  nlen = (uint32_t)(key_len - alen - 1 - slen - 1);
+  if (alen > ACCOUNTLEN || slen >= sizeof sid || nlen == 0 || nlen >= sizeof num)
+    return;
+  memcpy(acc, key, alen); acc[alen] = '\0';
+  memcpy(sid, p1 + 1, slen); sid[slen] = '\0';
+  memcpy(num, p2 + 1, nlen); num[nlen] = '\0';
+
+  age = crdt_beacon[host].recv_ts ? (CurrentTime - crdt_beacon[host].recv_ts) : (time_t)-1;
+  grace_ok = (age < 0) || (age > CRDT_BEACON_STALE + CRDT_ORPHAN_REAP_GRACE);
+  lease = crdt_blease_get(&g_crdt, acc, sid);
+  lease_host = lease ? lease->host : 0;
+  no_lease = (lease == NULL);
+  lease_moved = (lease && lease->host != host);
+  lease_dead = (lease && !crdt_shadow_server_beacon_fresh(lease->host));
+  live_client = (findNUser(num) != NULL);
+  user_in_doc = (crdt_user_get(&g_crdt, num) != NULL);
+  would_reap_A = grace_ok && lease_moved && !live_client;
+  would_reap_B = grace_ok && (lease_moved || lease_dead || no_lease) && !live_client;
+
+  c->candidates++;
+  log_write(LS_SYSTEM, L_NOTICE, 0,
+    "CRDT orphan-residue CANDIDATE host=%u connnum=%s acct=%s sid=%s "
+    "beacon_age=%lds no_lease=%d lease_host=%u lease_moved=%d lease_dead=%d "
+    "live_client=%d user_in_doc=%d grace_ok=%d would_reap_A=%d would_reap_B=%d",
+    (unsigned)host, num, acc, sid, (long)age, no_lease, (unsigned)lease_host,
+    lease_moved, lease_dead, live_client, user_in_doc, grace_ok,
+    would_reap_A, would_reap_B);
+}
+
+void crdt_shadow_orphan_reap_scan(void)
+{
+  struct orphan_scan_ctx c;
+  if (!shadow_on() || !feature_bool(FEAT_CRDT_BOUNCER_DOC))
+    return;
+  c.me = (uint16_t)base64toint(cli_yxx(&me));
+  c.candidates = 0;
+  crdt_lwwmap_foreach(&g_crdt.bconns, orphan_scan_cb, &c);
+}
+
 /* 5-5e M5: liveness-lease wrappers + the beacon-freshness liveness signal. */
 const struct CrdtBouncerLease *crdt_shadow_blease_get(const char *account,
                                                       const char *sessid)

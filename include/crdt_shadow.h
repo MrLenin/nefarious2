@@ -87,6 +87,8 @@ void crdt_shadow_bconn_set(const char *account, const char *sessid,
 void crdt_shadow_bconn_remove(const char *account, const char *sessid,
                               const char *connnum);
 void crdt_shadow_bconn_reap(void);
+/* Dead-node doc-residue reap, Increment 0: detect-and-log only (no delete). */
+void crdt_shadow_orphan_reap_scan(void);
 int crdt_shadow_bconn_roster_count(const char *account, const char *sessid);
 
 /** 5-5e M5 (liveness lease, SHADOW): claim/refresh, tombstone, and read the per-session

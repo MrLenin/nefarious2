@@ -2238,6 +2238,7 @@ void bounce_crdt_bsess_sweep(void)
     }
   }
   crdt_shadow_bconn_reap();   /* M4: tombstone stale-owned connections (disconnected) */
+  crdt_shadow_orphan_reap_scan();  /* dead-node residue reap Increment 0: detect-and-log only */
   if (n || nc || nl)
     log_write(LS_SYSTEM, L_NOTICE, 0,
               "CRDT bsess shadow: mirrored %d session(s) + %d connection(s) + %d lease(s) to doc",
