@@ -6184,6 +6184,27 @@ int bounce_demote_live_primary_to_alias(struct Client *acptr,
     }
   }
 
+  /* M6d ghost-freedom: tombstone the demoted primary's CRDT user record
+   * BEFORE flipping it to an alias.  Why here: on a same-nick heal the
+   * §17.5 resolver (crdt_nick_take) force-renames this losing local holder
+   * to its numeric, and that rename's crdt_shadow_user_add hook wrote a
+   * PRIMARY user record at the numeric into the doc.  Converting the local
+   * Client to an alias does NOT retract that doc record (aliases self-skip
+   * user_add, but the existing record lingers, never tombstoned) -> the
+   * gateway keeps presenting the force-rename numeric to legacy peers as a
+   * live primary == a ghost (inv#6/#7 violation).  An explicit op-recording
+   * delete here makes the LWW user collection authoritative: the delete
+   * dominates the slightly-earlier add, and crdt_shadow_reconcile_user_removes
+   * exits the spurious remote primary on every CRDT peer; on the gateway the
+   * 3m exit-gateway (s_misc.c crdt_shadow_user_remove + the now-legacy-only
+   * exit_client relay) emits a clean QUIT to legacy.  Must run while acptr is
+   * still a non-alias primary (crdt_shadow_user_remove guards IsBouncerAlias).
+   * MyConnect gate = single-writer (only the owning server tombstones; peers
+   * converge via the delta).  Reap skips MyUser + IsBouncerAlias, so leaf3's
+   * own local alias is never exited by its own tombstone. */
+  if (feature_bool(FEAT_CRDT_BOUNCER_DOC) && MyConnect(acptr))
+    crdt_shadow_user_remove(acptr);
+
   /* Promote the Client to alias: flag, NULL alias_primary (caller
    * patches via bounce_finish_live_primary_demote), drop from nick
    * hash (aliases share their primary's nick and aren't hashed). */
