@@ -921,6 +921,36 @@ static struct Client *crdt_m6c1_session_chans(const char *account, const char *s
   return uc;
 }
 
+/* M6c-1 Increment 1: synthesize BS C toward legacy for a doc-origin replica the
+ * gateway just materialized — the originating CRDT leaf's BS C died (no legacy
+ * downlink), so the gateway re-originates it (the §17.7 gateway applied to BS).
+ * skip_crdt = legacy leg only (CRDT peers already have the doc). Source &me
+ * (server-sourced, matches bounce_broadcast/bounce_burst; .2 routes it). Format
+ * mirrors bounce_broadcast case 'C' (active) and the bounce_handle BS C holding
+ * re-relay EXACTLY. Channels come from live memberships (chans), never the
+ * replica's empty hs_channels[]. Gated by the caller on crdt_gateway_has_legacy_peer. */
+static void crdt_m6c1_synth_bs_c(const char *account, const char *sessid,
+                                 const struct CrdtBouncerSession *rec,
+                                 const struct BouncerSession *sess,
+                                 const char *chans)
+{
+  sendcmdto_set_skip_crdt_servers();
+  if (rec->state == BOUNCE_HOLDING)
+    sendcmdto_serv_butone_v3(&me, CMD_BOUNCER_SESSION, NULL,
+                          "C %s %s %s holding %Tu %Tu %u %Tu :%s",
+                          account, sessid, rec->token, (time_t)rec->created,
+                          sess->hs_disconnect_time, (unsigned)rec->attach_count,
+                          (time_t)rec->total_active, chans);
+  else
+    sendcmdto_serv_butone_v3(&me, CMD_BOUNCER_SESSION, NULL,
+                          "C %s %s %s active %Tu %u %Tu :%s",
+                          account, sessid, rec->token, (time_t)rec->created,
+                          (unsigned)rec->attach_count, (time_t)rec->total_active, chans);
+  log_write(LS_SYSTEM, L_NOTICE, 0,
+            "CRDT M6c-1: synth BS C -> legacy acct=%s sid=%s state=%s chans=[%s]",
+            account, sessid, rec->state == BOUNCE_HOLDING ? "holding" : "active", chans);
+}
+
 struct reconcile_bsess_ctx { unsigned created; unsigned state_applied; };
 static void reconcile_bsess_cb(const char *key, uint32_t key_len,
                                const struct CrdtLWWValue *val, void *ctx)
@@ -1003,24 +1033,29 @@ static void reconcile_bsess_cb(const char *key, uint32_t key_len,
     return;                                   /* I am the holder but have no local session — anomaly; skip */
   inttobase64(origin, lease->host, 2);
   origin[2] = '\0';
-  if (bounce_create_replica_from_doc(account, sessid, rec->token, origin,
+  {
+    struct BouncerSession *newsess =
+      bounce_create_replica_from_doc(account, sessid, rec->token, origin,
                                      (time_t)rec->created, (time_t)rec->last_active,
                                      (time_t)rec->total_active, rec->attach_count,
-                                     (int)rec->state)) {
-    c->created++;
-    /* M6c-1 Increment 0 (detect-and-log, NO emit): a doc-origin replica just
-     * materialized on the gateway; it WOULD synthesize BS C toward legacy (the
-     * originating leaf's BS C died — leaf has no legacy downlink).  Log the
-     * would-be emit + the channel string from live memberships (proves the
-     * trigger fires once-per-create + the channels resolution + inv#8). */
-    if (crdt_gateway_has_legacy_peer()) {
-      char chans[512];
-      struct Client *uc = crdt_m6c1_session_chans(account, sessid, chans, sizeof chans);
-      log_write(LS_SYSTEM, L_NOTICE, 0,
-                "CRDT M6c-1 would-synth: BS C acct=%s sid=%s state=%s client=%s chans=[%s]",
-                account, sessid,
-                rec->state == BOUNCE_HOLDING ? "holding" : "active",
-                uc ? "materialized" : "PENDING", chans);
+                                     (int)rec->state);
+    if (newsess) {
+      c->created++;
+      /* M6c-1 Increment 1: the gateway re-originates BS C toward legacy (the
+       * leaf's BS C died — no legacy downlink).  Channels from live memberships.
+       * If the materializing user isn't live here yet (PENDING), defer one cycle
+       * rather than emit empty channels (the state-apply / next create pass will
+       * carry it). */
+      if (crdt_gateway_has_legacy_peer()) {
+        char chans[512];
+        struct Client *uc = crdt_m6c1_session_chans(account, sessid, chans, sizeof chans);
+        if (uc)
+          crdt_m6c1_synth_bs_c(account, sessid, rec, newsess, chans);
+        else
+          log_write(LS_SYSTEM, L_NOTICE, 0,
+                    "CRDT M6c-1: BS C synth deferred (user not materialized) "
+                    "acct=%s sid=%s", account, sessid);
+      }
     }
   }
 }
