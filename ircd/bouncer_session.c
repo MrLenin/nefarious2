@@ -8486,6 +8486,26 @@ int bounce_materialize_alias_from_doc(const char *account, const char *sessid,
   return 1;
 }
 
+/* M6c-1 BX Inc-2: silently de-materialize a GATEWAY-materialized REPLICA alias
+ * whose doc bconn was tombstoned — the counterpart to bounce_materialize_alias_
+ * from_doc.  Mirrors the BX X receiver's SILENT teardown (bounce_alias_destroy),
+ * NOT exit_client/exit_one_client (whose alias branch checks FLAG_KILLED and can
+ * cascade to whole-session teardown — bouncer inv#6).  No wire emit: the reconcile
+ * caller synthesizes BX X to legacy.  REPLICA-only: refuses a real local-fd alias
+ * (MyConnect) so we never tear down a genuine local connection.  inv#8: guards. */
+void bounce_dematerialize_replica_alias(struct Client *alias)
+{
+  if (!alias || !IsBouncerAlias(alias) || MyConnect(alias) || !cli_user(alias))
+    return;
+  bounce_alias_untrack(alias);          /* also s2s_bxm_cleanup_alias; its eager
+                                         * crdt_shadow_bconn_remove no-ops here
+                                         * (server!=&me) — single-writer safe */
+  remove_user_from_all_channels(alias); /* CHFL_ALIAS members -> crdt_shadow_part
+                                         * is gated !IsMemberAlias => no part op */
+  RemoveYXXClient(cli_user(alias)->server, cli_yxx(alias));
+  remove_client_from_list(alias);       /* frees User + Client; no crdt hook */
+}
+
 /* ---------------------------------------------------------------- */
 /* BX X: Destroy alias                                               */
 /* ---------------------------------------------------------------- */

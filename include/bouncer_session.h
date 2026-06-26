@@ -496,6 +496,9 @@ extern struct BouncerSession *bounce_create_replica_from_doc(
 extern int bounce_materialize_alias_from_doc(const char *account, const char *sessid,
                                              const char *primary_num,
                                              const char *alias_num);
+/* M6c-1 BX Inc-2: de-materialize a gateway-materialized replica alias whose doc
+ * bconn was tombstoned (silent teardown, no wire emit; reconcile synthesizes BX X). */
+extern void bounce_dematerialize_replica_alias(struct Client *alias);
 
 /** Look up sessions for an account.
  * @param[in] account Account name.
