@@ -951,6 +951,42 @@ static void crdt_m6c1_synth_bs_c(const char *account, const char *sessid,
             account, sessid, rec->state == BOUNCE_HOLDING ? "holding" : "active", chans);
 }
 
+/* M6c-1 Increment 2: synthesize BS A (HOLDING->ACTIVE) / BS D (ACTIVE->HOLDING)
+ * toward legacy for a doc state transition on a replica.  SOURCE = the owning leaf
+ * stub (cli_user(uc)->server), NOT &me — the A/D conn/ghost field is a 3-char XXX
+ * the receiver prefixes with the SOURCE server's YY; sourcing from the leaf stub
+ * (present-stub on .2) makes .2 resolve the full numeric to the right user, never a
+ * wrong-server hijack (inv#3).  skip_crdt = legacy leg only.  Format mirrors
+ * bounce_broadcast cases 'A'/'D' exactly.  uc must be the live materialized client
+ * (caller guarantees cli_user(uc) via crdt_m6c1_session_chans); inv#8: re-guard. */
+static void crdt_m6c1_synth_bs_ad(const char *account, const char *sessid,
+                                  const struct CrdtBouncerSession *rec,
+                                  const struct BouncerSession *sess,
+                                  struct Client *uc, const char *chans)
+{
+  struct Client *srv;
+  if (!uc || !cli_user(uc))
+    return;
+  srv = cli_user(uc)->server;
+  if (!srv)
+    return;
+  sendcmdto_set_skip_crdt_servers();
+  if (rec->state == BOUNCE_HOLDING)
+    sendcmdto_serv_butone_v3(srv, CMD_BOUNCER_SESSION, NULL,
+                          "D %s %s %s %Tu :%s",
+                          account, sessid, cli_yxx(uc),
+                          sess->hs_disconnect_time, chans);
+  else
+    sendcmdto_serv_butone_v3(srv, CMD_BOUNCER_SESSION, NULL,
+                          "A %s %s %s %lu %x",
+                          account, sessid, cli_yxx(uc),
+                          (unsigned long)sess->hs_last_active, 0u);
+  log_write(LS_SYSTEM, L_NOTICE, 0,
+            "CRDT M6c-1: synth BS %s -> legacy acct=%s sid=%s src=%s chans=[%s]",
+            rec->state == BOUNCE_HOLDING ? "D" : "A", account, sessid,
+            cli_name(srv), chans);
+}
+
 struct reconcile_bsess_ctx { unsigned created; unsigned state_applied; };
 static void reconcile_bsess_cb(const char *key, uint32_t key_len,
                                const struct CrdtLWWValue *val, void *ctx)
@@ -1007,19 +1043,20 @@ static void reconcile_bsess_cb(const char *key, uint32_t key_len,
                   "CRDT bsess M6b-1b: replica acct=%s sid=%s state -> %s (doc-apply)",
                   account, sessid,
                   rec->state == BOUNCE_HOLDING ? "HOLDING" : "ACTIVE");
-        /* M6c-1 Increment 0 (detect-and-log, NO emit): on a transition the
-         * gateway WOULD synthesize BS A (HOLDING->ACTIVE) / BS D (ACTIVE->
-         * HOLDING) toward its legacy downlinks (the originating leaf's BS was
-         * suppressed + the leaf has no legacy downlink).  Log what it would
-         * emit incl. the channel string from live memberships, to prove the
-         * trigger + channels resolution + inv#8 null-check before any wire emit. */
+        /* M6c-1 Increment 2: the gateway re-originates BS A (HOLDING->ACTIVE) /
+         * BS D (ACTIVE->HOLDING) toward legacy on a doc transition (the leaf's
+         * BS A/D was suppressed + the leaf has no legacy downlink).  If the user
+         * isn't materialized here yet, defer+log rather than emit a bad numeric. */
         if (crdt_gateway_has_legacy_peer()) {
           char chans[512];
           struct Client *uc = crdt_m6c1_session_chans(account, sessid, chans, sizeof chans);
-          log_write(LS_SYSTEM, L_NOTICE, 0,
-                    "CRDT M6c-1 would-synth: BS %s acct=%s sid=%s client=%s chans=[%s]",
-                    rec->state == BOUNCE_HOLDING ? "D" : "A", account, sessid,
-                    uc ? "materialized" : "PENDING", chans);
+          if (uc)
+            crdt_m6c1_synth_bs_ad(account, sessid, rec, existing, uc, chans);
+          else
+            log_write(LS_SYSTEM, L_NOTICE, 0,
+                      "CRDT M6c-1: BS %s synth deferred (user not materialized) "
+                      "acct=%s sid=%s",
+                      rec->state == BOUNCE_HOLDING ? "D" : "A", account, sessid);
         }
       }
       return;                                   /* already materialized; state reconciled above */

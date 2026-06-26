@@ -2293,6 +2293,18 @@ void bounce_crdt_replica_reap(void)
     log_write(LS_SYSTEM, L_NOTICE, 0,
               "CRDT replica reap: removing stale session acct=%s sid=%s (doc tombstoned)",
               doomed[i]->hs_account, doomed[i]->hs_sessid);
+    /* M6c-1 Increment 2: synthesize BS X toward legacy.  The originating leaf's
+     * own BS X died (no legacy downlink) and bounce_destroy does NOT broadcast,
+     * so without this a destroyed CRDT-leaf session lingers forever on a bouncer-
+     * aware non-CRDT peer.  This is TOMBSTONE-GATED by the reap (it only runs when
+     * crdt_shadow_bsess_present is false = genuine destroy), so it CANNOT fire on
+     * an M6d transfer (which keeps the bsess record live) — the transfer-vs-destroy
+     * guard for free.  bounce_broadcast 'X' is skip_crdt (legacy leg only) so only
+     * a node WITH a legacy downlink (the gateway) actually emits to .2; a leaf
+     * reaping the same replica reaches no legacy peer => exactly-once toward .2
+     * (single-gateway; multi-gateway = MR-4d election, out of scope). BS X is
+     * account/sessid-keyed (no server-relative numeric) so &me source is correct. */
+    bounce_broadcast(doomed[i], 'X', NULL);
     bounce_destroy(doomed[i]);
   }
 }

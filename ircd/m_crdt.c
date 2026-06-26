@@ -681,6 +681,17 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
           crdt_shadow_reconcile_shuns();   /* SHUN: drive global Shuns from doc (+gateway) */
           crdt_shadow_reconcile_zlines();  /* ZLINE: drive global Z-lines from doc (+gateway) */
           crdt_shadow_reconcile_jupes();   /* JUPE: drive juped servers from doc (+gateway) */
+          /* M6c-1 Increment 2: reconcile bouncer sessions EAGERLY on the delta that
+           * carries the change, not on the 30s verify timer.  Without this the
+           * gateway's HOLDING<->ACTIVE state-apply (and its BS A/D synth toward
+           * legacy) lagged ~120s (verify timer + holder sweep + lease claim),
+           * missing fast revive/hold transitions.  Runs LAST so reconcile_users +
+           * members + member_status have already materialized the user + its
+           * memberships -> chans resolves for the synth.  Idempotent: the state-
+           * apply emit is gated on hs_state != doc state, so repeated eager calls
+           * after convergence are no-ops (no BS A/D storm).  NO local-holder sweep
+           * here -- eager ingest is doc->live only; the sweep stays verify-timer. */
+          crdt_shadow_reconcile_bouncer();
         }
       }
       MyFree(bin);
