@@ -1100,42 +1100,81 @@ static void reconcile_bsess_cb(const char *key, uint32_t key_len,
 /* M6a-2: materialize remote aliases (bconns host != me, is_primary=0) by driving the real
  * BX-C path. Idempotent — at rest (relay flowing) every alias is already linked so this is
  * a pure no-op (the inert proof); it becomes load-bearing only once M6b suppresses relay. */
+/* Parse a bconns doc key (account\0sessid\0connnum) into its three parts.
+ * Returns 1 on success.  Used by reconcile_bconn_cb for both the live and
+ * the tombstone branches (Item1 BX). */
+static int crdt_parse_bconn_key(const char *key, uint32_t key_len,
+                                char *account, size_t acclen,
+                                char *sessid, size_t sesslen,
+                                char *connnum, size_t connlen)
+{
+  const char *p1, *p2;
+  uint32_t alen, slen, nlen;
+  p1 = memchr(key, '\0', key_len);
+  if (!p1) return 0;
+  alen = (uint32_t)(p1 - key);
+  p2 = memchr(p1 + 1, '\0', key_len - alen - 1);
+  if (!p2) return 0;
+  slen = (uint32_t)(p2 - (p1 + 1));
+  nlen = (uint32_t)(key_len - alen - 1 - slen - 1);
+  if (alen >= acclen || slen == 0 || slen >= sesslen ||
+      nlen == 0 || nlen >= connlen)
+    return 0;
+  memcpy(account, key, alen);    account[alen] = '\0';
+  memcpy(sessid, p1 + 1, slen);  sessid[slen] = '\0';
+  memcpy(connnum, p2 + 1, nlen); connnum[nlen] = '\0';
+  return 1;
+}
+
 struct reconcile_bconn_ctx { unsigned created; };
 static void reconcile_bconn_cb(const char *key, uint32_t key_len,
                                const struct CrdtLWWValue *val, void *ctx)
 {
   struct reconcile_bconn_ctx *c = ctx;
   const struct CrdtBouncerConn *rec;
-  const char *p1, *p2;
-  uint32_t alen, slen, nlen;
   char account[ACCOUNTLEN + 1], sessid[64], aliasn[16], primary[16];
   uint16_t myn;
-  if (!val->data || val->data_len != sizeof(struct CrdtBouncerConn))
-    return;                                   /* tombstone */
+  if (!val->data || val->data_len != sizeof(struct CrdtBouncerConn)) {
+    /* tombstone.  Item1 BX Inc-0 (detect-and-log): reconcile currently does
+     * NOTHING here — so a previously-materialized REPLICA alias (no local fd)
+     * is never de-materialized when its doc bconn is tombstoned (the reap->.2
+     * gap Item 2 observed).  If such a stale alias is still live on the
+     * gateway, log it; Inc-2 will add the de-materialize + BX X synth. */
+    if (crdt_gateway_has_legacy_peer() &&
+        crdt_parse_bconn_key(key, key_len, account, sizeof account,
+                             sessid, sizeof sessid, aliasn, sizeof aliasn)) {
+      struct Client *al = findNUser(aliasn);
+      if (al && IsBouncerAlias(al) && !MyConnect(al))
+        log_write(LS_SYSTEM, L_NOTICE, 0,
+                  "CRDT M6c-1 BX Inc0: tombstoned bconn but alias %s still "
+                  "materialized (acct=%s sid=%s) — would de-materialize + synth "
+                  "BX X (no de-mat path yet)", aliasn, account, sessid);
+    }
+    return;
+  }
   rec = (const struct CrdtBouncerConn *)val->data;
   if (rec->is_primary)
     return;                                   /* primary = a real user (reconcile_users), not an alias */
   myn = (uint16_t)base64toint(cli_yxx(&me));
   if (rec->host == myn)
     return;                                   /* real local fd alias — never materialize our own */
-  /* key = account\0sessid\0connnum */
-  p1 = memchr(key, '\0', key_len);
-  if (!p1) return;
-  alen = (uint32_t)(p1 - key);
-  p2 = memchr(p1 + 1, '\0', key_len - alen - 1);
-  if (!p2) return;
-  slen = (uint32_t)(p2 - (p1 + 1));
-  nlen = (uint32_t)(key_len - alen - 1 - slen - 1);
-  if (alen > ACCOUNTLEN || slen == 0 || slen >= sizeof sessid ||
-      nlen == 0 || nlen >= sizeof aliasn)
+  if (!crdt_parse_bconn_key(key, key_len, account, sizeof account,
+                            sessid, sizeof sessid, aliasn, sizeof aliasn))
     return;
-  memcpy(account, key, alen);       account[alen] = '\0';
-  memcpy(sessid, p1 + 1, slen);     sessid[slen] = '\0';
-  memcpy(aliasn, p2 + 1, nlen);     aliasn[nlen] = '\0';
   if (!crdt_bconn_primary(&g_crdt, account, sessid, primary, sizeof primary))
     return;                                   /* no primary in doc yet — retry next cycle */
-  if (bounce_materialize_alias_from_doc(account, sessid, primary, aliasn))
+  if (bounce_materialize_alias_from_doc(account, sessid, primary, aliasn)) {
     c->created++;
+    /* Item1 BX Inc-0: confirm the gateway materialize fires + has a legacy
+     * peer (bounce_materialize_alias_from_doc -> bounce_alias_create's forward
+     * already delivers BX C to legacy today, ungated — Inc-1 makes it
+     * skip_crdt so it's the clean legacy-only synth). */
+    if (crdt_gateway_has_legacy_peer())
+      log_write(LS_SYSTEM, L_NOTICE, 0,
+                "CRDT M6c-1 BX Inc0: materialized alias %s from doc (acct=%s "
+                "sid=%s) — alias_create forward delivers BX C to legacy",
+                aliasn, account, sessid);
+  }
 }
 
 void crdt_shadow_reconcile_bouncer(void)
