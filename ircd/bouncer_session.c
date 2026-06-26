@@ -6367,6 +6367,10 @@ int bounce_finish_live_primary_demote(struct Client *demoted_alias,
     }
 
     alias_modes = umode_str(demoted_alias);
+    /* M6c-1 BX Inc-1: suppress BX C among CRDT peers (doc carries it); the
+     * legacy Q retraction below stays (legacy leg). */
+    if (feature_bool(FEAT_CRDT_BOUNCER_DOC))
+      sendcmdto_set_skip_crdt_servers();
     sendcmdto_serv_butone(&me, CMD_BOUNCER_TRANSFER, NULL,
                           "C %s %s %s %s %s%s :%s",
                           primary_full, alias_full,
@@ -7792,6 +7796,11 @@ int bounce_setup_local_alias(struct Client *sptr, struct BouncerSession *session
       const char *alias_profile = cli_active_profile(sptr)[0]
                                     ? cli_active_profile(sptr)
                                     : PERSISTENCE_PROFILE_DEFAULT;
+      /* M6c-1 BX Inc-1: suppress BX C among CRDT peers (they converge the alias
+       * via the bconns doc); legacy still gets it (the gateway leg).  Mirrors the
+       * M6b-1 BS C/X suppression.  The paired BX P below is already legacy-only. */
+      if (feature_bool(FEAT_CRDT_BOUNCER_DOC))
+        sendcmdto_set_skip_crdt_servers();
       sendcmdto_serv_butone(&me, CMD_BOUNCER_TRANSFER, NULL,
                              "C %s %s %s %s %s%s %s :%s",
                              primary_full,
@@ -7808,6 +7817,20 @@ int bounce_setup_local_alias(struct Client *sptr, struct BouncerSession *session
                              primary_full,       /* new: the existing primary */
                              session->hs_sessid,
                              cli_name(primary));
+      /* M6c-1 BX Inc-1: eager bconn doc write so the alias appears in the doc
+       * immediately — the sweep (bounce_crdt_bsess_sweep) is verify-timer-only
+       * (~21s lag, Item 2 measured), which once BX C is suppressed would delay
+       * cross-CRDT alias convergence.  Mirrors the sweep's alias-bconn record;
+       * host==me (this node owns the local alias); caps refined by next sweep. */
+      if (feature_bool(FEAT_CRDT_BOUNCER_DOC) && feature_bool(FEAT_CRDT_PRIMARY)) {
+        struct CrdtBouncerConn cr;
+        memset(&cr, 0, sizeof cr);
+        cr.host = (uint16_t)base64toint(cli_yxx(&me));
+        cr.is_primary = 0;
+        cr.last_active = (uint64_t)session->hs_last_active;
+        crdt_shadow_bconn_set(session->hs_account, session->hs_sessid,
+                              alias_full, &cr);
+      }
     }
   } /* end YYXXX numeric scope */
 
@@ -8324,7 +8347,14 @@ track_alias:
          alias_numeric, primary_numeric, cli_name(primary)));
 
 forward:
-  /* Forward to other servers — include modes if present */
+  /* Forward to other servers — include modes if present.
+   * M6c-1 BX Inc-1: suppress the forward among CRDT peers (they converge the
+   * alias via the bconns doc — forwarding BX C to them is redundant-with-doc).
+   * Legacy still gets it: on the gateway this IS the synth — the doc-materialize
+   * path (bounce_materialize_alias_from_doc) reaches this forward and now emits
+   * BX C to legacy only (the paired BX P below is already legacy-only). */
+  if (feature_bool(FEAT_CRDT_BOUNCER_DOC))
+    sendcmdto_set_skip_crdt_servers();
   if (alias_modes && *alias_modes)
     sendcmdto_serv_butone(sptr, CMD_BOUNCER_TRANSFER, cptr,
                           "C %s %s %s %s %s :%s",
@@ -8497,6 +8527,17 @@ void bounce_alias_untrack(struct Client *alias)
           memmove(&session->hs_aliases[i], &session->hs_aliases[i + 1],
                   (session->hs_alias_count - 1 - i) * sizeof(struct BounceAlias));
         session->hs_alias_count--;
+        /* M6c-1 BX Inc-1: if THIS node hosted the alias, eagerly tombstone its
+         * bconn doc entry.  The eager bconn WRITE at alias-create means a stale
+         * still-live doc bconn would make reconcile RE-MATERIALIZE the alias on
+         * the gateway right after BX X removed it (resurrection) — and the ~30s
+         * verify-timer reap is too slow to prevent it.  Removing here closes the
+         * window.  Single-writer: only the owning host (server==&me) removes its
+         * own bconn (matches the sweep's ba_server==me_yxx gate). */
+        if (feature_bool(FEAT_CRDT_BOUNCER_DOC) && cli_user(alias)
+            && cli_user(alias)->server == &me)
+          crdt_shadow_bconn_remove(cli_user(alias)->account,
+                                   session->hs_sessid, full_numeric);
         /* Persist the updated (shrunk) roster.  Alias is no longer
          * tracked; on next restart the session won't expect it. */
         bounce_db_put(session);
