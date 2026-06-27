@@ -1793,20 +1793,30 @@ void client_sock_callback(struct Event* ev)
 
     /* Check if client should enter bouncer HOLD mode instead of exiting.
      *
-     * No immediate-promote shortcut here: a primary disconnect with
-     * aliases attached must hold first, even when promote *looks* viable.
-     * Otherwise the alias's server may concurrently be tearing down the
-     * same alias (BX X) — promote and BX X cross on the wire and both
-     * sides converge to a session pointing at a destroyed numeric, with
-     * channel state lost.  Promotion runs only from bounce_hold_expire,
-     * after the network has settled and hs_alias_count reflects reality.
-     * Cooperative roaming (user alive on both ends) uses BX C session
-     * move instead — that path doesn't touch this disconnect handler. */
+     * Immediate-promote shortcut (mirrors m_quit.c): a primary disconnect
+     * with a LOCAL alias promotes inline — same-server alias state is
+     * synchronously authoritative, so the BX P numeric swap can't race a
+     * concurrent BX X from the alias's home server (we ARE that server).
+     * This must match the clean-/QUIT path: a socket EOF and a /QUIT are the
+     * same event to the bouncer, and holding a ghost while a live local alias
+     * sits ready is wrong (the session should continue under the alias, not
+     * leave a phantom held primary).  ONLY when every alias is remote do we
+     * hold and defer the promote (bounce_schedule_cross_server_promote /
+     * hold-expire), which is the cross-server BX-X race window. */
     if (IsUser(cptr) && bounce_should_hold(cptr)) {
-      /* Transition to ghost/hold state - suppresses QUIT, keeps channels */
-      if (bounce_hold_client(cptr, msg) == 0) {
-        /* Successfully entered hold - don't exit_client */
-        return;
+      struct BouncerSession *bsess = bounce_get_session(cptr);
+      int promoted = -1;
+      if (bsess && bsess->hs_client == cptr && bsess->hs_alias_count > 0)
+        promoted = bounce_promote_alias(bsess, 1 /* local_only */);
+      if (promoted == 0) {
+        /* Inline local promote done — channels stripped, BX P + BS T sent.
+         * Fall through to the normal exit so the old primary leaves cleanly. */
+      } else if (bounce_hold_client(cptr, msg) == 0) {
+        /* Entered HOLDING.  Remote-only aliases: schedule a settled-tick
+         * promote (lets any concurrent BX X land first). */
+        if (bsess && bsess->hs_alias_count > 0)
+          bounce_schedule_cross_server_promote(bsess);
+        return;  /* Held - don't exit_client */
       }
       /* If hold failed, fall through to normal exit */
     }
