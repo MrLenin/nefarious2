@@ -3405,9 +3405,17 @@ static void crdt_reconcile_user_update(struct Client *live,
       build_umode_delta(delta, sizeof delta, livel, rec->umodes);
       if (delta[0]) {
         char nbuf[CRDT_NUMERICLEN], *pv[4];
+        /* §17.7: when the reconcile delta toggles oper, force +o propagation to
+         * legacy.  This user is a presented remote (no local PRIV_PROPAGATE), so
+         * set_user_mode's prop stays 0 and send_umode_out would strip o via
+         * SEND_UMODES_BUT_OPER — the legacy peer counted +o at the NICK intro but
+         * never sees the matching transition, drifting/underflowing its
+         * UserStats.opers.  CRDT peers still get the change via the doc (crdt_gate). */
+        int am = ALLOWMODES_ANY;
+        if (strchr(delta, 'o')) am |= ALLOWMODES_FORCE_OPER_PROP;
         ircd_strncpy(nbuf, numbuf, sizeof nbuf);
         pv[0] = cli_name(live); pv[1] = nbuf; pv[2] = delta; pv[3] = NULL;
-        set_user_mode(cli_from(live), live, 3, pv, ALLOWMODES_ANY);
+        set_user_mode(cli_from(live), live, 3, pv, am);
         c->umoded++;
       }
     }

@@ -2578,8 +2578,13 @@ int set_user_mode(struct Client *cptr, struct Client *sptr, int parc,
     }
     /* Alias->primary sync: the alias has PRIV_PROPAGATE from the leaf's
      * Oper block (via PRIVS message), but the primary doesn't.  Force
-     * propagation so +o is included in the S2S mode string. */
-    if (allow_modes & ALLOWMODES_ALIAS_SYNC) {
+     * propagation so +o is included in the S2S mode string.
+     * ALLOWMODES_FORCE_OPER_PROP: same need for the §17.7 gateway umode
+     * reconcile of a presented remote user (no local PRIV_PROPAGATE) — without
+     * it a reconcile-driven o transition is stripped (SEND_UMODES_BUT_OPER) on
+     * the legacy leg, desyncing the legacy peer's UserStats.opers (it counted
+     * +o at the NICK intro, never sees the matching -o -> underflow on exit). */
+    if (allow_modes & (ALLOWMODES_ALIAS_SYNC | ALLOWMODES_FORCE_OPER_PROP)) {
       prop = 1;
     }
     if (FlagHas(&setflags, FLAG_OPER) && !IsOper(acptr)) {

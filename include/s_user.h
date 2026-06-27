@@ -56,6 +56,10 @@ struct ConfItem;
 #define ALLOWMODES_DEFAULT  1 /**< Only allow the subset of modes that are legit defaults */
 #define ALLOWMODES_SVSMODE 2 /**< Allow any user mode to be changed ignoring restrictions */
 #define ALLOWMODES_ALIAS_SYNC 4 /**< Alias->primary mode sync: force +o propagation */
+#define ALLOWMODES_FORCE_OPER_PROP 8 /**< §17.7 gateway umode reconcile: force +o
+    propagation to legacy for a presented (privs-less) remote user, so the legacy
+    peer's UserStats.opers stays balanced (its NICK intro counted +o; without this
+    a reconcile-driven -o/+o is stripped via SEND_UMODES_BUT_OPER and the count drifts) */
 
 /* flags for do_oper() */
 #define OPER_FLAG_SILENT 1 /**< Suppress oper announcement, OPERMOTD, and log */
