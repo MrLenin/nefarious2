@@ -2309,6 +2309,60 @@ void bounce_crdt_replica_reap(void)
   }
 }
 
+/** M6c-1 BX Inc-2 (fix): the ALIAS analog of bounce_crdt_replica_reap — tear down
+ * gateway-materialized REPLICA aliases whose owner tombstoned their bconn doc record.
+ * LIVE-WALK (accountHash -> sessions -> hs_aliases[]) + crdt_shadow_bconn_present check
+ * — NOT a foreach over the bconns map (crdt_lwwmap_foreach skips deleted entries, so the
+ * reconcile_bconn_cb tombstone branch was unreachable dead code).  Collect-then-act
+ * (no mid-walk hs_aliases[] mutation).  Synthesizes BX X to legacy (skip_crdt => legacy
+ * leg only => only a node WITH a legacy downlink, i.e. the gateway, actually emits to .2;
+ * a leaf reaching no legacy peer is a no-op).  This is the WORKING de-materialize path
+ * that makes the Inc-2c alias BX X suppression correct (the analog of replica_reap making
+ * BS X suppression correct). */
+void bounce_crdt_alias_reap(void)
+{
+  enum { REAP_BATCH = 32 };
+  char doomed[REAP_BATCH][6];   /* YYXXX numerics */
+  int i, nd = 0;
+
+  if (!feature_bool(FEAT_CRDT_BOUNCER_DOC) || !feature_bool(FEAT_CRDT_PRIMARY))
+    return;
+
+  for (i = 0; i < BOUNCE_ACCOUNT_HASHSIZE && nd < REAP_BATCH; i++) {
+    struct AccountSessions *as;
+    for (as = accountHash[i]; as && nd < REAP_BATCH; as = as->as_hnext) {
+      struct BouncerSession *s;
+      for (s = as->as_sessions; s && nd < REAP_BATCH; s = s->hs_anext) {
+        int a;
+        for (a = 0; a < s->hs_alias_count && nd < REAP_BATCH; a++) {
+          struct Client *al = findNUser(s->hs_aliases[a].ba_numeric);
+          if (!al || !IsBouncerAlias(al) || MyConnect(al))
+            continue;                 /* only gateway-materialized REPLICA aliases */
+          if (crdt_shadow_bconn_present(s->hs_account, s->hs_sessid,
+                                        s->hs_aliases[a].ba_numeric))
+            continue;                 /* doc bconn still live -> keep */
+          ircd_strncpy(doomed[nd++], s->hs_aliases[a].ba_numeric, sizeof doomed[0]);
+        }
+      }
+    }
+  }
+
+  for (i = 0; i < nd; i++) {
+    struct Client *al = findNUser(doomed[i]);
+    if (!al || !IsBouncerAlias(al) || MyConnect(al))
+      continue;                       /* ABA re-check after prior de-mats */
+    /* Synth BX X to legacy first (the de-mat counterpart to materialize's BX C) so
+     * .2 drops the alias.  skip_crdt => legacy-only; numeric-keyed so &me source is
+     * correct.  Then tear down the local materialized alias silently. */
+    sendcmdto_set_skip_crdt_servers();
+    sendcmdto_serv_butone(&me, CMD_BOUNCER_TRANSFER, NULL, "X %s", doomed[i]);
+    log_write(LS_SYSTEM, L_NOTICE, 0,
+              "CRDT M6c-1 BX Inc-2: de-materialized stale replica alias %s "
+              "(doc bconn tombstoned)", doomed[i]);
+    bounce_dematerialize_replica_alias(al);
+  }
+}
+
 /** Per redesign C.2 + design intent #135 + #254: do we have any
  * locally-held bouncer sessions on this server?
  *

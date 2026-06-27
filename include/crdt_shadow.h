@@ -76,6 +76,9 @@ void crdt_shadow_bsess_remove(const char *account, const char *sessid);
 const char *crdt_shadow_bsess_winner(const char *account, char *out, size_t outsz);
 /** 5-5e M6a-3: 1 iff a non-tombstone bsessions doc record exists (replica-reap gate). */
 int crdt_shadow_bsess_present(const char *account, const char *sessid);
+/** M6c-1 BX Inc-2: 1 iff a non-tombstone bconns doc record exists (alias-reap gate). */
+int crdt_shadow_bconn_present(const char *account, const char *sessid,
+                             const char *connnum);
 /** 5-5e M6d: full P10 numeric of the doc-recorded PRIMARY connection (or NULL). */
 const char *crdt_shadow_bconn_primary(const char *account, const char *sessid,
                                       char *out, size_t outsz);

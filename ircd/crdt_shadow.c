@@ -641,6 +641,17 @@ int crdt_shadow_bsess_present(const char *account, const char *sessid)
   return crdt_bsess_get(&g_crdt, account, sessid) != NULL;
 }
 
+/* M6c-1 BX Inc-2 (fix): is this connection's bconn doc record still LIVE (not
+ * tombstoned/absent)?  The alias-reap oracle, mirror of crdt_shadow_bsess_present
+ * for the replica-session reap.  crdt_bconn_get returns NULL for a tombstone. */
+int crdt_shadow_bconn_present(const char *account, const char *sessid,
+                             const char *connnum)
+{
+  if (!shadow_on())
+    return 0;
+  return crdt_bconn_get(&g_crdt, account, sessid, connnum) != NULL;
+}
+
 /* 5-5e M6d: the full P10 numeric of the doc-recorded PRIMARY connection for
  * (account,sessid), or NULL if none in the doc.  Used by the lease-authoritative
  * resume decision to resolve the live holder's primary Client (findNUser) when a
@@ -1126,7 +1137,7 @@ static int crdt_parse_bconn_key(const char *key, uint32_t key_len,
   return 1;
 }
 
-struct reconcile_bconn_ctx { unsigned created; unsigned demat; char doomed[32][16]; int nd; };
+struct reconcile_bconn_ctx { unsigned created; };
 static void reconcile_bconn_cb(const char *key, uint32_t key_len,
                                const struct CrdtLWWValue *val, void *ctx)
 {
@@ -1134,23 +1145,13 @@ static void reconcile_bconn_cb(const char *key, uint32_t key_len,
   const struct CrdtBouncerConn *rec;
   char account[ACCOUNTLEN + 1], sessid[64], aliasn[16], primary[16];
   uint16_t myn;
-  if (!val->data || val->data_len != sizeof(struct CrdtBouncerConn)) {
-    /* tombstone.  M6c-1 BX Inc-2: COLLECT a still-materialized REPLICA alias whose
-     * doc bconn was tombstoned, for de-materialization AFTER the walk (mid-walk-safe,
-     * mirror bounce_crdt_replica_reap).  Closes the resurrection: P10 BX X removes
-     * the gateway alias, a reconcile can re-materialize it from the briefly-still-live
-     * bconn (re-synthing BX C to legacy), then the tombstone must undo it — regardless
-     * of BX-X-vs-tombstone ordering.  Collect on ANY node (a leaf can re-materialize
-     * too); the legacy BX X synth in the act loop is gateway-gated. */
-    if (crdt_parse_bconn_key(key, key_len, account, sizeof account,
-                             sessid, sizeof sessid, aliasn, sizeof aliasn)) {
-      struct Client *al = findNUser(aliasn);
-      if (al && IsBouncerAlias(al) && !MyConnect(al) &&
-          c->nd < (int)(sizeof c->doomed / sizeof c->doomed[0]))
-        ircd_strncpy(c->doomed[c->nd++], aliasn, sizeof c->doomed[0]);
-    }
-    return;
-  }
+  if (!val->data || val->data_len != sizeof(struct CrdtBouncerConn))
+    return;                                   /* tombstone — NOTE: crdt_lwwmap_foreach
+                                               * SKIPS deleted entries, so this branch is
+                                               * never reached for a tombstone.  Alias
+                                               * de-materialization rides bounce_crdt_alias_reap
+                                               * (a live-walk + crdt_shadow_bconn_present check,
+                                               * mirror of the replica-session reap), NOT here. */
   rec = (const struct CrdtBouncerConn *)val->data;
   if (rec->is_primary)
     return;                                   /* primary = a real user (reconcile_users), not an alias */
@@ -1188,32 +1189,6 @@ void crdt_shadow_reconcile_bouncer(void)
    * runs before this in the verify timer). */
   crdt_lwwmap_foreach(&g_crdt.bsessions, reconcile_bsess_cb, &cs);
   crdt_lwwmap_foreach(&g_crdt.bconns, reconcile_bconn_cb, &ca);
-  /* M6c-1 BX Inc-2: de-materialize the collected stale replica aliases AFTER the
-   * walk (collect-then-act — no mid-walk mutation of the bconns map / no UAF).  On
-   * the gateway, synth BX X to legacy FIRST so .2 drops the (possibly resurrected)
-   * alias — the de-mat counterpart to materialize's BX C.  BX X is numeric-keyed
-   * (findNUser on the receiver), so &me source is correct (unlike BS A/D, inv#3).
-   * skip_crdt = legacy leg only.  Re-resolve + re-check each victim (ABA/idempotency:
-   * the P10 BX X may have already removed it -> findNUser NULL -> skip). */
-  {
-    int di;
-    for (di = 0; di < ca.nd; di++) {
-      struct Client *al = findNUser(ca.doomed[di]);
-      if (!al || !IsBouncerAlias(al) || MyConnect(al))
-        continue;
-      if (crdt_gateway_has_legacy_peer()) {
-        sendcmdto_set_skip_crdt_servers();
-        sendcmdto_serv_butone_v3(&me, CMD_BOUNCER_TRANSFER, NULL,
-                                 "X %s", ca.doomed[di]);
-      }
-      bounce_dematerialize_replica_alias(al);
-      ca.demat++;
-    }
-    if (ca.demat)
-      log_write(LS_SYSTEM, L_NOTICE, 0,
-                "CRDT M6c-1 BX Inc-2: de-materialized %u stale replica alias(es) "
-                "(doc tombstone)", ca.demat);
-  }
   if (cs.created || ca.created || cs.state_applied)
     log_write(LS_SYSTEM, L_NOTICE, 0,
               "CRDT bouncer-reconcile: created %u replica session(s) + %u alias(es), "
@@ -1223,6 +1198,12 @@ void crdt_shadow_reconcile_bouncer(void)
    * their doc record (the teardown counterpart that makes BS X suppression
    * correct).  Lives in bouncer_session.c (owns the session hashes). */
   bounce_crdt_replica_reap();
+  /* M6c-1 BX Inc-2 (fix): the ALIAS removal half — tear down replica ALIASES whose
+   * owner tombstoned their bconn (live-walk + crdt_shadow_bconn_present check, mirror
+   * of replica_reap).  This is the WORKING de-materialize path — the earlier
+   * reconcile_bconn_cb tombstone-branch approach was dead code (crdt_lwwmap_foreach
+   * skips deleted entries).  On the gateway it synthesizes BX X to legacy. */
+  bounce_crdt_alias_reap();
 }
 
 /* Phase 4c: server reachability is a LOCAL determination, NOT replicated state.

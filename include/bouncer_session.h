@@ -1401,5 +1401,8 @@ extern void bounce_crdt_bsess_sweep(void);
  *  BS X suppression (M6b-1) correct: the doc tombstone is the sole teardown
  *  signal toward CRDT peers.  Gated on FEAT_CRDT_BOUNCER_DOC. */
 extern void bounce_crdt_replica_reap(void);
+/* M6c-1 BX Inc-2: tear down replica ALIASES whose owner tombstoned their bconn
+ * (live-walk + crdt_shadow_bconn_present check; gateway synthesizes BX X to legacy). */
+extern void bounce_crdt_alias_reap(void);
 
 #endif /* INCLUDED_bouncer_session_h */

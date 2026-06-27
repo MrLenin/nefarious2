@@ -1041,6 +1041,17 @@ int exit_client(struct Client *cptr,
     char client_full[6];
     ircd_snprintf(0, client_full, sizeof(client_full), "%s%s",
                   cli_yxx(cli_user(victim)->server), cli_yxx(victim));
+    /* M6c-1 BX Inc-2c: suppress ALIAS BX X among CRDT peers — the doc tombstone
+     * (eager bconn_remove at untrack) + the gateway de-materialize
+     * (crdt_shadow_reconcile_bouncer) drive removal everywhere, and the gateway
+     * synthesizes BX X to legacy from the de-mat.  This makes the de-mat the SOLE
+     * destroy path among CRDT peers (no racing P10 BX X) — eliminating the Inc-1
+     * resurrection at its root and forcing the de-mat to be exercised.  ONLY for
+     * aliases: held-ghost (IsBouncerHold) destroy stays on the BS path (M6c-1 reap
+     * synthesizes BS X) — do NOT disturb it.  skip_crdt still reaches legacy peers
+     * (the gateway's .2 leg), so a gateway-local alias destroy still notifies .2. */
+    if (feature_bool(FEAT_CRDT_BOUNCER_DOC) && IsBouncerAlias(victim))
+      sendcmdto_set_skip_crdt_servers();
     sendcmdto_serv_butone(&me, CMD_BOUNCER_TRANSFER, cli_from(killer),
                           "X %s", client_full);
   }
