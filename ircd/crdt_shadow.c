@@ -998,6 +998,30 @@ static void crdt_m6c1_synth_bs_ad(const char *account, const char *sessid,
             cli_name(srv), chans);
 }
 
+/* M6b-2 BS O (Inc-B): synthesize the session oper grant set/clear toward legacy
+ * from the doc.  SOURCE = &me (unlike BS A/D): BS O is account/sessid-keyed —
+ * the receiver resolves the session via bounce_find_by_token_sessid and never a
+ * source-prefixed numeric — so inv#3 does NOT apply.  skip_crdt = legacy leg
+ * only.  Format mirrors bounce_broadcast case 'O' exactly.  Gated by the caller
+ * on crdt_gateway_has_legacy_peer; on first materialize the caller MUST emit BS
+ * C before BS O (the receiver drops O if the session does not exist yet). */
+static void crdt_m6c1_synth_bs_o(const char *account, const char *sessid,
+                                 const struct CrdtBouncerSession *rec)
+{
+  sendcmdto_set_skip_crdt_servers();
+  if (rec->oper_name[0])
+    sendcmdto_serv_butone_v3(&me, CMD_BOUNCER_SESSION, NULL,
+                          "O %s %s %Tu %s",
+                          account, sessid, (time_t)rec->oper_granted_at,
+                          rec->oper_name);
+  else
+    sendcmdto_serv_butone_v3(&me, CMD_BOUNCER_SESSION, NULL,
+                          "O %s %s", account, sessid);
+  log_write(LS_SYSTEM, L_NOTICE, 0,
+            "CRDT M6b-2: synth BS O -> legacy acct=%s sid=%s grant=%s",
+            account, sessid, rec->oper_name[0] ? rec->oper_name : "(cleared)");
+}
+
 struct reconcile_bsess_ctx { unsigned created; unsigned state_applied; };
 static void reconcile_bsess_cb(const char *key, uint32_t key_len,
                                const struct CrdtLWWValue *val, void *ctx)
@@ -1057,6 +1081,13 @@ static void reconcile_bsess_cb(const char *key, uint32_t key_len,
                   "CRDT bsess M6b-2: replica acct=%s sid=%s oper grant -> %s "
                   "(doc-apply)", account, sessid,
                   rec->oper_name[0] ? rec->oper_name : "(cleared)");
+        /* M6b-2 Inc-B: the gateway re-originates the grant set/clear toward
+         * legacy (the leaf's BS O is now suppressed among CRDT peers).  The
+         * session already exists on the legacy peer (BS C synth'd at create),
+         * so BS O alone suffices here.  Fires once per actual change (the
+         * strncmp/granted_at guard above), so no repeat-storm. */
+        if (crdt_gateway_has_legacy_peer())
+          crdt_m6c1_synth_bs_o(account, sessid, rec);
       }
       if ((int)existing->hs_state != (int)rec->state) {
         if (rec->state == BOUNCE_HOLDING) {
@@ -1126,9 +1157,14 @@ static void reconcile_bsess_cb(const char *key, uint32_t key_len,
       if (crdt_gateway_has_legacy_peer()) {
         char chans[512];
         struct Client *uc = crdt_m6c1_session_chans(account, sessid, chans, sizeof chans);
-        if (uc)
+        if (uc) {
           crdt_m6c1_synth_bs_c(account, sessid, rec, newsess, chans);
-        else
+          /* M6b-2 Inc-B: C-before-O — emit the oper grant right after BS C so
+           * the just-created legacy session records it (the receiver drops a
+           * BS O whose session does not exist yet). */
+          if (rec->oper_name[0])
+            crdt_m6c1_synth_bs_o(account, sessid, rec);
+        } else
           log_write(LS_SYSTEM, L_NOTICE, 0,
                     "CRDT M6c-1: BS C synth deferred (user not materialized) "
                     "acct=%s sid=%s", account, sessid);

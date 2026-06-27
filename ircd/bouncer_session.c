@@ -4251,7 +4251,13 @@ void bounce_broadcast(struct BouncerSession *session, char subcmd,
   case 'O': /* Oper grant set/clear.  @a extra is the opername; pass
              * NULL or empty to clear.  Receivers apply the grant to
              * any local session members and persist it on the local
-             * session record so server-restart restores it. */
+             * session record so server-restart restores it.
+             * M6b-2 Inc-B: among CRDT peers the grant rides the doc
+             * (swept into CrdtBouncerSession); suppress the relay so the
+             * gateway re-originates it to legacy from the doc
+             * (crdt_m6c1_synth_bs_o) — doc-native, mirroring BS C/A/D/X. */
+    if (feature_bool(FEAT_CRDT_BOUNCER_DOC))
+      sendcmdto_set_skip_crdt_servers();
     if (extra && *extra)
       sendcmdto_serv_butone_v3(&me, CMD_BOUNCER_SESSION,
                             NULL,
@@ -4836,7 +4842,12 @@ bsc_forward:
       bounce_apply_remote_oper_grant(session, opername, granted_at);
 
     /* Forward to other peers (this server bounces it onward like the
-     * other BS subcommands). */
+     * other BS subcommands).  M6b-2 Inc-B: suppress the onward relay to
+     * CRDT peers — the grant rides the doc among them; only the legacy
+     * leg should see the relayed BS O (and the gateway re-originates from
+     * the doc anyway). */
+    if (feature_bool(FEAT_CRDT_BOUNCER_DOC))
+      sendcmdto_set_skip_crdt_servers();
     if (opername && *opername)
       sendcmdto_serv_butone_v3(sptr, CMD_BOUNCER_SESSION,
                             cptr,
