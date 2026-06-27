@@ -178,6 +178,7 @@ struct CrdtNickClaim {
 
 #define CRDT_BSESS_NAMELEN   40   /* >= BOUNCER_NAME_LEN (32) */
 #define CRDT_BSESS_TOKENLEN  72   /* >= BOUNCER_TOKEN_LEN (64) + NUL */
+#define CRDT_BSESS_OPERLEN   31   /* >= NICKLEN(30) + NUL; matches hs_oper_name */
 /** Bouncer session as CRDT-native doc state (5-5e doc-native track).  Keyed by
  *  account\0sessid in the `bsessions` LWW-map; the HOLDER node is the single writer.
  *  M2 = SHADOW only (mirrored + verified against live, NOT yet authoritative).
@@ -189,11 +190,13 @@ struct CrdtBouncerSession {
   uint64_t created;                     /**< hs_created (TS) */
   uint64_t last_active;                 /**< hs_last_active (TS) */
   uint64_t total_active;                /**< hs_total_active (seconds) */
+  uint64_t oper_granted_at;             /**< hs_oper_granted_at (TS; 0 = not opered) — M6b-2 BS O */
   uint32_t attach_count;                /**< hs_attach_count */
   uint32_t connect_count;               /**< hs_connect_count */
   uint8_t  state;                       /**< enum BouncerState (ACTIVE/HOLDING) */
   int8_t   hold_override;               /**< -1=default / 0=no-hold / 1=hold */
-  uint8_t  pad[6];                      /**< explicit pad -> stable digest layout */
+  char     oper_name[CRDT_BSESS_OPERLEN];/**< hs_oper_name (empty = not opered) — M6b-2 BS O */
+  uint8_t  pad[7];                      /**< explicit pad -> stable digest layout (sizeof=192) */
 };
 
 /** Per-connection record (5-5e M4 doc-native bouncer).  Keyed by account\0sessid\0connnum

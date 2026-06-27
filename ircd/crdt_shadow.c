@@ -1039,6 +1039,25 @@ static void reconcile_bsess_cb(const char *key, uint32_t key_len,
         return;                                 /* local holder = single-writer */
       if (rec->state != BOUNCE_HOLDING && rec->state != BOUNCE_ACTIVE)
         return;                                 /* destroy rides the X tombstone, not here */
+      /* M6b-2 BS O: converge the oper grant onto an already-materialized
+       * REPLICA from the doc (a grant set/cleared after this replica
+       * materialized).  Past the single-writer gate above => never the
+       * authoritative local holder, so this writes only local replica state
+       * (the sweep's MyConnect gate means it never re-writes the doc).
+       * Populate only; +o on a live local promote is applied later by
+       * bounce_apply_oper_grant from this name.  inv: NO O:line revalidation
+       * here (persist-across-move; revalidation is restart-only). */
+      if (0 != strncmp(existing->hs_oper_name, rec->oper_name,
+                       sizeof existing->hs_oper_name)
+          || existing->hs_oper_granted_at != (time_t)rec->oper_granted_at) {
+        ircd_strncpy(existing->hs_oper_name, rec->oper_name,
+                     sizeof existing->hs_oper_name);
+        existing->hs_oper_granted_at = (time_t)rec->oper_granted_at;
+        log_write(LS_SYSTEM, L_NOTICE, 0,
+                  "CRDT bsess M6b-2: replica acct=%s sid=%s oper grant -> %s "
+                  "(doc-apply)", account, sessid,
+                  rec->oper_name[0] ? rec->oper_name : "(cleared)");
+      }
       if ((int)existing->hs_state != (int)rec->state) {
         if (rec->state == BOUNCE_HOLDING) {
           existing->hs_state = BOUNCE_HOLDING;
@@ -1089,6 +1108,16 @@ static void reconcile_bsess_cb(const char *key, uint32_t key_len,
                                      (int)rec->state);
     if (newsess) {
       c->created++;
+      /* M6b-2 BS O: carry the doc oper grant onto the freshly-materialized
+       * replica session.  POPULATE ONLY — do not apply +o here: this user is
+       * remote (!MyConnect on this node), so live +o state arrives via normal
+       * P10 umode propagation; the stored name is what a FUTURE local
+       * promote/revive (bounce_apply_oper_grant) needs to re-oper.  Persist-
+       * across-move: NO local-O:line revalidation on the materialize path
+       * (that is restart-only, in bounce_create_ghost). */
+      ircd_strncpy(newsess->hs_oper_name, rec->oper_name,
+                   sizeof newsess->hs_oper_name);
+      newsess->hs_oper_granted_at = (time_t)rec->oper_granted_at;
       /* M6c-1 Increment 1: the gateway re-originates BS C toward legacy (the
        * leaf's BS C died — no legacy downlink).  Channels from live memberships.
        * If the materializing user isn't live here yet (PENDING), defer one cycle

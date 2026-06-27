@@ -2114,6 +2114,13 @@ void bounce_crdt_bsess_sweep(void)
           rec.connect_count = s->hs_connect_count;
           rec.state         = (uint8_t)s->hs_state;
           rec.hold_override = (int8_t)s->hs_hold_override;
+          /* M6b-2 BS O: carry the session-anchored oper grant doc-native so a
+           * replica/gateway that materializes (or revives) this session from
+           * the doc retains it — without this, a doc-materialized session loses
+           * the grant and a later promote/revive comes back non-oper.  Empty
+           * hs_oper_name = not opered; the field stays zeroed (memset above). */
+          ircd_strncpy(rec.oper_name, s->hs_oper_name, sizeof rec.oper_name);
+          rec.oper_granted_at = (uint64_t)s->hs_oper_granted_at;
           crdt_shadow_bsess_set(s->hs_account, s->hs_sessid, &rec);
           n++;
           /* M3 de-risk: doc-derived election winner must equal this live sessid. */
@@ -3246,6 +3253,10 @@ void bounce_db_shutdown(void)
  * oper to the new primary from the session's stored grant. */
 static void bounce_apply_oper_grant(struct Client *cptr,
                                      struct BouncerSession *sess);
+/* Forward decl — defined alongside bounce_apply_oper_grant.  Used by the
+ * restart restore path (bounce_db_restore) to revalidate a persisted oper
+ * grant against the local O:line config (fail-closed: drop on miss). */
+static struct ConfItem *find_oper_conf_by_name(const char *opername);
 /* Forward decl — defined alongside its siblings further down.  Used
  * by bounce_handle_bs's case 'O' to apply (or clear) a session's
  * oper grant on every locally-attached member when the change
@@ -3656,10 +3667,39 @@ int bounce_db_restore(void)
                  sizeof(session->hs_oper_name));
     session->hs_oper_granted_at = (time_t)rec->bsr_oper_granted_at;
 
-    /* If the session had an oper grant when persisted, re-apply it to
-     * the just-created ghost so the held identity carries oper rights
-     * across restart.  No-op when the grant is empty or no local
-     * O:line matches hs_oper_name. */
+    /* RESTART REVALIDATION (M6b-2 BS O doc-native oper model, fail-CLOSED).
+     * This is the ONLY site that revalidates a persisted oper grant against
+     * the local O:line config — a true restart-from-disk restore (we are in
+     * bounce_db_restore).  Per the model: a grant PERSISTS a primary-move /
+     * doc-materialize unconditionally (those paths never revalidate), but on
+     * restart we DROP it if the granting O:line no longer exists locally (the
+     * operator's o-line / OLVL may have been removed while we were down).
+     * X3 auto-opers eligible users on their next reconnect, so a dropped
+     * grant self-heals; a wrongly-RETAINED one would be a privilege leak.
+     * (De-oping a still-valid persisted oper otherwise requires an ORESET.)
+     *
+     * Durability: this clears only the in-memory grant; the on-disk record is
+     * rewritten on the next dirty event, so a second restart before then
+     * re-runs this (idempotent) drop.  No UserStats decrement is needed —
+     * bounce_apply_oper_grant has not run yet, so nothing was counted. */
+    if (session->hs_oper_name[0]
+        && !find_oper_conf_by_name(session->hs_oper_name)) {
+      log_write(LS_SYSTEM, L_NOTICE, 0,
+                "Bouncer: dropping persisted oper grant on restore "
+                "(no local O:line '%s') acct=%s sid=%s",
+                session->hs_oper_name, session->hs_account, session->hs_sessid);
+      sendto_opmask_butone(0, SNO_OLDSNO,
+                "Bouncer: dropped oper grant '%s' for %s (session %s) on "
+                "restore -- no matching O:line",
+                session->hs_oper_name, session->hs_account,
+                session->hs_sessid);
+      session->hs_oper_name[0] = '\0';
+      session->hs_oper_granted_at = 0;
+    }
+
+    /* If the (revalidated) grant survives, re-apply it to the just-created
+     * ghost so the held identity carries oper rights across restart.
+     * No-op when the grant is empty or no local O:line matches. */
     if (session->hs_oper_name[0])
       bounce_apply_oper_grant(ghost, session);
 

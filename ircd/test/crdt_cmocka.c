@@ -438,12 +438,20 @@ static void test_bsess_op_replicates(void **state)
   crdt_state_init(&s1, 1);
   crdt_state_init(&s2, 2);
 
+  /* Layout pin (M6b-2 BS O): catch an accidental interior hole / wrong pad
+   * when fields are added — the digest hashes the whole record incl. pad, so
+   * the size must stay a stable 8-byte multiple (memset-before-fill keeps the
+   * pad deterministic across replicas). */
+  assert_int_equal(192, (int)sizeof(struct CrdtBouncerSession));
+
   memset(&rec, 0, sizeof rec);
   rec.state = 1 /* BOUNCE_HOLDING */; rec.hold_override = 1;
   rec.created = 1000; rec.last_active = 1500; rec.total_active = 42;
   rec.attach_count = 3; rec.connect_count = 7;
   strcpy(rec.name, "laptop");
   strcpy(rec.token, "tok-abc-123");
+  strcpy(rec.oper_name, "shmoo");          /* M6b-2 BS O: doc-native oper grant */
+  rec.oper_granted_at = 1234567;
   crdt_bsess_set(&s1, ACC, SID, &rec);
   crdt_state_sync(&s2, &s1);
 
@@ -456,6 +464,8 @@ static void test_bsess_op_replicates(void **state)
   assert_int_equal(7, (int)g->connect_count);
   assert_string_equal("laptop", g->name);
   assert_string_equal("tok-abc-123", g->token);
+  assert_string_equal("shmoo", g->oper_name);
+  assert_int_equal(1234567, (int)g->oper_granted_at);
   assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
   /* present -> not "explicitly removed" on either replica */
   assert_int_equal(0, crdt_bsess_is_explicitly_removed(&s1, ACC, SID));
