@@ -163,6 +163,17 @@ On a CRDT-server SQUIT, instead of cascade-tombstoning, the departed server is K
     LOCAL determination (`FindNServer` + the beacon), never replicated CRDT state ("no amount of
     patching makes a per-viewpoint value robust as shared state"). Don't resurrect it — path-vector
     routing would, which is why the roadmap recommends gossip-flood instead.
+11. **Doc-REMOVAL reconciles must LIVE-WALK + check `*_present()`, NEVER foreach the tombstone.**
+    `crdt_lwwmap_foreach` (crdt_types.c) **skips deleted entries** (`if (!e->deleted)`), and OR-Set
+    iteration is similar — so a reconcile callback's `!val->data` / tombstone branch is UNREACHABLE for
+    a removal. To act on a doc removal (e.g. de-materialize a replica/alias whose owner tombstoned its
+    record), walk the LIVE local objects (the session/account hashes, channel lists) and gate on
+    `crdt_shadow_*_present()` (`crdt_*_get` → NULL for a tombstone), collect-then-act (no mid-walk
+    mutation). This is the `bounce_crdt_replica_reap` (sessions) / `bounce_crdt_alias_reap` (aliases)
+    pattern. Cost of the trap: M6c-1 BX Inc-2 shipped a de-mat in the (dead) tombstone branch — it never
+    fired; the legacy P10 BX X silently masked it until BX X suppression made the de-mat the sole path
+    and exposed the strand. Reconcile-CREATE in the `val->data` branch is fine (live entries ARE walked);
+    only REMOVAL needs the live-walk.
 
 ## Build / test / verify
 
