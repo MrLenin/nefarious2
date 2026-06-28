@@ -327,6 +327,13 @@ enum Flag
                                      *   race-proof). Never set/cleared directly elsewhere. */
     FLAG_COUNTED_INV,              /**< This client currently contributes +1 to UserStats.inv_clients.
                                      *   Same discipline as FLAG_COUNTED_OPER. */
+    FLAG_CRDT_ORPHAN_PENDING,      /**< Orphan-reap (gateway ghost-reap) debounce: this materialized
+                                     *   remote user read wholly ABSENT from the CRDT doc on the
+                                     *   previous reconcile pass.  Two consecutive absent passes with a
+                                     *   beacon-fresh owner == a stale-materialization ghost (its delete
+                                     *   tombstone was GC'd before the tombstone-only reap reached it).
+                                     *   Cleared the moment a doc entry reappears.  A debounce, not
+                                     *   durable state. */
 
     FLAG_LAST_FLAG,                 /**< number of flags */
     FLAG_LOCAL_UMODES = FLAG_LOCOP, /**< First local mode flag */

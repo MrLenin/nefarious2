@@ -842,6 +842,62 @@ void crdt_shadow_orphan_reap_scan(void)
   crdt_lwwmap_foreach(&g_crdt.bconns, orphan_scan_cb, &c);
 }
 
+/* Orphan-reap milestone, Inc 1 — STALE-MATERIALIZATION detector (DETECT-AND-LOG ONLY).
+ *
+ * Class-1 ghost: a materialized remote user lingers as a live Client here but its
+ * CRDT_COLL_USERS doc record is WHOLLY ABSENT (no value, no tombstone) — its delete
+ * tombstone was GC'd (crdt_lwwmap_gc_deleted, once the DELETE op went causally stable —
+ * e.g. the deleting peer left the gmin set) before crdt_shadow_reconcile_user_removes
+ * (tombstone-ONLY) reaped it.  Invariant: a present doc entry never vanishes (GC reclaims
+ * only tombstones), so a previously-materialized user now wholly absent WAS deleted.
+ *
+ * Predicate note: the LEASE is the WRONG oracle for class-1 — it tracks the session/
+ * account (alive on its home), not the individual user incarnation that quit, so a ghost
+ * shows lease_moved=0.  The correct signal is owner-BEACON-fresh + not-bursting +
+ * persistence (a partitioned owner goes beacon-stale -> self-suppresses, the proven
+ * partition oracle from the bconn orphan scan).
+ *
+ * Inc 1 LOGS would_reap WITHOUT acting, so a real bed can confirm it stays 0 across a
+ * netns partition+heal UNDER CHURN (false-death gate) and fires only on genuine churn
+ * ghosts, before Inc 2 makes it destructive.  No exit_client here — cannot crash. */
+static void crdt_shadow_stale_user_scan(void)
+{
+  struct Client *acptr;
+  int bursting = 0;
+  if (!shadow_on() || !feature_bool(FEAT_CRDT_BOUNCER_DOC))
+    return;
+  for (acptr = GlobalClientList; acptr; acptr = cli_next(acptr))
+    if (IsServer(acptr) && IsBurstOrBurstAck(acptr)) { bursting = 1; break; }
+  for (acptr = GlobalClientList; acptr; acptr = cli_next(acptr)) {
+    char num[CRDT_NUMERICLEN];
+    struct Client *owner;
+    uint16_t onum;
+    int owner_fresh, prev_absent, would_reap;
+    if (!IsUser(acptr) || MyUser(acptr) || IsBouncerAlias(acptr))
+      continue;
+    if (crdt_user_is_mesh_only(acptr))
+      continue;                       /* mesh-stub user — retire path owns it */
+    user_numeric(acptr, num, sizeof num);
+    if (crdt_user_get(&g_crdt, num) || crdt_user_is_explicitly_removed(&g_crdt, num)) {
+      ClrFlag(acptr, FLAG_CRDT_ORPHAN_PENDING);   /* present or tombstoned — healthy */
+      continue;
+    }
+    /* wholly absent from the doc: candidate ghost */
+    owner = cli_user(acptr) ? cli_user(acptr)->server : NULL;
+    onum  = (owner && IsServer(owner)) ? (uint16_t)base64toint(cli_yxx(owner)) : 0;
+    owner_fresh = (owner && IsServer(owner) && IsCrdtAware(owner) && !IsMeshStub(owner)
+                   && crdt_shadow_server_beacon_fresh(onum));
+    prev_absent = HasFlag(acptr, FLAG_CRDT_ORPHAN_PENDING);
+    would_reap = owner_fresh && !bursting && prev_absent;  /* 2nd consecutive absent pass */
+    log_write(LS_SYSTEM, L_NOTICE, 0,
+      "CRDT stale-mat CANDIDATE num=%s nick=%s acct=%s owner=%s owner_fresh=%d "
+      "bursting=%d prev_absent=%d would_reap=%d",
+      num, cli_name(acptr), cli_account(acptr)[0] ? cli_account(acptr) : "-",
+      owner ? cli_name(owner) : "?", owner_fresh, bursting, prev_absent, would_reap);
+    SetFlag(acptr, FLAG_CRDT_ORPHAN_PENDING);     /* mark for next-pass debounce */
+  }
+}
+
 /* 5-5e M5: liveness-lease wrappers + the beacon-freshness liveness signal. */
 const struct CrdtBouncerLease *crdt_shadow_blease_get(const char *account,
                                                       const char *sessid)
@@ -4397,6 +4453,7 @@ static void crdt_shadow_verify_cb(struct Event *ev)
   crdt_shadow_reconcile_member_status(); /* Phase 3h: per-member status (+o/+v/+h) */
   crdt_shadow_reconcile_bans();    /* Phase 3i: channel bans/excepts (+b/+e) */
   crdt_shadow_reconcile_user_removes(); /* Phase 3m: QUIT / delete-on-leave (after channel cleanup) */
+  crdt_shadow_stale_user_scan();   /* orphan-reap Inc 1: detect-and-log stale-materialization ghosts (absent-from-doc) the tombstone-only reap left behind */
   crdt_shadow_reconcile_glines();  /* GLINE step 3: drive global G-lines from doc (+gateway) */
   crdt_shadow_reconcile_shuns();   /* SHUN: drive global Shuns from doc (+gateway) */
   crdt_shadow_reconcile_zlines();  /* ZLINE: drive global Z-lines from doc (+gateway) */
