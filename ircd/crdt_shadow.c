@@ -3143,10 +3143,9 @@ static struct Client *crdt_materialize_one_user(const char *key, uint32_t key_le
   user_apply_umode_str(nc, rec->umodes);         /* sets umode FLAGS only */
   SetUser(nc);
   Count_newremoteclient(UserStats, srv);
-  if (IsInvisible(nc))                            /* user_apply_umode_str doesn't */
-    ++UserStats.inv_clients;                      /* bump these — exit asserts >0  */
-  if (IsOper(nc) && !IsHideOper(nc) && !IsChannelService(nc) && !IsBot(nc))
-    ++UserStats.opers;
+  /* user_apply_umode_str only set the FLAGS; reconcile the +o/+i counters
+   * (flag-keyed source of truth, matched by userstats_count_clear at reap). */
+  userstats_count_sync(nc);
   return nc;
 }
 

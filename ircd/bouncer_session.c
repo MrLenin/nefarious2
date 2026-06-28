@@ -8323,8 +8323,12 @@ track_alias:
    * the local view of the primary, which may be stale or incomplete.
    * e.g. alias created on originating server after /OPER, but the
    * primary on this server hasn't received the mode change yet. */
-  if (alias_modes && *alias_modes)
+  if (alias_modes && *alias_modes) {
     user_apply_umode_str(alias, alias_modes);
+    /* user_apply_umode_str sets FLAGS only — reconcile counting to the final
+     * mode state (no-op for a remote alias, which is ineligible). */
+    userstats_count_sync(alias);
+  }
 
   /* Track alias in session replica.
    *
