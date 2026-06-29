@@ -8166,9 +8166,9 @@ static int bounce_alias_create(struct Client *cptr, struct Client *sptr,
      * pre-conversion N is left with the alias's old nick stuck in
      * their channel-state cache, and the eventual silent
      * IsBouncerAlias destroy in s_misc.c never cleans it up.
-     * Mitigation sketch: sendcmdto_common_channels_butone(alias,
-     * CMD_QUIT, "Session converging") here before hRemClient.  Not
-     * implemented pending evidence of real-world occurrence.  See
+     * This is now mitigated below (after the F-BW1 account gate): a
+     * CMD_QUIT for the old nick is emitted to common channels before
+     * hRemClient so observers clean up the ghost.  See
      * `.claude/para/projects/legacy-bx-p-in-place-conversion.md`
      * (Open questions — "Client-side ghost on in-place conversion"). */
     sendto_opmask_butone(0, SNO_NETWORK,
@@ -8187,7 +8187,9 @@ static int bounce_alias_create(struct Client *cptr, struct Client *sptr,
      * its entire identity; without this a malformed/hostile BX C
      * hijacks an unrelated user's Client slot.  Aliases are
      * account-anchored, so a legitimate convert target always has the
-     * matching account set; a mismatch is drop-worthy + canaried. */
+     * matching account set; a mismatch is drop-worthy + canaried.
+     * Runs BEFORE the ghost-clearing QUIT below so a refused conversion
+     * emits nothing. */
     if (!IsAccount(alias) || 0 != ircd_strcmp(user->account, account)) {
       sendto_opmask_butone(0, SNO_NETWORK,
           "BX C convert-in-place REFUSED (account mismatch): alias=%s "
