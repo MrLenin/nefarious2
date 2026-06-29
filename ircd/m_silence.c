@@ -29,6 +29,7 @@
 
 #include "channel.h"
 #include "client.h"
+#include "crdt_shadow.h" /* Tier C F1-c: mirror silence list into the CRDT doc */
 #include "hash.h"
 #include "ircd.h"
 #include "ircd_features.h"
@@ -263,6 +264,11 @@ forward_silences(struct Client *sptr, char *silences, struct Client *dest)
       free_ban(accepted[ii]);
     }
   }
+
+  /* Tier C F1-c: the user's silence list is now finalized — mirror it into the
+   * CRDT doc so it reaches overlay-only mesh peers (the P10 broadcast above only
+   * reaches tree neighbours). Self-skips for remote users (home server owns it). */
+  crdt_shadow_silences(sptr);
 }
 
 /** Handle a SILENCE command from a local user.

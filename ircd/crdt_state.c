@@ -151,6 +151,7 @@ void crdt_state_init(struct CrdtNetworkState *st, uint16_t my_numeric)
   crdt_lwwmap_init(&st->bsessions);
   crdt_lwwmap_init(&st->bconns);
   crdt_lwwmap_init(&st->bleases);
+  crdt_orset_init(&st->silences);
 }
 
 void crdt_state_clear(struct CrdtNetworkState *st)
@@ -172,6 +173,7 @@ void crdt_state_clear(struct CrdtNetworkState *st)
   crdt_lwwmap_clear(&st->bsessions);
   crdt_lwwmap_clear(&st->bconns);
   crdt_lwwmap_clear(&st->bleases);
+  crdt_orset_clear(&st->silences);
   for (int b = 0; b < CRDT_CHAN_BUCKETS; b++) {
     struct CrdtChannel *c = st->chan_buckets[b];
     while (c) {
@@ -342,6 +344,55 @@ void crdt_chan_ban_remove(struct CrdtNetworkState *st, const char *chan,
     op->chan = memdup(chan, clen);
     op->chan_len = clen;
     op->key = memdup(mask, klen);
+    op->key_len = klen;
+    op->tag = removed[i];
+    op->priority = priority;
+    record(st, op);
+  }
+}
+
+/* Tier C F1-c: per-user SILENCE OR-Set (global collection keyed usernumeric\0mask).
+ * Mirrors crdt_chan_ban_add/remove but on st->silences with op->chan unused (the
+ * collection is global; the user numeric is folded into the composite op->key).
+ * The mask must not contain a NUL (it never does — it's an IRC ban mask). */
+static uint32_t silence_key(char *out, const char *usernumeric, const char *mask)
+{
+  uint32_t ul = (uint32_t)strlen(usernumeric);
+  uint32_t ml = (uint32_t)strlen(mask);
+  memcpy(out, usernumeric, ul);
+  out[ul] = '\0';
+  memcpy(out + ul + 1, mask, ml);
+  return ul + 1 + ml;
+}
+
+void crdt_silence_add(struct CrdtNetworkState *st, const char *usernumeric,
+                      const char *mask)
+{
+  uint64_t seq = st->next_seq++;
+  struct CrdtTag tag = { st->my_numeric, seq };
+  char key[CRDT_NUMERICLEN + 1 + 256];
+  uint32_t klen = silence_key(key, usernumeric, mask);
+  struct CrdtOp *op;
+  crdt_orset_add(&st->silences, key, klen, tag);
+  op = op_new(st->my_numeric, seq, CRDT_OP_ADD, CRDT_COLL_SILENCES);
+  op->key = memdup(key, klen);
+  op->key_len = klen;
+  op->tag = tag;
+  record(st, op);
+}
+
+void crdt_silence_remove(struct CrdtNetworkState *st, const char *usernumeric,
+                         const char *mask, uint8_t priority)
+{
+  char key[CRDT_NUMERICLEN + 1 + 256];
+  uint32_t klen = silence_key(key, usernumeric, mask);
+  struct CrdtTag removed[64];
+  int n, i;
+  n = crdt_orset_remove(&st->silences, key, klen, priority, removed, 64);
+  for (i = 0; i < n; i++) {
+    uint64_t seq = st->next_seq++;
+    struct CrdtOp *op = op_new(st->my_numeric, seq, CRDT_OP_REMOVE, CRDT_COLL_SILENCES);
+    op->key = memdup(key, klen);
     op->key_len = klen;
     op->tag = removed[i];
     op->priority = priority;
@@ -1347,6 +1398,11 @@ void crdt_state_apply_op(struct CrdtNetworkState *st, const struct CrdtOp *op)
     else if (op->type == CRDT_OP_DELETE)
       crdt_lwwmap_delete(&st->bleases, op->key, op->key_len, op->ts, op->writer);
     hlc_receive(&st->clock, &op->ts);            /* advance our clock */
+  } else if (op->coll == CRDT_COLL_SILENCES) {   /* Tier C F1-c global silences OR-Set */
+    if (op->type == CRDT_OP_ADD)
+      crdt_orset_merge_add(&st->silences, op->key, op->key_len, op->tag);
+    else
+      crdt_orset_merge_remove(&st->silences, op->tag, op->priority);
   } else {
     struct CrdtLWWMap *map = lww_for(st, op->coll);
     if (op->type == CRDT_OP_SET)
@@ -1587,6 +1643,7 @@ uint64_t crdt_state_digest(const struct CrdtNetworkState *st)
   acc = digest_lww(acc, &st->bsessions, 16); /* salt 16: 5-5e bouncer sessions */
   acc = digest_lww(acc, &st->bconns, 17);    /* salt 17: 5-5e M4 bouncer connections */
   acc = digest_blease(acc, &st->bleases, 18);/* salt 18: 5-5e M5 lease (value-only) */
+  acc = digest_orset(acc, &st->silences, "", 0, 19);/* salt 19: Tier C F1-c silences */
   for (bk = 0; bk < CRDT_CHAN_BUCKETS; bk++) {
     struct CrdtChannel *c;
     for (c = st->chan_buckets[bk]; c; c = c->next) {
@@ -1642,6 +1699,7 @@ uint64_t crdt_state_digest_materialized(const struct CrdtNetworkState *st)
   acc = digest_lww(acc, &st->bsessions, 16); /* salt 16: 5-5e bouncer sessions */
   acc = digest_lww(acc, &st->bconns, 17);    /* salt 17: 5-5e M4 bouncer connections */
   acc = digest_blease(acc, &st->bleases, 18);/* salt 18: 5-5e M5 lease (value-only) */
+  acc = digest_orset_present(acc, &st->silences, "", 0, 19);/* salt 19: Tier C F1-c silences */
   for (bk = 0; bk < CRDT_CHAN_BUCKETS; bk++) {
     struct CrdtChannel *c;
     for (c = st->chan_buckets[bk]; c; c = c->next) {
@@ -1793,6 +1851,7 @@ int crdt_state_gc(struct CrdtNetworkState *st,
       freed += crdt_orset_gc(&c->bans, stable);
       freed += crdt_orset_gc(&c->excepts, stable);
     }
+  freed += crdt_orset_gc(&st->silences, stable);  /* Tier C F1-c global silences OR-Set */
 
   /* record the reclaimed cut: anything <= gc_floor is gone from the oplog, so a
    * peer whose SV is below it must be sent a full snapshot, not a delta. */

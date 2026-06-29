@@ -349,6 +349,66 @@ static void test_chan_ban_op_replicates(void **state)
   crdt_state_clear(&s2);
 }
 
+/* F1-c: per-user SILENCE OR-Set — a GLOBAL collection keyed usernumeric\0mask.
+ * Ops replicate via DELTA sync (not just snapshot), removes tombstone, a second
+ * mask for the same user coexists, digests converge each step, and the surviving
+ * state round-trips through a CR-F snapshot (the cold-join path). Mirrors
+ * test_chan_ban_op_replicates but on the global st->silences OR-Set. */
+static void test_silence_op_replicates(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s1, s2, s3;
+  const char *U = "AAAAB";                 /* a 5-char client numeric */
+  const char *M1 = "spammer!*@*.evil";
+  const char *M2 = "flooder!*@*.bad";
+  char k1[64], k2[64];
+  uint32_t ul = (uint32_t)strlen(U);
+  uint32_t k1l, k2l;
+  uint8_t buf[8192];
+  int n;
+
+  /* composite keys: usernumeric\0mask (NUL-separated, mask may not contain NUL) */
+  memcpy(k1, U, ul); k1[ul] = '\0'; memcpy(k1 + ul + 1, M1, strlen(M1));
+  k1l = ul + 1 + (uint32_t)strlen(M1);
+  memcpy(k2, U, ul); k2[ul] = '\0'; memcpy(k2 + ul + 1, M2, strlen(M2));
+  k2l = ul + 1 + (uint32_t)strlen(M2);
+
+  crdt_state_init(&s1, 1);
+  crdt_state_init(&s2, 2);
+
+  /* +silence on s1 -> delta sync -> s2 has it */
+  crdt_silence_add(&s1, U, M1);
+  crdt_state_sync(&s2, &s1);
+  assert_int_equal(1, crdt_orset_contains(&s2.silences, k1, k1l));
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+
+  /* a second mask for the same user coexists (OR-Set, distinct keys) */
+  crdt_silence_add(&s1, U, M2);
+  crdt_state_sync(&s2, &s1);
+  assert_int_equal(1, crdt_orset_contains(&s2.silences, k2, k2l));
+  assert_int_equal(1, crdt_orset_contains(&s2.silences, k1, k1l));
+
+  /* -silence M1 -> delta sync -> s2 removes M1, keeps M2 */
+  crdt_silence_remove(&s1, U, M1, CRDT_PRIORITY_USER);
+  crdt_state_sync(&s2, &s1);
+  assert_int_equal(0, crdt_orset_contains(&s2.silences, k1, k1l));
+  assert_int_equal(1, crdt_orset_contains(&s2.silences, k2, k2l));
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+
+  /* snapshot roundtrip (CR-F cold join) preserves the surviving silence */
+  crdt_state_init(&s3, 3);
+  n = crdt_snapshot_encode(&s1, buf, sizeof buf);
+  assert_true(n > 0);
+  assert_true(crdt_snapshot_apply(&s3, buf, (size_t)n) >= 0);
+  assert_int_equal(1, crdt_orset_contains(&s3.silences, k2, k2l));
+  assert_int_equal(0, crdt_orset_contains(&s3.silences, k1, k1l));
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s3));
+
+  crdt_state_clear(&s1);
+  crdt_state_clear(&s2);
+  crdt_state_clear(&s3);
+}
+
 /* ================================================================== */
 /* Global-state track: a G-line set/update/delete replicates via DELTA and the
  * record round-trips with field fidelity; digests converge each step; the
@@ -2264,6 +2324,7 @@ int main(void)
     cmocka_unit_test(test_C_part_yields_to_concurrent_join),
     cmocka_unit_test(test_orset_explicit_removal_gate),
     cmocka_unit_test(test_chan_ban_op_replicates),
+    cmocka_unit_test(test_silence_op_replicates),
     cmocka_unit_test(test_gline_op_replicates),
     cmocka_unit_test(test_bsess_op_replicates),
     cmocka_unit_test(test_bsess_winner),

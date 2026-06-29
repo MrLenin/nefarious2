@@ -342,6 +342,20 @@ int crdt_snapshot_encode(const struct CrdtNetworkState *st,
   }
   wpatch_u32(&w, chan_off, chan_n);
 
+  /* Tier C F1-c: global OR-Sets (count-framed, coll-byte routed). Appended AFTER
+   * channels so it is forward/backward tolerant: an older decoder stops after the
+   * channel section and ignores these trailing bytes; a newer decoder reads them
+   * only when bytes remain (see crdt_snapshot_apply). */
+  {
+    size_t go_off = w.off;
+    uint32_t go_n = 0;
+    wput_u32(&w, 0);
+    wput_u8(&w, (uint8_t)CRDT_COLL_SILENCES);
+    snap_put_orset(&w, &st->silences);
+    go_n++;
+    wpatch_u32(&w, go_off, go_n);
+  }
+
   return w.err ? -1 : (int)w.off;
 }
 
@@ -457,6 +471,23 @@ int crdt_snapshot_apply(struct CrdtNetworkState *st,
       cd.node_id = rget_u16(&r);
       if (r.err) return -1;
       crdt_chan_ctime_merge(st, cname, nlen, cv, cs, cd);
+    }
+  }
+
+  /* Tier C F1-c: global OR-Sets — present only in newer snapshots. Guard on
+   * bytes-remaining so an OLDER snapshot (no trailing section) is tolerated
+   * (no spurious r.err -> no reject). Count-framed + coll-byte routed. */
+  if (!r.err && r.off < r.len) {
+    uint32_t go_n = rget_u32(&r), gi;
+    for (gi = 0; gi < go_n && !r.err; gi++) {
+      uint8_t coll = rget_u8(&r);
+      if (coll == (uint8_t)CRDT_COLL_SILENCES) {
+        if (snap_get_orset(&r, &st->silences) < 0) return -1;
+      } else {
+        return -1;  /* unknown global OR-Set (a newer peer's collection) — reject;
+                     * snap_get_orset is self-framing but unskippable blind, so a
+                     * fresh snapshot will be re-requested. No second one exists yet. */
+      }
     }
   }
 

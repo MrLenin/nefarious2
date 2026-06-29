@@ -269,7 +269,8 @@ enum CrdtCollection {
   CRDT_COLL_JUPES,         /**< server-name -> CrdtJupeRecord (LWW) — global-state track */
   CRDT_COLL_BSESSIONS,     /**< account\0sessid -> CrdtBouncerSession (LWW) — 5-5e doc-native bouncer */
   CRDT_COLL_BCONNS,        /**< account\0sessid\0connnum -> CrdtBouncerConn (LWW) — 5-5e M4 */
-  CRDT_COLL_BLEASES        /**< account\0sessid -> CrdtBouncerLease (comparator-merge) — 5-5e M5 */
+  CRDT_COLL_BLEASES,       /**< account\0sessid -> CrdtBouncerLease (comparator-merge) — 5-5e M5 */
+  CRDT_COLL_SILENCES       /**< usernumeric\0mask -> per-user silence masks (OR-Set) — Tier C F1-c */
 };
 
 struct CrdtOp {
@@ -352,6 +353,7 @@ struct CrdtNetworkState {
   struct CrdtLWWMap       bsessions;    /**< account\0sessid -> CrdtBouncerSession (5-5e) */
   struct CrdtLWWMap       bconns;       /**< account\0sessid\0connnum -> CrdtBouncerConn (5-5e M4) */
   struct CrdtLWWMap       bleases;      /**< account\0sessid -> CrdtBouncerLease (5-5e M5) */
+  struct CrdtORSet        silences;     /**< usernumeric\0mask -> per-user silence masks (Tier C F1-c) */
   struct CrdtChannel     *chan_buckets[CRDT_CHAN_BUCKETS];
 };
 
@@ -380,6 +382,13 @@ void crdt_chan_ban_add(struct CrdtNetworkState *st, const char *chan,
                        const char *mask, int is_except);
 void crdt_chan_ban_remove(struct CrdtNetworkState *st, const char *chan,
                           const char *mask, uint8_t priority, int is_except);
+/** Tier C F1-c: per-user SILENCE mask add/remove on the global silences OR-Set
+ *  (keyed usernumeric\0mask). Op-recording (delta-replicating), mirrors
+ *  crdt_chan_ban_add/remove. */
+void crdt_silence_add(struct CrdtNetworkState *st, const char *usernumeric,
+                      const char *mask);
+void crdt_silence_remove(struct CrdtNetworkState *st, const char *usernumeric,
+                         const char *mask, uint8_t priority);
 /** Phase 3j: set/get a channel's creationtime as an incarnation min-register.
  *  set() merges in {value, set_hlc=now, del_hlc=current}, records a
  *  CRDT_COLL_CHAN_CTIME op (so it replicates via delta). clear() bumps the local

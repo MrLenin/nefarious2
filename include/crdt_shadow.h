@@ -263,6 +263,14 @@ void crdt_shadow_modes(struct Channel *chptr, struct Client *from);
  *  single-writer gate. */
 void crdt_shadow_lists(struct Channel *chptr, struct Client *from);
 
+/** Tier C F1-c: per-user SILENCE convergence over the mesh.
+ *  crdt_shadow_silences mirrors a LOCAL user's live silence list into the doc
+ *  (home server is the single-writer); crdt_shadow_sync_user_silences brings a
+ *  REMOTE/materialized user's live list into line with the doc (doc-authoritative).
+ *  Additive — the legacy P10 SILENCE token is not suppressed. */
+void crdt_shadow_silences(struct Client *cptr);
+void crdt_shadow_sync_user_silences(struct Client *live);
+
 /** Global-state track (GLINE step 2 shadow-write): mirror a global G-line into the
  *  GLINES doc collection (keyed by its ban mask). Called from the canonical gline.c
  *  state-change points (add/activate/deactivate/modify). @a from is the change's

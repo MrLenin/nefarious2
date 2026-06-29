@@ -1889,6 +1889,151 @@ void crdt_shadow_lists(struct Channel *chptr, struct Client *from)
   crdt_sync_push();                    /* eager-propagate to CRDT peers */
 }
 
+/* ---- Tier C F1-c: per-user SILENCE OR-Set (global, keyed usernumeric\0mask) ----
+ * Under tree-retirement, the legacy P10 SILENCE broadcast (forward_silences ->
+ * sendcmdto_serv_butone "* mask") reaches tree neighbours + legacy but NOT an
+ * overlay-only CRDT leaf — so a sender there can't suppress a remote target's
+ * messages (is_silenced checks the TARGET's list at the SENDER's server). The doc
+ * fills that gap: the home server mirrors a user's silence list into the global
+ * OR-Set; every node materializes it onto the (possibly remote) user's live list.
+ * ADDITIVE — the P10 token is NOT suppressed, so legacy is unaffected. */
+
+/* Collect this user's silence masks from the doc OR-Set (filter by numeric prefix).
+ * Keys are usernumeric\0mask; extract the mask tail. */
+struct sil_collect_ctx { const char *num; uint32_t numlen;
+                         char masks[64][CRDT_MASKLEN]; int n; };
+static void sil_collect_cb(const char *key, uint32_t key_len, void *ctx)
+{
+  struct sil_collect_ctx *c = ctx;
+  uint32_t mlen;
+  if (c->n >= 64) return;
+  if (key_len <= c->numlen + 1) return;
+  if (memcmp(key, c->num, c->numlen) != 0 || key[c->numlen] != '\0') return;
+  mlen = key_len - c->numlen - 1;
+  if (mlen >= CRDT_MASKLEN) mlen = CRDT_MASKLEN - 1;
+  memcpy(c->masks[c->n], key + c->numlen + 1, mlen);
+  c->masks[c->n][mlen] = '\0';
+  c->n++;
+}
+
+/* Doc-mask form of a silence Ban: a leading '~' marks an exception so the
+ * BAN_EXCEPTION bit round-trips through the doc (else a +~mask exception would
+ * materialize as a positive silence and wrongly suppress). Else the bare mask. */
+static void sil_docmask(const struct Ban *b, char *out, size_t n)
+{
+  if ((b->flags & BAN_EXCEPTION) && n > 1) {
+    out[0] = '~';
+    ircd_strncpy(out + 1, b->banstr, n - 1);
+  } else {
+    ircd_strncpy(out, b->banstr, n);
+  }
+}
+
+/* Is a doc-mask (possibly '~'-prefixed) present in a live silence list? */
+static int sil_mask_in_list(struct Ban *list, const char *docmask)
+{
+  char dm[CRDT_MASKLEN];
+  struct Ban *b;
+  for (b = list; b; b = b->next) {
+    sil_docmask(b, dm, sizeof dm);
+    if (0 == ircd_strcmp(dm, docmask))
+      return 1;
+  }
+  return 0;
+}
+
+/* Mirror a LOCAL user's live silence list -> the doc (single-writer = home server).
+ * Op-recording add/remove so it replicates via delta. Mirrors reconcile_list. */
+void crdt_shadow_silences(struct Client *cptr)
+{
+  char numbuf[CRDT_NUMERICLEN + 4];
+  const char *num;
+  struct sil_collect_ctx col;
+  struct Ban *b;
+  char dm[CRDT_MASKLEN];
+  char key[CRDT_NUMERICLEN + 1 + CRDT_MASKLEN];
+  int i;
+  if (!shadow_on() || !cptr || !cli_user(cptr))
+    return;
+  if (!cli_user(cptr)->server || !cli_yxx(cptr)[0] || IsBouncerAlias(cptr))
+    return;
+  if (from_crdt_peer(cli_from(cptr)))   /* single-writer: only the home server mirrors */
+    return;
+  num = user_numeric(cptr, numbuf, sizeof numbuf);
+  /* add: live masks not yet in the doc (doc-mask form encodes exceptions) */
+  for (b = cli_user(cptr)->silence; b; b = b->next) {
+    uint32_t ul = (uint32_t)strlen(num), ml;
+    uint32_t klen;
+    sil_docmask(b, dm, sizeof dm);
+    ml = (uint32_t)strlen(dm);
+    klen = ul + 1 + ml;
+    if (klen > sizeof key) continue;
+    memcpy(key, num, ul); key[ul] = '\0'; memcpy(key + ul + 1, dm, ml);
+    if (!crdt_orset_contains(&g_crdt.silences, key, klen))
+      crdt_silence_add(&g_crdt, num, dm);
+  }
+  /* remove: doc masks for this user no longer present live */
+  col.num = num; col.numlen = (uint32_t)strlen(num); col.n = 0;
+  crdt_orset_foreach(&g_crdt.silences, sil_collect_cb, &col);
+  for (i = 0; i < col.n; i++)
+    if (!sil_mask_in_list(cli_user(cptr)->silence, col.masks[i]))
+      crdt_silence_remove(&g_crdt, num, col.masks[i], CRDT_PRIORITY_USER);
+  crdt_sync_push();
+}
+
+/* Build a live silence Ban from a doc-mask (decoding the '~' exception prefix).
+ * apply_ban asserts BAN_ADD|BAN_DEL is set, and BAN_EXCEPTION must be restored
+ * so is_silenced treats exceptions correctly — mirrors apply_silence's flagging. */
+static struct Ban *sil_make_from_docmask(const char *docmask)
+{
+  int is_exc = (docmask[0] == '~');
+  const char *bare = is_exc ? docmask + 1 : docmask;
+  struct Ban *nb;
+  if (!bare[0]) return NULL;
+  nb = make_ban(bare);
+  if (!nb) return NULL;
+  nb->flags |= BAN_ADD | (is_exc ? BAN_EXCEPTION : 0);
+  return nb;
+}
+
+/* Bring a REMOTE/materialized user's live silence list into line with the doc
+ * (doc is authoritative for remote users). Add missing masks, drop extras.
+ * NEVER call for a local user (their live list is the source of truth -> mirror). */
+void crdt_shadow_sync_user_silences(struct Client *live)
+{
+  char numbuf[CRDT_NUMERICLEN + 4];
+  const char *num;
+  struct sil_collect_ctx col;
+  struct Ban *b, *next, **plast;
+  char dm[CRDT_MASKLEN];
+  int i;
+  if (!live || !cli_user(live))
+    return;
+  /* Fast path: nothing in the doc AND nothing live -> the overwhelming common
+   * case (no silences anywhere) is O(1), not an O(silences) scan per user/cycle. */
+  if (crdt_orset_size(&g_crdt.silences) == 0 && !cli_user(live)->silence)
+    return;
+  num = user_numeric(live, numbuf, sizeof numbuf);
+  col.num = num; col.numlen = (uint32_t)strlen(num); col.n = 0;
+  crdt_orset_foreach(&g_crdt.silences, sil_collect_cb, &col);
+  /* add doc masks missing from the live list */
+  for (i = 0; i < col.n; i++)
+    if (!sil_mask_in_list(cli_user(live)->silence, col.masks[i])) {
+      struct Ban *nb = sil_make_from_docmask(col.masks[i]);
+      if (nb) apply_ban(&cli_user(live)->silence, nb, 1);
+    }
+  /* drop live masks no longer in the doc */
+  for (plast = &cli_user(live)->silence; (b = *plast) != NULL; ) {
+    int keep;
+    sil_docmask(b, dm, sizeof dm);
+    keep = 0;
+    for (i = 0; i < col.n; i++)
+      if (0 == ircd_strcmp(dm, col.masks[i])) { keep = 1; break; }
+    if (keep) { plast = &b->next; }
+    else { next = b->next; *plast = next; free_ban(b); }
+  }
+}
+
 /* ---- Global-state track: GLINEs as CRDT-native doc state (step 2 shadow-write) ---- */
 
 /* Build the doc key (ban mask) for a G-line into @a buf, or NULL if the gline must
@@ -3221,6 +3366,9 @@ static struct Client *crdt_materialize_one_user(const char *key, uint32_t key_le
   /* user_apply_umode_str only set the FLAGS; reconcile the +o/+i counters
    * (flag-keyed source of truth, matched by userstats_count_clear at reap). */
   userstats_count_sync(nc);
+  /* Tier C F1-c: populate the materialized user's silence list from the doc so
+   * source-side is_silenced on this node suppresses their silenced senders. */
+  crdt_shadow_sync_user_silences(nc);
   return nc;
 }
 
@@ -3587,6 +3735,11 @@ static void crdt_reconcile_user_update(struct Client *live,
     ms_mark(cli_from(live), &me, 5, pv);
     c->attr++;
   }
+  /* Tier C F1-c: bring a remote user's live silence list into line with the doc
+   * (doc-authoritative for remote users). Source-side is_silenced on this node
+   * then suppresses correctly. Only for remote users (home owns local lists). */
+  if (from_crdt_peer(cli_from(live)))
+    crdt_shadow_sync_user_silences(live);
 }
 
 static void recon_user_cb(const char *key, uint32_t key_len,
