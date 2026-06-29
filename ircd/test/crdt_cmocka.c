@@ -409,6 +409,63 @@ static void test_silence_op_replicates(void **state)
   crdt_state_clear(&s3);
 }
 
+/* F2-a: read-marker MAX-register — delta replicates, multi-writer advance converges,
+ * the merge keeps the MAX timestamp and NEVER regresses (a lower value set later, or
+ * carried by a snapshot, must not overwrite a higher one — the regression guard that
+ * is the whole reason for a comparator register vs plain HLC-LWW), digest converges. */
+static void test_marker_op_replicates(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s1, s2, s3;
+  char key[32], got[64];
+  uint32_t klen;
+  uint8_t buf[8192];
+  int n;
+  /* key = account\0target (opaque composite, NUL-separated); values are fixed-width
+   * "seconds.milliseconds" strings (lexical compare == numeric for equal width). */
+  memcpy(key, "alice", 5); key[5] = '\0'; memcpy(key + 6, "#chan", 5);
+  klen = 5 + 1 + 5;
+
+  crdt_state_init(&s1, 1);
+  crdt_state_init(&s2, 2);
+
+  /* set on s1 -> delta -> s2 */
+  crdt_marker_set(&s1, key, klen, "1719630000.100");
+  crdt_state_sync(&s2, &s1);
+  assert_true(crdt_marker_get(&s2, key, klen, got, sizeof got) > 0);
+  assert_string_equal("1719630000.100", got);
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+
+  /* multi-writer: advance on s2 -> delta -> s1 converges up */
+  crdt_marker_set(&s2, key, klen, "1719630000.200");
+  crdt_state_sync(&s1, &s2);
+  assert_true(crdt_marker_get(&s1, key, klen, got, sizeof got) > 0);
+  assert_string_equal("1719630000.200", got);
+
+  /* ★ MAX guard: a LOWER value set LATER must NOT regress the marker */
+  crdt_marker_set(&s1, key, klen, "1719630000.150");   /* < .200 -> local no-op */
+  crdt_marker_get(&s1, key, klen, got, sizeof got);
+  assert_string_equal("1719630000.200", got);
+  crdt_state_sync(&s2, &s1);
+  crdt_marker_get(&s2, key, klen, got, sizeof got);
+  assert_string_equal("1719630000.200", got);
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+
+  /* snapshot roundtrip: a snapshot carrying a LOWER marker (.200) must NOT regress a
+   * higher local one (.300) — guards the lexical-max snapshot special-case vs lww_set */
+  crdt_state_init(&s3, 3);
+  crdt_marker_set(&s3, key, klen, "1719630000.300");
+  n = crdt_snapshot_encode(&s1, buf, sizeof buf);   /* s1 holds .200 */
+  assert_true(n > 0);
+  assert_true(crdt_snapshot_apply(&s3, buf, (size_t)n) >= 0);
+  crdt_marker_get(&s3, key, klen, got, sizeof got);
+  assert_string_equal("1719630000.300", got);
+
+  crdt_state_clear(&s1);
+  crdt_state_clear(&s2);
+  crdt_state_clear(&s3);
+}
+
 /* ================================================================== */
 /* Global-state track: a G-line set/update/delete replicates via DELTA and the
  * record round-trips with field fidelity; digests converge each step; the
@@ -2325,6 +2382,7 @@ int main(void)
     cmocka_unit_test(test_orset_explicit_removal_gate),
     cmocka_unit_test(test_chan_ban_op_replicates),
     cmocka_unit_test(test_silence_op_replicates),
+    cmocka_unit_test(test_marker_op_replicates),
     cmocka_unit_test(test_gline_op_replicates),
     cmocka_unit_test(test_bsess_op_replicates),
     cmocka_unit_test(test_bsess_winner),

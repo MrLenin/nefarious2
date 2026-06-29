@@ -151,6 +151,7 @@ void crdt_state_init(struct CrdtNetworkState *st, uint16_t my_numeric)
   crdt_lwwmap_init(&st->bsessions);
   crdt_lwwmap_init(&st->bconns);
   crdt_lwwmap_init(&st->bleases);
+  crdt_lwwmap_init(&st->markers);
   crdt_orset_init(&st->silences);
 }
 
@@ -173,6 +174,7 @@ void crdt_state_clear(struct CrdtNetworkState *st)
   crdt_lwwmap_clear(&st->bsessions);
   crdt_lwwmap_clear(&st->bconns);
   crdt_lwwmap_clear(&st->bleases);
+  crdt_lwwmap_clear(&st->markers);
   crdt_orset_clear(&st->silences);
   for (int b = 0; b < CRDT_CHAN_BUCKETS; b++) {
     struct CrdtChannel *c = st->chan_buckets[b];
@@ -1317,6 +1319,87 @@ void crdt_blease_merge_snapshot(struct CrdtNetworkState *st, const char *key,
   blease_merge(st, key, klen, rec, writer, ts);
 }
 
+/* Lexical compare of two timestamp-string values (length-aware; == strcmp for the
+ * fixed-width "seconds.milliseconds" form markread uses). */
+static int marker_ts_cmp(const void *a, uint32_t alen, const void *b, uint32_t blen)
+{
+  uint32_t n = alen < blen ? alen : blen;
+  int c = (n ? memcmp(a, b, n) : 0);
+  if (c) return c;
+  return (alen > blen) - (alen < blen);
+}
+
+/* Tier C F2-a: read-marker MAX-register merge. Markers only advance (monotonic),
+ * and the SAME account writes from any server (multi-writer) -> the merge keeps the
+ * LEXICALLY-GREATER timestamp string, NOT HLC-LWW (which would regress a marker to a
+ * clock-skewed lower-value-later-write). Lexical-max is order-independent + idempotent
+ * -> multi-writer-safe. Byte-identical to markread's own strcmp "only if newer".
+ * Clone of blease_merge with the value-string max comparator. */
+static int marker_merge(struct CrdtNetworkState *st, const char *key, uint32_t klen,
+                        const void *inval, uint32_t inlen, uint16_t writer,
+                        struct HLC fresh_ts)
+{
+  const struct CrdtLWWValue *cur;
+  struct HLC ts;
+  if (!inlen)
+    return 0;
+  cur = crdt_lwwmap_get(&st->markers, key, klen);
+  if (cur && cur->data && cur->data_len) {
+    if (marker_ts_cmp(inval, inlen, cur->data, cur->data_len) <= 0)
+      return 0;                       /* current >= incoming -> no-op (idempotent max) */
+    ts = cur->ts;                     /* synth HLC strictly > the stored write so it sticks */
+    if (++ts.logical == 0)
+      ts.physical_ms++;
+  } else {
+    ts = fresh_ts;
+  }
+  crdt_lwwmap_set(&st->markers, key, klen, inval, inlen, ts, writer);
+  return 1;
+}
+
+void crdt_marker_set(struct CrdtNetworkState *st, const char *key, uint32_t klen,
+                     const char *tsstr)
+{
+  struct HLC ts = hlc_local_event(&st->clock);
+  uint32_t vlen;
+  uint64_t seq;
+  struct CrdtOp *op;
+  if (!klen || !tsstr || !tsstr[0])
+    return;
+  vlen = (uint32_t)strlen(tsstr);
+  if (!marker_merge(st, key, klen, tsstr, vlen, st->my_numeric, ts))
+    return;                           /* not newer -> no op storm (idempotent) */
+  seq = st->next_seq++;
+  op = op_new(st->my_numeric, seq, CRDT_OP_SET, CRDT_COLL_MARKERS);
+  op->key = memdup(key, klen);
+  op->key_len = klen;
+  op->val = memdup(tsstr, vlen);
+  op->val_len = vlen;
+  op->ts = ts;
+  op->writer = st->my_numeric;
+  record(st, op);
+}
+
+/* Snapshot-apply entry (crdt_wire.c): MERGE via the lexical-max comparator, NOT a
+ * generic HLC-LWW assign (which would regress on snapshot catch-up). Mirrors blease. */
+void crdt_marker_merge_snapshot(struct CrdtNetworkState *st, const char *key,
+                                uint32_t klen, const void *val, uint32_t vlen,
+                                uint16_t writer, struct HLC ts)
+{
+  marker_merge(st, key, klen, val, vlen, writer, ts);
+}
+
+int crdt_marker_get(const struct CrdtNetworkState *st, const char *key, uint32_t klen,
+                    char *out, size_t outsz)
+{
+  const struct CrdtLWWValue *v = crdt_lwwmap_get(&st->markers, key, klen);
+  if (!v || !v->data || !v->data_len || v->data_len >= outsz)
+    return -1;
+  memcpy(out, v->data, v->data_len);
+  out[v->data_len] = '\0';
+  return (int)v->data_len;
+}
+
 const struct CrdtBouncerLease *crdt_blease_get(const struct CrdtNetworkState *st,
                                                const char *account, const char *sessid)
 {
@@ -1353,6 +1436,7 @@ static struct CrdtLWWMap *lww_for(struct CrdtNetworkState *st,
   case CRDT_COLL_BSESSIONS:     return &st->bsessions;
   case CRDT_COLL_BCONNS:        return &st->bconns;
   case CRDT_COLL_BLEASES:       return &st->bleases;
+  case CRDT_COLL_MARKERS:       return &st->markers;
   default:                return NULL;
   }
 }
@@ -1403,6 +1487,10 @@ void crdt_state_apply_op(struct CrdtNetworkState *st, const struct CrdtOp *op)
       crdt_orset_merge_add(&st->silences, op->key, op->key_len, op->tag);
     else
       crdt_orset_merge_remove(&st->silences, op->tag, op->priority);
+  } else if (op->coll == CRDT_COLL_MARKERS) {    /* Tier C F2-a read-marker MAX-register */
+    if (op->type == CRDT_OP_SET && op->val && op->val_len)
+      marker_merge(st, op->key, op->key_len, op->val, op->val_len, op->writer, op->ts);
+    hlc_receive(&st->clock, &op->ts);            /* advance our clock */
   } else {
     struct CrdtLWWMap *map = lww_for(st, op->coll);
     if (op->type == CRDT_OP_SET)
@@ -1593,6 +1681,27 @@ static uint64_t digest_blease(uint64_t acc, const struct CrdtLWWMap *m, uint8_t 
   return acc;
 }
 
+/* Tier C F2-a: digest a read-marker MAX-register collection — value-aware (the
+ * ts_ms value IS the convergence metric, unlike a plain LWW where the HLC suffices).
+ * Used for both the full and materialized digest (no GC-variant divergence). */
+static uint64_t digest_marker(uint64_t acc, const struct CrdtLWWMap *m, uint8_t ns)
+{
+  uint32_t b;
+  for (b = 0; b < m->nbuckets; b++) {
+    struct CrdtLWWEntry *e;
+    for (e = m->buckets[b]; e; e = e->ht_next) {
+      uint64_t h = FNV64_OFFSET;
+      h = fnv64(h, &ns, 1);
+      h = fnv64(h, e->key, e->key_len);
+      h = fnv64(h, &e->deleted, sizeof e->deleted);
+      if (!e->deleted && e->val.data && e->val.data_len)
+        h = fnv64(h, e->val.data, e->val.data_len);
+      acc ^= h;
+    }
+  }
+  return acc;
+}
+
 static uint64_t digest_orset(uint64_t acc, const struct CrdtORSet *s,
                              const char *cname, uint32_t cnlen, uint8_t ns)
 {
@@ -1643,6 +1752,7 @@ uint64_t crdt_state_digest(const struct CrdtNetworkState *st)
   acc = digest_lww(acc, &st->bsessions, 16); /* salt 16: 5-5e bouncer sessions */
   acc = digest_lww(acc, &st->bconns, 17);    /* salt 17: 5-5e M4 bouncer connections */
   acc = digest_blease(acc, &st->bleases, 18);/* salt 18: 5-5e M5 lease (value-only) */
+  acc = digest_marker(acc, &st->markers, 20);/* salt 20: Tier C F2-a read-markers */
   acc = digest_orset(acc, &st->silences, "", 0, 19);/* salt 19: Tier C F1-c silences */
   for (bk = 0; bk < CRDT_CHAN_BUCKETS; bk++) {
     struct CrdtChannel *c;
@@ -1699,6 +1809,7 @@ uint64_t crdt_state_digest_materialized(const struct CrdtNetworkState *st)
   acc = digest_lww(acc, &st->bsessions, 16); /* salt 16: 5-5e bouncer sessions */
   acc = digest_lww(acc, &st->bconns, 17);    /* salt 17: 5-5e M4 bouncer connections */
   acc = digest_blease(acc, &st->bleases, 18);/* salt 18: 5-5e M5 lease (value-only) */
+  acc = digest_marker(acc, &st->markers, 20);/* salt 20: Tier C F2-a read-markers */
   acc = digest_orset_present(acc, &st->silences, "", 0, 19);/* salt 19: Tier C F1-c silences */
   for (bk = 0; bk < CRDT_CHAN_BUCKETS; bk++) {
     struct CrdtChannel *c;

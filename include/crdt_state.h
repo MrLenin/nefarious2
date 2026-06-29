@@ -270,7 +270,8 @@ enum CrdtCollection {
   CRDT_COLL_BSESSIONS,     /**< account\0sessid -> CrdtBouncerSession (LWW) — 5-5e doc-native bouncer */
   CRDT_COLL_BCONNS,        /**< account\0sessid\0connnum -> CrdtBouncerConn (LWW) — 5-5e M4 */
   CRDT_COLL_BLEASES,       /**< account\0sessid -> CrdtBouncerLease (comparator-merge) — 5-5e M5 */
-  CRDT_COLL_SILENCES       /**< usernumeric\0mask -> per-user silence masks (OR-Set) — Tier C F1-c */
+  CRDT_COLL_SILENCES,      /**< usernumeric\0mask -> per-user silence masks (OR-Set) — Tier C F1-c */
+  CRDT_COLL_MARKERS        /**< markread storage key -> read-marker ts (MAX-register) — Tier C F2-a */
 };
 
 struct CrdtOp {
@@ -353,6 +354,7 @@ struct CrdtNetworkState {
   struct CrdtLWWMap       bsessions;    /**< account\0sessid -> CrdtBouncerSession (5-5e) */
   struct CrdtLWWMap       bconns;       /**< account\0sessid\0connnum -> CrdtBouncerConn (5-5e M4) */
   struct CrdtLWWMap       bleases;      /**< account\0sessid -> CrdtBouncerLease (5-5e M5) */
+  struct CrdtLWWMap       markers;      /**< markread key -> read-marker ts_ms (MAX-register, Tier C F2-a) */
   struct CrdtORSet        silences;     /**< usernumeric\0mask -> per-user silence masks (Tier C F1-c) */
   struct CrdtChannel     *chan_buckets[CRDT_CHAN_BUCKETS];
 };
@@ -548,6 +550,23 @@ const struct CrdtBouncerLease *crdt_blease_get(const struct CrdtNetworkState *st
 void crdt_blease_merge_snapshot(struct CrdtNetworkState *st, const char *key,
                                 uint32_t klen, const struct CrdtBouncerLease *rec,
                                 uint16_t writer, struct HLC ts);
+
+/** Tier C F2-a: read-marker (MR) as a MAX-register collection (clone of the blease
+ *  comparator-register). The key is the markread storage key, treated as an OPAQUE
+ *  blob (account\0target today; profile-extensible). The VALUE is the read-marker
+ *  timestamp STRING (fixed-width "seconds.milliseconds"); the merge keeps the
+ *  LEXICALLY-GREATER value — byte-identical to markread's own strcmp "only if newer"
+ *  semantics (metadata_readmarker_set / session_markread_set). Multi-writer safe
+ *  (lexical-max is order-independent + idempotent). */
+void crdt_marker_set(struct CrdtNetworkState *st, const char *key, uint32_t klen,
+                     const char *ts);
+void crdt_marker_merge_snapshot(struct CrdtNetworkState *st, const char *key,
+                                uint32_t klen, const void *val, uint32_t vlen,
+                                uint16_t writer, struct HLC ts);
+/** Copy the current marker value (timestamp string) into @a out (NUL-terminated);
+ *  returns its length, or -1 if absent / out too small. */
+int crdt_marker_get(const struct CrdtNetworkState *st, const char *key, uint32_t klen,
+                    char *out, size_t outsz);
 /** Phase 3k: set/get per-kick metadata (LWW, keyed chan\0numeric). set() records a
  *  SET op so it replicates via delta; get() returns the LWW value (NULL if absent)
  *  so callers can read both the CrdtKickInfo payload and its HLC (.ts) for the

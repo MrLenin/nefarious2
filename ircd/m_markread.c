@@ -38,6 +38,7 @@
 #include "capab.h"
 #include "channel.h"
 #include "client.h"
+#include "crdt_shadow.h" /* Tier C F2-a: mirror read-markers into the CRDT doc */
 #include "hash.h"
 #include "history.h"
 #include "metadata.h"
@@ -367,6 +368,10 @@ int m_markread(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
         /* Broadcast to other servers: MR <account> <target> <timestamp> */
         sendcmdto_serv_butone_v3(&me, CMD_MARKREAD, cptr, "%s %s %s",
                               account, target, timestamp);
+
+        /* Tier C F2-a: mirror into the CRDT doc so overlay-only mesh leaves (which the
+         * P10 broadcast above does not reach) converge it. Additive; max-register. */
+        crdt_shadow_marker_set(account, target, timestamp);
       } else if (rc == 1) {
         /* Timestamp was not newer - respond with current stored value */
         rc = metadata_readmarker_get(account, target, stored_ts);
@@ -446,6 +451,11 @@ int ms_markread(struct Client *cptr, struct Client *sptr, int parc, char *parv[]
   /* Propagate to other servers */
   sendcmdto_serv_butone_v3(sptr, CMD_MARKREAD, cptr, "%s %s %s",
                         account, target, timestamp);
+
+  /* Tier C F2-a: mirror into the CRDT doc so overlay-only mesh leaves converge it.
+   * Covers legacy-origin markers (a CRDT gateway relays the MR here). Max-register +
+   * idempotent -> safe even though CRDT tree-neighbours also got the P10 broadcast. */
+  crdt_shadow_marker_set(account, target, timestamp);
 
   return 0;
 }

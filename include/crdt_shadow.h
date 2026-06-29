@@ -271,6 +271,13 @@ void crdt_shadow_lists(struct Channel *chptr, struct Client *from);
 void crdt_shadow_silences(struct Client *cptr);
 void crdt_shadow_sync_user_silences(struct Client *live);
 
+/** Tier C F2-a: read-marker (MR) convergence. crdt_shadow_marker_set mirrors a local
+ *  account-anchored marker into the doc (max-register, opaque storage key);
+ *  crdt_shadow_reconcile_markers drives the local readmarkers_cf from the doc. Additive
+ *  (the P10 MR token is not suppressed). */
+void crdt_shadow_marker_set(const char *account, const char *target, const char *ts);
+void crdt_shadow_reconcile_markers(void);
+
 /** Global-state track (GLINE step 2 shadow-write): mirror a global G-line into the
  *  GLINES doc collection (keyed by its ban mask). Called from the canonical gline.c
  *  state-change points (add/activate/deactivate/modify). @a from is the change's

@@ -317,6 +317,7 @@ int crdt_snapshot_encode(const struct CrdtNetworkState *st,
   snap_put_lww(&w, &st->bsessions, (uint8_t)CRDT_COLL_BSESSIONS, &lww_total); /* 5-5e */
   snap_put_lww(&w, &st->bconns, (uint8_t)CRDT_COLL_BCONNS, &lww_total);       /* 5-5e M4 */
   snap_put_lww(&w, &st->bleases, (uint8_t)CRDT_COLL_BLEASES, &lww_total);     /* 5-5e M5 */
+  snap_put_lww(&w, &st->markers, (uint8_t)CRDT_COLL_MARKERS, &lww_total);     /* Tier C F2-a */
   wpatch_u32(&w, lww_off, lww_total);
 
   /* channels: members / bans / excepts */
@@ -436,6 +437,10 @@ int crdt_snapshot_apply(struct CrdtNetworkState *st,
          * the lease to a clock-skewed loser on snapshot catch-up). Mirrors ctime. */
         crdt_blease_merge_snapshot(st, key ? key : "", klen,
                                    (const struct CrdtBouncerLease *)val, writer, ts);
+      else if (coll == (uint8_t)CRDT_COLL_MARKERS && vlen)
+        /* Tier C F2-a: lexical-MAX-register merge, NOT a generic HLC-LWW assign (which
+         * would regress a read-marker on snapshot catch-up). Mirrors blease/ctime. */
+        crdt_marker_merge_snapshot(st, key ? key : "", klen, val, vlen, writer, ts);
       else
         crdt_lwwmap_set(map, key ? key : "", klen, val, vlen, ts, writer);
     }

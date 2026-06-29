@@ -681,6 +681,7 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
           crdt_shadow_reconcile_shuns();   /* SHUN: drive global Shuns from doc (+gateway) */
           crdt_shadow_reconcile_zlines();  /* ZLINE: drive global Z-lines from doc (+gateway) */
           crdt_shadow_reconcile_jupes();   /* JUPE: drive juped servers from doc (+gateway) */
+          crdt_shadow_reconcile_markers(); /* Tier C F2-a: drive read-markers from doc -> RocksDB */
           /* M6c-1 Increment 2: reconcile bouncer sessions EAGERLY on the delta that
            * carries the change, not on the 30s verify timer.  Without this the
            * gateway's HOLDING<->ACTIVE state-apply (and its BS A/D synth toward

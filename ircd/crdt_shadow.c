@@ -40,6 +40,7 @@
 #include "handlers.h"        /* crdt_sync_broadcast */
 #include "mark.h"            /* Tier C F1-b: MARK_* sub-type tags */
 #include "ircd_geoip.h"      /* Tier C F1-b: geoip_apply_mark (rebuild names from codes) */
+#include "metadata.h"        /* Tier C F2-a: metadata_readmarker_set (doc -> readmarkers_cf) */
 
 #include <stdarg.h>          /* verify_emit dual log/client targeting */
 #include <stdio.h>
@@ -57,6 +58,7 @@ static struct Timer            g_verify_timer;
  * Synchronous — reconcile is never re-entrant. */
 static int                     g_gline_reconciling = 0;
 static int                     g_shun_reconciling = 0;   /* SHUN: same role as g_gline_reconciling */
+static int                     g_marker_reconciling = 0; /* Tier C F2-a: same role (read-markers) */
 static int                     g_zline_reconciling = 0;  /* ZLINE: same role */
 static int                     g_jupe_reconciling = 0;   /* JUPE: same role */
 
@@ -2032,6 +2034,75 @@ void crdt_shadow_sync_user_silences(struct Client *live)
     if (keep) { plast = &b->next; }
     else { next = b->next; *plast = next; free_ban(b); }
   }
+}
+
+/* ---- Tier C F2-a: read-marker (MR) doc <-> RocksDB readmarkers_cf ----
+ * ADDITIVE: the P10 MR broadcast still reaches tree neighbours + legacy; the doc only
+ * adds the overlay-leaf reach + backfill-on-link. The doc VALUE is the markread
+ * timestamp string (lexical-max, byte-identical to metadata_readmarker_set's strcmp).
+ * The key is the markread storage key (account\0target) treated as an opaque blob —
+ * if per-profile markread later keys by account\0sessid\0target, this inherits it. */
+
+/* Mirror a local account-anchored read-marker set into the doc (multi-writer; the
+ * lexical-max merge is order-independent + idempotent). Hooked at the m_markread
+ * account-anchored set sites (local command + S2S relay) so BOTH CRDT- and
+ * legacy-origin markers enter the doc. The reconcile writes RocksDB directly (not via
+ * m_markread), so there is no mirror<->reconcile loop; the guard is defensive. */
+void crdt_shadow_marker_set(const char *account, const char *target, const char *ts)
+{
+  char key[ACCOUNTLEN + CHANNELLEN + 4];
+  uint32_t al, tl, klen;
+  if (!shadow_on() || g_marker_reconciling)
+    return;
+  if (!account || !*account || !target || !*target || !ts || !*ts)
+    return;
+  al = (uint32_t)strlen(account);
+  tl = (uint32_t)strlen(target);
+  klen = al + 1 + tl;
+  if (al > ACCOUNTLEN || tl > CHANNELLEN || klen > sizeof key)
+    return;
+  memcpy(key, account, al); key[al] = '\0'; memcpy(key + al + 1, target, tl);
+  crdt_marker_set(&g_crdt, key, klen, ts);
+  crdt_sync_push();
+}
+
+struct reconcile_marker_ctx { unsigned int applied; };
+static void reconcile_marker_cb(const char *key, uint32_t key_len,
+                                const struct CrdtLWWValue *val, void *ctx)
+{
+  struct reconcile_marker_ctx *c = ctx;
+  const char *nul;
+  char account[ACCOUNTLEN + 1], target[CHANNELLEN + 1], ts[64];
+  uint32_t al, tl;
+  if (!val || !val->data || !val->data_len || val->data_len >= sizeof ts)
+    return;
+  nul = memchr(key, '\0', key_len);          /* key = account\0target (opaque split) */
+  if (!nul)
+    return;
+  al = (uint32_t)(nul - key);
+  tl = key_len - al - 1;
+  if (al == 0 || al > ACCOUNTLEN || tl == 0 || tl > CHANNELLEN)
+    return;
+  memcpy(account, key, al); account[al] = '\0';
+  memcpy(target, nul + 1, tl); target[tl] = '\0';
+  memcpy(ts, val->data, val->data_len); ts[val->data_len] = '\0';
+  if (metadata_readmarker_set(account, target, ts) == 0)   /* 0 = stored (was newer) */
+    c->applied++;
+}
+
+/* Drive the local readmarkers_cf from the doc (metadata_readmarker_set is newer-wins +
+ * idempotent). Dispatched from the verify cycle + eager delta-apply, like reconcile_glines. */
+void crdt_shadow_reconcile_markers(void)
+{
+  struct reconcile_marker_ctx c = { 0 };
+  if (!shadow_on())
+    return;
+  g_marker_reconciling = 1;
+  crdt_lwwmap_foreach(&g_crdt.markers, reconcile_marker_cb, &c);
+  g_marker_reconciling = 0;
+  if (c.applied)
+    log_write(LS_SYSTEM, L_DEBUG, 0,
+              "CRDT marker-reconcile: %u read-marker(s) applied from doc", c.applied);
 }
 
 /* ---- Global-state track: GLINEs as CRDT-native doc state (step 2 shadow-write) ---- */
@@ -4664,6 +4735,7 @@ static void crdt_shadow_verify_cb(struct Event *ev)
   crdt_shadow_stale_user_scan();   /* orphan-reap Inc 1: detect-and-log stale-materialization ghosts (absent-from-doc) the tombstone-only reap left behind */
   crdt_shadow_reconcile_glines();  /* GLINE step 3: drive global G-lines from doc (+gateway) */
   crdt_shadow_reconcile_shuns();   /* SHUN: drive global Shuns from doc (+gateway) */
+  crdt_shadow_reconcile_markers(); /* Tier C F2-a: drive read-markers from doc -> RocksDB */
   crdt_shadow_reconcile_zlines();  /* ZLINE: drive global Z-lines from doc (+gateway) */
   crdt_shadow_reconcile_jupes();   /* JUPE: drive juped servers from doc (+gateway) */
   bounce_crdt_bsess_sweep();       /* 5-5e M2: mirror local-holder bouncer sessions -> doc (shadow) */
