@@ -38,6 +38,8 @@
 #include "s_user.h"          /* umode_str, make_user, user_apply_umode_str */
 #include "send.h"            /* sendcmdto_* (Phase 3d topic gateway) */
 #include "handlers.h"        /* crdt_sync_broadcast */
+#include "mark.h"            /* Tier C F1-b: MARK_* sub-type tags */
+#include "ircd_geoip.h"      /* Tier C F1-b: geoip_apply_mark (rebuild names from codes) */
 
 #include <stdarg.h>          /* verify_emit dual log/client targeting */
 #include <stdio.h>
@@ -581,6 +583,11 @@ void crdt_shadow_user_add(struct Client *cptr)
   strncpy(rec.swhois, cli_user(cptr)->swhois, sizeof rec.swhois - 1);
   if (cli_user(cptr)->away)
     strncpy(rec.away, cli_user(cptr)->away, sizeof rec.away - 1);
+  /* Tier C F1-b: MARK-carried per-user state (CVERSION/SSLCLIFP/GEOIP codes). */
+  strncpy(rec.version, cli_version(cptr), sizeof rec.version - 1);
+  strncpy(rec.sslclifp, cli_sslclifp(cptr), sizeof rec.sslclifp - 1);
+  strncpy(rec.countrycode, cli_countrycode(cptr), sizeof rec.countrycode - 1);
+  strncpy(rec.continentcode, cli_continentcode(cptr), sizeof rec.continentcode - 1);
   umode_letters(rec.umodes, sizeof rec.umodes, umode_str(cptr));
   memcpy(rec.ip6, &cli_ip(cptr), sizeof rec.ip6);   /* struct irc_in_addr, 16B */
   rec.nick_ts = (uint64_t)cli_lastnick(cptr);
@@ -2838,6 +2845,10 @@ static void mat_user_cb(const char *key, uint32_t key_len,
   MCK(strcmp(rec->account, cli_user(live)->account), "account");
   MCK(strcmp(rec->swhois, cli_user(live)->swhois), "swhois");
   MCK(strcmp(rec->away, cli_user(live)->away ? cli_user(live)->away : ""), "away");
+  MCK(strcmp(rec->version, cli_version(live)), "version");
+  MCK(strcmp(rec->sslclifp, cli_sslclifp(live)), "sslclifp");
+  MCK(strcmp(rec->countrycode, cli_countrycode(live)), "countrycode");
+  MCK(strcmp(rec->continentcode, cli_continentcode(live)), "continentcode");
   MCK(memcmp(rec->ip6, &cli_ip(live), sizeof rec->ip6), "ip");
   MCK(rec->nick_ts != (uint64_t)cli_lastnick(live), "ts");
   { char letters[CRDT_UMODELEN];
@@ -3191,6 +3202,14 @@ static struct Client *crdt_materialize_one_user(const char *key, uint32_t key_le
     ircd_strncpy(cli_user(nc)->swhois, rec->swhois, BUFSIZE + 1);
   if (rec->away[0])
     user_set_away(cli_user(nc), (char *)rec->away);   /* user_set_away copies; safe */
+  /* Tier C F1-b: MARK state.  GeoIP carries only the codes; geoip_apply_mark rebuilds
+   * the country/continent NAMES locally + sets SetGeoIP (cheap, deterministic). */
+  if (rec->version[0])
+    ircd_strncpy(cli_version(nc), rec->version, VERSIONLEN + 1);
+  if (rec->sslclifp[0])
+    ircd_strncpy(cli_sslclifp(nc), rec->sslclifp, BUFSIZE + 1);
+  if (rec->countrycode[0])
+    geoip_apply_mark(nc, (char *)rec->countrycode, (char *)rec->continentcode, NULL);
   if (rec->account[0]) {
     ircd_strncpy(cli_user(nc)->account, rec->account, ACCOUNTLEN + 1);
     cli_user(nc)->acc_create = (time_t)rec->acc_create;
@@ -3531,6 +3550,42 @@ static void crdt_reconcile_user_update(struct Client *live,
       ms_away(cli_from(live), live, 2, pv);
       c->attr++;
     }
+  }
+  /* F1-b: MARK state (CVERSION / SSLCLIFP / GEOIP).  All SERVER-sourced -> sptr=&me.
+   * ★ ms_mark resolves its target via FindUser (by NICK), NOT findNUser (numeric) like
+   * SVSIDENT/SWHOIS — so parv[1] = cli_name(live), never numbuf.  skip_crdt one-shot =
+   * legacy-only gateway re-emit; the inner crdt_shadow_user_add self-skips. */
+  if (ircd_strcmp(cli_version(live), rec->version) != 0) {
+    char vbuf[CRDT_VERSIONLEN], *pv[5];
+    ircd_strncpy(vbuf, rec->version, sizeof vbuf);
+    pv[0] = cli_name(&me); pv[1] = cli_name(live);
+    pv[2] = (char *)MARK_CVERSION; pv[3] = vbuf; pv[4] = NULL;
+    sendcmdto_set_skip_crdt_servers();
+    ms_mark(cli_from(live), &me, 4, pv);
+    c->attr++;
+  }
+  if (ircd_strcmp(cli_sslclifp(live), rec->sslclifp) != 0) {
+    char fbuf[CRDT_SSLFPLEN], *pv[5];
+    ircd_strncpy(fbuf, rec->sslclifp, sizeof fbuf);
+    pv[0] = cli_name(&me); pv[1] = cli_name(live);
+    pv[2] = (char *)MARK_SSLCLIFP; pv[3] = fbuf; pv[4] = NULL;
+    sendcmdto_set_skip_crdt_servers();
+    ms_mark(cli_from(live), &me, 4, pv);
+    c->attr++;
+  }
+  /* GeoIP: carry only the codes; ms_mark -> geoip_apply_mark rebuilds the names locally.
+   * Gate on a non-empty doc code so empty-geoip users never drive a spurious MARK. */
+  if (rec->countrycode[0] &&
+      (ircd_strcmp(cli_countrycode(live), rec->countrycode) != 0 ||
+       ircd_strcmp(cli_continentcode(live), rec->continentcode) != 0)) {
+    char cc[CRDT_GEOCODELEN], cont[CRDT_GEOCODELEN], *pv[6];
+    ircd_strncpy(cc, rec->countrycode, sizeof cc);
+    ircd_strncpy(cont, rec->continentcode, sizeof cont);
+    pv[0] = cli_name(&me); pv[1] = cli_name(live);
+    pv[2] = (char *)MARK_GEOIP; pv[3] = cc; pv[4] = cont; pv[5] = NULL;
+    sendcmdto_set_skip_crdt_servers();
+    ms_mark(cli_from(live), &me, 5, pv);
+    c->attr++;
   }
 }
 

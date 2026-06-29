@@ -25,6 +25,7 @@
 #include "config.h"
 
 #include "client.h"
+#include "crdt_shadow.h" /* Tier C F1-b: crdt_shadow_user_add (push realname into the doc) */
 #include "handlers.h"
 #include "ircd.h"
 #include "ircd_reply.h"
@@ -62,6 +63,11 @@ int ms_svsinfo(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
   ircd_strncpy(acptr->cli_info, parv[2], REALLEN + 1);
 
   bounce_emit_alias_update(acptr, "realname", acptr->cli_info);
+
+  /* Tier C F1-b: push the realname change into the CRDT doc so it reaches mesh peers (the
+   * P10 relay below islands under tree-retirement); reuses the existing realname/setname
+   * reconcile path on the receive side. Self-skips on from_crdt_peer. */
+  crdt_shadow_user_add(acptr);
 
   sendcmdto_serv_butone(sptr, CMD_SVSINFO, cptr, "%C :%s", acptr, acptr->cli_info);
 

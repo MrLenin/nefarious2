@@ -30,6 +30,11 @@
                                * BUFSIZE+1 but real swhois lines are short — a
                                * >255-char line truncates in the mesh doc (cosmetic) */
 #define CRDT_AWAYLEN    256   /* away message; live AWAYLEN=250 (+NUL fits) */
+#define CRDT_VERSIONLEN 128   /* MARK_CVERSION client version; live VERSIONLEN=250 but
+                               * real CTCP versions are short — >127 truncates (cosmetic) */
+#define CRDT_SSLFPLEN    96   /* MARK_SSLCLIFP cert fingerprint; live BUFSIZE+1 but a
+                               * SHA-256 CertFP ("SHA256:"+64 hex) is ~71 chars (cosmetic) */
+#define CRDT_GEOCODELEN   3   /* GeoIP 2-letter country/continent code + NUL */
 #define CRDT_TOPICNICKLEN 120 /* >= NICKLEN+USERLEN+HOSTLEN+3 +1 */
 
 /* Compact per-member channel status bits (mapped from CHFL_* at the shadow
@@ -71,6 +76,10 @@ struct CrdtUserRecord {
   char     account[CRDT_ACCOUNTLEN];  /**< "" if not logged in */
   char     swhois[CRDT_SWHOISLEN];    /**< services WHOIS line (SWHOIS); "" if none */
   char     away[CRDT_AWAYLEN];        /**< away message ("" if not away) */
+  char     version[CRDT_VERSIONLEN];  /**< MARK_CVERSION client version; "" if none */
+  char     sslclifp[CRDT_SSLFPLEN];   /**< MARK_SSLCLIFP SSL cert fingerprint; "" if none */
+  char     countrycode[CRDT_GEOCODELEN];   /**< MARK_GEOIP country code; "" if unset */
+  char     continentcode[CRDT_GEOCODELEN]; /**< MARK_GEOIP continent code; "" if unset */
   char     umodes[CRDT_UMODELEN];     /**< umode_str() form, e.g. "+rix" */
   unsigned char ip6[16];              /**< struct irc_in_addr bytes (host order) */
   uint64_t nick_ts;                   /**< cli_lastnick (TS) */

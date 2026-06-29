@@ -82,6 +82,7 @@
 #include "config.h"
 
 #include "client.h"
+#include "crdt_shadow.h" /* Tier C F1-b: crdt_shadow_user_add (push MARK state into the doc) */
 #include "hash.h"
 #include "ircd.h"
 #include "ircd_geoip.h"
@@ -126,6 +127,7 @@ int ms_mark(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
         sendcmdto_serv_butone(sptr, CMD_MARK, cptr, "%s %s %s %s :%s", cli_name(acptr), MARK_GEOIP, parv[3], parv[4], parv[5]);
       else
         sendcmdto_serv_butone(sptr, CMD_MARK, cptr, "%s %s %s %s", cli_name(acptr), MARK_GEOIP, parv[3], parv[4]);
+      crdt_shadow_user_add(acptr); /* Tier C F1-b: GeoIP codes -> doc (mesh peers) */
     }
   } else if (!strcmp(parv[2], MARK_CVERSION)) {
     if(parc < 4)
@@ -134,6 +136,7 @@ int ms_mark(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
     if ((acptr = FindUser(parv[1]))) {
        ircd_strncpy(cli_version(acptr), parv[3], VERSIONLEN + 1);
        sendcmdto_serv_butone(sptr, CMD_MARK, cptr, "%s %s :%s", cli_name(acptr), MARK_CVERSION, parv[3]);
+       crdt_shadow_user_add(acptr); /* Tier C F1-b: client version -> doc (mesh peers) */
     }
   } else if (!strcmp(parv[2], MARK_SSLCLIFP)) {
     if(parc < 4)
@@ -142,6 +145,7 @@ int ms_mark(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
     if ((acptr = FindUser(parv[1]))) {
        ircd_strncpy(cli_sslclifp(acptr), parv[3], BUFSIZE + 1);
        sendcmdto_serv_butone(sptr, CMD_MARK, cptr, "%s %s :%s", cli_name(acptr), MARK_SSLCLIFP, parv[3]);
+       crdt_shadow_user_add(acptr); /* Tier C F1-b: SSL fingerprint -> doc (mesh peers) */
     }
   } else if (!strcmp(parv[2], MARK_SSLCLIEXP)) {
     if(parc < 4)
