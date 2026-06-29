@@ -271,7 +271,8 @@ enum CrdtCollection {
   CRDT_COLL_BCONNS,        /**< account\0sessid\0connnum -> CrdtBouncerConn (LWW) — 5-5e M4 */
   CRDT_COLL_BLEASES,       /**< account\0sessid -> CrdtBouncerLease (comparator-merge) — 5-5e M5 */
   CRDT_COLL_SILENCES,      /**< usernumeric\0mask -> per-user silence masks (OR-Set) — Tier C F1-c */
-  CRDT_COLL_MARKERS        /**< markread storage key -> read-marker ts (MAX-register) — Tier C F2-a */
+  CRDT_COLL_MARKERS,       /**< markread storage key -> read-marker ts (MAX-register) — Tier C F2-a */
+  CRDT_COLL_METADATA       /**< account\0key -> metadata blob (LWW) — Tier C F2-b */
 };
 
 struct CrdtOp {
@@ -355,6 +356,7 @@ struct CrdtNetworkState {
   struct CrdtLWWMap       bconns;       /**< account\0sessid\0connnum -> CrdtBouncerConn (5-5e M4) */
   struct CrdtLWWMap       bleases;      /**< account\0sessid -> CrdtBouncerLease (5-5e M5) */
   struct CrdtLWWMap       markers;      /**< markread key -> read-marker ts_ms (MAX-register, Tier C F2-a) */
+  struct CrdtLWWMap       metadata;     /**< account\0key -> metadata blob (LWW, Tier C F2-b) */
   struct CrdtORSet        silences;     /**< usernumeric\0mask -> per-user silence masks (Tier C F1-c) */
   struct CrdtChannel     *chan_buckets[CRDT_CHAN_BUCKETS];
 };
@@ -567,6 +569,22 @@ void crdt_marker_merge_snapshot(struct CrdtNetworkState *st, const char *key,
  *  returns its length, or -1 if absent / out too small. */
 int crdt_marker_get(const struct CrdtNetworkState *st, const char *key, uint32_t klen,
                     char *out, size_t outsz);
+
+/** Tier C F2-b: account metadata (MD) as a plain HLC-LWW collection (clone of GLINES;
+ *  uses the GENERIC apply + snapshot paths, no special-case merge). The key is the
+ *  account metadata storage key, treated as an OPAQUE blob (account\0metakey). The
+ *  value is the raw metadata blob (no visibility — the account layer stores none).
+ *  set/del are op-recording; the explicit-removal gate distinguishes a delete-tombstone
+ *  from mere absence (the doc->store remove driver gates on it, sync-lag safety). */
+void crdt_metadata_set(struct CrdtNetworkState *st, const char *key, uint32_t klen,
+                       const void *val, uint32_t vlen);
+void crdt_metadata_del(struct CrdtNetworkState *st, const char *key, uint32_t klen);
+int crdt_metadata_is_explicitly_removed(const struct CrdtNetworkState *st,
+                                        const char *key, uint32_t klen);
+/** Return the current metadata LWW value (NULL if absent/tombstoned) — for the
+ *  reconcile echo-guard read. */
+const struct CrdtLWWValue *crdt_metadata_get(const struct CrdtNetworkState *st,
+                                             const char *key, uint32_t klen);
 /** Phase 3k: set/get per-kick metadata (LWW, keyed chan\0numeric). set() records a
  *  SET op so it replicates via delta; get() returns the LWW value (NULL if absent)
  *  so callers can read both the CrdtKickInfo payload and its HLC (.ts) for the

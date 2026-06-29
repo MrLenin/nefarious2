@@ -278,6 +278,18 @@ void crdt_shadow_sync_user_silences(struct Client *live);
 void crdt_shadow_marker_set(const char *account, const char *target, const char *ts);
 void crdt_shadow_reconcile_markers(void);
 
+/** Tier C F2-b: account metadata (MD) convergence. crdt_shadow_metadata_set mirrors a
+ *  PERMANENT account-metadata set (or a delete of a doc-present key) into the doc
+ *  (plain LWW, opaque account\0key); TTL-bound sets are skipped (per-server caches).
+ *  crdt_shadow_reconcile_metadata drives the local metadata_cf from the doc (SET heal +
+ *  DELETE store-walk). crdt_shadow_metadata_suspend toggles the single-writer guard so
+ *  a P10-relayed apply (ms_metadata) does NOT re-mirror. Additive (P10 MD not
+ *  suppressed). */
+void crdt_shadow_metadata_set(const char *account, const char *key,
+                              const char *value, int permanent);
+void crdt_shadow_reconcile_metadata(void);
+void crdt_shadow_metadata_suspend(int on);
+
 /** Global-state track (GLINE step 2 shadow-write): mirror a global G-line into the
  *  GLINES doc collection (keyed by its ban mask). Called from the canonical gline.c
  *  state-change points (add/activate/deactivate/modify). @a from is the change's

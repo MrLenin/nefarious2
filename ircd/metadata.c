@@ -46,6 +46,7 @@
 #include "ircd_snprintf.h"
 #include "ircd_string.h"
 #include "metadata.h"
+#include "crdt_shadow.h"   /* Tier C F2-b: mirror permanent account metadata into the doc */
 #include "msg.h"
 #include "numeric.h"
 #include "s_debug.h"
@@ -474,6 +475,11 @@ static int metadata_account_set_ts(const char *account, const char *key,
 
   rc = db_writebatch_commit(wb, /*sync_durably=*/0);
   db_writebatch_destroy(wb);
+  if (rc == DB_OK)
+    /* Tier C F2-b: mirror into the CRDT doc (the storage chokepoint — covers local-cmd,
+     * S2S, and profile-config origins). permanent = (timestamp==0); the shadow fn holds
+     * all gates (eligibility / re-entrancy / single-writer). value==NULL => delete. */
+    crdt_shadow_metadata_set(account, key, value, timestamp == 0);
   return (rc == DB_OK) ? 0 : -1;
 }
 
@@ -959,6 +965,34 @@ int metadata_account_purge_expired(void)
   return purged;
 }
 
+/** Iterate every key in the account-metadata store (metadata_cf), invoking
+ * @a cb(key, klen, arg) for each raw storage key (account\0metakey, KEY_SEP='\0').
+ * For the CRDT F2-b delete-reconcile store-walk. The db iterator is LIVE during the
+ * callback — cb must NOT mutate the store (collect-then-act outside this call).
+ * @return number of keys visited, or -1 on error. */
+int metadata_account_foreach_key(void (*cb)(const void *key, size_t klen, void *arg),
+                                 void *arg)
+{
+  struct db_iter *it;
+  int rc, count = 0;
+
+  if (!metadata_lmdb_available || !cb)
+    return -1;
+  it = db_iter_open(metadata_db_env, metadata_cf, /*snap=*/NULL);
+  if (!it)
+    return -1;
+  for (rc = db_iter_seek_first(it);
+       rc == DB_OK && db_iter_valid(it);
+       rc = db_iter_next(it)) {
+    size_t klen;
+    const void *kbuf = db_iter_key(it, &klen);
+    cb(kbuf, klen, arg);
+    count++;
+  }
+  db_iter_close(it);
+  return count;
+}
+
 #else /* !defined(USE_ROCKSDB) — no backend available */
 
 /* Stub implementations when no storage backend is available */
@@ -973,6 +1007,7 @@ struct MetadataEntry *metadata_account_list(const char *account) { return NULL; 
 int metadata_account_clear(const char *account) { return -1; }
 int metadata_account_count_keys(const char *account) { return 0; }
 int metadata_account_purge_expired(void) { return -1; }
+int metadata_account_foreach_key(void (*cb)(const void *key, size_t klen, void *arg), void *arg) { (void)cb; (void)arg; return -1; }
 int metadata_channel_persist(const char *channel, const char *key, const char *value) { return -1; }
 struct MetadataEntry *metadata_channel_load(const char *channel) { return NULL; }
 int metadata_readmarker_get(const char *account, const char *target, char *timestamp) { (void)account; (void)target; (void)timestamp; return -1; }

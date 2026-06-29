@@ -318,6 +318,7 @@ int crdt_snapshot_encode(const struct CrdtNetworkState *st,
   snap_put_lww(&w, &st->bconns, (uint8_t)CRDT_COLL_BCONNS, &lww_total);       /* 5-5e M4 */
   snap_put_lww(&w, &st->bleases, (uint8_t)CRDT_COLL_BLEASES, &lww_total);     /* 5-5e M5 */
   snap_put_lww(&w, &st->markers, (uint8_t)CRDT_COLL_MARKERS, &lww_total);     /* Tier C F2-a */
+  snap_put_lww(&w, &st->metadata, (uint8_t)CRDT_COLL_METADATA, &lww_total);   /* Tier C F2-b */
   wpatch_u32(&w, lww_off, lww_total);
 
   /* channels: members / bans / excepts */

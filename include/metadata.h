@@ -145,6 +145,14 @@ extern int metadata_readmarker_set(const char *account, const char *target, cons
  */
 extern int metadata_account_clear(const char *account);
 
+/** Iterate every key in the account-metadata store, invoking @a cb(key, klen, arg)
+ * for each raw storage key (account\0metakey). For the CRDT F2-b delete-reconcile
+ * store-walk. The db iterator is live during the callback — cb must NOT mutate the
+ * store (collect-then-act). @return number of keys visited, or -1 on error.
+ */
+extern int metadata_account_foreach_key(void (*cb)(const void *key, size_t klen, void *arg),
+                                        void *arg);
+
 /** Purge expired metadata entries from LMDB.
  * Called periodically to enforce METADATA_CACHE_TTL.
  * @return Number of entries purged, or -1 on error.

@@ -152,6 +152,7 @@ void crdt_state_init(struct CrdtNetworkState *st, uint16_t my_numeric)
   crdt_lwwmap_init(&st->bconns);
   crdt_lwwmap_init(&st->bleases);
   crdt_lwwmap_init(&st->markers);
+  crdt_lwwmap_init(&st->metadata);
   crdt_orset_init(&st->silences);
 }
 
@@ -175,6 +176,7 @@ void crdt_state_clear(struct CrdtNetworkState *st)
   crdt_lwwmap_clear(&st->bconns);
   crdt_lwwmap_clear(&st->bleases);
   crdt_lwwmap_clear(&st->markers);
+  crdt_lwwmap_clear(&st->metadata);
   crdt_orset_clear(&st->silences);
   for (int b = 0; b < CRDT_CHAN_BUCKETS; b++) {
     struct CrdtChannel *c = st->chan_buckets[b];
@@ -750,6 +752,55 @@ int crdt_gline_is_explicitly_removed(const struct CrdtNetworkState *st,
                                      const char *mask)
 {
   return crdt_lwwmap_is_deleted(&st->glines, mask, (uint32_t)strlen(mask));
+}
+
+/* Tier C F2-b: account metadata as a plain HLC-LWW collection (clone of crdt_gline_*,
+ * but the key carries an embedded NUL (account\0metakey) so klen is passed explicitly,
+ * and the value is a variable-length blob). Uses the GENERIC apply + snapshot paths —
+ * no special-case merge (plain last-write-wins). */
+void crdt_metadata_set(struct CrdtNetworkState *st, const char *key, uint32_t klen,
+                       const void *val, uint32_t vlen)
+{
+  struct HLC ts = hlc_local_event(&st->clock);
+  uint64_t seq;
+  struct CrdtOp *op;
+  crdt_lwwmap_set(&st->metadata, key, klen, val, vlen, ts, st->my_numeric);
+  seq = st->next_seq++;
+  op = op_new(st->my_numeric, seq, CRDT_OP_SET, CRDT_COLL_METADATA);
+  op->key = memdup(key, klen);
+  op->key_len = klen;
+  op->val = vlen ? memdup(val, vlen) : NULL;
+  op->val_len = vlen;
+  op->ts = ts;
+  op->writer = st->my_numeric;
+  record(st, op);
+}
+
+void crdt_metadata_del(struct CrdtNetworkState *st, const char *key, uint32_t klen)
+{
+  struct HLC ts = hlc_local_event(&st->clock);
+  uint64_t seq;
+  struct CrdtOp *op;
+  crdt_lwwmap_delete(&st->metadata, key, klen, ts, st->my_numeric);
+  seq = st->next_seq++;
+  op = op_new(st->my_numeric, seq, CRDT_OP_DELETE, CRDT_COLL_METADATA);
+  op->key = memdup(key, klen);
+  op->key_len = klen;
+  op->ts = ts;
+  op->writer = st->my_numeric;
+  record(st, op);
+}
+
+int crdt_metadata_is_explicitly_removed(const struct CrdtNetworkState *st,
+                                        const char *key, uint32_t klen)
+{
+  return crdt_lwwmap_is_deleted(&st->metadata, key, klen);
+}
+
+const struct CrdtLWWValue *crdt_metadata_get(const struct CrdtNetworkState *st,
+                                             const char *key, uint32_t klen)
+{
+  return crdt_lwwmap_get(&st->metadata, key, klen);
 }
 
 /* SHUN (global-state track): op-recording set/del/gate, mirroring crdt_gline_*. */
@@ -1437,6 +1488,7 @@ static struct CrdtLWWMap *lww_for(struct CrdtNetworkState *st,
   case CRDT_COLL_BCONNS:        return &st->bconns;
   case CRDT_COLL_BLEASES:       return &st->bleases;
   case CRDT_COLL_MARKERS:       return &st->markers;
+  case CRDT_COLL_METADATA:      return &st->metadata;
   default:                return NULL;
   }
 }
@@ -1753,6 +1805,7 @@ uint64_t crdt_state_digest(const struct CrdtNetworkState *st)
   acc = digest_lww(acc, &st->bconns, 17);    /* salt 17: 5-5e M4 bouncer connections */
   acc = digest_blease(acc, &st->bleases, 18);/* salt 18: 5-5e M5 lease (value-only) */
   acc = digest_marker(acc, &st->markers, 20);/* salt 20: Tier C F2-a read-markers */
+  acc = digest_lww(acc, &st->metadata, 21);  /* salt 21: Tier C F2-b account metadata */
   acc = digest_orset(acc, &st->silences, "", 0, 19);/* salt 19: Tier C F1-c silences */
   for (bk = 0; bk < CRDT_CHAN_BUCKETS; bk++) {
     struct CrdtChannel *c;
@@ -1810,6 +1863,7 @@ uint64_t crdt_state_digest_materialized(const struct CrdtNetworkState *st)
   acc = digest_lww(acc, &st->bconns, 17);    /* salt 17: 5-5e M4 bouncer connections */
   acc = digest_blease(acc, &st->bleases, 18);/* salt 18: 5-5e M5 lease (value-only) */
   acc = digest_marker(acc, &st->markers, 20);/* salt 20: Tier C F2-a read-markers */
+  acc = digest_lww(acc, &st->metadata, 21);  /* salt 21: Tier C F2-b account metadata */
   acc = digest_orset_present(acc, &st->silences, "", 0, 19);/* salt 19: Tier C F1-c silences */
   for (bk = 0; bk < CRDT_CHAN_BUCKETS; bk++) {
     struct CrdtChannel *c;

@@ -45,6 +45,7 @@
 #include "ircd_snprintf.h"
 #include "ircd_string.h"
 #include "metadata.h"
+#include "crdt_shadow.h"   /* Tier C F2-b: suspend the doc mirror on a P10-relayed apply */
 #include "msg.h"
 #include "numeric.h"
 #include "s_bsd.h"
@@ -1539,6 +1540,15 @@ int ms_metadata(struct Client *cptr, struct Client *sptr, int parc, char *parv[]
     return 0;
   }
 
+  /* Tier C F2-b: this is a P10-relayed metadata apply — the ORIGIN server
+   * already mirrored it into the CRDT doc.  Suspend the storage-layer mirror
+   * across the apply + cache writes below so this server does NOT re-enter the
+   * doc (single-writer).  Placed AFTER the F-M6 materialize/limit early-returns
+   * (decompress-fail, limit-exceeded) so a dropped apply can't leak the suspend
+   * — the matching resume(0) is after the cache block below, with no early
+   * return in between. */
+  crdt_shadow_metadata_suspend(1);
+
   /* Apply the change with visibility (plain_value is already
    * decompressed above, so both arms use it directly). */
   if (is_channel) {
@@ -1594,6 +1604,8 @@ int ms_metadata(struct Client *cptr, struct Client *sptr, int parc, char *parv[]
                 "ms_metadata: Cached metadata %s/%s in LMDB", cache_key, key);
     }
   }
+
+  crdt_shadow_metadata_suspend(0);   /* Tier C F2-b: end the single-writer suspend */
 
   /* Notify local subscribers (only for public metadata) */
   if (visibility == METADATA_VIS_PUBLIC) {

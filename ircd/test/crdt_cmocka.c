@@ -539,6 +539,92 @@ static void test_gline_op_replicates(void **state)
   crdt_state_clear(&s2);
 }
 
+/* ================================================================== */
+/* Tier C F2-b: account metadata as a plain HLC-LWW doc collection keyed by the
+ * opaque account\0key composite (variable-length blob value). SET replicates via
+ * DELTA + round-trips byte-exact; a newer-HLC SET wins (last-write-wins, NOT a
+ * max-register like markers); DELETE tombstones + flips the explicit-removal gate
+ * (the doc->store remove driver gates on it, never on mere absence); a snapshot
+ * round-trip preserves a present entry and a tombstone (the CR-F cold-join path). */
+static void test_metadata_op_replicates(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s1, s2, s3;
+  char key[96];
+  const struct CrdtLWWValue *v;
+  uint32_t klen;
+  uint8_t buf[8192];
+  int n;
+  /* key = account\0metakey (opaque composite, NUL-separated — metadata keys are
+   * validated to [a-z0-9_./-] so the only NUL is our separator). */
+  memcpy(key, "alice", 5); key[5] = '\0'; memcpy(key + 6, "avatar", 6);
+  klen = 5 + 1 + 6;
+
+  crdt_state_init(&s1, 1);
+  crdt_state_init(&s2, 2);
+
+  /* set on s1 -> delta -> s2; value blob round-trips byte-exact */
+  crdt_metadata_set(&s1, key, klen, "https://x/a.png", 15);
+  crdt_state_sync(&s2, &s1);
+  v = crdt_metadata_get(&s2, key, klen);
+  assert_non_null(v); assert_non_null(v->data);
+  assert_int_equal(15, (int)v->data_len);
+  assert_memory_equal("https://x/a.png", v->data, 15);
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+  assert_int_equal(0, crdt_metadata_is_explicitly_removed(&s1, key, klen));
+  assert_int_equal(0, crdt_metadata_is_explicitly_removed(&s2, key, klen));
+
+  /* update (newer HLC) wins — plain LWW, no max/lexical constraint */
+  crdt_metadata_set(&s1, key, klen, "v2", 2);
+  crdt_state_sync(&s2, &s1);
+  v = crdt_metadata_get(&s2, key, klen);
+  assert_non_null(v); assert_non_null(v->data);
+  assert_int_equal(2, (int)v->data_len);
+  assert_memory_equal("v2", v->data, 2);
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+
+  /* snapshot roundtrip preserves a present entry (pins the snap_put_lww line) */
+  crdt_state_init(&s3, 3);
+  n = crdt_snapshot_encode(&s1, buf, sizeof buf);
+  assert_true(n > 0);
+  assert_true(crdt_snapshot_apply(&s3, buf, (size_t)n) >= 0);
+  v = crdt_metadata_get(&s3, key, klen);
+  assert_non_null(v); assert_non_null(v->data);
+  assert_int_equal(2, (int)v->data_len);
+  assert_memory_equal("v2", v->data, 2);
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s3));
+
+  /* delete (tombstone) replicates -> gone; explicit-removal gate flips on BOTH */
+  crdt_metadata_del(&s1, key, klen);
+  crdt_state_sync(&s2, &s1);
+  v = crdt_metadata_get(&s2, key, klen);
+  assert_true(v == NULL || v->data == NULL);
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+  assert_int_equal(1, crdt_metadata_is_explicitly_removed(&s1, key, klen));
+  assert_int_equal(1, crdt_metadata_is_explicitly_removed(&s2, key, klen));
+  /* a key NEVER set is absent, NOT explicitly removed (sync-lag safety) */
+  {
+    char nk[16]; memcpy(nk, "bob", 3); nk[3] = '\0'; memcpy(nk + 4, "x", 1);
+    assert_int_equal(0, crdt_metadata_is_explicitly_removed(&s2, nk, 3 + 1 + 1));
+  }
+
+  /* snapshot carrying the tombstone reconstructs it as explicitly-removed on a
+   * fresh replica (backfill-on-link: the leaf learns the CLEAR via snapshot) */
+  {
+    struct CrdtNetworkState s4;
+    crdt_state_init(&s4, 4);
+    n = crdt_snapshot_encode(&s1, buf, sizeof buf);
+    assert_true(n > 0);
+    assert_true(crdt_snapshot_apply(&s4, buf, (size_t)n) >= 0);
+    assert_int_equal(1, crdt_metadata_is_explicitly_removed(&s4, key, klen));
+    crdt_state_clear(&s4);
+  }
+
+  crdt_state_clear(&s1);
+  crdt_state_clear(&s2);
+  crdt_state_clear(&s3);
+}
+
 /* 5-5e M2: bouncer-session doc collection (account\0sessid -> CrdtBouncerSession LWW):
  * field-by-field pack round-trips, replicates via delta, digest converges, update wins,
  * the explicit-removal gate distinguishes delete-tombstone from absent, and a snapshot
@@ -2384,6 +2470,7 @@ int main(void)
     cmocka_unit_test(test_silence_op_replicates),
     cmocka_unit_test(test_marker_op_replicates),
     cmocka_unit_test(test_gline_op_replicates),
+    cmocka_unit_test(test_metadata_op_replicates),
     cmocka_unit_test(test_bsess_op_replicates),
     cmocka_unit_test(test_bsess_winner),
     cmocka_unit_test(test_bconn_roster),

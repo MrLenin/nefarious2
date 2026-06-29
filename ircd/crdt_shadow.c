@@ -59,6 +59,12 @@ static struct Timer            g_verify_timer;
 static int                     g_gline_reconciling = 0;
 static int                     g_shun_reconciling = 0;   /* SHUN: same role as g_gline_reconciling */
 static int                     g_marker_reconciling = 0; /* Tier C F2-a: same role (read-markers) */
+static int                     g_metadata_reconciling = 0;    /* Tier C F2-b: same role (metadata) */
+static int                     g_metadata_remote_applying = 0;/* Tier C F2-b: set by ms_metadata
+                                                               * around a P10-relayed store write so
+                                                               * the mirror does NOT re-enter the doc
+                                                               * (single-writer; analog of
+                                                               * from_crdt_peer for the storage hook) */
 static int                     g_zline_reconciling = 0;  /* ZLINE: same role */
 static int                     g_jupe_reconciling = 0;   /* JUPE: same role */
 
@@ -2103,6 +2109,175 @@ void crdt_shadow_reconcile_markers(void)
   if (c.applied)
     log_write(LS_SYSTEM, L_DEBUG, 0,
               "CRDT marker-reconcile: %u read-marker(s) applied from doc", c.applied);
+}
+
+/* ---- Tier C F2-b: account metadata (MD) as CRDT-native doc state ---- */
+/* Cap on doc-tombstoned store keys reaped per reconcile cycle (more next tick). */
+#define CRDT_METADATA_REMOVE_MAX 256
+
+/* Set by ms_metadata around a P10-relayed store write so the storage-layer mirror
+ * (crdt_shadow_metadata_set, called from metadata_account_set_ts) does NOT re-enter
+ * the doc — single-writer: only the ORIGIN server mirrors a SET. */
+void crdt_shadow_metadata_suspend(int on)
+{
+  g_metadata_remote_applying = on ? 1 : 0;
+}
+
+/* Build the opaque doc key account\0metakey (byte-identical to the metadata_cf storage
+ * key, KEY_SEP='\0'), or return 0 if it must not enter the doc. */
+static uint32_t metadata_doc_key(const char *account, const char *key,
+                                 char *buf, size_t n)
+{
+  uint32_t al, kl, klen;
+  if (!account || !*account || !key || !*key)
+    return 0;
+  /* never converge channel metadata (its own track) — only true accounts */
+  if (IsChannelName(account))
+    return 0;
+  al = (uint32_t)strlen(account);
+  kl = (uint32_t)strlen(key);
+  klen = al + 1 + kl;
+  if (al > ACCOUNTLEN || kl > METADATA_KEY_LEN || klen > n)
+    return 0;
+  memcpy(buf, account, al); buf[al] = '\0'; memcpy(buf + al + 1, key, kl);
+  return klen;
+}
+
+/* Mirror a permanent account-metadata write into the doc. value!=NULL && permanent ->
+ * SET; value==NULL -> DELETE, but only if the key is doc-present (no spurious tombstones
+ * for TTL-cache deletes). A TTL-bound set (permanent==0, value!=NULL) is a per-server
+ * cache (last_present / ms_metadata remote cache) and is NOT converged. Self-skips while
+ * a doc-driven reconcile or a P10-relayed apply is in flight (single-writer + loop
+ * prevention). Called from metadata_account_set_ts (the storage chokepoint). */
+void crdt_shadow_metadata_set(const char *account, const char *key,
+                              const char *value, int permanent)
+{
+  char dk[ACCOUNTLEN + METADATA_KEY_LEN + 4];
+  uint32_t klen;
+  if (!shadow_on() || g_metadata_reconciling || g_metadata_remote_applying)
+    return;
+  klen = metadata_doc_key(account, key, dk, sizeof dk);
+  if (!klen)
+    return;
+  if (value) {
+    if (!permanent)
+      return;                              /* TTL cache — not shared truth, skip */
+    crdt_metadata_set(&g_crdt, dk, klen, value, (uint32_t)strlen(value));
+    crdt_sync_push();
+  } else {
+    /* delete: only mint a tombstone for a key we actually converged */
+    const struct CrdtLWWValue *v = crdt_metadata_get(&g_crdt, dk, klen);
+    if (!v || !v->data)
+      return;
+    crdt_metadata_del(&g_crdt, dk, klen);
+    crdt_sync_push();
+  }
+}
+
+/* SET heal/backfill: for each PRESENT doc metadata entry, drive it into metadata_cf as a
+ * permanent value if the store copy is missing or differs (echo-guarded so a
+ * P10-delivered value isn't bounced back + no write churn). Runs under
+ * g_metadata_reconciling so metadata_account_set_permanent's mirror self-skips. */
+struct reconcile_metadata_ctx { unsigned int applied; };
+static void reconcile_metadata_set_cb(const char *key, uint32_t key_len,
+                                      const struct CrdtLWWValue *val, void *ctx)
+{
+  struct reconcile_metadata_ctx *c = ctx;
+  const char *nul;
+  char account[ACCOUNTLEN + 1], mkey[METADATA_KEY_LEN + 1];
+  char cur[METADATA_VALUE_LEN + 1], docval[METADATA_VALUE_LEN + 1];
+  uint32_t al, kl;
+  if (!val || !val->data || !val->data_len || val->data_len > METADATA_VALUE_LEN)
+    return;
+  nul = memchr(key, '\0', key_len);          /* key = account\0metakey (opaque split) */
+  if (!nul)
+    return;
+  al = (uint32_t)(nul - key);
+  kl = key_len - al - 1;
+  if (al == 0 || al > ACCOUNTLEN || kl == 0 || kl > METADATA_KEY_LEN)
+    return;
+  memcpy(account, key, al); account[al] = '\0';
+  memcpy(mkey, nul + 1, kl); mkey[kl] = '\0';
+  memcpy(docval, val->data, val->data_len); docval[val->data_len] = '\0';
+  /* echo guard: skip if the store already holds exactly this value */
+  if (metadata_account_get(account, mkey, cur) == 0 &&
+      strlen(cur) == val->data_len && memcmp(cur, docval, val->data_len) == 0)
+    return;
+  if (metadata_account_set_permanent(account, mkey, docval) == 0)
+    c->applied++;
+}
+
+/* DELETE store-walk: collect metadata_cf keys the doc has EXPLICITLY tombstoned
+ * (never on mere absence — sync-lag safety; never deletes a TTL cache key, which was
+ * never doc-present). Collect-then-act (metadata_account_foreach_key holds a live db
+ * iterator; the deletes run after it closes). */
+struct reconcile_metadata_del_ctx {
+  char keys[CRDT_METADATA_REMOVE_MAX][ACCOUNTLEN + METADATA_KEY_LEN + 4];
+  uint32_t klens[CRDT_METADATA_REMOVE_MAX];
+  int nr;
+  int capped;
+};
+static void reconcile_metadata_del_collect(const void *key, size_t klen, void *arg)
+{
+  struct reconcile_metadata_del_ctx *d = arg;
+  if (d->capped || klen == 0 || klen > sizeof d->keys[0])
+    return;
+  if (!crdt_metadata_is_explicitly_removed(&g_crdt, key, (uint32_t)klen))
+    return;
+  if (d->nr >= CRDT_METADATA_REMOVE_MAX) { d->capped = 1; return; }
+  memcpy(d->keys[d->nr], key, klen);
+  d->klens[d->nr] = (uint32_t)klen;
+  d->nr++;
+}
+
+/* Drive the local metadata_cf from the doc: SET heal (foreach present) + DELETE
+ * store-walk (reap doc-tombstoned keys). Dispatched from the verify cycle + eager
+ * delta-apply, like reconcile_glines/markers. The whole pass runs under
+ * g_metadata_reconciling so no store write re-mints a doc op. Additive — the P10 MD
+ * broadcast is untouched; this only adds overlay-leaf reach. */
+void crdt_shadow_reconcile_metadata(void)
+{
+  struct reconcile_metadata_ctx c = { 0 };
+  struct reconcile_metadata_del_ctx *d;
+  unsigned int removed = 0;
+  int i;
+  if (!shadow_on())
+    return;
+  g_metadata_reconciling = 1;
+  crdt_lwwmap_foreach(&g_crdt.metadata, reconcile_metadata_set_cb, &c);
+
+  /* DELETE pass — heap-alloc the collector (large arrays; off the stack). */
+  d = (struct reconcile_metadata_del_ctx *)MyCalloc(1, sizeof *d);
+  if (d) {
+    metadata_account_foreach_key(reconcile_metadata_del_collect, d);
+    for (i = 0; i < d->nr; i++) {
+      const char *k = d->keys[i];
+      const char *nul = memchr(k, '\0', d->klens[i]);
+      char account[ACCOUNTLEN + 1], mkey[METADATA_KEY_LEN + 1];
+      uint32_t al, kl;
+      if (!nul)
+        continue;
+      al = (uint32_t)(nul - k);
+      kl = d->klens[i] - al - 1;
+      if (al == 0 || al > ACCOUNTLEN || kl == 0 || kl > METADATA_KEY_LEN)
+        continue;
+      memcpy(account, k, al); account[al] = '\0';
+      memcpy(mkey, nul + 1, kl); mkey[kl] = '\0';
+      if (metadata_account_set(account, mkey, NULL) == 0)   /* delete from store */
+        removed++;
+    }
+    if (d->capped)
+      log_write(LS_SYSTEM, L_DEBUG, 0,
+                "CRDT metadata-reconcile: remove capped at %d (more next tick)",
+                CRDT_METADATA_REMOVE_MAX);
+    MyFree(d);
+  }
+  g_metadata_reconciling = 0;
+
+  if (c.applied || removed)
+    log_write(LS_SYSTEM, L_INFO, 0,
+              "CRDT metadata-reconcile: %u set, %u removed from doc",
+              c.applied, removed);
 }
 
 /* ---- Global-state track: GLINEs as CRDT-native doc state (step 2 shadow-write) ---- */
@@ -4736,6 +4911,7 @@ static void crdt_shadow_verify_cb(struct Event *ev)
   crdt_shadow_reconcile_glines();  /* GLINE step 3: drive global G-lines from doc (+gateway) */
   crdt_shadow_reconcile_shuns();   /* SHUN: drive global Shuns from doc (+gateway) */
   crdt_shadow_reconcile_markers(); /* Tier C F2-a: drive read-markers from doc -> RocksDB */
+  crdt_shadow_reconcile_metadata(); /* Tier C F2-b: drive account metadata from doc -> metadata_cf */
   crdt_shadow_reconcile_zlines();  /* ZLINE: drive global Z-lines from doc (+gateway) */
   crdt_shadow_reconcile_jupes();   /* JUPE: drive juped servers from doc (+gateway) */
   bounce_crdt_bsess_sweep();       /* 5-5e M2: mirror local-holder bouncer sessions -> doc (shadow) */
