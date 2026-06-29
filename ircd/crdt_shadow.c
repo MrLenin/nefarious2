@@ -240,6 +240,29 @@ void crdt_shadow_beacon_burst(struct Client *peer)
             "beacon(s) at link time (cold-link bringup)", cli_name(peer), replayed);
 }
 
+/* Overlay liveness probe (active, traffic-based).  An overlay edge is ping-EXEMPT
+ * (check_pings) because it never "registers"; its design liveness is TCP-EOF +
+ * write-failure.  But a half-open / black-holed socket (peer host crash, kernel
+ * panic, silent partition) delivers NO EOF and a write() into it is buffered by the
+ * kernel and does NOT fail for ~15 min (TCP give-up) — so the passive checks never
+ * fire, the overlay zombies, and try_connections' "already present" dedup blocks
+ * reconnect for the whole window.  Close the gap with an ACTIVE probe: CR traffic
+ * (the CR H beacon alone arrives every CRDT_VERIFY_INTERVAL=30s over every overlay
+ * edge) refreshes cli_lasttime on read (s_bsd.c read_packet); an edge silent for
+ * >CRDT_BEACON_STALE (90s = 3 beacon rounds) is silently dead.  Returns 1 → caller
+ * (check_pings) tears it down so the normal reap→try_connections reconnect runs.
+ * Mirrors the mesh-stub beacon-staleness retirement (same constant, same rationale). */
+int crdt_overlay_is_stale(const struct Client *ov)
+{
+  time_t ref;
+  if (!ov || !IsCrdtOverlay(ov))
+    return 0;
+  /* No CR received yet on a fresh overlay → measure from connect time, so a
+   * just-opened edge gets a full window before we judge it (no startup false-kill). */
+  ref = cli_lasttime(ov) ? cli_lasttime(ov) : cli_firsttime(ov);
+  return ref && (CurrentTime - ref) > CRDT_BEACON_STALE;
+}
+
 /* Build this server's own direct-CRDT-peer list (base64 numerics, comma-joined)
  * into @a out for the CR H beacon, AND record our own mesh-map row locally so the
  * map is populated before any beacon round-trips back.  A node's direct peers are

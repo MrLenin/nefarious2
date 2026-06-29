@@ -547,9 +547,10 @@ static void try_connections(struct Event* ev) {
       if (hold || done)
         continue;
       for (ov = GlobalClientList; ov; ov = cli_next(ov))
-        if (IsCrdtOverlay(ov) && MyConnect(ov) &&
+        if (IsCrdtOverlay(ov) && MyConnect(ov) && !IsDead(ov) &&
             0 == ircd_strcmp(cli_name(ov), aconf->name)) {
-          present = 1;
+          present = 1;        /* !IsDead: a dead (pending-reap) overlay must NOT count
+                              * as present, else a stale edge blocks reconnect */
           break;
         }
       if (present)
@@ -638,11 +639,23 @@ static void check_pings(struct Event* ev) {
 
     /* Phase 4b: CRDT overlay links are long-lived unregistered (STAT_HANDSHAKE)
      * connections carrying only CR tokens — exempt from the registration ping
-     * timeout (they never "finish registration").  Liveness is covered by TCP
-     * EOF (handled by the IsDead check above) plus the periodic CR anti-entropy
-     * writes (a write to a dead socket fails -> FLAG_DEADSOCKET). */
-    if (IsCrdtOverlay(cptr))
+     * timeout (they never "finish registration").  TCP EOF (the IsDead check above)
+     * handles a graceful peer close, but a half-open / black-holed socket (peer host
+     * crash, kernel panic, silent partition) delivers NO EOF and a write into it is
+     * kernel-buffered (the write() does not fail for ~15 min of TCP retransmit) — so
+     * the passive liveness checks never fire and the overlay zombies, blocking
+     * reconnect (try_connections' "already present" dedup).  Add an ACTIVE probe: an
+     * edge silent of CR traffic for >CRDT_BEACON_STALE is dead — exit_client it here
+     * so the next try_connections tick reconnects. */
+    if (IsCrdtOverlay(cptr)) {
+      if (crdt_overlay_is_stale(cptr)) {
+        log_write(LS_SYSTEM, L_INFO, 0,
+                  "CRDT overlay to %s: no CR traffic in liveness window — silently "
+                  "dead, tearing down for reconnect", cli_name(cptr));
+        exit_client(cptr, cptr, &me, "CRDT overlay liveness timeout");
+      }
       continue;
+    }
 
     /* Check for client batch timeout (draft/multiline) */
     check_client_batch_timeout(cptr);

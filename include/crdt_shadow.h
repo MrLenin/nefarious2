@@ -226,6 +226,12 @@ void crdt_shadow_present_stubs_to(struct Client *cptr);
  *  Returns the peer count.  Observability-only (see crdt_meshmap.h). */
 int crdt_shadow_local_peers(char *out, size_t outsz);
 
+/** Active overlay liveness probe: 1 iff @a ov is a CRDT overlay that has received no
+ *  CR traffic for >CRDT_BEACON_STALE (a half-open/black-holed silently-dead edge the
+ *  passive EOF/write-failure checks miss).  check_pings tears such an edge down so the
+ *  reap→try_connections reconnect runs.  See the definition for the full rationale. */
+int crdt_overlay_is_stale(const struct Client *ov);
+
 /** The gossiped mesh-topology map (read-only) for the /CRDT command.  Forward-
  *  declared so callers that only pass the pointer need not include crdt_meshmap.h. */
 struct CrdtMeshMap;
