@@ -309,8 +309,22 @@ jupe_find(char *server)
   for (jupe = GlobalJupeList; jupe; jupe = sjupe) { /* go through jupes */
     sjupe = jupe->ju_next;
 
-    if (jupe->ju_expire <= CurrentTime) /* expire any that need expiring */
+    if (jupe->ju_expire <= CurrentTime) { /* expire any that need expiring */
+      /* Wall-clock expiry is terminal for a legacy jupe (jupe_free unlinks it from
+       * GlobalJupeList), so mint a doc tombstone -- unlike the reversible oper
+       * deactivation (-jupe), which stays an inactive SET. This is the FIRST producer
+       * of a jupe tombstone and thus activates the otherwise-dormant jupe reconcile
+       * REMOVE pass (crdt_shadow_reconcile_jupes), which on the primary gateways the
+       * removal to legacy as CMD_JUPE -server carrying ju_lastmod. Without the mint the
+       * JUPES doc + CR F snapshots grow unbounded (expired entries are never
+       * re-materialized). Hook the expiry site, not jupe_free -- free also runs on
+       * explicit removal and doc-driven recreate, where hooking would double-mint. &me
+       * is the source; crdt_shadow_jupe_remove self-skips for local jupes and under the
+       * reconcile guard (so a jupe expired inside a reconcile-driven jupe_find is not
+       * re-minted -- benign: another node's expiry originates the tombstone). */
+      crdt_shadow_jupe_remove(jupe, &me);
       jupe_free(jupe);
+    }
     else if (0 == ircd_strcmp(server, jupe->ju_server)) /* found it yet? */
       return jupe;
   }
