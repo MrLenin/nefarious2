@@ -1852,7 +1852,10 @@ void crdt_shadow_topic(struct Channel *chptr, struct Client *from)
   /* op-recording setter so the topic replicates (a direct crdt_lwwmap_set
    * would never enter the oplog and never sync — that was the modes/topic
    * convergence bug). */
-  crdt_topic_set(&g_crdt, chptr->chname, chptr->topic);
+  /* M11: pass chptr->topic_time so the mesh orders topics as a MAX-register on it
+   * (legacy P10 order) — the integration already holds this wall-clock value; the
+   * engine never reads a clock for it, so engine purity holds. */
+  crdt_topic_set(&g_crdt, chptr->chname, chptr->topic, (uint64_t)chptr->topic_time);
   write_chanmeta(chptr);               /* topic_time/topic_nick + creationtime */
   crdt_sync_push();                    /* eager-propagate to CRDT peers */
 }
@@ -3034,7 +3037,7 @@ void crdt_shadow_verify(struct Client *to)
     {
       const struct CrdtLWWValue *tv =
         crdt_lwwmap_get(&g_crdt.topics, chptr->chname, strlen(chptr->chname));
-      const char *stopic = tv ? (const char *)tv->data : "";
+      const char *stopic = tv ? crdt_topic_value_text(tv->data, tv->data_len, NULL) : "";
       if (strcmp(stopic, chptr->topic) != 0) {
         mismatches++;
         verify_emit(to,
@@ -3498,7 +3501,7 @@ void crdt_shadow_materialize_check(void)
       }
       /* topic string */
       tv = crdt_lwwmap_get(&g_crdt.topics, nbuf, dc->name_len);
-      if (strcmp(tv ? (const char *)tv->data : "", live->topic) != 0) {
+      if (strcmp(tv ? crdt_topic_value_text(tv->data, tv->data_len, NULL) : "", live->topic) != 0) {
         gaps++;
         if (logged++ < MAT_LOG_CAP)
           log_write(LS_SYSTEM, L_NOTICE, 0,
@@ -3808,8 +3811,16 @@ static void rebuild_channel_from_doc(struct Channel *chptr,
     ircd_strncpy(chptr->topic_nick, meta->topic_nick, sizeof chptr->topic_nick - 1);
   }
   v = crdt_lwwmap_get(&g_crdt.topics, nbuf, dc->name_len);
-  if (v && v->data)
-    ircd_strncpy(chptr->topic, (const char *)v->data, TOPICLEN + 1);
+  if (v && v->data) {
+    uint64_t tt = 0;
+    ircd_strncpy(chptr->topic, crdt_topic_value_text(v->data, v->data_len, &tt),
+                 TOPICLEN + 1);
+    /* M11: topic_time comes from the winning topic value (the MAX-register key), keeping
+     * it consistent with the topic the gateway will re-emit; chanmeta above only supplies
+     * topic_nick provenance now. Fall back to chanmeta's if the value carries none. */
+    if (tt)
+      chptr->topic_time = (time_t)tt;
+  }
   v = crdt_lwwmap_get(&g_crdt.modes, nbuf, dc->name_len);
   if (v && v->data_len == sizeof(struct ShadowModeSnap)) {
     const struct ShadowModeSnap *s = (const struct ShadowModeSnap *)v->data;
@@ -4320,6 +4331,7 @@ static void reconcile_topic_cb(const char *key, uint32_t key_len,
   char chname[CHANNELLEN + 1];
   struct Channel *chptr;
   const char *doc_topic;
+  uint64_t doc_topic_time = 0;
   const struct CrdtLWWValue *cm;
   if (key_len >= sizeof chname || !val->data)
     return;
@@ -4327,7 +4339,7 @@ static void reconcile_topic_cb(const char *key, uint32_t key_len,
   chptr = FindChannel(chname);
   if (!chptr)
     return;                              /* channel not live yet (materialize/BURST) */
-  doc_topic = (const char *)val->data;
+  doc_topic = crdt_topic_value_text(val->data, val->data_len, &doc_topic_time);
   if (strcmp(doc_topic, chptr->topic) == 0)
     return;                              /* already in sync — also the echo guard:
                                             a P10 topic sets live+doc together, so
@@ -4335,10 +4347,15 @@ static void reconcile_topic_cb(const char *key, uint32_t key_len,
   /* Drive the live topic DIRECTLY — never via do_settopic, so crdt_shadow_topic
    * is not re-invoked and no new op is minted (loop prevention). */
   ircd_strncpy(chptr->topic, doc_topic, TOPICLEN + 1);
+  /* M11: topic_time is now authoritative in the topics value (the MAX-register key),
+   * so re-emit it — NOT chanmeta's (which converges independently by HLC-LWW and can
+   * diverge from the winning topic's time under skew, which would keep the legacy split
+   * open). chanmeta still supplies topic_nick provenance. */
+  if (doc_topic_time)
+    chptr->topic_time = (time_t)doc_topic_time;
   cm = crdt_lwwmap_get(&g_crdt.chanmeta, chname, key_len);
   if (cm && cm->data_len == sizeof(struct CrdtChanMeta)) {
     const struct CrdtChanMeta *meta = (const struct CrdtChanMeta *)cm->data;
-    chptr->topic_time = (time_t)meta->topic_time;
     ircd_strncpy(chptr->topic_nick, meta->topic_nick, sizeof chptr->topic_nick - 1);
   }
   /* notify LOCAL clients on this server */

@@ -453,6 +453,11 @@ int crdt_snapshot_apply(struct CrdtNetworkState *st,
         /* Tier C F2-a: lexical-MAX-register merge, NOT a generic HLC-LWW assign (which
          * would regress a read-marker on snapshot catch-up). Mirrors blease/ctime. */
         crdt_marker_merge_snapshot(st, key ? key : "", klen, val, vlen, writer, ts);
+      else if (coll == (uint8_t)CRDT_COLL_TOPICS && vlen > sizeof(uint64_t))
+        /* M11: topic_time MAX-register merge, NOT a generic HLC-LWW assign (which would
+         * regress a topic to a clock-skewed lower-topic_time on snapshot catch-up and
+         * re-open the legacy P10 split). Mirrors marker/blease/ctime. */
+        crdt_topic_merge_snapshot(st, key ? key : "", klen, val, vlen, writer, ts);
       else
         crdt_lwwmap_set(map, key ? key : "", klen, val, vlen, ts, writer);
     }

@@ -577,24 +577,122 @@ int crdt_server_state(const struct CrdtNetworkState *st, uint16_t numeric)
   return (int)((const struct CrdtServerRecord *)sv->data)->state;  /* ACTIVE/SPLIT */
 }
 
+/* ------------------------------------------------------------------ */
+/* M11: channel topic — MAX-register on topic_time (legacy P10 order)   */
+/* ------------------------------------------------------------------ */
+/* The topics LWW value is a SERIALIZED buffer, NOT a padded struct:
+ *   [ uint64_t topic_time ][ topic text, NUL-terminated ]
+ * Built member-by-member (INVARIANT 4): topic_time is a scalar (no struct padding),
+ * the text follows it — nothing memcpy's a struct-with-padding onto the wire. Native
+ * byte order, same convention as ctime_payload's uint64 value (the mesh is homogeneous).
+ * topic_nick is deliberately NOT folded in — it stays in chanmeta (deferred). */
+#define TOPIC_VAL_HDR ((uint32_t)sizeof(uint64_t))   /* 8-byte topic_time prefix */
+
+/* value-only lexical comparator, shared with the read-marker MAX-register (defined
+ * below); forward-declared so topic_merge can reuse it for the same-second tiebreak. */
+static int marker_ts_cmp(const void *a, uint32_t alen, const void *b, uint32_t blen);
+
+static uint32_t topic_val_build(char *buf, uint64_t topic_time,
+                                const char *text, uint32_t textlen)
+{
+  memcpy(buf, &topic_time, sizeof topic_time);       /* scalar: no padding, deterministic */
+  memcpy(buf + TOPIC_VAL_HDR, text, textlen);        /* text (setter includes the NUL) */
+  return TOPIC_VAL_HDR + textlen;
+}
+
+const char *crdt_topic_value_text(const void *data, uint32_t data_len,
+                                  uint64_t *out_time)
+{
+  if (out_time)
+    *out_time = 0;
+  if (!data || data_len < TOPIC_VAL_HDR)
+    return "";                                       /* absent/short -> empty topic */
+  if (out_time)
+    memcpy(out_time, data, sizeof *out_time);
+  if (data_len == TOPIC_VAL_HDR)
+    return "";                                       /* topic_time present, no text */
+  return (const char *)data + TOPIC_VAL_HDR;         /* NUL-terminated (setter guarantees) */
+}
+
+/* MAX-register merge: topic_time is the PRIMARY key (so the mesh converges on the
+ * highest-topic_time topic, which every legacy island's m_topic gate then accepts);
+ * text lexical-max is the deterministic TIEBREAK for the same-second case. This mirrors
+ * marker_merge — a VALUE-ONLY comparator that reads the FAITHFULLY-STORED value, never
+ * the synthesized LWW write-HLC (reading the synth HLC as a tiebreak is provably NON-
+ * convergent across 3+ same-second writers; the lexical-on-text tiebreak is a proper
+ * join: commutative/associative/idempotent). On a win we synthesize an HLC strictly >
+ * the stored write so crdt_lwwmap_set accepts it (the ordering decision is already made
+ * by the MAX compare; the synth only makes the winner stick). Returns 1 if it changed. */
+static int topic_merge(struct CrdtNetworkState *st, const char *key, uint32_t klen,
+                       uint64_t topic_time, const char *text, uint32_t textlen,
+                       uint16_t writer, struct HLC fresh_ts)
+{
+  const struct CrdtLWWValue *cur;
+  struct HLC ts;
+  char buf[TOPIC_VAL_HDR + CRDT_TOPIC_MAXLEN];
+  uint32_t vlen;
+  if (!textlen || textlen > CRDT_TOPIC_MAXLEN)
+    return 0;                            /* empty / oversized -> ignore (degradation) */
+  cur = crdt_lwwmap_get(&st->topics, key, klen);
+  if (cur && cur->data && cur->data_len >= TOPIC_VAL_HDR) {
+    uint64_t cur_time = 0;
+    const char *cur_text = (const char *)cur->data + TOPIC_VAL_HDR;
+    uint32_t cur_textlen = cur->data_len - TOPIC_VAL_HDR;
+    memcpy(&cur_time, cur->data, sizeof cur_time);
+    if (topic_time < cur_time)
+      return 0;                          /* lower wall-clock topic_time -> no-op (MAX) */
+    if (topic_time == cur_time &&
+        marker_ts_cmp(text, textlen, cur_text, cur_textlen) <= 0)
+      return 0;                          /* tie & not lexically-greater text -> no-op */
+    ts = cur->ts;                        /* synth HLC strictly > the stored write */
+    if (++ts.logical == 0)
+      ts.physical_ms++;
+  } else {
+    ts = fresh_ts;
+  }
+  vlen = topic_val_build(buf, topic_time, text, textlen);
+  crdt_lwwmap_set(&st->topics, key, klen, buf, vlen, ts, writer);
+  return 1;
+}
+
 void crdt_topic_set(struct CrdtNetworkState *st, const char *chan,
-                    const char *topic)
+                    const char *topic, uint64_t topic_time)
 {
   struct HLC ts = hlc_local_event(&st->clock);
   uint32_t klen = (uint32_t)strlen(chan);
-  uint32_t vlen = (uint32_t)strlen(topic) + 1;   /* include the NUL */
+  uint32_t textlen = (uint32_t)strlen(topic) + 1;   /* include the NUL */
+  char buf[TOPIC_VAL_HDR + CRDT_TOPIC_MAXLEN];
+  uint32_t vlen;
   uint64_t seq;
   struct CrdtOp *op;
-  crdt_lwwmap_set(&st->topics, chan, klen, topic, vlen, ts, st->my_numeric);
+  if (textlen > CRDT_TOPIC_MAXLEN)
+    textlen = CRDT_TOPIC_MAXLEN;                     /* clamp (keeps the trailing NUL slot) */
+  if (!topic_merge(st, chan, klen, topic_time, topic, textlen, st->my_numeric, ts))
+    return;                             /* not a MAX win -> no op storm (idempotent) */
+  vlen = topic_val_build(buf, topic_time, topic, textlen);
   seq = st->next_seq++;
   op = op_new(st->my_numeric, seq, CRDT_OP_SET, CRDT_COLL_TOPICS);
   op->key = memdup(chan, klen);
   op->key_len = klen;
-  op->val = memdup(topic, vlen);
+  op->val = memdup(buf, vlen);
   op->val_len = vlen;
   op->ts = ts;
   op->writer = st->my_numeric;
   record(st, op);
+}
+
+/* Snapshot-apply entry (crdt_wire.c): decode the serialized value + MERGE via the
+ * topic_time MAX-register (NOT a generic HLC-LWW assign). Mirrors marker/blease/ctime. */
+void crdt_topic_merge_snapshot(struct CrdtNetworkState *st, const char *key,
+                               uint32_t klen, const void *val, uint32_t vlen,
+                               uint16_t writer, struct HLC ts)
+{
+  uint64_t topic_time = 0;
+  if (!val || vlen <= TOPIC_VAL_HDR)
+    return;
+  memcpy(&topic_time, val, sizeof topic_time);
+  topic_merge(st, key, klen, topic_time, (const char *)val + TOPIC_VAL_HDR,
+              vlen - TOPIC_VAL_HDR, writer, ts);
 }
 
 void crdt_modes_set(struct CrdtNetworkState *st, const char *chan,
@@ -1567,6 +1665,19 @@ void crdt_state_apply_op(struct CrdtNetworkState *st, const struct CrdtOp *op)
     if (op->type == CRDT_OP_SET && op->val && op->val_len)
       marker_merge(st, op->key, op->key_len, op->val, op->val_len, op->writer, op->ts);
     hlc_receive(&st->clock, &op->ts);            /* advance our clock */
+  } else if (op->coll == CRDT_COLL_TOPICS) {     /* M11 topic MAX-register on topic_time */
+    if (op->type == CRDT_OP_SET && op->val && op->val_len > TOPIC_VAL_HDR) {
+      /* val_len guard (mirrors ctime's == sizeof): a wrong-sized payload is IGNORED,
+       * not misread — forward/backward-compat degradation across a mixed-binary mesh. */
+      uint64_t topic_time = 0;
+      memcpy(&topic_time, op->val, sizeof topic_time);
+      topic_merge(st, op->key, op->key_len, topic_time,
+                  (const char *)op->val + TOPIC_VAL_HDR,
+                  op->val_len - TOPIC_VAL_HDR, op->writer, op->ts);
+    } else if (op->type == CRDT_OP_DELETE) {
+      crdt_lwwmap_delete(&st->topics, op->key, op->key_len, op->ts, op->writer);
+    }
+    hlc_receive(&st->clock, &op->ts);            /* advance our clock */
   } else {
     struct CrdtLWWMap *map = lww_for(st, op->coll);
     /* unknown collection (an op from a NEWER peer): lww_for returns NULL —
@@ -1786,6 +1897,30 @@ static uint64_t digest_marker(uint64_t acc, const struct CrdtLWWMap *m, uint8_t 
   return acc;
 }
 
+/* M11: digest the topics MAX-register VALUE-ONLY. The value buffer already encodes
+ * topic_time + text (the convergent observable); hashing the LWW write-HLC/writer —
+ * as the generic digest_lww does — would FALSELY diverge two nodes that converged on
+ * the SAME topic via different synthesized write HLCs (topic_merge synth-on-win), which
+ * would trip Fix-A's anti-entropy into a perpetual CR F snapshot storm. Clone of
+ * digest_marker (value-only for the identical reason). Salt 4 (unchanged). */
+static uint64_t digest_topic(uint64_t acc, const struct CrdtLWWMap *m, uint8_t ns)
+{
+  uint32_t b;
+  for (b = 0; b < m->nbuckets; b++) {
+    struct CrdtLWWEntry *e;
+    for (e = m->buckets[b]; e; e = e->ht_next) {
+      uint64_t h = FNV64_OFFSET;
+      h = fnv64(h, &ns, 1);
+      h = fnv64(h, e->key, e->key_len);
+      h = fnv64(h, &e->deleted, sizeof e->deleted);
+      if (!e->deleted && e->val.data && e->val.data_len)
+        h = fnv64(h, e->val.data, e->val.data_len);
+      acc ^= h;
+    }
+  }
+  return acc;
+}
+
 static uint64_t digest_orset(uint64_t acc, const struct CrdtORSet *s,
                              const char *cname, uint32_t cnlen, uint8_t ns)
 {
@@ -1824,7 +1959,7 @@ uint64_t crdt_state_digest(const struct CrdtNetworkState *st)
   acc = digest_lww(acc, &st->servers, 1);
   acc = digest_lww(acc, &st->users, 2);
   acc = digest_lww(acc, &st->nicks, 3);
-  acc = digest_lww(acc, &st->topics, 4);
+  acc = digest_topic(acc, &st->topics, 4);   /* M11: value-only (TRAP 2 — see digest_topic) */
   acc = digest_lww(acc, &st->modes, 5);
   acc = digest_lww(acc, &st->members_status, 6);
   acc = digest_lww(acc, &st->chanmeta, 7);
@@ -1882,7 +2017,7 @@ uint64_t crdt_state_digest_materialized(const struct CrdtNetworkState *st)
   acc = digest_lww(acc, &st->servers, 1);
   acc = digest_lww(acc, &st->users, 2);
   acc = digest_lww(acc, &st->nicks, 3);
-  acc = digest_lww(acc, &st->topics, 4);
+  acc = digest_topic(acc, &st->topics, 4);   /* M11: value-only (TRAP 2 — see digest_topic) */
   acc = digest_lww(acc, &st->modes, 5);
   acc = digest_lww(acc, &st->members_status, 6);
   acc = digest_lww(acc, &st->chanmeta, 7);

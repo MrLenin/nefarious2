@@ -36,6 +36,9 @@
                                * SHA-256 CertFP ("SHA256:"+64 hex) is ~71 chars (cosmetic) */
 #define CRDT_GEOCODELEN   3   /* GeoIP 2-letter country/continent code + NUL */
 #define CRDT_TOPICNICKLEN 120 /* >= NICKLEN+USERLEN+HOSTLEN+3 +1 */
+#define CRDT_TOPIC_MAXLEN 512 /* M11: engine-local cap on a topic text (incl NUL) in the
+                               * topics MAX-register value; comfortably > live TOPICLEN(250)
+                               * so no truncation. Keeps the engine free of ircd_defs.h. */
 
 /* Compact per-member channel status bits (mapped from CHFL_* at the shadow
  * boundary; raw CHFL_HALFOP=0x800000 won't fit a byte). */
@@ -415,9 +418,27 @@ void crdt_state_resume_seq(struct CrdtNetworkState *st);
 /** Current doc state of server @a numeric: CRDT_SRV_ACTIVE (0), CRDT_SRV_SPLIT
  *  (1), or -1 if absent.  Used by the single-writer self-ACTIVE assert. */
 int crdt_server_state(const struct CrdtNetworkState *st, uint16_t numeric);
-/** Set a channel topic (LWW). Records a SET op so it replicates. */
+/** M11: Set a channel topic — a MAX-register on @a topic_time (PRIMARY key), text
+ *  lexical-max as the deterministic TIEBREAK for the same-second case (mirrors
+ *  marker_merge's value-only comparator; a naked HLC-LWW would regress to a
+ *  clock-skewed lower-topic_time-later-write and permanently split the legacy P10
+ *  gateway, whose m_topic gate orders by topic_time). @a topic_time is a wall-clock
+ *  value passed IN by the integration (chptr->topic_time); the engine never reads a
+ *  clock for it, so engine purity holds. Records a SET op (only on a MAX win) so it
+ *  replicates. The op/wire value is serialized [uint64_t topic_time][text incl NUL]. */
 void crdt_topic_set(struct CrdtNetworkState *st, const char *chan,
-                    const char *topic);
+                    const char *topic, uint64_t topic_time);
+/** M11: decode a topics MAX-register value buffer into its text (returned, always
+ *  NUL-terminated — "" if absent/short) and, if @a out_time non-NULL, its topic_time.
+ *  Used by the gateway/materialization readers that pull the topic out of the doc. */
+const char *crdt_topic_value_text(const void *data, uint32_t data_len,
+                                  uint64_t *out_time);
+/** M11: snapshot-apply entry (crdt_wire.c) — MERGE via the topic_time MAX-register,
+ *  NOT a generic HLC-LWW assign (which would regress a topic on snapshot catch-up).
+ *  Mirrors crdt_marker_merge_snapshot. */
+void crdt_topic_merge_snapshot(struct CrdtNetworkState *st, const char *key,
+                               uint32_t klen, const void *val, uint32_t vlen,
+                               uint16_t writer, struct HLC ts);
 /** Set a channel mode snapshot (opaque blob, LWW). Records a SET op. */
 void crdt_modes_set(struct CrdtNetworkState *st, const char *chan,
                     const void *snap, uint32_t snaplen);

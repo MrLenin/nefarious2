@@ -468,6 +468,125 @@ static void test_marker_op_replicates(void **state)
 }
 
 /* ================================================================== */
+/* M11: channel topic — MAX-register on topic_time (legacy P10 order), NOT a naked
+ * HLC-LWW (which regresses to a clock-skewed lower-topic_time-later-write and permanently
+ * splits the legacy m_topic gate). topic_time is PRIMARY; text lexical-max is the
+ * same-second TIEBREAK; the digest is VALUE-ONLY (topic_time+text) so converged nodes
+ * holding different synthesized write-HLCs don't false-diverge (Fix-A / CR F guard). */
+
+static const char *topic_text(struct CrdtNetworkState *s, const char *chan)
+{
+  const struct CrdtLWWValue *v =
+    crdt_lwwmap_get(&s->topics, chan, (uint32_t)strlen(chan));
+  return v ? crdt_topic_value_text(v->data, v->data_len, NULL) : "";
+}
+
+/* (1) SKEW REGRESSION — the core red->green: a causally-LATER topic carrying a LOWER
+ * topic_time must LOSE to the higher-topic_time topic. Pure-HLC-LWW (pre-fix) picks the
+ * HLC-later "new"; the MAX-register picks the higher-topic_time "old". */
+static void test_topic_skew_topic_time_beats_later_hlc(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState A, B;
+  crdt_state_init(&A, 1);
+  crdt_state_init(&B, 2);
+  crdt_topic_set(&B, "#c", "old", 200);   /* earlier HLC, HIGHER topic_time */
+  /* Warm A's clock to wall-time first (a set advances it), THEN skew it 60s ahead so
+   * the bump sticks — a bump on a still-zero clock is obliterated by wall-time in
+   * hlc_local_event. Now A's "new"@100 carries a strictly-LATER HLC than B's "old"@200
+   * — the exact clock-skew M11 targets (a causally-later topic with a LOWER topic_time). */
+  crdt_topic_set(&A, "#warm", "x", 1);
+  A.clock.physical_ms += 60000;
+  crdt_topic_set(&A, "#c", "new", 100);
+  crdt_state_sync(&A, &B);                 /* cross-merge BOTH directions */
+  crdt_state_sync(&B, &A);
+  assert_string_equal("old", topic_text(&A, "#c"));   /* topic_time 200 wins ... */
+  assert_string_equal("old", topic_text(&B, "#c"));   /* ... on BOTH, not the HLC-later "new" */
+  crdt_state_clear(&A);
+  crdt_state_clear(&B);
+}
+
+/* (2) SAME-SECOND TIE DETERMINISM: equal topic_time, different text, different origins ->
+ * both nodes pick the SAME deterministic winner, order-independently. The earlier-HLC
+ * node sets the lexically-GREATER text, so the value-only lexical tiebreak (wins) and a
+ * naive HLC tiebreak (would pick "aaa") DISAGREE — a real guard, not a vacuous one. */
+static void test_topic_same_second_tiebreak_deterministic(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState A, B, A2, B2;
+  crdt_state_init(&A, 1);
+  crdt_state_init(&B, 2);
+  crdt_topic_set(&A, "#c", "zzz", 500);   /* earlier HLC, lexically GREATER */
+  crdt_topic_set(&B, "#warm", "x", 1);    /* warm B's clock so the skew below sticks */
+  B.clock.physical_ms += 60000;
+  crdt_topic_set(&B, "#c", "aaa", 500);   /* strictly-LATER HLC, lexically lesser */
+  crdt_state_sync(&A, &B);
+  crdt_state_sync(&B, &A);
+  assert_string_equal("zzz", topic_text(&A, "#c"));   /* lexical-max wins the tie ... */
+  assert_string_equal("zzz", topic_text(&B, "#c"));   /* ... not the HLC-later "aaa" */
+  /* permuted apply order (opposite sync direction) -> identical winner */
+  crdt_state_init(&A2, 1);
+  crdt_state_init(&B2, 2);
+  crdt_topic_set(&B2, "#warm", "x", 1);
+  B2.clock.physical_ms += 60000;
+  crdt_topic_set(&B2, "#c", "aaa", 500);  /* later HLC applied FIRST this time */
+  crdt_topic_set(&A2, "#c", "zzz", 500);
+  crdt_state_sync(&B2, &A2);
+  crdt_state_sync(&A2, &B2);
+  assert_string_equal("zzz", topic_text(&A2, "#c"));
+  assert_string_equal("zzz", topic_text(&B2, "#c"));
+  crdt_state_clear(&A);  crdt_state_clear(&B);
+  crdt_state_clear(&A2); crdt_state_clear(&B2);
+}
+
+/* (3) DIGEST LOCKSTEP / Fix-A safety (the TRAP-2 guard): two nodes converge on the SAME
+ * {topic_time, text} via a topic_merge win that SYNTHESIZES different per-node write HLCs
+ * -> assert crdt_state_digest is EQUAL. The value-only digest_topic passes; the old
+ * HLC-inclusive digest_lww would FALSELY diverge -> perpetual CR F storm. Fails red if
+ * the value-aware digest switch is skipped. */
+static void test_topic_digest_lockstep_value_only(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState A, B, C;
+  crdt_state_init(&A, 1);
+  crdt_state_init(&B, 2);
+  crdt_state_init(&C, 3);
+  /* A and B each write "old"@100 locally; their write HLCs carry the node's own
+   * node_id (1 vs 2) so they DIFFER regardless of wall-clock. */
+  crdt_topic_set(&A, "#c", "old", 100);   /* A: "old"@100, write HLC node_id=1 */
+  crdt_topic_set(&B, "#c", "old", 100);   /* B: "old"@100, write HLC node_id=2 (differs) */
+  crdt_topic_set(&C, "#c", "new", 200);   /* a higher-topic_time topic from origin 3 */
+  crdt_state_sync(&A, &C);                 /* WIN on A: synth HLC keeps A's node_id=1 ... */
+  crdt_state_sync(&B, &C);                 /* WIN on B: synth HLC keeps B's node_id=2 (differs) */
+  assert_string_equal("new", topic_text(&A, "#c"));
+  assert_string_equal("new", topic_text(&B, "#c"));
+  assert_true(crdt_state_digest(&A) == crdt_state_digest(&B));  /* value-only -> equal */
+  crdt_state_clear(&A);
+  crdt_state_clear(&B);
+  crdt_state_clear(&C);
+}
+
+/* (4) MONOTONIC MAX: a lower-topic_time late arrival (even at a strictly-later HLC) is an
+ * idempotent no-op; an equal-topic_time lexically-lesser text is a no-op; a strictly-
+ * higher topic_time advances. Mirrors test_marker_op_replicates' never-regress guard. */
+static void test_topic_max_never_regresses(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s;
+  crdt_state_init(&s, 1);
+  crdt_topic_set(&s, "#c", "high", 200);
+  assert_string_equal("high", topic_text(&s, "#c"));
+  s.clock.physical_ms += 60000;           /* strictly-later HLC, but LOWER topic_time */
+  crdt_topic_set(&s, "#c", "low", 100);
+  assert_string_equal("high", topic_text(&s, "#c"));   /* 100 < 200 -> no-op */
+  crdt_topic_set(&s, "#c", "aaa", 200);                /* equal time, lexically lesser */
+  assert_string_equal("high", topic_text(&s, "#c"));   /* "aaa" < "high" -> no-op */
+  crdt_topic_set(&s, "#c", "newer", 300);              /* strictly higher -> advances */
+  assert_string_equal("newer", topic_text(&s, "#c"));
+  crdt_state_clear(&s);
+}
+
+/* ================================================================== */
 /* Global-state track: a G-line set/update/delete replicates via DELTA and the
  * record round-trips with field fidelity; digests converge each step; the
  * collection survives a snapshot roundtrip (the CR-F cold-join path). */
@@ -1686,9 +1805,9 @@ static void test_wire_digest_converges(void **state)
    * and modes are included on purpose: they must be op-backed to converge
    * (regression guard for the bug where they bypassed the oplog). */
   crdt_user_set(&s1, "AAAAA", &u);  crdt_chan_join(&s1, "#d", "AAAAA");
-  crdt_topic_set(&s1, "#d", "hello");  crdt_modes_set(&s1, "#d", msnap, sizeof msnap);
+  crdt_topic_set(&s1, "#d", "hello", 1000);  crdt_modes_set(&s1, "#d", msnap, sizeof msnap);
   crdt_user_set(&s2, "AAAAA", &u);  crdt_chan_join(&s2, "#d", "AAAAA");
-  crdt_topic_set(&s2, "#d", "hello");  crdt_modes_set(&s2, "#d", msnap, sizeof msnap);
+  crdt_topic_set(&s2, "#d", "hello", 1000);  crdt_modes_set(&s2, "#d", msnap, sizeof msnap);
   assert_true(crdt_state_digest(&s1) != crdt_state_digest(&s2));  /* tags differ */
   /* exchange deltas both ways -> tag union -> converge */
   n = crdt_delta_encode(&s1.oplog, &s2.local_sv, buf, sizeof buf);
@@ -1722,7 +1841,7 @@ static void test_single_writer_full_digest_converges(void **state)
 
   crdt_user_set(&A, "AAAAA", &u);
   crdt_chan_join(&A, "#c", "AAAAA");
-  crdt_topic_set(&A, "#c", "hi");
+  crdt_topic_set(&A, "#c", "hi", 1000);
   crdt_modes_set(&A, "#c", msnap, sizeof msnap);
 
   /* one-way sync B<-A (B is the single-writer-gated peer: it mirrors nothing) */
@@ -1896,8 +2015,8 @@ static void test_wire_concurrent_converges(void **state)
   crdt_user_set(&s2, "AAAAA", &aY);
   crdt_chan_remove(&s1, "#x", "BBBBB", CRDT_PRIORITY_USER); /* s1 parts B    */
   crdt_user_set(&s2, "CCCCC", &ub); crdt_chan_join(&s2, "#x", "CCCCC"); /* s2 adds C */
-  crdt_topic_set(&s1, "#x", "topic-one");           /* conflicting topic    */
-  crdt_topic_set(&s2, "#x", "topic-two");
+  crdt_topic_set(&s1, "#x", "topic-one", 1000);           /* conflicting topic    */
+  crdt_topic_set(&s2, "#x", "topic-two", 1000);
   crdt_modes_set(&s1, "#x", m1, sizeof m1);         /* conflicting modes    */
   crdt_modes_set(&s2, "#x", m2, sizeof m2);
 
@@ -1936,7 +2055,7 @@ static void test_snapshot_roundtrip(void **state)
   crdt_chan_join(&s1, "#r", "AAAAA");
   crdt_chan_join(&s1, "#r", "BBBBB");
   crdt_chan_remove(&s1, "#r", "BBBBB", CRDT_PRIORITY_USER);  /* leaves a tombstone */
-  crdt_topic_set(&s1, "#r", "hello world");
+  crdt_topic_set(&s1, "#r", "hello world", 1000);
   crdt_modes_set(&s1, "#r", modesnap, sizeof modesnap);
 
   n = crdt_snapshot_encode(&s1, buf, sizeof buf);
@@ -1957,7 +2076,7 @@ static void test_gc_advances_floor(void **state)
   crdt_state_init(&s1, 1);
   crdt_user_set(&s1, "AAAAA", &u);
   crdt_chan_join(&s1, "#g", "AAAAA");
-  crdt_topic_set(&s1, "#g", "t");
+  crdt_topic_set(&s1, "#g", "t", 1000);
   assert_int_equal(0, (int)s1.gc_floor.seq[1]);
   crdt_state_gc(&s1, &s1.local_sv);
   assert_int_equal((int)s1.local_sv.seq[1], (int)s1.gc_floor.seq[1]);
@@ -1978,7 +2097,7 @@ static void test_snapshot_recovers_gc_gap(void **state)
   crdt_state_init(&s2, 2);
   crdt_user_set(&s1, "AAAAA", &u);
   crdt_chan_join(&s1, "#g", "AAAAA");
-  crdt_topic_set(&s1, "#g", "t");
+  crdt_topic_set(&s1, "#g", "t", 1000);
 
   /* s1 GCs against its own SV (every other peer caught up; s2 was split) ->
    * oplog emptied, gc_floor now past s2's (empty) SV. */
@@ -2042,13 +2161,13 @@ static void test_fresh_mirror_snapshot_converges(void **state)
    * materialized state survives, reachable solely via a snapshot) */
   crdt_user_set(&hub, "AAAAA", &u);
   crdt_chan_join(&hub, "#c", "AAAAA");
-  crdt_topic_set(&hub, "#c", "hi");
+  crdt_topic_set(&hub, "#c", "hi", 1000);
   crdt_state_gc(&hub, &hub.local_sv);
 
   /* leaf independently re-mirrors the same logical state (its own origin/HLC) */
   crdt_user_set(&leaf, "AAAAA", &u);
   crdt_chan_join(&leaf, "#c", "AAAAA");
-  crdt_topic_set(&leaf, "#c", "hi");
+  crdt_topic_set(&leaf, "#c", "hi", 1000);
 
   /* leaf is behind hub's GC floor -> CR F snapshot */
   n = crdt_snapshot_encode(&hub, buf, sizeof buf);
@@ -2540,7 +2659,7 @@ static void test_orphan_chan_meta_reclaimed(void **state)
   memset(&cm, 0, sizeof cm); cm.creationtime = 42;
   crdt_state_init(&s, 1);
   crdt_chan_join(&s, "#c", "AAAAB");
-  crdt_topic_set(&s, "#c", "hello world");
+  crdt_topic_set(&s, "#c", "hello world", 1000);
   crdt_modes_set(&s, "#c", "ntk", 3);
   crdt_chanmeta_set(&s, "#c", &cm);
   assert_non_null(crdt_lwwmap_get(&s.topics, "#c", 2));
@@ -2574,7 +2693,7 @@ static void test_orphan_chan_meta_kept_while_live(void **state)
   memset(&cm, 0, sizeof cm);
   crdt_state_init(&s, 1);
   crdt_chan_join(&s, "#c", "AAAAB");
-  crdt_topic_set(&s, "#c", "hi");
+  crdt_topic_set(&s, "#c", "hi", 1000);
   crdt_modes_set(&s, "#c", "nt", 2);
   crdt_chanmeta_set(&s, "#c", &cm);
   assert_int_equal(0, crdt_state_reclaim_orphan_chan_meta(&s));
@@ -2594,7 +2713,7 @@ static void test_orphan_chan_meta_kept_while_tombstone_present(void **state)
   memset(&cm, 0, sizeof cm);
   crdt_state_init(&s, 1);
   crdt_chan_join(&s, "#c", "AAAAB");
-  crdt_topic_set(&s, "#c", "hi");
+  crdt_topic_set(&s, "#c", "hi", 1000);
   crdt_modes_set(&s, "#c", "nt", 2);
   crdt_chanmeta_set(&s, "#c", &cm);
   crdt_chan_remove(&s, "#c", "AAAAB", CRDT_PRIORITY_USER);
@@ -2617,7 +2736,7 @@ static void test_orphan_chan_meta_kept_while_ctime_live(void **state)
   crdt_state_init(&s, 1);
   crdt_chan_join(&s, "#c", "AAAAB");
   crdt_chan_ctime_set(&s, "#c", 1234567890);   /* live incarnation */
-  crdt_topic_set(&s, "#c", "hi");
+  crdt_topic_set(&s, "#c", "hi", 1000);
   crdt_chan_remove(&s, "#c", "AAAAB", CRDT_PRIORITY_USER);
   crdt_sv_init(&stable); crdt_sv_update(&stable, 1, 100000);
   crdt_state_gc(&s, &stable);            /* members empty + stable, but ctime still live */
@@ -2637,7 +2756,7 @@ static void test_orphan_chan_meta_kept_while_struct_absent(void **state)
   (void)state;
   struct CrdtNetworkState s;
   crdt_state_init(&s, 1);
-  crdt_topic_set(&s, "#c", "hi");        /* meta present, NO struct-creating op */
+  crdt_topic_set(&s, "#c", "hi", 1000);        /* meta present, NO struct-creating op */
   assert_int_equal(0, crdt_state_reclaim_orphan_chan_meta(&s));
   assert_non_null(crdt_lwwmap_get(&s.topics, "#c", 2));
   crdt_state_clear(&s);
@@ -2654,7 +2773,7 @@ static void test_orphan_chan_meta_reclaimed_after_ctime_clear(void **state)
   crdt_state_init(&s, 1);
   crdt_chan_join(&s, "#c", "AAAAB");
   crdt_chan_ctime_set(&s, "#c", 1234567890);   /* live incarnation */
-  crdt_topic_set(&s, "#c", "hi");
+  crdt_topic_set(&s, "#c", "hi", 1000);
   crdt_chan_remove(&s, "#c", "AAAAB", CRDT_PRIORITY_USER);
   crdt_chan_ctime_clear(&s, "#c");             /* destroy: ctime_del > ctime_set */
   crdt_sv_init(&stable); crdt_sv_update(&stable, 1, 100000);
@@ -2954,6 +3073,10 @@ int main(void)
     cmocka_unit_test(test_chan_ban_op_replicates),
     cmocka_unit_test(test_silence_op_replicates),
     cmocka_unit_test(test_marker_op_replicates),
+    cmocka_unit_test(test_topic_skew_topic_time_beats_later_hlc),
+    cmocka_unit_test(test_topic_same_second_tiebreak_deterministic),
+    cmocka_unit_test(test_topic_digest_lockstep_value_only),
+    cmocka_unit_test(test_topic_max_never_regresses),
     cmocka_unit_test(test_gline_op_replicates),
     cmocka_unit_test(test_force_lastmod_breaks_tie),
     cmocka_unit_test(test_crdt_beacon_tick_stale),
