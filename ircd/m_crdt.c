@@ -253,7 +253,14 @@ static void crdt_tree_forward_chan(int except_num, const char *msgid, char cmd,
 static void crdt_m_source_token(struct Client *from, char *buf, size_t cap)
 {
   if (IsServer(from) || IsMeshStub(from) || IsMe(from) || !cli_user(from))
-    ircd_snprintf(0, buf, cap, "%s", cli_yxx(from));
+    /* Canonical 2-char server numeric.  cli_yxx is only 1 char for a server
+     * configured with a 1-char P10 numeric; the receiver discriminates the
+     * server form as EXACTLY 2 chars (srcyxx[0] && srcyxx[1] && !srcyxx[2]),
+     * so a 1-char token would be misread as user-form and misresolved by
+     * findNUser.  Re-encode to a fixed 2-char width (buf/cap is always >= 3):
+     * base64toint recovers the value for a 1- or 2-char yxx, and a server
+     * numeric is 0..4095, so inttobase64(,2) reproduces it exactly. */
+    inttobase64(buf, base64toint(cli_yxx(from)), 2);
   else
     ircd_snprintf(0, buf, cap, "%s%s", NumNick(from));
 }
