@@ -642,6 +642,12 @@ int  crdt_state_gc(struct CrdtNetworkState *st,
  *  reclaimed. Safe + idempotent to call each GC cycle. */
 int  crdt_state_reclaim_orphan_member_meta(struct CrdtNetworkState *st);
 
+/** M10: reclaim orphaned per-channel LWW meta (topics / modes / chanmeta) for
+ *  channels that are FULLY gone (members OR-Set empty AND causally stable AND ctime
+ *  incarnation dead) by minting DELETE ops so they ride the tombstone GC. Returns
+ *  the count reclaimed. Safe + idempotent to call each GC cycle. */
+int  crdt_state_reclaim_orphan_chan_meta(struct CrdtNetworkState *st);
+
 /* ---- queries ---- */
 struct CrdtChannel *crdt_state_channel(struct CrdtNetworkState *st,
                                        const char *chan, int create);

@@ -2329,6 +2329,114 @@ static void test_orphan_meta_kept_while_tombstone_present(void **state)
 }
 
 /* ================================================================== */
+/* M10: orphaned per-channel LWW meta (topics/modes/chanmeta) for FULLY-GONE
+ * channels. Like member-meta these LWW entries are live registers, not tombstones,
+ * so the normal GC never reclaims them; they leak forever for churned channels and
+ * bloat every CR F snapshot. crdt_state_reclaim_orphan_chan_meta mints DELETE ops
+ * once the channel is fully gone: members OR-Set empty AND causally stable
+ * (tomb_count==0) AND the ctime incarnation dead. Reclaim = mint a DELETE (never a
+ * local free — a peer's CR F would resurrect a local-free and flap the digest). */
+
+/* RECLAIMED: a fully-gone channel's topic/modes/chanmeta are reclaimed, and the reap
+ * moves local_sv AND the doc digest in lockstep (never an SV-equal/digest-different
+ * state, which would trip Fix-A's anti-entropy into a spurious CR F snapshot). */
+static void test_orphan_chan_meta_reclaimed(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s;
+  struct CrdtChanMeta cm;
+  struct CrdtStateVector stable;
+  uint64_t d_before, d_after, sv_before, sv_after;
+  memset(&cm, 0, sizeof cm); cm.creationtime = 42;
+  crdt_state_init(&s, 1);
+  crdt_chan_join(&s, "#c", "AAAAB");
+  crdt_topic_set(&s, "#c", "hello world");
+  crdt_modes_set(&s, "#c", "ntk", 3);
+  crdt_chanmeta_set(&s, "#c", &cm);
+  assert_non_null(crdt_lwwmap_get(&s.topics, "#c", 2));
+  assert_non_null(crdt_lwwmap_get(&s.modes, "#c", 2));
+  assert_non_null(crdt_lwwmap_get(&s.chanmeta, "#c", 2));
+  /* channel empties + removal becomes causally stable -> members OR-Set tombstone GC'd */
+  crdt_chan_remove(&s, "#c", "AAAAB", CRDT_PRIORITY_USER);
+  crdt_sv_init(&stable); crdt_sv_update(&stable, 1, 100000);
+  crdt_state_gc(&s, &stable);
+  /* fully gone -> reclaim mints 3 DELETE ops (topic/modes/chanmeta) */
+  d_before = crdt_state_digest(&s); sv_before = s.local_sv.seq[1];
+  assert_int_equal(3, crdt_state_reclaim_orphan_chan_meta(&s));
+  d_after = crdt_state_digest(&s); sv_after = s.local_sv.seq[1];
+  assert_true(sv_after > sv_before);     /* an op was minted (SV moved) */
+  assert_true(d_after != d_before);      /* the doc digest moved with it (lockstep) */
+  assert_null(crdt_lwwmap_get(&s.topics, "#c", 2));
+  assert_null(crdt_lwwmap_get(&s.modes, "#c", 2));
+  assert_null(crdt_lwwmap_get(&s.chanmeta, "#c", 2));
+  /* the delete tombstones themselves GC after stability (no unbounded growth) */
+  crdt_sv_update(&stable, 1, 200000);
+  crdt_state_gc(&s, &stable);
+  crdt_state_clear(&s);
+}
+
+/* KEPT: a live channel's meta is NOT reclaimed. */
+static void test_orphan_chan_meta_kept_while_live(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s;
+  struct CrdtChanMeta cm;
+  memset(&cm, 0, sizeof cm);
+  crdt_state_init(&s, 1);
+  crdt_chan_join(&s, "#c", "AAAAB");
+  crdt_topic_set(&s, "#c", "hi");
+  crdt_modes_set(&s, "#c", "nt", 2);
+  crdt_chanmeta_set(&s, "#c", &cm);
+  assert_int_equal(0, crdt_state_reclaim_orphan_chan_meta(&s));
+  assert_non_null(crdt_lwwmap_get(&s.topics, "#c", 2));
+  crdt_state_clear(&s);
+}
+
+/* KEPT: while the member OR-Set tombstone is still present (removal NOT yet causally
+ * stable, tomb_count>0) the channel meta is retained -- lagging peers may still be
+ * mid-departure, so the members-empty signal is not yet trustworthy. */
+static void test_orphan_chan_meta_kept_while_tombstone_present(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s;
+  struct CrdtChanMeta cm;
+  struct CrdtStateVector stable;
+  memset(&cm, 0, sizeof cm);
+  crdt_state_init(&s, 1);
+  crdt_chan_join(&s, "#c", "AAAAB");
+  crdt_topic_set(&s, "#c", "hi");
+  crdt_modes_set(&s, "#c", "nt", 2);
+  crdt_chanmeta_set(&s, "#c", &cm);
+  crdt_chan_remove(&s, "#c", "AAAAB", CRDT_PRIORITY_USER);
+  crdt_sv_init(&stable);                 /* nothing stable -> tombstone remains */
+  crdt_state_gc(&s, &stable);
+  assert_int_equal(0, crdt_state_reclaim_orphan_chan_meta(&s));
+  assert_non_null(crdt_lwwmap_get(&s.topics, "#c", 2));
+  crdt_state_clear(&s);
+}
+
+/* KEPT: an empty channel whose ctime incarnation is still LIVE (members drained but
+ * the channel not destroyed) is NOT reclaimed -- a peer may hold it as a transient
+ * 0-member live incarnation that can regain members / re-set its topic. The ctime
+ * gate (not members alone) guards that M6-trap-1 resurrection. */
+static void test_orphan_chan_meta_kept_while_ctime_live(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s;
+  struct CrdtStateVector stable;
+  crdt_state_init(&s, 1);
+  crdt_chan_join(&s, "#c", "AAAAB");
+  crdt_chan_ctime_set(&s, "#c", 1234567890);   /* live incarnation */
+  crdt_topic_set(&s, "#c", "hi");
+  crdt_chan_remove(&s, "#c", "AAAAB", CRDT_PRIORITY_USER);
+  crdt_sv_init(&stable); crdt_sv_update(&stable, 1, 100000);
+  crdt_state_gc(&s, &stable);            /* members empty + stable, but ctime still live */
+  assert_int_equal(0, crdt_state_reclaim_orphan_chan_meta(&s));
+  assert_non_null(crdt_lwwmap_get(&s.topics, "#c", 2));
+  crdt_state_clear(&s);
+}
+
+/* ================================================================== */
 /* Fix A (digest-aware anti-entropy): the state vector counts ops per origin but
  * does NOT summarise content/HLC, so two replicas can share an SV yet hold
  * different content (e.g. a CR F snapshot HLC-merge or ctime incarnation change
@@ -2457,6 +2565,10 @@ int main(void)
     cmocka_unit_test(test_orphan_member_meta_reclaimed),
     cmocka_unit_test(test_orphan_meta_kept_while_member_live),
     cmocka_unit_test(test_orphan_meta_kept_while_tombstone_present),
+    cmocka_unit_test(test_orphan_chan_meta_reclaimed),
+    cmocka_unit_test(test_orphan_chan_meta_kept_while_live),
+    cmocka_unit_test(test_orphan_chan_meta_kept_while_tombstone_present),
+    cmocka_unit_test(test_orphan_chan_meta_kept_while_ctime_live),
     cmocka_unit_test(test_A_convergence),
     cmocka_unit_test(test_B_collision_different_user_oldest_wins),
     cmocka_unit_test(test_B_collision_same_user_newest_wins),

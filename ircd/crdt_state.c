@@ -1976,27 +1976,92 @@ static void orphan_collect_cb(const char *key, uint32_t key_len,
   o->n++;
 }
 
+/* Generalized LWW-orphan reap core: collect the keys of @a map whose ANCHOR (tested
+ * by @a collect_cb, which fills the shared orphan_ctx) is fully-gone-and-causally-
+ * stable, then mint a DELETE op for each. Bounded ORPHAN_MAX per pass (survivors
+ * caught next cycle); collect-then-act so the map is never mutated mid-iterate.
+ * Returns the count reclaimed. Shared by the member-meta anchor (chan\0numeric ->
+ * per-member OR-Set slot) and the chan-meta anchor (channel name -> channel gone). */
+static int reclaim_lww_orphans(struct CrdtNetworkState *st,
+                               struct CrdtLWWMap *map, int coll,
+                               crdt_lwwmap_iter_fn collect_cb)
+{
+  static struct orphan_ctx o;            /* static: 32KB, avoids a huge stack frame */
+  int i;
+  o.st = st; o.n = 0;
+  crdt_lwwmap_foreach(map, collect_cb, &o);
+  for (i = 0; i < o.n; i++)
+    mint_meta_delete(st, map, coll, o.keys[i], o.lens[i]);
+  return o.n;
+}
+
 /* Reclaim orphaned members_status/kick_info entries for fully-departed members by
  * minting DELETE ops. Returns the number reclaimed. Idempotent + safe to call every
  * GC cycle. */
 int crdt_state_reclaim_orphan_member_meta(struct CrdtNetworkState *st)
 {
-  static struct orphan_ctx o;            /* static: 32KB, avoids a huge stack frame */
-  int i, total = 0;
+  int total = 0;
+  total += reclaim_lww_orphans(st, &st->members_status, CRDT_COLL_MEMBER_STATUS,
+                               orphan_collect_cb);
+  total += reclaim_lww_orphans(st, &st->kick_info, CRDT_COLL_KICK_INFO,
+                               orphan_collect_cb);
+  return total;
+}
 
-  o.st = st; o.n = 0;
-  crdt_lwwmap_foreach(&st->members_status, orphan_collect_cb, &o);
-  for (i = 0; i < o.n; i++)
-    mint_meta_delete(st, &st->members_status, CRDT_COLL_MEMBER_STATUS,
-                     o.keys[i], o.lens[i]);
-  total += o.n;
+/* M10 anchor test: a channel is FULLY gone iff its members OR-Set is empty AND
+ * causally stable (no live member-removes: tomb_count==0) AND its ctime incarnation
+ * is dead. tomb_count==0 (NOT ctime-dead alone) is the causal-stability signal:
+ * ctime_del is local-only (bumped by crdt_chan_ctime_clear, no op), so ctime-dead-
+ * locally does not prove death network-wide; members-empty-AND-stable proves every
+ * peer saw the departures. A NULL struct (channel never seen on this node — M6 keeps
+ * every struct ever created, so NULL means never-created) is vacuously fully-gone. */
+static int chan_fully_gone(struct CrdtNetworkState *st,
+                           const char *name, uint32_t nlen)
+{
+  struct CrdtChannel *ch = chan_find(st, name, nlen);
+  if (!ch)
+    return 1;
+  if (crdt_orset_size(&ch->members) != 0 || crdt_orset_tomb_count(&ch->members) != 0)
+    return 0;
+  if (hlc_compare(&ch->ctime_set, &ch->ctime_del) > 0)   /* ctime incarnation still live */
+    return 0;
+  return 1;
+}
 
-  o.n = 0;
-  crdt_lwwmap_foreach(&st->kick_info, orphan_collect_cb, &o);
-  for (i = 0; i < o.n; i++)
-    mint_meta_delete(st, &st->kick_info, CRDT_COLL_KICK_INFO, o.keys[i], o.lens[i]);
-  total += o.n;
+/* foreach callback: collect (don't mutate mid-iterate) the keys of per-channel meta
+ * entries whose CHANNEL is fully gone. The key IS the channel name (no numeric part
+ * to parse). Foreach-ing LIVE meta entries and gating on the channel anchor is
+ * legitimate (invariant 11 bars foreach-ing a *tombstone*, not present entries). */
+static void chanmeta_orphan_collect_cb(const char *key, uint32_t key_len,
+                                       const struct CrdtLWWValue *val, void *ctx)
+{
+  struct orphan_ctx *o = (struct orphan_ctx *)ctx;
+  (void)val;
+  if (o->n >= ORPHAN_MAX || key_len >= sizeof o->keys[0])
+    return;
+  if (!chan_fully_gone(o->st, key, key_len))
+    return;
+  memcpy(o->keys[o->n], key, key_len);
+  o->lens[o->n] = key_len;
+  o->n++;
+}
 
+/* M10: reclaim orphaned topic/modes/chanmeta LWW entries for fully-gone channels by
+ * minting DELETE ops (NOT a local free — a local free is resurrected by a peer's CR F
+ * snapshot that still holds the live entry -> digest flap; a real tombstone propagates
+ * + LWW-wins + rides the existing tombstone GC). These three LWW registers are keyed
+ * by channel name and, unlike the members OR-Set, are never tombstoned on destroy, so
+ * they leak forever for churned channels and bloat every CR F snapshot without this
+ * reap. Returns the count reclaimed. Safe + idempotent to call every GC cycle. */
+int crdt_state_reclaim_orphan_chan_meta(struct CrdtNetworkState *st)
+{
+  int total = 0;
+  total += reclaim_lww_orphans(st, &st->topics, CRDT_COLL_TOPICS,
+                               chanmeta_orphan_collect_cb);
+  total += reclaim_lww_orphans(st, &st->modes, CRDT_COLL_MODES,
+                               chanmeta_orphan_collect_cb);
+  total += reclaim_lww_orphans(st, &st->chanmeta, CRDT_COLL_CHANMETA,
+                               chanmeta_orphan_collect_cb);
   return total;
 }
 

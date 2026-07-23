@@ -4888,6 +4888,13 @@ static void crdt_shadow_gc(void)
                 "CRDT GC: reclaimed %d orphan member-meta entr(ies) (departed members)",
                 orph);
   }
+  {
+    int orph = crdt_state_reclaim_orphan_chan_meta(&g_crdt);
+    if (orph > 0)
+      log_write(LS_SYSTEM, L_NOTICE, 0,
+                "CRDT GC: reclaimed %d orphan chan-meta entr(ies) (gone channels)",
+                orph);
+  }
   freed = crdt_state_gc(&g_crdt, &gmin);
   if (freed > 0)
     log_write(LS_SYSTEM, L_NOTICE, 0,
