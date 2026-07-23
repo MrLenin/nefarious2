@@ -789,6 +789,14 @@ int metadata_account_clear(const char *account)
         memcmp(kbuf, prefix, (size_t)prefixlen) != 0)
       break;
     db_writebatch_del(wb, metadata_cf, kbuf, klen);
+    /* Tier C F2-b: also mint the doc tombstone. The bulk store delete alone bypasses
+     * the (account,key) doc-mirror chokepoint, so the doc keeps the SET and
+     * reconcile_metadata_set_cb heals the cleared value back into the store ~30s later
+     * (active resurrection; no peer learns of the clear). The store key IS the doc key
+     * (account\0metakey). CLEAR is a user action, not a reconcile, so the wrapper's
+     * re-entrancy guards pass and the mint fires; the store del and the doc tombstone
+     * stay in lockstep. */
+    crdt_shadow_metadata_remove_key(kbuf, (uint32_t)klen);
   }
   db_iter_close(it);
 

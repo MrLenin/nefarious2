@@ -293,6 +293,11 @@ void crdt_shadow_reconcile_markers(void);
  *  suppressed). */
 void crdt_shadow_metadata_set(const char *account, const char *key,
                               const char *value, int permanent);
+/** Mint a doc metadata tombstone for a pre-formed storage key (account\0key). Raw-key
+ *  variant of crdt_shadow_metadata_set's delete branch, for metadata_account_clear's
+ *  bulk store-delete (which bypasses the (account,key) chokepoint). Same gates; skips
+ *  keys not doc-present. */
+void crdt_shadow_metadata_remove_key(const void *key, uint32_t klen);
 void crdt_shadow_reconcile_metadata(void);
 void crdt_shadow_metadata_suspend(int on);
 

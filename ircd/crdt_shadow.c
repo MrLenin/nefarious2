@@ -2203,6 +2203,30 @@ void crdt_shadow_metadata_set(const char *account, const char *key,
   }
 }
 
+/* Raw-key variant of crdt_shadow_metadata_set's delete branch: mint a doc tombstone
+ * for an already-formed storage key (account\0metakey, KEY_SEP=='\0'), rather than
+ * re-deriving it from (account,key). Used by metadata_account_clear, whose bulk
+ * db_writebatch_del over the store would otherwise bypass the doc-mirror chokepoint
+ * and leave the doc SET intact -> reconcile_metadata_set_cb SET-heals the cleared
+ * value back ~30s later (active resurrection). Same gates as the delete branch: the
+ * re-entrancy guards are 0 for a user CLEAR (not a reconcile / remote apply), so the
+ * mint fires; the "only tombstone a converged key" read skips TTL-cache keys that were
+ * never doc-present. reconcile_metadata_del_collect (store-walk, gated on
+ * crdt_metadata_is_explicitly_removed) then reaps the store copy on every node. */
+void crdt_shadow_metadata_remove_key(const void *key, uint32_t klen)
+{
+  const struct CrdtLWWValue *v;
+  if (!shadow_on() || g_metadata_reconciling || g_metadata_remote_applying)
+    return;
+  if (!key || !klen)
+    return;
+  v = crdt_metadata_get(&g_crdt, (const char *)key, klen);
+  if (!v || !v->data)
+    return;                                /* only tombstone a key we actually converged */
+  crdt_metadata_del(&g_crdt, (const char *)key, klen);
+  crdt_sync_push();
+}
+
 /* SET heal/backfill: for each PRESENT doc metadata entry, drive it into metadata_cf as a
  * permanent value if the store copy is missing or differs (echo-guarded so a
  * P10-delivered value isn't bounced back + no write churn). Runs under
