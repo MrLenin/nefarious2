@@ -163,17 +163,26 @@ On a CRDT-server SQUIT, instead of cascade-tombstoning, the departed server is K
     LOCAL determination (`FindNServer` + the beacon), never replicated CRDT state ("no amount of
     patching makes a per-viewpoint value robust as shared state"). Don't resurrect it — path-vector
     routing would, which is why the roadmap recommends gossip-flood instead.
-11. **Doc-REMOVAL reconciles must LIVE-WALK + check `*_present()`, NEVER foreach the tombstone.**
-    `crdt_lwwmap_foreach` (crdt_types.c) **skips deleted entries** (`if (!e->deleted)`), and OR-Set
-    iteration is similar — so a reconcile callback's `!val->data` / tombstone branch is UNREACHABLE for
-    a removal. To act on a doc removal (e.g. de-materialize a replica/alias whose owner tombstoned its
-    record), walk the LIVE local objects (the session/account hashes, channel lists) and gate on
-    `crdt_shadow_*_present()` (`crdt_*_get` → NULL for a tombstone), collect-then-act (no mid-walk
-    mutation). This is the `bounce_crdt_replica_reap` (sessions) / `bounce_crdt_alias_reap` (aliases)
-    pattern. Cost of the trap: M6c-1 BX Inc-2 shipped a de-mat in the (dead) tombstone branch — it never
-    fired; the legacy P10 BX X silently masked it until BX X suppression made the de-mat the sole path
-    and exposed the strand. Reconcile-CREATE in the `val->data` branch is fine (live entries ARE walked);
-    only REMOVAL needs the live-walk.
+11. **Doc-REMOVAL reconciles must LIVE-WALK + gate on `*_is_explicitly_removed()` (NOT `!*_present()`),
+    NEVER foreach the tombstone.** `crdt_lwwmap_foreach` (crdt_types.c) **skips deleted entries**
+    (`if (!e->deleted)`), and OR-Set iteration is similar — so a reconcile callback's `!val->data` /
+    tombstone branch is UNREACHABLE for a removal. To act on a doc removal (e.g. de-materialize a
+    replica/alias whose owner tombstoned its record), walk the LIVE local objects (the session/account
+    hashes, channel lists), collect-then-act (no mid-walk mutation), and gate on
+    **`crdt_*_is_explicitly_removed()` (= `crdt_lwwmap_is_deleted`), NOT on `!*_present()` /
+    `crdt_*_get()==NULL`.** `get()==NULL` is true for a tombstone **AND a never-written key**, so an
+    absence-gate wrongly reaps a record NO CRDT node ever wrote — e.g. a legacy-hosted session/alias
+    (a `bsess`/`bconn` is written only by its CRDT host). This is the pattern EVERY reap already uses
+    (user/metadata/gline/shun/zline/jupe/bans/members). **The two bouncer reaps `bounce_crdt_replica_reap`
+    (sessions) / the alias reap originally gated on `!*_present()` and spuriously destroyed LIVE
+    legacy-hosted sessions/aliases every verify tick (BS X/BX X) — fixed 2026-07-23 (P3-5b2) by
+    re-gating on `*_is_explicitly_removed`.** Tombstones persist until causally stable (crdt_state_gc
+    reclaims only after every peer acked → reap-before-GC in verify_cb guarantees the tombstone is seen),
+    so a genuine removal always reaps; a crashed host that never tombstones is the ORPHAN-REAP track's
+    job, not these reaps. Cost of the foreach-trap half: M6c-1 BX Inc-2 shipped a de-mat in the (dead)
+    tombstone branch — it never fired; the legacy P10 BX X silently masked it until BX X suppression made
+    the de-mat the sole path and exposed the strand. Reconcile-CREATE in the `val->data` branch is fine
+    (live entries ARE walked); only REMOVAL needs the live-walk.
 
 ## Build / test / verify
 
