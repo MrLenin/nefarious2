@@ -1501,6 +1501,13 @@ struct CrdtLWWMap *crdt_state_lww_for(struct CrdtNetworkState *st,
 
 void crdt_state_apply_op(struct CrdtNetworkState *st, const struct CrdtOp *op)
 {
+  /* origin/tag.origin index seq[CRDT_MAX_SERVERS] (sv_has_seen below, sv_update
+   * at the bottom, OR-Set GC on the tag) — crdt_op_decode already rejects OOB
+   * values at the wire; mirror it here so no in-process caller can index the
+   * state vector out of bounds either. */
+  if (op->origin >= CRDT_MAX_SERVERS || op->tag.origin >= CRDT_MAX_SERVERS)
+    return;
+
   if (crdt_sv_has_seen(&st->local_sv, op->origin, op->seq))
     return;                                  /* idempotent */
 

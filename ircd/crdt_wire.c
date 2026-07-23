@@ -65,6 +65,7 @@ static void rget_blob(struct rbuf *r, void **out, size_t n)
   if (n == 0) { *out = NULL; return; }
   if (r->err || r->off + n > r->len) { r->err = 1; *out = NULL; return; }
   *out = malloc(n);
+  if (!*out) { r->err = 1; return; }     /* never memcpy after a failed alloc */
   memcpy(*out, r->p + r->off, n);
   r->off += n;
 }
@@ -156,6 +157,14 @@ int crdt_op_decode(struct CrdtOp *op, const uint8_t *buf, size_t len)
   op->val_len = rget_u32(&r);
   rget_blob(&r, &op->val, op->val_len);
   if (r.err) { crdt_op_free_fields(op); return -1; }
+  /* origin/tag.origin index seq[CRDT_MAX_SERVERS] downstream (sv_has_seen /
+   * sv_update — a conditional WRITE — and the OR-Set GC) — reject OOB at the
+   * trust boundary, mirroring crdt_sv_decode.  Never remap to another slot:
+   * that would corrupt a real server's SV entry. */
+  if (op->origin >= CRDT_MAX_SERVERS || op->tag.origin >= CRDT_MAX_SERVERS) {
+    crdt_op_free_fields(op);
+    return -1;
+  }
   return (int)r.off;
 }
 
@@ -376,6 +385,7 @@ static int snap_get_orset(struct rbuf *r, struct CrdtORSet *set)
     tag.origin = rget_u16(r);
     tag.seq = rget_u64(r);
     if (r->err) return -1;
+    if (tag.origin >= CRDT_MAX_SERVERS) return -1;  /* indexes seq[] in GC — reject */
     crdt_orset_merge_add(set, (const char *)kp, klen, tag);   /* copies key */
   }
   tomb_n = rget_u32(r);
@@ -387,6 +397,7 @@ static int snap_get_orset(struct rbuf *r, struct CrdtORSet *set)
     tag.seq = rget_u64(r);
     prio = rget_u8(r);
     if (r->err) return -1;
+    if (tag.origin >= CRDT_MAX_SERVERS) return -1;  /* indexes seq[] in GC — reject */
     crdt_orset_merge_remove(set, tag, prio);
   }
   return 0;
