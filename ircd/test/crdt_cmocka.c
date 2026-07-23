@@ -2436,6 +2436,44 @@ static void test_orphan_chan_meta_kept_while_ctime_live(void **state)
   crdt_state_clear(&s);
 }
 
+/* KEPT: a meta entry whose CrdtChannel struct has not been created on this node is
+ * NOT reaped. A topic/modes/chanmeta SET op creates no struct (only member/ban/
+ * except/ctime ops do), so under cross-origin delta lag a node can hold the meta
+ * before the struct-creating ops arrive -- chan_find is NULL for a channel that is
+ * forming, not gone. Reaping there would delete a live channel's meta network-wide.
+ * (Would FAIL under the prior `!ch -> return 1` vacuous-fully-gone behavior.) */
+static void test_orphan_chan_meta_kept_while_struct_absent(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s;
+  crdt_state_init(&s, 1);
+  crdt_topic_set(&s, "#c", "hi");        /* meta present, NO struct-creating op */
+  assert_int_equal(0, crdt_state_reclaim_orphan_chan_meta(&s));
+  assert_non_null(crdt_lwwmap_get(&s.topics, "#c", 2));
+  crdt_state_clear(&s);
+}
+
+/* RECLAIMED via the realistic destroy path: ctime is SET (live incarnation) then
+ * CLEARED (crdt_chan_ctime_clear bumps ctime_del past ctime_set), so the channel is
+ * dead by incarnation-compare, not merely by both-HLCs-unset. */
+static void test_orphan_chan_meta_reclaimed_after_ctime_clear(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s;
+  struct CrdtStateVector stable;
+  crdt_state_init(&s, 1);
+  crdt_chan_join(&s, "#c", "AAAAB");
+  crdt_chan_ctime_set(&s, "#c", 1234567890);   /* live incarnation */
+  crdt_topic_set(&s, "#c", "hi");
+  crdt_chan_remove(&s, "#c", "AAAAB", CRDT_PRIORITY_USER);
+  crdt_chan_ctime_clear(&s, "#c");             /* destroy: ctime_del > ctime_set */
+  crdt_sv_init(&stable); crdt_sv_update(&stable, 1, 100000);
+  crdt_state_gc(&s, &stable);
+  assert_true(crdt_state_reclaim_orphan_chan_meta(&s) >= 1);   /* topic reaped */
+  assert_null(crdt_lwwmap_get(&s.topics, "#c", 2));
+  crdt_state_clear(&s);
+}
+
 /* ================================================================== */
 /* M9: per-user SILENCE masks (global silences OR-Set, keyed usernumeric\0mask). A
  * departed user's masks are never tombstoned by user_remove, so they persist as LIVE
@@ -2701,6 +2739,8 @@ int main(void)
     cmocka_unit_test(test_orphan_meta_kept_while_member_live),
     cmocka_unit_test(test_orphan_meta_kept_while_tombstone_present),
     cmocka_unit_test(test_orphan_chan_meta_reclaimed),
+    cmocka_unit_test(test_orphan_chan_meta_reclaimed_after_ctime_clear),
+    cmocka_unit_test(test_orphan_chan_meta_kept_while_struct_absent),
     cmocka_unit_test(test_orphan_chan_meta_kept_while_live),
     cmocka_unit_test(test_orphan_chan_meta_kept_while_tombstone_present),
     cmocka_unit_test(test_orphan_chan_meta_kept_while_ctime_live),

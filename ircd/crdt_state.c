@@ -2017,14 +2017,20 @@ int crdt_state_reclaim_orphan_member_meta(struct CrdtNetworkState *st)
  * is dead. tomb_count==0 (NOT ctime-dead alone) is the causal-stability signal:
  * ctime_del is local-only (bumped by crdt_chan_ctime_clear, no op), so ctime-dead-
  * locally does not prove death network-wide; members-empty-AND-stable proves every
- * peer saw the departures. A NULL struct (channel never seen on this node — M6 keeps
- * every struct ever created, so NULL means never-created) is vacuously fully-gone. */
+ * peer saw the departures. A NULL struct is NOT proof of fully-gone: a
+ * topic/modes/chanmeta SET op does not create the CrdtChannel struct (only
+ * member/ban/except/ctime ops do), so under cross-origin delta lag a node can
+ * hold a meta entry before the struct-creating ops arrive — chan_find is then
+ * NULL for a channel that is forming, not gone. Reaping there would DELETE a
+ * live channel's meta network-wide. Since M6 keeps every struct ever created, a
+ * genuinely fully-gone channel ALWAYS still has its struct, so it is reaped via
+ * the real predicate below; NULL means "can't prove gone yet" -> keep. */
 static int chan_fully_gone(struct CrdtNetworkState *st,
                            const char *name, uint32_t nlen)
 {
   struct CrdtChannel *ch = chan_find(st, name, nlen);
   if (!ch)
-    return 1;
+    return 0;
   if (crdt_orset_size(&ch->members) != 0 || crdt_orset_tomb_count(&ch->members) != 0)
     return 0;
   if (hlc_compare(&ch->ctime_set, &ch->ctime_del) > 0)   /* ctime incarnation still live */
