@@ -2343,8 +2343,23 @@ void bounce_crdt_alias_reap(void)
         int a;
         for (a = 0; a < s->hs_alias_count && nd < REAP_BATCH; a++) {
           struct Client *al = findNUser(s->hs_aliases[a].ba_numeric);
+          struct Client *host;
           if (!al || !IsBouncerAlias(al) || MyConnect(al))
             continue;                 /* only gateway-materialized REPLICA aliases */
+          /* M14 (crdt-mesh INVARIANT 11: absent != removed).  crdt_shadow_bconn_present
+           * is crdt_bconn_get()!=NULL, which is NULL for a doc TOMBSTONE *and* for a
+           * NEVER-WRITTEN key.  A bconn is only ever written by the alias's HOST
+           * (bounce_crdt_bsess_sweep, gated ba_server==me_yxx), so a LEGACY-hosted
+           * alias never has one — treating "absent" as "tombstoned" would de-materialize
+           * a LIVE legacy-hosted alias every verify cycle and emit a spurious BX X.  So
+           * only treat an absent bconn as a genuine doc removal when the alias's host is
+           * a CRDT participant (aware server, or a mesh stub whose doc records are still
+           * authoritative); a legacy-hosted alias's teardown rides the legacy BX X, not
+           * the doc reap.  Unresolvable host -> skip (safe direction: keep).  Mirrors the
+           * sibling session reap's hs_client==NULL-first structural gate. */
+          host = FindNServer(s->hs_aliases[a].ba_server);
+          if (!host || !(IsCrdtAware(host) || IsMeshStub(host)))
+            continue;                 /* legacy/unresolvable host -> not doc-authoritative */
           if (crdt_shadow_bconn_present(s->hs_account, s->hs_sessid,
                                         s->hs_aliases[a].ba_numeric))
             continue;                 /* doc bconn still live -> keep */
