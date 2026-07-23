@@ -244,6 +244,20 @@ static void crdt_tree_forward_chan(int except_num, const char *msgid, char cmd,
                                    const char *srcfull, const char *target,
                                    int ttl, const char *text);
 
+/* CR M source token for @a from: a user's 5-char YXX, or — for a USERLESS
+ * source (a real server, a mesh stub, or &me: nick-collision / services
+ * KILLs, server-sourced WALLOPS/NOTICEs) — its 2-char server numeric.
+ * NumNick() on a userless source derefs cli_user(from)->server (NULL) ->
+ * SIGSEGV (invariant 2: user-branch formatters crash on a server/stub
+ * source).  The receiver discriminates the two forms by token length. */
+static void crdt_m_source_token(struct Client *from, char *buf, size_t cap)
+{
+  if (IsServer(from) || IsMeshStub(from) || IsMe(from) || !cli_user(from))
+    ircd_snprintf(0, buf, cap, "%s", cli_yxx(from));
+  else
+    ircd_snprintf(0, buf, cap, "%s%s", NumNick(from));
+}
+
 /* Gossip a live message via ephemeral CR M.
  *   cmd    'P' (PRIVMSG) / 'N' (NOTICE) / 'T' (TAGMSG)
  *   target a 5-char user numeric (unicast) OR a #channel name
@@ -256,22 +270,22 @@ void crdt_gossip_message(struct Client *from, char cmd, const char *target,
 {
   struct Client *acptr;
   const char *mid;
+  char srcfull[16];
   if (!crdt_shadow_active() || !from || !target || !text)
     return;
   mid = (msgid && *msgid) ? msgid : "*";
   crdt_m_seen_check_add(msgid);        /* record so an echo/relay-back is deduped */
+  crdt_m_source_token(from, srcfull, sizeof srcfull);
 
   if ((target[0] == '#' || target[0] == '&' || target[0] == '*') &&
       feature_bool(FEAT_CRDT_ROUTE_BCAST) && crdt_shadow_mesh_bcast_stable(CurrentTime)) {
-    char srcfull[16];
-    ircd_snprintf(0, srcfull, sizeof srcfull, "%s%s", NumNick(from));
     crdt_tree_forward_chan(-1, mid, cmd, srcfull, target, CRDT_M_TTL_DEFAULT, text);
     return;
   }
   for (acptr = GlobalClientList; acptr; acptr = cli_next(acptr))
     if (IsCrdtSyncTarget(acptr))
-      sendcmdto_one(&me, CMD_CRDT_REPLICATION, acptr, "M %s %c %s%s %s %d :%s",
-                    mid, cmd, NumNick(from), target, CRDT_M_TTL_DEFAULT, text);
+      sendcmdto_one(&me, CMD_CRDT_REPLICATION, acptr, "M %s %c %s %s %d :%s",
+                    mid, cmd, srcfull, target, CRDT_M_TTL_DEFAULT, text);
 }
 
 /* MR-1: the direct CRDT peer (server link or overlay) whose numeric == @a num,
@@ -347,7 +361,7 @@ int crdt_route_unicast_try(struct Client *from, char cmd, struct Client *tgt,
 {
   static int16_t nh[CRDT_MAX_SERVERS];
   struct Client *tsrv, *peer;
-  char tyxx[6];
+  char tyxx[6], srcfull[16];
   const char *mid;
   unsigned int owner, ournum;
   int known = 0;
@@ -383,8 +397,9 @@ int crdt_route_unicast_try(struct Client *from, char cmd, struct Client *tgt,
     peer = crdt_peer_by_num((unsigned int)nh[owner]);
     if (peer) {
       crdt_m_seen_check_add(mid);        /* dedup our own relay-back */
-      sendcmdto_one(&me, CMD_CRDT_REPLICATION, peer, "M %s %c %s%s %s %d :%s",
-                    mid, cmd, NumNick(from), tyxx, CRDT_M_TTL_DEFAULT, text);
+      crdt_m_source_token(from, srcfull, sizeof srcfull);  /* server/stub-safe */
+      sendcmdto_one(&me, CMD_CRDT_REPLICATION, peer, "M %s %c %s %s %d :%s",
+                    mid, cmd, srcfull, tyxx, CRDT_M_TTL_DEFAULT, text);
       break;
     }
     /* fallthrough: next-hop peer vanished -> flood */
@@ -764,8 +779,8 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
      * touches the doc/oplog. */
     const char *m_msgid, *m_cmd, *srcyxx, *target, *m_text, *cmdstr;
     const struct CrdtUserRecord *src;
-    struct Client *p;
-    int is_tag, ttl, ttl_next;
+    struct Client *p, *srcsrv, *srcu;
+    int is_tag, ttl, ttl_next, src_is_srv;
     if (parc < 7)
       return 0;
     m_msgid = parv[2]; m_cmd = parv[3]; srcyxx = parv[4]; target = parv[5];
@@ -780,6 +795,15 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
     cmdstr = (m_cmd[0] == 'N') ? "NOTICE" : (m_cmd[0] == 'K') ? "KILL"
              : (m_cmd[0] == 'I') ? "INVITE" : (is_tag ? "TAGMSG" : "PRIVMSG");
     src = crdt_shadow_user_record(srcyxx);
+    /* Source-form discrimination: a 2-char token is the SERVER-form source
+     * (server / mesh stub / &me — a userless origin has no user YXX, see
+     * crdt_m_source_token).  findNUser() on a 2-char token MISRESOLVES:
+     * FindNServer() reads both chars as the server numeric, then the char at
+     * yxx+1 indexes that server's client_list -> an arbitrary user would get
+     * attributed as the source.  Resolve each form explicitly, once. */
+    src_is_srv = (srcyxx[0] && srcyxx[1] && !srcyxx[2]);
+    srcsrv = src_is_srv ? FindNServer(srcyxx) : NULL;
+    srcu = src_is_srv ? NULL : findNUser(srcyxx);
     /* R4a (channel-over-mesh): per-server local-delivery dedup.  If the TREE plane
      * already delivered this msgid to our locals (the channel relay marked it), skip the
      * redundant CR-M LOCAL delivery — but still relay the flood onward below.  Distinct
@@ -787,7 +811,8 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
      * would let a tree-first delivery suppress the CR-M relay and break the flood. */
     if (!crdt_shadow_chan_local_check_add(m_msgid)) {
     if (m_cmd[0] == 'W') {                                /* MR-2b: all-server WALLOPS */
-      struct Client *wsrc = findNUser(srcyxx);
+      struct Client *wsrc = srcu ? srcu : srcsrv;   /* server-form: server WALLOPS
+                                                     * (%:#C handles server + stub) */
       if (wsrc)
         sendwallto_local(wsrc, WALL_WALLOPS, m_text);    /* deliver to local +w opers */
     } else if (target[0] == '#' || target[0] == '&') {    /* channel delivery */
@@ -805,13 +830,15 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
                             src->nick, src->ident,
                             src->host[0] ? src->host : "mesh", target);
             else
-              sendrawto_one(memb->user, "@%s :%s TAGMSG %s", m_text, srcyxx, target);
+              sendrawto_one(memb->user, "@%s :%s TAGMSG %s", m_text,
+                            srcsrv ? cli_name(srcsrv) : srcyxx, target);
           } else if (src && src->nick[0])
             sendrawto_one(memb->user, ":%s!%s@%s %s %s :%s", src->nick,
                           src->ident, src->host[0] ? src->host : "mesh",
                           cmdstr, target, m_text);
           else
-            sendrawto_one(memb->user, ":%s %s %s :%s", srcyxx, cmdstr, target,
+            sendrawto_one(memb->user, ":%s %s %s :%s",
+                          srcsrv ? cli_name(srcsrv) : srcyxx, cmdstr, target,
                           m_text);
         }
       /* R6b (gateway CR-M -> legacy bridge): re-emit this channel message to LEGACY P10
@@ -824,7 +851,8 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
        * cannot place it (the partition case = R6c).  TAGMSG ('T') deferred (its @-tag legacy
        * form differs + its tree leg is not yet demoted). */
       if (ch && !is_tag) {
-        struct Client *srcc = findNUser(srcyxx);
+        struct Client *srcc = srcu;   /* USER sources only: legacy can't place a
+                                       * server-form (2-char) source in a channel */
         if (srcc && !crdt_user_is_mesh_only(srcc))
           sendcmdto_flag_serv_butone(srcc, (m_cmd[0] == 'N') ? CMD_NOTICE : CMD_PRIVATE,
                                      NULL, FLAG_LAST_FLAG, FLAG_CRDT_AWARE,
@@ -835,7 +863,7 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
        * set it skips CRDT-aware peers -> legacy IRCv3 peers only.  m_text is the client-only
        * tag string. */
       if (ch && is_tag) {
-        struct Client *srcc = findNUser(srcyxx);
+        struct Client *srcc = srcu;   /* USER sources only (as above) */
         if (srcc && !crdt_user_is_mesh_only(srcc)) {
           sendcmdto_set_skip_crdt_servers();
           sendcmdto_serv_butone_v3(srcc, CMD_TAGMSG, NULL, "@%s %s", m_text, ch->chname);
@@ -850,16 +878,20 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
          * re-emit branch below instead.  The resulting exit writes the doc tombstone, so
          * the removal propagates to every materialized copy (the single teardown
          * authority — same as the MR-4c gateway-KILL path). */
-        struct Client *ksrc = findNUser(srcyxx);
+        struct Client *ksrc = srcu;
+        /* server-form source (collision / services kill): attribute the kill
+         * to the ORIGIN SERVER by name; the emitting client stays &me (a mesh
+         * stub must never become an exit/emit source — invariant 2). */
         struct Client *ksh  = (feature_bool(FEAT_HIS_KILLWHO) || !ksrc) ? &me : ksrc;
         const char *kn = feature_bool(FEAT_HIS_KILLWHO) ? feature_str(FEAT_HIS_SERVERNAME)
-                         : (ksrc ? cli_name(ksrc) : "mesh");
+                         : (ksrc ? cli_name(ksrc)
+                                 : (srcsrv ? cli_name(srcsrv) : "mesh"));
         sendcmdto_one(ksh, CMD_KILL, tgt, "%C :%s %s", tgt, kn, m_text);
         exit_client_msg(cptr, tgt, ksh, "Killed (%s %s)", kn, m_text);
       } else if (tgt && MyConnect(tgt) && m_cmd[0] == 'I') {
         /* MR-5-1: a mesh-routed INVITE reached the target's HOME -> add the invite + notify
          * the local target (mirrors m_invite's MyConnect branch).  m_text = the channel. */
-        struct Client *isrc = findNUser(srcyxx);
+        struct Client *isrc = srcu;   /* INVITE sources are users; server-form -> &me */
         struct Channel *ich = FindChannel(m_text);
         if (ich) {
           add_invite(tgt, ich);
@@ -877,14 +909,17 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
                             src->ident, src->host[0] ? src->host : "mesh",
                             cli_name(tgt));
             else
-              sendrawto_one(tgt, "@%s :%s TAGMSG %s", m_text, srcyxx, cli_name(tgt));
+              sendrawto_one(tgt, "@%s :%s TAGMSG %s", m_text,
+                            srcsrv ? cli_name(srcsrv) : srcyxx, cli_name(tgt));
           }
         } else if (src && src->nick[0])
           sendrawto_one(tgt, ":%s!%s@%s %s %s :%s", src->nick, src->ident,
                         src->host[0] ? src->host : "mesh", cmdstr, cli_name(tgt),
                         m_text);
         else
-          sendrawto_one(tgt, ":%s %s %s :%s", srcyxx, cmdstr, cli_name(tgt), m_text);
+          sendrawto_one(tgt, ":%s %s %s :%s",
+                        srcsrv ? cli_name(srcsrv) : srcyxx, cmdstr, cli_name(tgt),
+                        m_text);
       } else if (tgt && cli_user(tgt) && cli_user(tgt)->server) {
         /* MR-4b: the CR-M -> legacy unicast bridge.  tgt resolved but is not local.  If
          * it is a real legacy user THIS node fronts — its owning server is a non-CRDT P10
@@ -913,7 +948,7 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
                     crdt_gateway_standby_suppressed);
         } else if (IsServer(tsrv) && !IsCrdtAware(tsrv) && cli_from(tsrv) &&
             !IsCrdtAware(cli_from(tsrv))) {
-          struct Client *srcc = findNUser(srcyxx);
+          struct Client *srcc = srcu;
           int is_kill = (m_cmd[0] == 'K');                 /* MR-4c */
           int is_inv  = (m_cmd[0] == 'I');
           if (feature_bool(FEAT_CRDT_GATEWAY_BRIDGE) && srcc &&
@@ -943,6 +978,19 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
             } else
               sendcmdto_one(srcc, (m_cmd[0] == 'N') ? CMD_NOTICE : CMD_PRIVATE, tgt,
                             "%C :%s", tgt, m_text);
+            crdt_cr_to_p10_bridged++;
+            log_write(LS_SYSTEM, L_INFO, 0, "MR-4 bridge: CR-M %s %s -> legacy user %s "
+                      "(on %s) re-emitted (count=%lu)", cmdstr, srcyxx, cli_name(tgt),
+                      cli_name(tsrv), crdt_cr_to_p10_bridged);
+          } else if (feature_bool(FEAT_CRDT_GATEWAY_BRIDGE) && !srcc && srcsrv &&
+                     is_kill) {
+            /* MR-4c, server-form source: a server/stub-sourced mesh KILL of a
+             * legacy-fronted victim (collision / services kill during a
+             * partition).  Re-emit from the GATEWAY itself — always placeable
+             * by legacy, and a mesh-stub srcsrv must never be an S2S message
+             * source (invariant 2) — naming the true origin in the path. */
+            sendcmdto_one(&me, CMD_KILL, tgt, "%C :%s!%s %s", tgt,
+                          cli_name(&me), cli_name(srcsrv), m_text);
             crdt_cr_to_p10_bridged++;
             log_write(LS_SYSTEM, L_INFO, 0, "MR-4 bridge: CR-M %s %s -> legacy user %s "
                       "(on %s) re-emitted (count=%lu)", cmdstr, srcyxx, cli_name(tgt),
