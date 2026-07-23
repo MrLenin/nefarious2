@@ -3043,6 +3043,246 @@ static void test_dedup_not_count_bounded(void **state)
 }
 
 /* ================================================================== */
+/* Batch P3-5c Suite 2 — permuted-order merge commutativity + idempotence.    */
+/*                                                                            */
+/* The existing convergence tests use a fixed two-direction exchange. These   */
+/* add ORDER-INDEPENDENCE: a fixed op set (LWW + OR-Set + MAX-register +      */
+/* SET/DELETE across 3 origins) applied in >=3 distinct valid interleavings   */
+/* must reach an IDENTICAL crdt_state_digest AND crdt_state_digest_material-  */
+/* ized. crdt_state_apply_op dedups per-origin by state-vector seq, so a      */
+/* valid delivery order (the transport guarantee) preserves each origin's     */
+/* internal op order; the permutations vary only the CROSS-origin interleave. */
+/* ================================================================== */
+
+/* Snapshot a source state's oplog into an ordered pointer array (oldest-first).
+ * The ops stay owned by @a src (valid until it is cleared), so the SAME op
+ * object can be re-applied to many targets in many orders. */
+static int collect_ops(const struct CrdtNetworkState *src,
+                       struct CrdtOp **out, int max)
+{
+  int n = 0;
+  struct CrdtOp *op;
+  for (op = src->oplog.head; op && n < max; op = op->next)
+    out[n++] = op;
+  return n;
+}
+
+/* Apply three per-origin op streams to @a dst in the cross-origin order named by
+ * @a sched (each entry 1/2/3 pulls the next op from that origin's cursor, so the
+ * per-origin order is preserved by construction — any schedule with the right
+ * per-origin counts is a VALID interleaving). Asserts the schedule consumes
+ * every op exactly once (a typo can't silently shrink coverage). */
+static void apply_schedule(struct CrdtNetworkState *dst,
+                           struct CrdtOp **o1, int n1,
+                           struct CrdtOp **o2, int n2,
+                           struct CrdtOp **o3, int n3,
+                           const int *sched, int slen)
+{
+  int c1 = 0, c2 = 0, c3 = 0, i;
+  for (i = 0; i < slen; i++) {
+    if (sched[i] == 1)      { assert_true(c1 < n1); crdt_state_apply_op(dst, o1[c1++]); }
+    else if (sched[i] == 2) { assert_true(c2 < n2); crdt_state_apply_op(dst, o2[c2++]); }
+    else                    { assert_true(c3 < n3); crdt_state_apply_op(dst, o3[c3++]); }
+  }
+  assert_int_equal(n1, c1);
+  assert_int_equal(n2, c2);
+  assert_int_equal(n3, c3);
+}
+
+static void test_permuted_merge_commutes_and_idempotent(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState src1, src2, src3;
+  struct CrdtNetworkState t_ref, t_b321, t_rr, t_scat;
+  struct CrdtOp *o1[16], *o2[16], *o3[16];
+  int n1, n2, n3;
+  uint64_t d, dm;
+  struct CrdtUserRecord ua = mkuser("alice", 1, "al", 0x0A0A0A0A);
+  struct CrdtUserRecord ub = mkuser("bob",   2, "bo", 0x0B0B0B0B);
+  struct CrdtUserRecord uc = mkuser("carol", 3, "ca", 0x0C0C0C0C);
+  const char *smask = "spammer!*@*.evil";
+  char mkey[32], rkey[32], tkey[32];
+  uint32_t mklen, rklen, tklen;
+
+  /* opaque composite keys (NUL-separated), mirroring the live storage keys */
+  memcpy(mkey, "alice", 5); mkey[5] = '\0'; memcpy(mkey + 6, "avatar", 6); mklen = 5 + 1 + 6;
+  memcpy(rkey, "alice", 5); rkey[5] = '\0'; memcpy(rkey + 6, "#c",     2); rklen = 5 + 1 + 2;
+  memcpy(tkey, "bob",   3); tkey[3] = '\0'; memcpy(tkey + 4, "temp",   4); tklen = 3 + 1 + 4;
+
+  crdt_state_init(&src1, 1);
+  crdt_state_init(&src2, 2);
+  crdt_state_init(&src3, 3);
+
+  /* origin 1: LWW user, OR-Set member, MAX-register marker (LOSER), LWW metadata */
+  crdt_user_set(&src1, "AAAAA", &ua);
+  crdt_chan_join(&src1, "#c", "AAAAA");
+  crdt_marker_set(&src1, rkey, rklen, "1719630000.100");
+  crdt_metadata_set(&src1, mkey, mklen, "v1", 2);       /* LWW conflict w/ origin 3 */
+
+  /* origin 2: LWW user, OR-Set member, MAX-register marker (WINNER), OR-Set silence */
+  crdt_user_set(&src2, "BBBBB", &ub);
+  crdt_chan_join(&src2, "#c", "BBBBB");
+  crdt_marker_set(&src2, rkey, rklen, "1719630000.200");
+  crdt_silence_add(&src2, "AAAAA", smask);
+
+  /* origin 3: LWW user, OR-Set member, topic MAX-register, SET+DELETE, LWW conflict */
+  crdt_user_set(&src3, "CCCCC", &uc);
+  crdt_chan_join(&src3, "#c", "CCCCC");
+  crdt_topic_set(&src3, "#c", "hello", 500);
+  crdt_metadata_set(&src3, tkey, tklen, "temp-val", 8); /* set ...            */
+  crdt_metadata_del(&src3, tkey, tklen);                /* ... then delete    */
+  crdt_metadata_set(&src3, mkey, mklen, "v3", 2);       /* LWW conflict w/ origin 1 */
+
+  n1 = collect_ops(&src1, o1, 16);
+  n2 = collect_ops(&src2, o2, 16);
+  n3 = collect_ops(&src3, o3, 16);
+  assert_int_equal(4, n1);
+  assert_int_equal(4, n2);
+  assert_int_equal(6, n3);
+
+  /* four VALID interleavings (each: 1x4, 2x4, 3x6; each preserves per-origin order) */
+  {
+    static const int sched_123[14] = { 1,1,1,1, 2,2,2,2, 3,3,3,3,3,3 };
+    static const int sched_321[14] = { 3,3,3,3,3,3, 2,2,2,2, 1,1,1,1 };
+    static const int sched_rr [14] = { 1,2,3, 1,2,3, 1,2,3, 1,2,3, 3,3 };
+    static const int sched_sc [14] = { 3,2,1, 3,3,2, 1,3,2, 1,3,2, 1,3 };
+
+    crdt_state_init(&t_ref,  9);
+    crdt_state_init(&t_b321, 9);
+    crdt_state_init(&t_rr,   9);
+    crdt_state_init(&t_scat, 9);
+
+    apply_schedule(&t_ref,  o1,n1, o2,n2, o3,n3, sched_123, 14);
+    apply_schedule(&t_b321, o1,n1, o2,n2, o3,n3, sched_321, 14);
+    apply_schedule(&t_rr,   o1,n1, o2,n2, o3,n3, sched_rr,  14);
+    apply_schedule(&t_scat, o1,n1, o2,n2, o3,n3, sched_sc,  14);
+  }
+
+  /* COMMUTATIVITY: every permutation reaches an IDENTICAL full digest (which
+   * includes OR-Set add-tags + tombstones — the strong check) AND materialized. */
+  d  = crdt_state_digest(&t_ref);
+  dm = crdt_state_digest_materialized(&t_ref);
+  assert_true(crdt_state_digest(&t_b321) == d);
+  assert_true(crdt_state_digest(&t_rr)   == d);
+  assert_true(crdt_state_digest(&t_scat) == d);
+  assert_true(crdt_state_digest_materialized(&t_b321) == dm);
+  assert_true(crdt_state_digest_materialized(&t_rr)   == dm);
+  assert_true(crdt_state_digest_materialized(&t_scat) == dm);
+
+  /* NON-VACUOUS: pin the converged MERGE OUTCOMES (all permutations agree on these) */
+  {
+    char got[64];
+    char sk[64]; uint32_t skl;
+    const struct CrdtLWWValue *m1, *m2;
+
+    /* MAX-register marker: origin 2's ".200" beats origin 1's ".100", any order */
+    assert_true(crdt_marker_get(&t_scat, rkey, rklen, got, sizeof got) > 0);
+    assert_string_equal("1719630000.200", got);
+    /* topic MAX-register converged */
+    assert_string_equal("hello", topic_text(&t_rr, "#c"));
+    /* all three members present */
+    assert_int_equal(3, crdt_chan_visible_members(&t_b321, "#c"));
+    /* SET+DELETE: bob\0temp ends TOMBSTONED (origin-3 order set-before-delete) */
+    assert_int_equal(1, crdt_metadata_is_explicitly_removed(&t_ref, tkey, tklen));
+    assert_null(crdt_metadata_get(&t_ref, tkey, tklen));
+    /* OR-Set silence present */
+    memcpy(sk, "AAAAA", 5); sk[5] = '\0';
+    memcpy(sk + 6, smask, strlen(smask)); skl = 5 + 1 + (uint32_t)strlen(smask);
+    assert_int_equal(1, crdt_orset_contains(&t_scat.silences, sk, skl));
+    /* LWW conflict on alice\0avatar resolves to the SAME winner on every permutation */
+    m1 = crdt_metadata_get(&t_ref,  mkey, mklen);
+    m2 = crdt_metadata_get(&t_scat, mkey, mklen);
+    assert_non_null(m1); assert_non_null(m2);
+    assert_int_equal((int)m1->data_len, (int)m2->data_len);
+    assert_memory_equal(m1->data, m2->data, m1->data_len);
+  }
+
+  /* IDEMPOTENCE (op-level): re-applying the whole set to a converged replica is a
+   * no-op — digest stable and the state vector unchanged. */
+  {
+    static struct CrdtStateVector sv_before;  /* 32KB — static to spare the stack */
+    static const int sched_rr2[14] = { 1,2,3, 1,2,3, 1,2,3, 1,2,3, 3,3 };
+    uint64_t before = crdt_state_digest(&t_ref);
+    sv_before = t_ref.local_sv;
+    apply_schedule(&t_ref, o1,n1, o2,n2, o3,n3, sched_rr2, 14);
+    assert_true(crdt_state_digest(&t_ref) == before);
+    assert_int_equal(0, memcmp(&sv_before, &t_ref.local_sv, sizeof sv_before));
+  }
+
+  /* IDEMPOTENCE (full-delta): crdt_state_sync converges to the SAME digest as the
+   * hand-permuted apply_op path, and a second sync pass applies nothing. */
+  {
+    struct CrdtNetworkState t_sync;
+    uint64_t before;
+    crdt_state_init(&t_sync, 9);
+    crdt_state_sync(&t_sync, &src1);
+    crdt_state_sync(&t_sync, &src2);
+    crdt_state_sync(&t_sync, &src3);
+    assert_true(crdt_state_digest(&t_sync) == d);          /* sync path == permute path */
+    before = crdt_state_digest(&t_sync);
+    assert_int_equal(0, crdt_state_sync(&t_sync, &src1));
+    assert_int_equal(0, crdt_state_sync(&t_sync, &src2));
+    assert_int_equal(0, crdt_state_sync(&t_sync, &src3));
+    assert_true(crdt_state_digest(&t_sync) == before);
+    crdt_state_clear(&t_sync);
+  }
+
+  crdt_state_clear(&t_ref);
+  crdt_state_clear(&t_b321);
+  crdt_state_clear(&t_rr);
+  crdt_state_clear(&t_scat);
+  crdt_state_clear(&src1);
+  crdt_state_clear(&src2);
+  crdt_state_clear(&src3);
+}
+
+/* Batch P3-5c Suite 2 — cross-entity out-of-order convergence (INVARIANT 8).
+ * A channel member-add that references a user is applied BEFORE that user's
+ * record arrives. Materialization re-walks the whole doc (the load-bearing
+ * full-walk), so cross-entity arrival order does not matter: both orders reach
+ * an identical digest AND the same visible membership. Distinct ORIGINS (server
+ * 2 observed the member, server 1 owns the user) keep per-origin SV order intact
+ * so neither op is deduped away. */
+static void test_cross_entity_out_of_order_converges(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState src_u, src_m, t_mfirst, t_ufirst;
+  struct CrdtOp *op_u, *op_m;
+  struct CrdtUserRecord u = mkuser("alice", 1, "al", 0x0A0A0A0A);
+
+  crdt_state_init(&src_u, 1);   /* origin 1 owns the USER record   */
+  crdt_state_init(&src_m, 2);   /* origin 2 observed the MEMBER add */
+  crdt_user_set(&src_u, "AAAAA", &u);
+  crdt_chan_join(&src_m, "#c", "AAAAA");
+  op_u = src_u.oplog.head;  assert_non_null(op_u);
+  op_m = src_m.oplog.head;  assert_non_null(op_m);
+
+  /* target A: MEMBER op first (owning user unknown), THEN the user record */
+  crdt_state_init(&t_mfirst, 9);
+  crdt_state_apply_op(&t_mfirst, op_m);
+  assert_int_equal(0, crdt_chan_visible_members(&t_mfirst, "#c"));  /* user unknown -> not visible */
+  crdt_state_apply_op(&t_mfirst, op_u);
+  assert_int_equal(1, crdt_chan_visible_members(&t_mfirst, "#c"));  /* full-walk now counts it */
+
+  /* target B: USER op first, THEN the member add (the natural causal order) */
+  crdt_state_init(&t_ufirst, 9);
+  crdt_state_apply_op(&t_ufirst, op_u);
+  crdt_state_apply_op(&t_ufirst, op_m);
+  assert_int_equal(1, crdt_chan_visible_members(&t_ufirst, "#c"));
+
+  /* both orders reconcile to an IDENTICAL document */
+  assert_true(crdt_state_digest(&t_mfirst) == crdt_state_digest(&t_ufirst));
+  assert_true(crdt_state_digest_materialized(&t_mfirst) ==
+              crdt_state_digest_materialized(&t_ufirst));
+  assert_non_null(crdt_user_get(&t_mfirst, "AAAAA"));
+
+  crdt_state_clear(&src_u);
+  crdt_state_clear(&src_m);
+  crdt_state_clear(&t_mfirst);
+  crdt_state_clear(&t_ufirst);
+}
+
+/* ================================================================== */
 
 int main(void)
 {
@@ -3129,6 +3369,9 @@ int main(void)
     cmocka_unit_test(test_chunk_reassembles),
     cmocka_unit_test(test_chunk_isolation),
     cmocka_unit_test(test_chunk_cleanup_link),
+    /* Batch P3-5c Suite 2 — permuted-order merge commutativity/idempotence */
+    cmocka_unit_test(test_permuted_merge_commutes_and_idempotent),
+    cmocka_unit_test(test_cross_entity_out_of_order_converges),
   };
   return cmocka_run_group_tests(tests, NULL, NULL);
 }

@@ -29,6 +29,7 @@ CMOCKA_TESTPROGS = \
 	chathistory_presence_cmocka \
 	recv_classify_cmocka \
 	crdt_cmocka \
+	crdt_hlc_cmocka \
 	crdt_meshmap_cmocka \
 	crdt_wire_hardening_cmocka
 
@@ -54,6 +55,7 @@ DEP_SRC = \
 	chathistory_presence_cmocka.c \
 	recv_classify_cmocka.c \
 	crdt_cmocka.c \
+	crdt_hlc_cmocka.c \
 	crdt_meshmap_cmocka.c \
 	crdt_wire_hardening_cmocka.c \
 	test_stub.c
@@ -166,6 +168,13 @@ recv_classify_cmocka: $(RECV_CLASSIFY_CMOCKA_OBJS)
 CRDT_CMOCKA_OBJS = crdt_cmocka.o test_stub.o ../crdt_types.o ../crdt_state.o ../crdt_hlc.o ../crdt_wire.o ../s2s_chunk.o
 crdt_cmocka: $(CRDT_CMOCKA_OBJS)
 	${CC} -o $@ $(LDFLAGS) $(CRDT_CMOCKA_OBJS) $(CMOCKA_LIBS)
+
+# CRDT HLC primitive + INVARIANT-4 digest padding-independence (Batch P3-5c).
+# Links the same engine object set as crdt_cmocka (the invariant-4 half exercises
+# the state/types digest, not just the pure HLC primitive).
+CRDT_HLC_CMOCKA_OBJS = crdt_hlc_cmocka.o test_stub.o ../crdt_hlc.o ../crdt_types.o ../crdt_state.o ../crdt_wire.o ../s2s_chunk.o
+crdt_hlc_cmocka: $(CRDT_HLC_CMOCKA_OBJS)
+	${CC} -o $@ $(LDFLAGS) $(CRDT_HLC_CMOCKA_OBJS) $(CMOCKA_LIBS)
 
 # CRDT mesh-topology map - pure graph (BFS/spanning/cross-edges); libc only.
 CRDT_MESHMAP_CMOCKA_OBJS = crdt_meshmap_cmocka.o test_stub.o ../crdt_meshmap.o

@@ -577,6 +577,117 @@ static void test_gateway_should_standby(void **state)
   assert_int_equal(1, crdt_gateway_should_standby(1, 0, 1)); /* fresh fronter 0 < us 1 -> stand down */
 }
 
+/* ================================================================== */
+/* Batch P3-5c Suite 3 — meshmap determinism + divergent/partition view.      */
+/*                                                                            */
+/* crdt_meshmap_set writes a node's row into a FIXED numeric-indexed slot, so */
+/* the same edge set inserted in any order yields a BYTE-identical map (rows  */
+/* are single-writer per numeric — no insertion-order state). The routing     */
+/* derivations (Kruskal-lex canon tree, BFS reachable) are pure functions of  */
+/* that map. Meshmaps are locally computed, NOT merged (skill), so the        */
+/* determinism guarantee is "same edges -> same map", incl. across instances. */
+/* ================================================================== */
+
+/* A fixed 5-node topology; each node's neighbour list is order-STABLE, so the
+ * only thing @a order varies is which NODE's row is written first. Inserting a
+ * prefix (nnodes < 5) models a partition view that never saw the later nodes. */
+static void build_fixed_topo(struct CrdtMeshMap *m, const int *order, int nnodes)
+{
+  int i;
+  for (i = 0; i < nnodes; i++) {
+    switch (order[i]) {
+      case 1: row(m, 1, FRESH, 2, 2, 3);    break;
+      case 2: row(m, 2, FRESH, 2, 1, 4);    break;
+      case 3: row(m, 3, FRESH, 2, 1, 4);    break;
+      case 4: row(m, 4, FRESH, 3, 2, 3, 5); break;
+      case 5: row(m, 5, FRESH, 1, 4);       break;
+      default: break;
+    }
+  }
+}
+
+/* Same edge set, >=3 different insertion orders -> BYTE-identical map (and the
+ * canonical tree the map derives is identical too). */
+static void test_meshmap_insertion_order_determinism(void **state)
+{
+  struct CrdtMeshMap *a = new_map(), *b = new_map(), *c = new_map();
+  const int ord1[5] = { 1, 2, 3, 4, 5 };
+  const int ord2[5] = { 5, 4, 3, 2, 1 };
+  const int ord3[5] = { 3, 1, 5, 2, 4 };
+  (void)state;
+
+  build_fixed_topo(a, ord1, 5);
+  build_fixed_topo(b, ord2, 5);
+  build_fixed_topo(c, ord3, 5);
+
+  /* the raw map bytes are identical regardless of insertion order */
+  assert_int_equal(0, memcmp(a, b, sizeof *a));
+  assert_int_equal(0, memcmp(a, c, sizeof *a));
+
+  /* the viewpoint-independent canonical tree is byte-identical too (pure of the map) */
+  {
+    uint16_t tua[16], tva[16], tuc[16], tvc[16];
+    int na = crdt_meshmap_canon_tree(a, NOW, STALE, tua, tva, 16);
+    int nc = crdt_meshmap_canon_tree(c, NOW, STALE, tuc, tvc, 16);
+    assert_int_equal(na, nc);
+    assert_int_equal(0, memcmp(tua, tuc, (size_t)na * sizeof(uint16_t)));
+    assert_int_equal(0, memcmp(tva, tvc, (size_t)na * sizeof(uint16_t)));
+  }
+
+  free(a); free(b); free(c);
+}
+
+/* Cross-instance determinism (two independent maps, same edges) + a divergent
+ * PARTITION view (a strict subset of the edges) that is itself deterministic and
+ * legitimately reaches fewer nodes than the full map. */
+static void test_meshmap_divergent_partition_and_cross_instance(void **state)
+{
+  struct CrdtMeshMap *full1 = new_map(), *full2 = new_map();
+  const int fo1[5] = { 1, 2, 3, 4, 5 };
+  const int fo2[5] = { 4, 2, 5, 1, 3 };
+  (void)state;
+
+  /* two INDEPENDENT instances from the same global edge set -> byte-identical */
+  build_fixed_topo(full1, fo1, 5);
+  build_fixed_topo(full2, fo2, 5);
+  assert_int_equal(0, memcmp(full1, full2, sizeof *full1));
+
+  /* PARTITION view: only nodes 1,2,3 present (the {4,5} arm never arrived). It is
+   * internally deterministic (built two ways -> identical) and its reachability
+   * legitimately DIFFERS from the full view. */
+  {
+    struct CrdtMeshMap *p1 = new_map(), *p2 = new_map();
+    const int po1[3] = { 1, 2, 3 };
+    const int po2[3] = { 3, 2, 1 };
+    uint8_t rp[CRDT_MAX_SERVERS], rf[CRDT_MAX_SERVERS];
+    uint16_t tu[16], tv[16];
+    int np, nfull;
+
+    build_fixed_topo(p1, po1, 3);
+    build_fixed_topo(p2, po2, 3);
+    assert_int_equal(0, memcmp(p1, p2, sizeof *p1));   /* subset determinism */
+
+    /* nodes 1,2,3 still declare 4 as a peer, but 4's row is absent -> pruned;
+     * the partition reaches 3, the full map reaches all 5. */
+    np    = crdt_meshmap_reachable(p1,    1, NOW, STALE, rp);
+    nfull = crdt_meshmap_reachable(full1, 1, NOW, STALE, rf);
+    assert_int_equal(3, np);
+    assert_int_equal(5, nfull);
+    assert_true(np != nfull);                          /* divergent views differ */
+    assert_int_equal(0, rp[4]);                        /* 4 unreachable in the partition */
+    assert_int_equal(1, rf[4]);                        /* ... reachable in the full view */
+
+    /* the partition's canonical tree is a pure function of its smaller edge set */
+    assert_int_equal(2, crdt_meshmap_canon_tree(p1, NOW, STALE, tu, tv, 16)); /* (1,2)(1,3) */
+    assert_true(has_edge(tu, tv, 2, 1, 2));
+    assert_true(has_edge(tu, tv, 2, 1, 3));
+
+    free(p1); free(p2);
+  }
+
+  free(full1); free(full2);
+}
+
 int main(void)
 {
   const struct CMUnitTest tests[] = {
@@ -605,6 +716,9 @@ int main(void)
     cmocka_unit_test(test_should_suppress_tree),
     cmocka_unit_test(test_should_suppress_intro),
     cmocka_unit_test(test_gateway_should_standby),
+    /* Batch P3-5c Suite 3 — meshmap determinism + divergent/partition view */
+    cmocka_unit_test(test_meshmap_insertion_order_determinism),
+    cmocka_unit_test(test_meshmap_divergent_partition_and_cross_instance),
   };
   return cmocka_run_group_tests(tests, NULL, NULL);
 }
