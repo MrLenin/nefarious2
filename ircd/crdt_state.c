@@ -2012,6 +2012,24 @@ int crdt_state_reclaim_orphan_member_meta(struct CrdtNetworkState *st)
   return total;
 }
 
+/* m15 (delete-on-leave): mint a members_status DELETE for a cleanly-departed member.
+ * Mirrors mint_meta_delete, keyed chan\0numeric exactly like crdt_member_status_set.
+ * NO stability gate — this is the real leave event on the single-writer home, minted
+ * unconditionally, exactly like the crdt_chan_remove one line above it at the part/kick
+ * integration hook (the GC reap gates on fully-gone-and-stable because it is a
+ * SPECULATIVE sweep; this is not). Coordinates cleanly with the reap above:
+ * crdt_lwwmap_foreach skips the tombstone this creates, so orphan_collect_cb never
+ * double-mints for the same key; the reap stays the backstop for UNCLEAN departures
+ * where the part/kick hook never fires on this node (home SQUIT/crash / netsplit). */
+void crdt_member_status_remove(struct CrdtNetworkState *st, const char *chan,
+                               const char *numeric)
+{
+  char key[512];                 /* chan \0 numeric — same key form as _set */
+  uint32_t klen = chan_num_key(chan, numeric, key, sizeof key);
+  if (klen)
+    mint_meta_delete(st, &st->members_status, CRDT_COLL_MEMBER_STATUS, key, klen);
+}
+
 /* M10 anchor test: a channel is FULLY gone iff its members OR-Set is empty AND
  * causally stable (no live member-removes: tomb_count==0) AND its ctime incarnation
  * is dead. tomb_count==0 (NOT ctime-dead alone) is the causal-stability signal:

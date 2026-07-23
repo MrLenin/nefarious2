@@ -425,6 +425,13 @@ void crdt_modes_set(struct CrdtNetworkState *st, const char *chan,
 void crdt_member_status_set(struct CrdtNetworkState *st, const char *chan,
                             const char *numeric,
                             const struct CrdtMemberRecord *rec);
+/** m15 (delete-on-leave): clear a member's channel status by minting a members_status
+ *  DELETE (keyed chan\0numeric, op-recording). Called synchronously from the clean
+ *  part/kick home hook so a stale +o cannot re-op the member on a later rejoin; the
+ *  GC reap (crdt_state_reclaim_orphan_member_meta) remains the backstop for UNCLEAN
+ *  departures. Mirrors crdt_member_status_set; engine-pure. */
+void crdt_member_status_remove(struct CrdtNetworkState *st, const char *chan,
+                               const char *numeric);
 /** Set per-channel metadata (creationtime/topic provenance, LWW). Records a SET. */
 void crdt_chanmeta_set(struct CrdtNetworkState *st, const char *chan,
                        const struct CrdtChanMeta *meta);

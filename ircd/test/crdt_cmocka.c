@@ -2390,6 +2390,101 @@ static void test_orphan_meta_kept_while_tombstone_present(void **state)
 }
 
 /* ================================================================== */
+/* m15 — delete-on-leave for members_status (Theme B).                       */
+/* members_status is a naked HLC-LWW register that was minted on join/mode but */
+/* NEVER cleared on part/kick, so a departed member's stale +o lingered and    */
+/* re-op'd them on rejoin (reconcile_mstatus_cb). crdt_member_status_remove    */
+/* mints a members_status DELETE synchronously at the clean part/kick home hook */
+/* (no stability gate — it is the real leave event), complementing the         */
+/* Theme-A GC reap which backstops UNCLEAN departures (SQUIT/crash).           */
+
+/* DELETE-ON-LEAVE: a clean leave clears the status; the delete moves both the SV
+ * and the doc digest in one step (Fix-A safe — never SV-equal/digest-different). */
+static void test_member_status_delete_on_leave(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s;
+  struct CrdtMemberRecord mr;
+  uint64_t d_before, d_after, sv_before, sv_after;
+  memset(&mr, 0, sizeof mr); mr.status = CRDT_MEMBER_OP; mr.oplevel = 3;
+  crdt_state_init(&s, 1);
+  crdt_chan_join(&s, "#c", "AAAAB");
+  crdt_member_status_set(&s, "#c", "AAAAB", &mr);
+  assert_non_null(crdt_member_status_get(&s, "#c", "AAAAB"));   /* +o present */
+  d_before = crdt_state_digest(&s); sv_before = s.local_sv.seq[1];
+  crdt_member_status_remove(&s, "#c", "AAAAB");                 /* clean leave */
+  d_after = crdt_state_digest(&s); sv_after = s.local_sv.seq[1];
+  assert_null(crdt_member_status_get(&s, "#c", "AAAAB"));       /* +o gone */
+  assert_true(sv_after > sv_before);      /* a DELETE op was minted (SV moved) */
+  assert_true(d_after != d_before);       /* digest moved in lockstep (Fix-A safe) */
+  crdt_state_clear(&s);
+}
+
+/* REJOIN-NOT-CONTAMINATED (the important one): the member is op'd on node A whose
+ * clock runs AHEAD, so the +o carries a HIGH HLC — naively that stale op would
+ * out-rank a later normal-clock write. But the clean leave mints the DELETE on the
+ * SAME node A, and A's HLC is monotone, so the delete's HLC strictly exceeds the +o's
+ * and wins the LWW on every replica. The stale +o is therefore gone network-wide, so
+ * reconcile_mstatus_cb finds no record and cannot re-op a plain rejoiner. (LWW is
+ * arrival-order-independent: even if the stale +o reaches a peer AFTER the delete, the
+ * higher-HLC delete still wins.) Pre-fix, with no delete, the +o lingered non-NULL and
+ * contaminated the rejoin. NB: the residual pathological case — a fast-clock +o minted
+ * on a DIFFERENT (far) node whose physical_ms exceeds the leaving home's delete — is
+ * NOT closed by delete-on-leave; the complete fix is membership-incarnation anchoring
+ * (Theme-B follow-up). */
+static void test_member_status_rejoin_not_contaminated(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState sA, sB;
+  struct CrdtMemberRecord op_rec;
+  memset(&op_rec, 0, sizeof op_rec); op_rec.status = CRDT_MEMBER_OP; op_rec.oplevel = 5;
+  crdt_state_init(&sA, 1);
+  crdt_state_init(&sB, 2);
+  crdt_chan_join(&sA, "#c", "BBBBB");
+  sA.clock.physical_ms += 60000;          /* A's clock runs 60s ahead */
+  crdt_member_status_set(&sA, "#c", "BBBBB", &op_rec);  /* +o at a HIGH HLC */
+  crdt_state_sync(&sB, &sA);
+  assert_non_null(crdt_member_status_get(&sB, "#c", "BBBBB"));  /* both hold the +o */
+  /* clean leave on the SAME node that op'd -> monotone HLC makes the delete win */
+  crdt_chan_remove(&sA, "#c", "BBBBB", CRDT_PRIORITY_USER);
+  crdt_member_status_remove(&sA, "#c", "BBBBB");
+  crdt_state_sync(&sB, &sA);
+  assert_null(crdt_member_status_get(&sA, "#c", "BBBBB"));      /* stale +o gone... */
+  assert_null(crdt_member_status_get(&sB, "#c", "BBBBB"));      /* ...on both replicas */
+  assert_true(crdt_state_digest(&sA) == crdt_state_digest(&sB));/* converged */
+  crdt_state_clear(&sA);
+  crdt_state_clear(&sB);
+}
+
+/* NO-DOUBLE-MINT-WITH-REAP: after the synchronous delete tombstones the entry, the
+ * Theme-A GC reap must not re-mint a second DELETE for the same key — crdt_lwwmap_
+ * foreach skips the deleted entry (and once causally stable the tombstone GC frees it
+ * outright). Either way the reap reclaims 0 for a member whose status was already
+ * cleared on leave. The reap stays the backstop for UNCLEAN departures. */
+static void test_member_status_remove_no_double_mint_with_reap(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s;
+  struct CrdtMemberRecord mr;
+  struct CrdtStateVector stable;
+  memset(&mr, 0, sizeof mr); mr.status = CRDT_MEMBER_OP;
+  crdt_state_init(&s, 1);
+  crdt_chan_join(&s, "#c", "AAAAB");
+  crdt_member_status_set(&s, "#c", "AAAAB", &mr);
+  /* clean leave: OR-Set remove + the synchronous members_status DELETE */
+  crdt_chan_remove(&s, "#c", "AAAAB", CRDT_PRIORITY_USER);
+  crdt_member_status_remove(&s, "#c", "AAAAB");
+  assert_null(crdt_member_status_get(&s, "#c", "AAAAB"));
+  /* make the removal causally stable so the reap WOULD consider the member gone */
+  crdt_sv_init(&stable); crdt_sv_update(&stable, 1, 1000);
+  crdt_state_gc(&s, &stable);
+  /* no kick_info here + members_status already tombstoned -> reap re-mints nothing */
+  assert_int_equal(0, crdt_state_reclaim_orphan_member_meta(&s));
+  assert_null(crdt_member_status_get(&s, "#c", "AAAAB"));
+  crdt_state_clear(&s);
+}
+
+/* ================================================================== */
 /* M10: orphaned per-channel LWW meta (topics/modes/chanmeta) for FULLY-GONE
  * channels. Like member-meta these LWW entries are live registers, not tombstones,
  * so the normal GC never reclaims them; they leak forever for churned channels and
@@ -2799,6 +2894,9 @@ int main(void)
     cmocka_unit_test(test_orphan_member_meta_reclaimed),
     cmocka_unit_test(test_orphan_meta_kept_while_member_live),
     cmocka_unit_test(test_orphan_meta_kept_while_tombstone_present),
+    cmocka_unit_test(test_member_status_delete_on_leave),
+    cmocka_unit_test(test_member_status_rejoin_not_contaminated),
+    cmocka_unit_test(test_member_status_remove_no_double_mint_with_reap),
     cmocka_unit_test(test_orphan_chan_meta_reclaimed),
     cmocka_unit_test(test_orphan_chan_meta_reclaimed_after_ctime_clear),
     cmocka_unit_test(test_orphan_chan_meta_kept_while_struct_absent),

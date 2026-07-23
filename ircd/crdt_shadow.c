@@ -545,6 +545,12 @@ void crdt_shadow_part(struct Channel *chptr, struct Client *who)
     return;
   crdt_chan_remove(&g_crdt, chptr->chname, user_numeric(who, num, sizeof num),
                    CRDT_PRIORITY_USER);
+  /* m15 (delete-on-leave): clear the member's status LWW on a clean leave so a stale
+   * +o can't re-op them on a later rejoin (reconcile_mstatus_cb re-drives m->status
+   * from the LWW-winning record). Mirrors the OR-Set remove above; `num` was just
+   * filled by the user_numeric() call. The GC reap (crdt_state_reclaim_orphan_member_
+   * meta) backstops UNCLEAN departures where this hook never fires (home SQUIT/crash). */
+  crdt_member_status_remove(&g_crdt, chptr->chname, num);
   crdt_sync_push();                   /* eager-propagate to CRDT peers */
 }
 
@@ -568,6 +574,12 @@ void crdt_shadow_kick(struct Channel *chptr, struct Client *who,
    * crdt_shadow_part remove then finds nothing uncovered → no double-mint). */
   user_numeric(who, whonum, sizeof whonum);
   crdt_chan_remove(&g_crdt, chptr->chname, whonum, CRDT_PRIORITY_USER);
+  /* m15 (delete-on-leave): clear the member's status LWW on kick too (same rationale as
+   * PART). kick_info below still rides its own HLC gate; this delete only tombstones the
+   * stale status so a rejoin isn't re-op'd. The subsequent crdt_shadow_part (from
+   * remove_user_from_channel) mints a second, idempotent status delete — benign, LWW-
+   * dedup'd, GC'd — mirroring the double crdt_chan_remove these two hooks already do. */
+  crdt_member_status_remove(&g_crdt, chptr->chname, whonum);
   /* kick metadata so reconcile-remove emits a KICK (with attribution) not a PART;
    * the HLC gate (kick_info.ts vs the member's last-join members_status.ts) keeps a
    * stale kick from re-tagging a later plain PART after a rejoin. */
