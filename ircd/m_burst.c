@@ -771,5 +771,15 @@ int ms_burst(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
     }
   }
 
+  /* CRDT-mesh (M5): the bursted +b/+e are now finalized in chptr->banlist /
+   * chptr->exceptlist above.  modebuf_flush() (channel.c) mirrors the channel's
+   * finalized modes AND ban/except lists into the doc (crdt_shadow_modes +
+   * crdt_shadow_lists), gated by from_crdt_peer(cptr): a LEGACY peer's burst is
+   * mirrored (so the masks reach a pure-CRDT leaf), a CRDT peer's burst is
+   * skipped (its CR F snapshot carries them).  Unlike the netrider topic clear
+   * above — topic is not a modebuf mode, so it needs its own crdt_shadow_topic()
+   * — bans ride this flush and require no explicit crdt_shadow_lists() here.
+   * mbuf is non-NULL exactly when MODE_PARSE_SET was set (the only paths that
+   * apply burst modes/bans), so no ban-bearing path skips the flush. */
   return mbuf ? modebuf_flush(mbuf) : 0;
 }
