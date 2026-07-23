@@ -583,7 +583,7 @@ gline_add(struct Client *cptr, struct Client *sptr, char *userhost,
   sendto_opmask_butone(0, ircd_strncmp(reason, "AUTO", 4) ? SNO_GLINE :
                        SNO_AUTO, "%s adding %s%s %s for %s%s%s, expiring at "
                        "%Tu: %s",
-                       (feature_bool(FEAT_HIS_SNOTICES) || IsServer(sptr)) ?
+                       (feature_bool(FEAT_HIS_SNOTICES) || IsServer(sptr) || IsMe(sptr)) ?
                          cli_name(sptr) :
                          cli_name((cli_user(sptr))->server),
                        (flags & GLINE_ACTIVE) ? "" : "deactivated ",
@@ -654,7 +654,7 @@ gline_activate(struct Client *cptr, struct Client *sptr, struct Gline *gline,
   /* Inform ops and log it */
   sendto_opmask_butone(0, SNO_GLINE, "%s activating global %s for %s%s%s, "
                        "expiring at %Tu: %s",
-                       (feature_bool(FEAT_HIS_SNOTICES) || IsServer(sptr)) ?
+                       (feature_bool(FEAT_HIS_SNOTICES) || IsServer(sptr) || IsMe(sptr)) ?
                          cli_name(sptr) :
                          cli_name((cli_user(sptr))->server),
                        GlineIsBadChan(gline) ? "BADCHAN" : "GLINE",
@@ -724,7 +724,7 @@ gline_deactivate(struct Client *cptr, struct Client *sptr, struct Gline *gline,
   /* Inform ops and log it */
   sendto_opmask_butone(0, SNO_GLINE, "%s %s %s for %s%s%s, expiring at %Tu: "
 		       "%s",
-                       (feature_bool(FEAT_HIS_SNOTICES) || IsServer(sptr)) ?
+                       (feature_bool(FEAT_HIS_SNOTICES) || IsServer(sptr) || IsMe(sptr)) ?
                          cli_name(sptr) :
                          cli_name((cli_user(sptr))->server),
 		       msg, GlineIsBadChan(gline) ? "BADCHAN" : "GLINE",
@@ -927,7 +927,7 @@ gline_modify(struct Client *cptr, struct Client *sptr, struct Gline *gline,
   non_auto = non_auto || ircd_strncmp(gline->gl_reason, "AUTO", 4);
   sendto_opmask_butone(0, non_auto ? SNO_GLINE : SNO_AUTO,
 		       "%s modifying global %s for %s%s%s:%s",
-		       (feature_bool(FEAT_HIS_SNOTICES) || IsServer(sptr)) ?
+		       (feature_bool(FEAT_HIS_SNOTICES) || IsServer(sptr) || IsMe(sptr)) ?
 		       cli_name(sptr) : cli_name((cli_user(sptr))->server),
 		       GlineIsBadChan(gline) ? "BADCHAN" : "GLINE",
 		       gline->gl_user, gline->gl_host ? "@" : "",
@@ -974,7 +974,7 @@ gline_destroy(struct Client *cptr, struct Client *sptr, struct Gline *gline)
 
   /* Inform ops and log it */
   sendto_opmask_butone(0, SNO_GLINE, "%s removing local %s for %s%s%s",
-		       (feature_bool(FEAT_HIS_SNOTICES) || IsServer(sptr)) ?
+		       (feature_bool(FEAT_HIS_SNOTICES) || IsServer(sptr) || IsMe(sptr)) ?
 		       cli_name(sptr) : cli_name((cli_user(sptr))->server),
 		       GlineIsBadChan(gline) ? "BADCHAN" : "GLINE",
 		       gline->gl_user, gline->gl_host ? "@" : "",
@@ -1328,7 +1328,7 @@ gline_remove(struct Client* sptr, char *userhost, char *reason)
             ||(!gline->gl_host && !host)) && ((!user && ircd_strcmp(gline->gl_user, "*") == 0) ||
                ircd_strcmp(gline->gl_user, user) == 0)) {
       sendto_opmask_butone(0, SNO_GLINE, "%s force removing GLINE for %s (%s)",
-                           feature_bool(FEAT_HIS_SNOTICES) || IsServer(sptr) ?
+                           feature_bool(FEAT_HIS_SNOTICES) || IsServer(sptr) || IsMe(sptr) ?
                            cli_name(sptr) : cli_name((cli_user(sptr))->server),
                            uhmask, reason);
 

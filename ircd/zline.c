@@ -411,7 +411,7 @@ zline_add(struct Client *cptr, struct Client *sptr, char *ipmask,
   sendto_opmask_butone(0, ircd_strncmp(reason, "AUTO", 4) ? SNO_GLINE :
                        SNO_AUTO, "%s adding %s%s ZLINE for %s, expiring at "
                        "%Tu: %s",
-                       (feature_bool(FEAT_HIS_SNOTICES) || IsServer(sptr)) ?
+                       (feature_bool(FEAT_HIS_SNOTICES) || IsServer(sptr) || IsMe(sptr)) ?
                          cli_name(sptr) :
                          cli_name((cli_user(sptr))->server),
                        (flags & ZLINE_ACTIVE) ? "" : "deactivated ",
@@ -476,7 +476,7 @@ zline_activate(struct Client *cptr, struct Client *sptr, struct Zline *zline,
   /* Inform ops and log it */
   sendto_opmask_butone(0, SNO_GLINE, "%s activating global ZLINE for %s, "
                        "expiring at %Tu: %s",
-                       (feature_bool(FEAT_HIS_SNOTICES) || IsServer(sptr)) ?
+                       (feature_bool(FEAT_HIS_SNOTICES) || IsServer(sptr) || IsMe(sptr)) ?
                          cli_name(sptr) :
                          cli_name((cli_user(sptr))->server),
                        zline->zl_mask, zline->zl_expire, zline->zl_reason);
@@ -540,7 +540,7 @@ zline_deactivate(struct Client *cptr, struct Client *sptr, struct Zline *zline,
   /* Inform ops and log it */
   sendto_opmask_butone(0, SNO_GLINE, "%s %s ZLINE for %s, expiring at %Tu: "
 		       "%s",
-                       (feature_bool(FEAT_HIS_SNOTICES) || IsServer(sptr)) ?
+                       (feature_bool(FEAT_HIS_SNOTICES) || IsServer(sptr) || IsMe(sptr)) ?
                          cli_name(sptr) :
                          cli_name((cli_user(sptr))->server), msg,
 		       zline->zl_mask, zline->zl_expire, zline->zl_reason);
@@ -736,7 +736,7 @@ zline_modify(struct Client *cptr, struct Client *sptr, struct Zline *zline,
   non_auto = non_auto || ircd_strncmp(zline->zl_reason, "AUTO", 4);
   sendto_opmask_butone(0, non_auto ? SNO_GLINE : SNO_AUTO,
 		       "%s modifying global ZLINE for %s:%s",
-		       (feature_bool(FEAT_HIS_SNOTICES) || IsServer(sptr)) ?
+		       (feature_bool(FEAT_HIS_SNOTICES) || IsServer(sptr) || IsMe(sptr)) ?
 		       cli_name(sptr) : cli_name((cli_user(sptr))->server),
 		       zline->zl_mask, buf);
 
@@ -776,7 +776,7 @@ zline_destroy(struct Client *cptr, struct Client *sptr, struct Zline *zline)
 
   /* Inform ops and log it */
   sendto_opmask_butone(0, SNO_GLINE, "%s removing local ZLINE for %s",
-		       (feature_bool(FEAT_HIS_SNOTICES) || IsServer(sptr)) ?
+		       (feature_bool(FEAT_HIS_SNOTICES) || IsServer(sptr) || IsMe(sptr)) ?
 		       cli_name(sptr) : cli_name((cli_user(sptr))->server),
 		       zline->zl_mask);
   log_write(LS_GLINE, L_INFO, LOG_NOSNOTICE,
@@ -1046,7 +1046,7 @@ zline_remove(struct Client* sptr, char *ipmask, char *reason)
     else if (((zline->zl_mask && mask && ircd_strcmp(zline->zl_mask,mask) == 0)
             ||(!zline->zl_mask && !mask))) {
       sendto_opmask_butone(0, SNO_GLINE, "%s force removing ZLINE for %s (%s)",
-                           feature_bool(FEAT_HIS_SNOTICES) || IsServer(sptr) ?
+                           feature_bool(FEAT_HIS_SNOTICES) || IsServer(sptr) || IsMe(sptr) ?
                            cli_name(sptr) : cli_name((cli_user(sptr))->server),
                            imask, reason);
 
