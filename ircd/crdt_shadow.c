@@ -1662,9 +1662,18 @@ void crdt_shadow_convert_to_stub(struct Client *srv)
   SetMeshStub(srv);
   crdt_mesh_stub_count++;            /* R6c: this node is now (partially) partitioned */
   SetFlag(srv, FLAG_MAP);            /* keep the stub's users visible in WHO */
-  {                                  /* seed the liveness clock: it was just reachable */
+  {                                  /* seed liveness: it was just reachable. The U6 sweep
+                                      * keys retirement on seen_since_tick/miss_ticks (NOT
+                                      * recv_ts), so seed THOSE — else a stub reusing a numeric
+                                      * slot a prior partition left at miss_ticks>=3 is retired
+                                      * on the very next tick, before its first post-split
+                                      * beacon lands, dropping its held users. */
     unsigned int n = (unsigned int)base64toint(cli_yxx(srv));
-    if (n < CRDT_MAX_SERVERS) crdt_beacon[n].recv_ts = CurrentTime;
+    if (n < CRDT_MAX_SERVERS) {
+      crdt_beacon[n].recv_ts          = CurrentTime;
+      crdt_beacon[n].seen_since_tick  = 1;
+      crdt_beacon[n].miss_ticks       = 0;
+    }
   }
   log_write(LS_SYSTEM, L_NOTICE, 0,
             "CRDT mesh: %s tree-split but mesh-reachable; %u user(s) held live "
