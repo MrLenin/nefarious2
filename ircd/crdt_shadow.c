@@ -716,6 +716,20 @@ int crdt_shadow_bsess_present(const char *account, const char *sessid)
   return crdt_bsess_get(&g_crdt, account, sessid) != NULL;
 }
 
+/* Batch P3-5b2 (crdt-mesh INVARIANT 11): is this session's bsessions doc record
+ * EXPLICITLY tombstoned (a genuine owner-side bounce_destroy minted a DELETE op)?
+ * Distinct from crdt_shadow_bsess_present's NULL: crdt_bsess_get is NULL for a
+ * tombstone AND for a never-written key, but is_explicitly_removed is 1 ONLY for a
+ * real tombstone.  The replica reap gates on THIS so absence (a legacy-primaried
+ * session that no CRDT node wrote, or a not-yet-synced record) is never mistaken
+ * for removal.  Mirrors every other CRDT reap (user/metadata/gline/shun/...). */
+int crdt_shadow_bsess_removed(const char *account, const char *sessid)
+{
+  if (!shadow_on())
+    return 0;
+  return crdt_bsess_is_explicitly_removed(&g_crdt, account, sessid);
+}
+
 /* M6c-1 BX Inc-2 (fix): is this connection's bconn doc record still LIVE (not
  * tombstoned/absent)?  The alias-reap oracle, mirror of crdt_shadow_bsess_present
  * for the replica-session reap.  crdt_bconn_get returns NULL for a tombstone. */
@@ -725,6 +739,20 @@ int crdt_shadow_bconn_present(const char *account, const char *sessid,
   if (!shadow_on())
     return 0;
   return crdt_bconn_get(&g_crdt, account, sessid, connnum) != NULL;
+}
+
+/* Batch P3-5b2 (crdt-mesh INVARIANT 11): is this connection's bconn doc record
+ * EXPLICITLY tombstoned (a genuine owner-side alias teardown minted a DELETE op)?
+ * The alias-reap oracle, mirror of crdt_shadow_bsess_removed.  Supersedes the M14
+ * FindNServer host-gate: a legacy-hosted alias is never written -> removed==0 ->
+ * spared without host resolution, and a CRDT-hosted sync-lag-absent alias is
+ * likewise removed==0 -> spared (the residual over-reap M14 could not close). */
+int crdt_shadow_bconn_removed(const char *account, const char *sessid,
+                             const char *connnum)
+{
+  if (!shadow_on())
+    return 0;
+  return crdt_bconn_is_explicitly_removed(&g_crdt, account, sessid, connnum);
 }
 
 /* 5-5e M6d: the full P10 numeric of the doc-recorded PRIMARY connection for

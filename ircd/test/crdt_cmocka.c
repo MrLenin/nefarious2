@@ -906,6 +906,11 @@ static void test_bconn_roster(void **state)
   assert_int_equal(1, crdt_bconn_roster_count(&s2, "alice", "S1"));
   assert_int_equal(1, crdt_bconn_is_explicitly_removed(&s2, "alice", "S1", "BBBBB"));
   assert_int_equal(0, crdt_bconn_is_explicitly_removed(&s2, "alice", "S1", "AAAAA"));
+  /* INVARIANT 11 guard: a NEVER-WRITTEN key is absent, NOT explicitly removed -> 0.
+   * This is the distinction the alias reap now gates on (absent != tombstoned): a
+   * never-written connnum and a never-written session must both read 0. */
+  assert_int_equal(0, crdt_bconn_is_explicitly_removed(&s2, "alice", "S1", "ZZZZZ"));
+  assert_int_equal(0, crdt_bconn_is_explicitly_removed(&s2, "alice", "S2", "AAAAA"));
   assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
 
   crdt_state_clear(&s1);

@@ -137,8 +137,18 @@ void crdt_shadow_bsess_remove(const char *account, const char *sessid);
 const char *crdt_shadow_bsess_winner(const char *account, char *out, size_t outsz);
 /** 5-5e M6a-3: 1 iff a non-tombstone bsessions doc record exists (replica-reap gate). */
 int crdt_shadow_bsess_present(const char *account, const char *sessid);
+/** Batch P3-5b2 (crdt-mesh INVARIANT 11): 1 iff the bsessions record is EXPLICITLY
+ *  tombstoned (a genuine owner-side destroy minted a DELETE), not merely absent —
+ *  the replica-reap gate.  Absent != removed: a legacy-primaried or not-yet-synced
+ *  session is absent, not tombstoned, and must be spared. */
+int crdt_shadow_bsess_removed(const char *account, const char *sessid);
 /** M6c-1 BX Inc-2: 1 iff a non-tombstone bconns doc record exists (alias-reap gate). */
 int crdt_shadow_bconn_present(const char *account, const char *sessid,
+                             const char *connnum);
+/** Batch P3-5b2 (crdt-mesh INVARIANT 11): 1 iff the bconns record is EXPLICITLY
+ *  tombstoned (a genuine owner-side alias teardown minted a DELETE), not merely
+ *  absent — the alias-reap gate (supersedes the M14 FindNServer host-gate). */
+int crdt_shadow_bconn_removed(const char *account, const char *sessid,
                              const char *connnum);
 /** 5-5e M6d: full P10 numeric of the doc-recorded PRIMARY connection (or NULL). */
 const char *crdt_shadow_bconn_primary(const char *account, const char *sessid,
