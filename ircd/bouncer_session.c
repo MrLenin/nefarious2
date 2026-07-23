@@ -2263,9 +2263,14 @@ void bounce_crdt_bsess_sweep(void)
  *
  * A doc replica is identified by the absence of a local primary socket
  * (hs_client == NULL) — on a non-owner node every bouncer session is a
- * replica.  An owner-side orphan (primary gone, session HOLDING) also has
- * hs_client == NULL, but its doc record is still PRESENT (only an explicit
- * destroy tombstones it), so the present-check spares it.  bounce_destroy on
+ * replica.  The reap then gates on an EXPLICIT doc tombstone
+ * (crdt_shadow_bsess_removed, crdt-mesh INVARIANT 11), NEVER on mere absence:
+ * absent != removed.  A legacy-primaried session is never written to the doc
+ * (single-writer = the MyConnect primary holder) so it is absent-not-removed
+ * -> spared (this is the CONFIRMED split-orphan bug the gate change fixes: G
+ * keeps such an orphan replica with hs_client == NULL by design).  An
+ * owner-side orphan (primary gone, session HOLDING) keeps its record PRESENT
+ * (only an explicit destroy tombstones it) -> also spared.  bounce_destroy on
  * a replica does NOT re-tombstone the doc — it gates the write on
  * MyConnect(hs_client), false here — so no write amplification and the
  * single-writer invariant holds.  Collect-then-destroy: bounce_destroy
@@ -2289,9 +2294,11 @@ void bounce_crdt_replica_reap(void)
           continue;
         if (s->hs_client != NULL)                       /* local primary -> not a replica */
           continue;
-        if (crdt_shadow_bsess_present(s->hs_account, s->hs_sessid))
-          continue;                                     /* doc record still live -> keep */
-        doomed[nd++] = s;        /* tombstoned/absent + no local primary -> stale replica */
+        if (!crdt_shadow_bsess_removed(s->hs_account, s->hs_sessid))
+          continue;              /* INVARIANT 11: reap ONLY on an EXPLICIT doc tombstone.
+                                  * Absent (legacy-primaried -> never written; or not yet
+                                  * synced) != removed -> spared, not reaped. */
+        doomed[nd++] = s;        /* explicitly tombstoned + no local primary -> stale replica */
       }
     }
   }
@@ -2304,7 +2311,7 @@ void bounce_crdt_replica_reap(void)
      * own BS X died (no legacy downlink) and bounce_destroy does NOT broadcast,
      * so without this a destroyed CRDT-leaf session lingers forever on a bouncer-
      * aware non-CRDT peer.  This is TOMBSTONE-GATED by the reap (it only runs when
-     * crdt_shadow_bsess_present is false = genuine destroy), so it CANNOT fire on
+     * crdt_shadow_bsess_removed is true = genuine destroy), so it CANNOT fire on
      * an M6d transfer (which keeps the bsess record live) — the transfer-vs-destroy
      * guard for free.  bounce_broadcast 'X' is skip_crdt (legacy leg only) so only
      * a node WITH a legacy downlink (the gateway) actually emits to .2; a leaf
@@ -2318,7 +2325,7 @@ void bounce_crdt_replica_reap(void)
 
 /** M6c-1 BX Inc-2 (fix): the ALIAS analog of bounce_crdt_replica_reap — tear down
  * gateway-materialized REPLICA aliases whose owner tombstoned their bconn doc record.
- * LIVE-WALK (accountHash -> sessions -> hs_aliases[]) + crdt_shadow_bconn_present check
+ * LIVE-WALK (accountHash -> sessions -> hs_aliases[]) + crdt_shadow_bconn_removed check
  * — NOT a foreach over the bconns map (crdt_lwwmap_foreach skips deleted entries, so the
  * reconcile_bconn_cb tombstone branch was unreachable dead code).  Collect-then-act
  * (no mid-walk hs_aliases[] mutation).  Synthesizes BX X to legacy (skip_crdt => legacy
@@ -2343,26 +2350,24 @@ void bounce_crdt_alias_reap(void)
         int a;
         for (a = 0; a < s->hs_alias_count && nd < REAP_BATCH; a++) {
           struct Client *al = findNUser(s->hs_aliases[a].ba_numeric);
-          struct Client *host;
           if (!al || !IsBouncerAlias(al) || MyConnect(al))
             continue;                 /* only gateway-materialized REPLICA aliases */
-          /* M14 (crdt-mesh INVARIANT 11: absent != removed).  crdt_shadow_bconn_present
-           * is crdt_bconn_get()!=NULL, which is NULL for a doc TOMBSTONE *and* for a
-           * NEVER-WRITTEN key.  A bconn is only ever written by the alias's HOST
-           * (bounce_crdt_bsess_sweep, gated ba_server==me_yxx), so a LEGACY-hosted
-           * alias never has one — treating "absent" as "tombstoned" would de-materialize
-           * a LIVE legacy-hosted alias every verify cycle and emit a spurious BX X.  So
-           * only treat an absent bconn as a genuine doc removal when the alias's host is
-           * a CRDT participant (aware server, or a mesh stub whose doc records are still
-           * authoritative); a legacy-hosted alias's teardown rides the legacy BX X, not
-           * the doc reap.  Unresolvable host -> skip (safe direction: keep).  Mirrors the
-           * sibling session reap's hs_client==NULL-first structural gate. */
-          host = FindNServer(s->hs_aliases[a].ba_server);
-          if (!host || !(IsCrdtAware(host) || IsMeshStub(host)))
-            continue;                 /* legacy/unresolvable host -> not doc-authoritative */
-          if (crdt_shadow_bconn_present(s->hs_account, s->hs_sessid,
-                                        s->hs_aliases[a].ba_numeric))
-            continue;                 /* doc bconn still live -> keep */
+          /* crdt-mesh INVARIANT 11 (absent != removed): reap ONLY on an EXPLICIT doc
+           * tombstone, never on mere absence.  A bconn is written solely by the alias's
+           * HOST (bounce_crdt_bsess_sweep, gated ba_server==me_yxx) and tombstoned solely
+           * by that host (crdt_shadow_bconn_reap, or the eager remove in
+           * bounce_alias_untrack), so:
+           *   - a LEGACY-hosted alias is never written -> removed==0 -> spared.  This
+           *     SUPERSEDES the M14 FindNServer host-gate (same spare, no host resolution);
+           *   - a CRDT-hosted alias whose bconn has not yet synced (or was GC'd) is absent
+           *     but not tombstoned -> removed==0 -> spared (the residual over-reap the M14
+           *     host-gate could not close);
+           *   - a genuinely torn-down CRDT-hosted alias carries an explicit tombstone ->
+           *     removed==1 -> reaped (BX X synthesized to legacy below).
+           * Mirrors the sibling session reap's crdt_shadow_bsess_removed gate. */
+          if (!crdt_shadow_bconn_removed(s->hs_account, s->hs_sessid,
+                                         s->hs_aliases[a].ba_numeric))
+            continue;                 /* not explicitly tombstoned (absent or live) -> keep */
           ircd_strncpy(doomed[nd++], s->hs_aliases[a].ba_numeric, sizeof doomed[0]);
         }
       }
