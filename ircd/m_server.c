@@ -730,6 +730,19 @@ int mr_crdtmesh(struct Client* cptr, struct Client* sptr, int parc, char* parv[]
   if (EmptyString(parv[2]) || strlen(parv[2]) > 2 ||
       base64toint(parv[2]) >= CRDT_MAX_SERVERS)
     return exit_client_msg(cptr, cptr, &me, "Bogus numeric (%s)", parv[2]);
+  /* The range check above is not enough: base64toint() maps any NON-base64
+   * byte to 0 (convert2n[]), so a bogus spelling like "@" / "@@" / "@X" passes
+   * the length+range test and aliases slot 0 (or another real slot) — CR-plane
+   * slot corruption.  Require the numeric to be its own canonical base64: decode
+   * then re-encode at the token's own length and demand it reproduce parv[2]
+   * exactly (a base64-alphabet string is its own round-trip; a legit 1-char
+   * numeric like "D" round-trips to "D", not "AD", because count = its strlen). */
+  {
+    char canon[3];
+    inttobase64(canon, base64toint(parv[2]), strlen(parv[2]));
+    if (strcmp(canon, parv[2]) != 0)
+      return exit_client_msg(cptr, cptr, &me, "Bogus numeric (%s)", parv[2]);
+  }
 
   /* Did WE initiate this link?  completed_connection() set STAT_HANDSHAKE on the
    * outbound overlay before this handler runs; an inbound (accepted) overlay is
