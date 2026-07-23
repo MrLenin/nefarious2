@@ -2208,7 +2208,7 @@ void sendcmdto_common_channels_butone(struct Client *from, const char *cmd,
   assert(0 != from);
   assert(0 != cli_from(from));
   assert(0 != pattern);
-  assert(!IsServer(from) && !IsMe(from));
+  assert(!IsServer(from) && !IsMe(from) && !IsMeshStub(from));
 
   vd.vd_format = pattern; /* set up the struct VarData for %v */
 
@@ -2299,7 +2299,7 @@ void sendcmdto_common_channels_capab_butone(struct Client *from, const char *cmd
   assert(0 != from);
   assert(0 != cli_from(from));
   assert(0 != pattern);
-  assert(!IsServer(from) && !IsMe(from));
+  assert(!IsServer(from) && !IsMe(from) && !IsMeshStub(from));
 
   vd.vd_format = pattern; /* set up the struct VarData for %v */
 
