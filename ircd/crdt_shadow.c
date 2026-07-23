@@ -3479,12 +3479,15 @@ void crdt_shadow_materialize_check(void)
                     "CRDT mat-check gap: channel %s in doc, not live", nbuf);
         continue;
       }
-      /* chanmeta: creationtime + topic provenance */
+      /* chanmeta: creationtime + topic_nick provenance. NOT topic_time: since M11 the
+       * live topic_time is materialized from the topics MAX-register value, while
+       * chanmeta.topic_time is an independent HLC-LWW that legitimately diverges from
+       * the MAX winner under clock skew -- comparing it here would false-flag a gap on
+       * exactly the skew M11 targets. */
       mv = crdt_lwwmap_get(&g_crdt.chanmeta, nbuf, dc->name_len);
       if (mv && mv->data_len == sizeof(struct CrdtChanMeta)) {
         const struct CrdtChanMeta *meta = (const struct CrdtChanMeta *)mv->data;
         if (meta->creationtime != (uint64_t)live->creationtime ||
-            meta->topic_time != (uint64_t)live->topic_time ||
             strcmp(meta->topic_nick, live->topic_nick) != 0) {
           gaps++;
           if (logged++ < MAT_LOG_CAP)
