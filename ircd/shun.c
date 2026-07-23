@@ -623,7 +623,7 @@ shun_add(struct Client *cptr, struct Client *sptr, char *userhost,
   sendto_opmask_butone(0, ircd_strncmp(reason, "AUTO", 4) ? SNO_GLINE :
                        SNO_AUTO, "%s adding %s%s SHUN for %s%s%s, expiring at "
                        "%Tu: %s",
-                       (feature_bool(FEAT_HIS_SNOTICES) || IsServer(sptr) || IsMe(sptr)) ?
+                       (feature_bool(FEAT_HIS_SNOTICES) || !cli_user(sptr)) ?
                          cli_name(sptr) :
                          cli_name((cli_user(sptr))->server),
                        (flags & SHUN_ACTIVE) ? "" : "deactivated ",
@@ -692,7 +692,7 @@ shun_activate(struct Client *cptr, struct Client *sptr, struct Shun *shun,
   /* Inform ops and log it */
   sendto_opmask_butone(0, SNO_GLINE, "%s activating global SHUN for %s%s%s, "
                        "expiring at %Tu: %s",
-                       (feature_bool(FEAT_HIS_SNOTICES) || IsServer(sptr) || IsMe(sptr)) ?
+                       (feature_bool(FEAT_HIS_SNOTICES) || !cli_user(sptr)) ?
                          cli_name(sptr) :
                          cli_name((cli_user(sptr))->server),
                        shun->sh_user, shun->sh_host ? "@" : "",
@@ -761,7 +761,7 @@ shun_deactivate(struct Client *cptr, struct Client *sptr, struct Shun *shun,
   /* Inform ops and log it */
   sendto_opmask_butone(0, SNO_GLINE, "%s %s SHUN for %s%s%s, expiring at %Tu: "
 		       "%s",
-                       (feature_bool(FEAT_HIS_SNOTICES) || IsServer(sptr) || IsMe(sptr)) ?
+                       (feature_bool(FEAT_HIS_SNOTICES) || !cli_user(sptr)) ?
                          cli_name(sptr) :
                          cli_name((cli_user(sptr))->server), msg,
 		       shun->sh_user, shun->sh_host ? "@" : "",
@@ -960,7 +960,7 @@ shun_modify(struct Client *cptr, struct Client *sptr, struct Shun *shun,
 
   /* All right, inform ops... */
   sendto_opmask_butone(0, SNO_GLINE, "%s modifying global SHUN for %s%s%s:%s",
-		       (feature_bool(FEAT_HIS_SNOTICES) || IsServer(sptr) || IsMe(sptr)) ?
+		       (feature_bool(FEAT_HIS_SNOTICES) || !cli_user(sptr)) ?
 		       cli_name(sptr) : cli_name((cli_user(sptr))->server),
 		       shun->sh_user, shun->sh_host ? "@" : "",
 		       shun->sh_host ? shun->sh_host : "", buf);
@@ -1006,7 +1006,7 @@ shun_destroy(struct Client *cptr, struct Client *sptr, struct Shun *shun)
 
   /* Inform ops and log it */
   sendto_opmask_butone(0, SNO_GLINE, "%s removing local SHUN for %s%s%s",
-		       (feature_bool(FEAT_HIS_SNOTICES) || IsServer(sptr) || IsMe(sptr)) ?
+		       (feature_bool(FEAT_HIS_SNOTICES) || !cli_user(sptr)) ?
 		       cli_name(sptr) : cli_name((cli_user(sptr))->server),
 		       shun->sh_user, shun->sh_host ? "@" : "",
 		       shun->sh_host ? shun->sh_host : "");
@@ -1326,7 +1326,7 @@ shun_remove(struct Client* sptr, char *userhost, char *reason)
             ||(!shun->sh_host && !host)) && ((!user && ircd_strcmp(shun->sh_user, "*") == 0) ||
                ircd_strcmp(shun->sh_user, user) == 0)) {
       sendto_opmask_butone(0, SNO_GLINE, "%s force removing SHUN for %s (%s)",
-                           feature_bool(FEAT_HIS_SNOTICES) || IsServer(sptr) || IsMe(sptr) ?
+                           feature_bool(FEAT_HIS_SNOTICES) || !cli_user(sptr) ?
                            cli_name(sptr) : cli_name((cli_user(sptr))->server),
                            uhmask, reason);
 

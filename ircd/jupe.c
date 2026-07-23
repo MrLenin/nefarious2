@@ -160,7 +160,7 @@ jupe_add(struct Client *cptr, struct Client *sptr, char *server, char *reason,
   /* Inform ops and log it */
   sendto_opmask_butone(0, SNO_NETWORK, "%s adding %sJUPE for %s, expiring at "
                        "%Tu: %s",
-                       (feature_bool(FEAT_HIS_SNOTICES) || IsServer(sptr) || IsMe(sptr)) ?
+                       (feature_bool(FEAT_HIS_SNOTICES) || !cli_user(sptr)) ?
                          cli_name(sptr) :
                          cli_name((cli_user(sptr))->server),
 		       flags & JUPE_LOCAL ? "local " : "", server,
@@ -217,7 +217,7 @@ jupe_activate(struct Client *cptr, struct Client *sptr, struct Jupe *jupe,
   /* Inform ops and log it */
   sendto_opmask_butone(0, SNO_NETWORK, "%s activating JUPE for %s, expiring "
 		       "at %Tu: %s",
-                       (feature_bool(FEAT_HIS_SNOTICES) || IsServer(sptr) || IsMe(sptr)) ?
+                       (feature_bool(FEAT_HIS_SNOTICES) || !cli_user(sptr)) ?
                          cli_name(sptr) :
                          cli_name((cli_user(sptr))->server),
 		       jupe->ju_server, jupe->ju_expire + TSoffset,
@@ -272,7 +272,7 @@ jupe_deactivate(struct Client *cptr, struct Client *sptr, struct Jupe *jupe,
   /* Inform ops and log it */
   sendto_opmask_butone(0, SNO_NETWORK, "%s %s JUPE for %s, expiring at %Tu: "
 		       "%s",
-                       (feature_bool(FEAT_HIS_SNOTICES) || IsServer(sptr) || IsMe(sptr)) ?
+                       (feature_bool(FEAT_HIS_SNOTICES) || !cli_user(sptr)) ?
                          cli_name(sptr) :
                          cli_name((cli_user(sptr))->server),
 		       JupeIsLocal(jupe) ? "removing local" : "deactivating",
