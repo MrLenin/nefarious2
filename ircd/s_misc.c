@@ -52,6 +52,7 @@
 #include "querycmds.h"
 #include "replay.h"
 #include "res.h"
+#include "s2s_chunk.h"
 #include "s_auth.h"
 #include "s_bsd.h"
 #include "s_conf.h"
@@ -328,6 +329,14 @@ static void exit_one_client(struct Client* bcptr, const char* comment)
     pending_bx_cleanup_link(bcptr);
     chathistory_fed_cleanup_link(bcptr);
   }
+  /* Any direct CR-feed link — a P10 server or a CRDT overlay (never IsServer)
+   * — that dies mid-chunk-stream leaves reassembly slots that can never
+   * complete: free them here or the fixed table leaks (and a recycled Client*
+   * would splice a new peer's chunks onto the stale buffer).  The SQUIT-keep
+   * branch converts a mesh-reachable server to a stub WITHOUT reaching
+   * exit_one_client; crdt_shadow_convert_to_stub covers that flavor. */
+  if (IsServer(bcptr) || IsCrdtOverlay(bcptr))
+    s2s_chunk_cleanup_link(bcptr);
   if (IsUser(bcptr)) {
     /* Phase 1 CRDT shadow: mirror user removal while cli_user + numeric are
      * still valid (gated on FEAT_CRDT_ENABLED; skips bouncer aliases). */

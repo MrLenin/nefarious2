@@ -34,6 +34,7 @@
 #include "msg.h"             /* CMD_TOPIC (Phase 3d gateway) */
 #include "numnicks.h"
 #include "querycmds.h"       /* UserStats, Count_newremoteclient (3c materialize) */
+#include "s2s_chunk.h"       /* s2s_chunk_cleanup_link (stub conversion kills the feed link) */
 #include "s_misc.h"          /* exit_client (Phase 3m user delete-on-leave) */
 #include "s_user.h"          /* umode_str, make_user, user_apply_umode_str */
 #include "send.h"            /* sendcmdto_* (Phase 3d topic gateway) */
@@ -1614,6 +1615,11 @@ void crdt_shadow_convert_to_stub(struct Client *srv)
   struct Client **acptrp;
   if (!srv || !cli_serv(srv))
     return;
+  /* The direct link just died (close_connection already ran): any in-flight
+   * CR chunk reassembly keyed to this Client can never complete — free the
+   * slots now.  This SQUIT-keep path never reaches exit_one_client (which
+   * covers the cascade + overlay teardown flavors), so it must clean here. */
+  s2s_chunk_cleanup_link(srv);
   acptrp = cli_serv(srv)->client_list;
   for (i = 0; i <= cli_serv(srv)->nn_mask; ++acptrp, ++i)
     if (*acptrp) held++;
