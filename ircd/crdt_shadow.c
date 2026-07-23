@@ -111,6 +111,13 @@ static struct crdt_peer_sv g_peers[CRDT_MAX_PEERS];
 #define CRDT_BEACON_STALE 90            /* 3 verify intervals */
 static struct {
   time_t emit_ts; time_t recv_ts;
+  uint8_t seen_since_tick;          /* M2+U6: set on ANY beacon arrival for this server (in
+                                       crdt_shadow_beacon_record, ABOVE the relay/dedup gate);
+                                       the verify sweep counts consecutive CLEAR windows via
+                                       miss_ticks instead of the clock-step-fragile
+                                       CurrentTime-recv_ts delta. */
+  uint8_t miss_ticks;               /* U6: consecutive verify ticks with no beacon for this
+                                       server (>= CRDT_BEACON_MISS_TICKS -> full-partition retire). */
   char name[HOSTLEN + 1];           /* #3: real server name (for the synthetic anchor) */
   char nn_cap[4];                   /* #3: base64 client capacity -> right-sized anchor mask */
   char min_fronter[4];              /* MR-4d: lowest-numeric gateway seen proxy-beaconing this
@@ -127,10 +134,24 @@ int crdt_shadow_beacon_record(unsigned int num, time_t emit_ts,
                               const char *nn_cap, const char *name,
                               const char *peers, const char *fronted_by)
 {
-  if (num >= CRDT_MAX_SERVERS || emit_ts <= crdt_beacon[num].emit_ts)
+  if (num >= CRDT_MAX_SERVERS)
     return 0;
+  /* Part A (M2 — INVARIANT 9 applied to reception): ANY beacon arrival for `num`
+   * proves the server reachable RIGHT NOW, so refresh the liveness signal
+   * UNCONDITIONALLY — even a dup / replay / backward-NTP-stepped beacon that must
+   * NOT be relayed.  The emit_ts monotonicity check below now gates ONLY the
+   * relay/dedup + the append-only metadata (nn_cap/name/min_fronter/meshmap), never
+   * liveness.  Previously it early-returned ABOVE these two stamps, so a future-
+   * dated or backward-stepped emit_ts froze recv_ts and the sweep retired a live,
+   * still-beaconing server.  Bounded-staleness caveat: crdt_shadow_beacon_burst
+   * replays only beacons it still considers fresh (recv within CRDT_BEACON_STALE),
+   * so a genuinely dead server is kept "alive" at most ~one staleness window past
+   * its last real beacon — the identical bound already accepted today. */
+  crdt_beacon[num].recv_ts         = CurrentTime;
+  crdt_beacon[num].seen_since_tick = 1;
+  if (emit_ts <= crdt_beacon[num].emit_ts)
+    return 0;                       /* relay/dedup gate ONLY — terminates the gossip flood */
   crdt_beacon[num].emit_ts = emit_ts;
-  crdt_beacon[num].recv_ts = CurrentTime;
   if (nn_cap && nn_cap[0])
     ircd_strncpy(crdt_beacon[num].nn_cap, nn_cap, sizeof crdt_beacon[num].nn_cap);
   if (name && name[0])
@@ -249,19 +270,22 @@ void crdt_shadow_beacon_burst(struct Client *peer)
  * fire, the overlay zombies, and try_connections' "already present" dedup blocks
  * reconnect for the whole window.  Close the gap with an ACTIVE probe: CR traffic
  * (the CR H beacon alone arrives every CRDT_VERIFY_INTERVAL=30s over every overlay
- * edge) refreshes cli_lasttime on read (s_bsd.c read_packet); an edge silent for
- * >CRDT_BEACON_STALE (90s = 3 beacon rounds) is silently dead.  Returns 1 → caller
- * (check_pings) tears it down so the normal reap→try_connections reconnect runs.
- * Mirrors the mesh-stub beacon-staleness retirement (same constant, same rationale). */
+ * edge) refreshes cli_lasttime on read (s_bsd.c read_packet).  U6: instead of a
+ * CurrentTime-cli_lasttime delta (which a wall-clock step makes lie for every edge
+ * at once), crdt_shadow_verify_cb drives a per-overlay CHANGE-DETECTOR each tick —
+ * con_ov_miss counts consecutive ticks in which cli_lasttime did NOT move (an
+ * inequality of two same-epoch reads, immune to any clock step).  This function just
+ * reads that verdict.  Returns 1 (>= CRDT_BEACON_MISS_TICKS silent ticks = 90s) →
+ * caller (check_pings) tears it down so the normal reap→try_connections reconnect
+ * runs.  Mirrors the mesh-stub tick-counted retirement (same helper, same rationale). */
 int crdt_overlay_is_stale(const struct Client *ov)
 {
-  time_t ref;
   if (!ov || !IsCrdtOverlay(ov))
     return 0;
-  /* No CR received yet on a fresh overlay → measure from connect time, so a
-   * just-opened edge gets a full window before we judge it (no startup false-kill). */
-  ref = cli_lasttime(ov) ? cli_lasttime(ov) : cli_firsttime(ov);
-  return ref && (CurrentTime - ref) > CRDT_BEACON_STALE;
+  /* con_ov_miss is advanced only by crdt_shadow_verify_cb's change-detector; a fresh
+   * overlay starts miss=0 (alloc_connection memset) and its first tick snapshots
+   * cli_lasttime (!= 0 from make_client) resetting to 0 -> no startup false-kill. */
+  return con_ov_miss(cli_connect(ov)) >= CRDT_BEACON_MISS_TICKS;
 }
 
 /* Build this server's own direct-CRDT-peer list (base64 numerics, comma-joined)
@@ -5032,13 +5056,36 @@ static void crdt_shadow_verify_cb(struct Event *ev)
   {
     struct Client *acptr, *stale[16];
     int ns = 0, k;
-    for (acptr = GlobalClientList; acptr && ns < 16; acptr = cli_next(acptr))
+    for (acptr = GlobalClientList; acptr; acptr = cli_next(acptr)) {
       if (IsMeshStub(acptr)) {
+        /* U6 (Design B): tick-counted liveness.  A CR H beacon seen since the last
+         * tick (seen_since_tick, set in crdt_shadow_beacon_record above the relay
+         * gate) resets the miss counter; CRDT_BEACON_MISS_TICKS consecutive silent
+         * ticks (90s) = the peer is unreachable via ANY CRDT path -> retire.  This
+         * replaces the CurrentTime-recv_ts delta that a forward wall-clock step made
+         * exceed the window for every stub in a single tick (the U6 mass-reap). */
         unsigned int n = (unsigned int)base64toint(cli_yxx(acptr));
-        if (n < CRDT_MAX_SERVERS &&
-            CurrentTime - crdt_beacon[n].recv_ts > CRDT_BEACON_STALE)
+        int seen;
+        if (n >= CRDT_MAX_SERVERS)
+          continue;
+        seen = crdt_beacon[n].seen_since_tick;
+        crdt_beacon[n].seen_since_tick = 0;          /* consume for the next window */
+        if (crdt_beacon_tick_stale(seen, &crdt_beacon[n].miss_ticks) && ns < 16)
           stale[ns++] = acptr;
+      } else if (IsCrdtOverlay(acptr) && MyConnect(acptr) && !IsDead(acptr)) {
+        /* U6 overlay change-detector: an overlay has no server numeric (never
+         * SetServerYXX) so it cannot key crdt_beacon[]; its liveness signal is
+         * socket-read activity (cli_lasttime, refreshed by read_packet on every CR).
+         * Compare two same-epoch reads for INEQUALITY (step-robust, no CurrentTime
+         * delta): a read since the last tick moved cli_lasttime -> reset; no read ->
+         * ++miss.  crdt_overlay_is_stale (check_pings) reads the con_ov_miss verdict. */
+        struct Connection *con = cli_connect(acptr);
+        int seen = (cli_lasttime(acptr) != con_ov_lastseen(con));
+        if (seen)
+          con_ov_lastseen(con) = cli_lasttime(acptr);
+        crdt_beacon_tick_stale(seen, &con_ov_miss(con));
       }
+    }
     for (k = 0; k < ns; k++)
       crdt_shadow_retire_mesh_stub(stale[k], "mesh beacon stale (full partition)");
   }

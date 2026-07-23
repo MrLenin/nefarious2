@@ -507,6 +507,14 @@ struct Connection
   unsigned char       con_recv_state;     /**< RECV_TAGS or RECV_MSG */
   unsigned int        con_recv_tag_bytes; /**< Bytes of @-region in current line (incl. @) */
   unsigned int        con_recv_msg_bytes; /**< Bytes of message region in current line */
+  /* U6 (Theme-B): CRDT overlay liveness change-detector — see crdt_shadow_verify_cb
+   * + crdt_overlay_is_stale.  An overlay has no server numeric so it cannot key the
+   * beacon table; its liveness is socket-read activity.  con_ov_lastseen snapshots
+   * cli_lasttime at the previous verify tick, con_ov_miss counts consecutive ticks
+   * with no read (>= CRDT_BEACON_MISS_TICKS -> silently dead).  Zeroed by
+   * alloc_connection's memset; unused on non-overlay connections. */
+  time_t              con_ov_lastseen;  /**< cli_lasttime snapshot at last CRDT verify tick */
+  uint8_t             con_ov_miss;      /**< consecutive CRDT verify ticks with no socket read */
 };
 
 /** Magic constant to identify valid Connection structures. */
@@ -884,6 +892,10 @@ struct Client {
 #define con_nextaway(con)	((con)->con_nextaway)
 /** Get last time we read from the connection. */
 #define con_lasttime(con)       ((con)->con_lasttime)
+/** Get the CRDT-overlay liveness snapshot (cli_lasttime at the last verify tick). */
+#define con_ov_lastseen(con)    ((con)->con_ov_lastseen)
+/** Get the CRDT-overlay consecutive-missed-verify-tick counter. */
+#define con_ov_miss(con)        ((con)->con_ov_miss)
 /** Get last time we accepted a command from the connection. */
 #define con_since(con)          ((con)->con_since)
 /** Get SendQ for connection. */

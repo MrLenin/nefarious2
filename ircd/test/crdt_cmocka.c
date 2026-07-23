@@ -2275,6 +2275,40 @@ static void test_force_lastmod_breaks_tie(void **state)
   assert_int_equal(201, (int)force_lastmod(200, 100));   /* live ahead-> live + 1 */
 }
 
+/* M2+U6 (Theme-B, liveness clock-source): crdt_beacon_tick_stale is the pure per-tick
+ * decision the mesh-stub sweep and the overlay change-detector share (Design B —
+ * count consecutive missed verify ticks, not a clock-step-fragile CurrentTime delta).
+ * seen -> reset to 0; N=CRDT_BEACON_MISS_TICKS consecutive misses -> stale.  This is
+ * the one Theme-B liveness piece unit-testable without a live bed; it guards the
+ * design-§2.6 hazard that a wrong reset silently disables retirement (ghost users). */
+static void test_crdt_beacon_tick_stale(void **state)
+{
+  uint8_t miss = 0;
+  (void)state;
+  /* seen every tick -> never stale, counter pinned at 0 */
+  assert_int_equal(0, crdt_beacon_tick_stale(1, &miss));
+  assert_int_equal(0, (int)miss);
+  /* 3 consecutive misses -> stale exactly on the 3rd (1, 2 keep) */
+  assert_int_equal(0, crdt_beacon_tick_stale(0, &miss));  /* miss=1 */
+  assert_int_equal(1, (int)miss);
+  assert_int_equal(0, crdt_beacon_tick_stale(0, &miss));  /* miss=2 */
+  assert_int_equal(2, (int)miss);
+  assert_int_equal(1, crdt_beacon_tick_stale(0, &miss));  /* miss=3 -> stale */
+  assert_int_equal(3, (int)miss);
+  /* a beacon after staleness resets (recovery on relink) */
+  assert_int_equal(0, crdt_beacon_tick_stale(1, &miss));
+  assert_int_equal(0, (int)miss);
+  /* seen ON tick 2 prevents staleness — the exact "reset mid-window" case §2.6 warns
+   * must reset on `seen`, not on the window clear */
+  miss = 0;
+  (void)crdt_beacon_tick_stale(0, &miss);                 /* miss=1 */
+  assert_int_equal(0, crdt_beacon_tick_stale(1, &miss));  /* seen -> reset */
+  assert_int_equal(0, (int)miss);
+  assert_int_equal(0, crdt_beacon_tick_stale(0, &miss));  /* miss=1 (not 2) */
+  assert_int_equal(0, crdt_beacon_tick_stale(0, &miss));  /* miss=2 */
+  assert_int_equal(1, crdt_beacon_tick_stale(0, &miss));  /* miss=3 -> stale */
+}
+
 /* Doc-convergence: two nodes set the SAME mask in the same second with EQUAL
  * lastmod but DIFFERENT reasons; after a cross-merge both replicas converge to one
  * winning record (identical digest, identical winning reason), and the tie-inducing
@@ -2922,6 +2956,7 @@ int main(void)
     cmocka_unit_test(test_marker_op_replicates),
     cmocka_unit_test(test_gline_op_replicates),
     cmocka_unit_test(test_force_lastmod_breaks_tie),
+    cmocka_unit_test(test_crdt_beacon_tick_stale),
     cmocka_unit_test(test_gline_doc_converges_same_lastmod),
     cmocka_unit_test(test_metadata_op_replicates),
     cmocka_unit_test(test_bsess_op_replicates),

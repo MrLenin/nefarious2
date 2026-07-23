@@ -53,6 +53,43 @@ static inline time_t force_lastmod(time_t live_lastmod, time_t doc_lastmod)
   return (doc_lastmod > live_lastmod) ? doc_lastmod : live_lastmod + 1;
 }
 
+/*
+ * M2 + U6 (Theme-B, liveness clock-source fix): the pure per-verify-tick staleness
+ * decision for one liveness slot.  Design B counts CONSECUTIVE missed verify cycles
+ * instead of a wall-clock delta (CurrentTime - recv_ts) that an NTP correction or a
+ * VM-resume clock step makes lie — a backward step freezes the delta (M2, retire a
+ * live server) and a forward step >90s makes it exceed the window for every slot at
+ * once (U6, mass-reap).  Counting ticks is step-robust: a forward wall-clock step
+ * fires the TT_PERIODIC verify timer AT MOST ONCE early (timer_run re-enqueues the
+ * periodic timer on the post-step CurrentTime, so its next expiry is CurrentTime+30
+ * > CurrentTime and the timer_run loop breaks — verified in ircd_events.c
+ * timer_run/timer_enqueue), so a missed tick advances *miss by exactly 1, never N.
+ *
+ * Shared by the mesh-stub sweep (seen = a CR H beacon arrived this window, tracked
+ * by crdt_beacon[].seen_since_tick, set in crdt_shadow_beacon_record ABOVE the relay
+ * gate) and the overlay change-detector (seen = cli_lasttime moved since last tick).
+ *
+ * Pure integer logic — no Client / timer / CurrentTime dep; `static inline` in the
+ * header so the cmocka suite gates it directly (guards the design-§2.6 hazard: a
+ * wrong reset silently disables retirement -> ghost mesh-only users).
+ *
+ * @param[in]     seen  non-zero if a liveness signal arrived since the last tick.
+ * @param[in,out] miss  running count of consecutive missed ticks (reset on seen).
+ * @return 1 if the slot is now stale (>= CRDT_BEACON_MISS_TICKS consecutive misses
+ *         -> full-partition retire / overlay teardown), else 0.
+ */
+#define CRDT_BEACON_MISS_TICKS 3   /* = CRDT_BEACON_STALE(90s) / CRDT_VERIFY_INTERVAL(30s) */
+static inline int crdt_beacon_tick_stale(int seen, uint8_t *miss)
+{
+  if (seen) {
+    *miss = 0;
+    return 0;
+  }
+  if (*miss < 255)                 /* saturate: a retired stub stops ticking long before this */
+    (*miss)++;
+  return *miss >= CRDT_BEACON_MISS_TICKS;
+}
+
 /** Initialise the shadow CRDT document for this server and arm the periodic
  *  verify timer. Idempotent; safe to call once at startup. */
 void crdt_shadow_init(uint16_t my_numeric);
