@@ -233,6 +233,10 @@ void crdt_user_remove(struct CrdtNetworkState *st, const char *numeric)
   op->ts = ts;
   op->writer = st->my_numeric;
   record(st, op);
+  /* M9: reap this user's SILENCE masks SYNCHRONOUSLY (not sweep-only) so the REMOVE
+   * ops get seqs immediately after the user DELETE and before any numeric-reuse SET,
+   * closing the numeric-reuse bleed via per-origin in-order delivery. */
+  crdt_state_reclaim_user_silences(st, numeric);
 }
 
 /* Phase 3m: 1 iff this numeric has an explicit user delete-tombstone in the doc
@@ -2063,6 +2067,98 @@ int crdt_state_reclaim_orphan_chan_meta(struct CrdtNetworkState *st)
   total += reclaim_lww_orphans(st, &st->chanmeta, CRDT_COLL_CHANMETA,
                                chanmeta_orphan_collect_cb);
   return total;
+}
+
+/* ------------------------------------------------------------------ */
+/* M9: per-user SILENCE-mask reaps (global silences OR-Set, keyed numeric\0mask) */
+/* ------------------------------------------------------------------ */
+/* A departed user's masks are never tombstoned by user_remove, so they persist as
+ * LIVE OR-Set entries (growth) and -- worse -- a reused P10 numeric inherits them via
+ * the numeric-keyed doc->live sync (the bleed). Both reaps collect (numeric,mask)
+ * pairs read-only, then mint crdt_silence_remove (priority-0, the exact op the live
+ * shadow-mirror path uses on a manual /SILENCE -mask) for each -- never a raw
+ * orset_remove, so each tombstone replicates as a delta. The reaped mask bytes are
+ * copied VERBATIM from the doc key, so crdt_silence_remove's silence_key() rebuilds
+ * the byte-identical key it tombstones: no mask re-canonicalization, hence no
+ * add/remove flip-flop with the live mirror. */
+#define SILENCE_REAP_MAX 64
+struct silence_reap_ctx {
+  struct CrdtNetworkState *st;
+  const char *only_numeric;              /* non-NULL: only this user (targeted reap) */
+  uint32_t    only_numlen;               /* NULL: sweep fully-gone users (backstop)  */
+  char        num[SILENCE_REAP_MAX][CRDT_NUMERICLEN + 1];
+  char        mask[SILENCE_REAP_MAX][256];
+  int         n;
+};
+
+/* foreach callback: collect (don't mutate mid-iterate) the numeric+mask of silence
+ * entries to reap. Targeted: entries matching only_numeric. Sweep: entries whose
+ * owning user is FULLY absent (get==NULL AND !is_deleted -> removal causally stable;
+ * a live user or a not-yet-stable delete-tombstone is kept). */
+static void silence_reap_collect_cb(const char *key, uint32_t key_len, void *ctx)
+{
+  struct silence_reap_ctx *c = (struct silence_reap_ctx *)ctx;
+  uint32_t numlen, masklen;
+  const char *mask;
+  if (c->n >= SILENCE_REAP_MAX)
+    return;
+  numlen = (uint32_t)strlen(key);        /* numeric is NUL-terminated within the key */
+  if (numlen + 1 > key_len)
+    return;                              /* malformed (no mask part) */
+  mask = key + numlen + 1;
+  masklen = key_len - numlen - 1;
+  if (numlen >= sizeof c->num[0] || masklen >= sizeof c->mask[0])
+    return;
+  if (c->only_numeric) {
+    if (numlen != c->only_numlen || memcmp(key, c->only_numeric, numlen) != 0)
+      return;                            /* a different user's mask -> skip */
+  } else if (crdt_lwwmap_get(&c->st->users, key, numlen) != NULL ||
+             crdt_lwwmap_is_deleted(&c->st->users, key, numlen)) {
+    return;                              /* user live, or removal not yet stable -> keep */
+  }
+  memcpy(c->num[c->n], key, numlen);    c->num[c->n][numlen] = '\0';
+  memcpy(c->mask[c->n], mask, masklen); c->mask[c->n][masklen] = '\0';
+  c->n++;
+}
+
+/* Targeted reap (from crdt_user_remove): mint crdt_silence_remove for every mask of
+ * @a numeric. Loops until a short round so a user with > SILENCE_REAP_MAX masks is
+ * FULLY drained synchronously -- the bleed close requires ALL of the departing user's
+ * masks tombstoned before any numeric reuse, not just the first bounded batch. */
+void crdt_state_reclaim_user_silences(struct CrdtNetworkState *st, const char *numeric)
+{
+  static struct silence_reap_ctx c;      /* static: avoids a large stack frame */
+  int i;
+  if (crdt_orset_size(&st->silences) == 0)   /* overwhelming common case: none */
+    return;
+  c.st = st;
+  c.only_numeric = numeric;
+  c.only_numlen = (uint32_t)strlen(numeric);
+  do {
+    c.n = 0;
+    crdt_orset_foreach(&st->silences, silence_reap_collect_cb, &c);
+    for (i = 0; i < c.n; i++)
+      crdt_silence_remove(st, c.num[i], c.mask[i], CRDT_PRIORITY_USER);
+  } while (c.n == SILENCE_REAP_MAX);
+}
+
+/* Backstop sweep (from crdt_shadow_gc): mint crdt_silence_remove for every mask whose
+ * owning user is fully absent. Bounded SILENCE_REAP_MAX per pass (survivors caught
+ * next cycle, like the member-meta template). Returns the count reclaimed. */
+int crdt_state_reclaim_orphan_silences(struct CrdtNetworkState *st)
+{
+  static struct silence_reap_ctx c;      /* static: avoids a large stack frame */
+  int i;
+  if (crdt_orset_size(&st->silences) == 0)
+    return 0;
+  c.st = st;
+  c.only_numeric = NULL;
+  c.only_numlen = 0;
+  c.n = 0;
+  crdt_orset_foreach(&st->silences, silence_reap_collect_cb, &c);
+  for (i = 0; i < c.n; i++)
+    crdt_silence_remove(st, c.num[i], c.mask[i], CRDT_PRIORITY_USER);
+  return c.n;
 }
 
 /* ------------------------------------------------------------------ */

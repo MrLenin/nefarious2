@@ -648,6 +648,19 @@ int  crdt_state_reclaim_orphan_member_meta(struct CrdtNetworkState *st);
  *  the count reclaimed. Safe + idempotent to call each GC cycle. */
 int  crdt_state_reclaim_orphan_chan_meta(struct CrdtNetworkState *st);
 
+/** M9: reap a departing user's SILENCE masks synchronously from crdt_user_remove --
+ *  mint crdt_silence_remove for each mask so the REMOVE ops get seqs BEFORE any future
+ *  numeric-reuse SET (same origin, monotonic next_seq -> applied in-order everywhere),
+ *  so a reused P10 numeric never inherits the departed predecessor's masks (the
+ *  numeric-reuse bleed). Engine-pure (silences + users both live in CrdtNetworkState). */
+void crdt_state_reclaim_user_silences(struct CrdtNetworkState *st,
+                                      const char *numeric);
+/** M9 backstop sweep: mint crdt_silence_remove for every silence mask whose owning
+ *  user is FULLY absent from the users map (get==NULL AND !is_deleted -> removal
+ *  causally stable). Catches the home-SQUIT-with-user-live case where crdt_user_remove
+ *  never fired. Returns the count reclaimed. Safe + idempotent to call each GC cycle. */
+int  crdt_state_reclaim_orphan_silences(struct CrdtNetworkState *st);
+
 /* ---- queries ---- */
 struct CrdtChannel *crdt_state_channel(struct CrdtNetworkState *st,
                                        const char *chan, int create);

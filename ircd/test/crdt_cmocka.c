@@ -2437,6 +2437,141 @@ static void test_orphan_chan_meta_kept_while_ctime_live(void **state)
 }
 
 /* ================================================================== */
+/* M9: per-user SILENCE masks (global silences OR-Set, keyed usernumeric\0mask). A
+ * departed user's masks are never tombstoned by user_remove, so they persist as LIVE
+ * OR-Set entries forever (growth) AND -- worse -- a reused P10 numeric inherits the
+ * departed predecessor's masks (bleed: sync_user_silences keys purely on the numeric).
+ * Two reaps mint crdt_silence_remove: a SYNCHRONOUS targeted reap inside
+ * crdt_user_remove (closes the bleed via same-origin seq-ordering) and a backstop GC
+ * sweep for the home-SQUIT-with-user-live case (crdt_user_remove never fires). */
+
+/* build the composite silences key numeric\0mask (mirrors the engine's silence_key). */
+static uint32_t mk_sil_key(char *out, const char *num, const char *mask)
+{
+  uint32_t ul = (uint32_t)strlen(num), ml = (uint32_t)strlen(mask);
+  memcpy(out, num, ul); out[ul] = '\0'; memcpy(out + ul + 1, mask, ml);
+  return ul + 1 + ml;
+}
+
+/* RECLAIMED (backstop sweep): a silence whose owning user is FULLY absent from the
+ * users map (removal causally stable / tombstone GC'd) is reaped. Assert the reap
+ * moves local_sv AND the doc digest in lockstep (never SV-equal/digest-different). */
+static void test_orphan_silences_reclaimed(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s;
+  char key[64];
+  uint32_t klen;
+  uint64_t d_before, d_after, sv_before, sv_after;
+  klen = mk_sil_key(key, "YAAAB", "*!*@x");
+  crdt_state_init(&s, 1);
+  /* silence present with NO user record -> the fully-gone state (user absent) */
+  crdt_silence_add(&s, "YAAAB", "*!*@x");
+  assert_true(crdt_orset_contains(&s.silences, key, klen));
+  d_before = crdt_state_digest(&s); sv_before = s.local_sv.seq[1];
+  assert_true(crdt_state_reclaim_orphan_silences(&s) >= 1);
+  d_after = crdt_state_digest(&s); sv_after = s.local_sv.seq[1];
+  assert_true(sv_after > sv_before);     /* a REMOVE op was minted (SV moved) */
+  assert_true(d_after != d_before);      /* the doc digest moved with it (lockstep) */
+  assert_false(crdt_orset_contains(&s.silences, key, klen));
+  crdt_state_clear(&s);
+}
+
+/* KEPT: a live user's silence is NOT reaped by the sweep. */
+static void test_orphan_silences_kept_while_user_live(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s;
+  struct CrdtUserRecord u;
+  char key[64];
+  uint32_t klen;
+  memset(&u, 0, sizeof u);
+  klen = mk_sil_key(key, "YAAAB", "*!*@x");
+  crdt_state_init(&s, 1);
+  crdt_user_set(&s, "YAAAB", &u);
+  crdt_silence_add(&s, "YAAAB", "*!*@x");
+  assert_int_equal(0, crdt_state_reclaim_orphan_silences(&s));
+  assert_true(crdt_orset_contains(&s.silences, key, klen));
+  crdt_state_clear(&s);
+}
+
+/* KEPT: while the user's delete-tombstone is still present (removal NOT yet causally
+ * stable, is_deleted()==1) the sweep must not act -- a lagging peer may not have seen
+ * the user yet; the LWW analog of the template's "kept while OR-Set tombstone present". */
+static void test_orphan_silences_kept_while_user_tombstone(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s;
+  struct CrdtUserRecord u;
+  char key[64];
+  uint32_t klen;
+  struct HLC hi = { 0xFFFFFFFFFFFFULL, 0, 1 };   /* far-future -> delete wins the set */
+  memset(&u, 0, sizeof u);
+  klen = mk_sil_key(key, "YAAAB", "*!*@x");
+  crdt_state_init(&s, 1);
+  crdt_user_set(&s, "YAAAB", &u);
+  crdt_silence_add(&s, "YAAAB", "*!*@x");
+  /* tombstone the user directly (op-less) so is_deleted()==1 but it is NOT GC'd */
+  crdt_lwwmap_delete(&s.users, "YAAAB", 5, hi, 1);
+  assert_true(crdt_lwwmap_is_deleted(&s.users, "YAAAB", 5));
+  assert_int_equal(0, crdt_state_reclaim_orphan_silences(&s));
+  assert_true(crdt_orset_contains(&s.silences, key, klen));
+  crdt_state_clear(&s);
+}
+
+/* BLEED REGRESSION (the important one): a P10 numeric YYXXX is reused by the SAME
+ * owning server after a client departs. Without the SYNCHRONOUS reap inside
+ * crdt_user_remove, the reused numeric would inherit the departed predecessor's masks
+ * (sync_user_silences keys purely on the numeric) and silently drop the new user's
+ * senders. The reap mints the silence REMOVE ops with seqs BEFORE any future user_set
+ * for the reused numeric (same origin, monotonic next_seq) -> every node applies the
+ * REMOVE before the reuse's user-SET -> the new user never inherits the mask. This
+ * case FAILS if the reap is moved out of crdt_user_remove to a sweep-only design. */
+static void test_silence_numeric_reuse_no_bleed(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s;
+  struct CrdtUserRecord u;
+  char key[64];
+  uint32_t klen;
+  memset(&u, 0, sizeof u);
+  klen = mk_sil_key(key, "YAAAB", "*!*@bad.example");
+  crdt_state_init(&s, 1);
+  /* original client on numeric YAAAB adds a silence, then departs */
+  crdt_user_set(&s, "YAAAB", &u);
+  crdt_silence_add(&s, "YAAAB", "*!*@bad.example");
+  assert_true(crdt_orset_contains(&s.silences, key, klen));   /* present while live */
+  crdt_user_remove(&s, "YAAAB");         /* synchronous targeted reap fires here */
+  /* the departed user's mask is tombstoned immediately -- BEFORE any reuse */
+  assert_false(crdt_orset_contains(&s.silences, key, klen));
+  /* the SAME server reuses the numeric for a fresh client */
+  crdt_user_set(&s, "YAAAB", &u);
+  /* the reused numeric does NOT inherit the predecessor's mask (bleed closed) */
+  assert_false(crdt_orset_contains(&s.silences, key, klen));
+  crdt_state_clear(&s);
+}
+
+/* MASK PARITY: an exception mask rides the doc in sil_docmask's '~'-prefixed form. The
+ * reap copies the mask bytes VERBATIM from the doc key (never re-canonicalizing), so a
+ * '~'-prefixed mask is tombstoned byte-identically -- crdt_silence_remove's
+ * silence_key() rebuilds the exact present key. This guards the design's flagged
+ * flip-flop risk: the reaped mask always matches the form the live mirror stored. */
+static void test_orphan_silences_reap_exception_mask(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s;
+  char key[64];
+  uint32_t klen;
+  klen = mk_sil_key(key, "YAAAB", "~*!*@safe.example");   /* '~' = BAN_EXCEPTION docmask */
+  crdt_state_init(&s, 1);
+  crdt_silence_add(&s, "YAAAB", "~*!*@safe.example");     /* no user record -> absent */
+  assert_true(crdt_orset_contains(&s.silences, key, klen));
+  assert_true(crdt_state_reclaim_orphan_silences(&s) >= 1);
+  assert_false(crdt_orset_contains(&s.silences, key, klen));
+  crdt_state_clear(&s);
+}
+
+/* ================================================================== */
 /* Fix A (digest-aware anti-entropy): the state vector counts ops per origin but
  * does NOT summarise content/HLC, so two replicas can share an SV yet hold
  * different content (e.g. a CR F snapshot HLC-merge or ctime incarnation change
@@ -2569,6 +2704,11 @@ int main(void)
     cmocka_unit_test(test_orphan_chan_meta_kept_while_live),
     cmocka_unit_test(test_orphan_chan_meta_kept_while_tombstone_present),
     cmocka_unit_test(test_orphan_chan_meta_kept_while_ctime_live),
+    cmocka_unit_test(test_orphan_silences_reclaimed),
+    cmocka_unit_test(test_orphan_silences_kept_while_user_live),
+    cmocka_unit_test(test_orphan_silences_kept_while_user_tombstone),
+    cmocka_unit_test(test_silence_numeric_reuse_no_bleed),
+    cmocka_unit_test(test_orphan_silences_reap_exception_mask),
     cmocka_unit_test(test_A_convergence),
     cmocka_unit_test(test_B_collision_different_user_oldest_wins),
     cmocka_unit_test(test_B_collision_same_user_newest_wins),

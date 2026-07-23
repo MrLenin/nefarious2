@@ -4895,6 +4895,15 @@ static void crdt_shadow_gc(void)
                 "CRDT GC: reclaimed %d orphan chan-meta entr(ies) (gone channels)",
                 orph);
   }
+  {
+    /* M9 backstop: departed-user silence masks the synchronous crdt_user_remove reap
+     * never saw (home SQUIT/crash with the user still live). */
+    int orph = crdt_state_reclaim_orphan_silences(&g_crdt);
+    if (orph > 0)
+      log_write(LS_SYSTEM, L_NOTICE, 0,
+                "CRDT GC: reclaimed %d orphan silence mask(s) (departed users)",
+                orph);
+  }
   freed = crdt_state_gc(&g_crdt, &gmin);
   if (freed > 0)
     log_write(LS_SYSTEM, L_NOTICE, 0,
