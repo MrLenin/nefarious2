@@ -29,7 +29,8 @@ CMOCKA_TESTPROGS = \
 	chathistory_presence_cmocka \
 	recv_classify_cmocka \
 	crdt_cmocka \
-	crdt_meshmap_cmocka
+	crdt_meshmap_cmocka \
+	crdt_wire_hardening_cmocka
 
 CMOCKA_LIBS = -lcmocka
 ZSTD_LIBS = -lzstd
@@ -54,6 +55,7 @@ DEP_SRC = \
 	recv_classify_cmocka.c \
 	crdt_cmocka.c \
 	crdt_meshmap_cmocka.c \
+	crdt_wire_hardening_cmocka.c \
 	test_stub.c
 
 all: ${TESTPROGS}
@@ -169,6 +171,12 @@ crdt_cmocka: $(CRDT_CMOCKA_OBJS)
 CRDT_MESHMAP_CMOCKA_OBJS = crdt_meshmap_cmocka.o test_stub.o ../crdt_meshmap.o
 crdt_meshmap_cmocka: $(CRDT_MESHMAP_CMOCKA_OBJS)
 	${CC} -o $@ $(LDFLAGS) $(CRDT_MESHMAP_CMOCKA_OBJS) $(CMOCKA_LIBS)
+
+# CRDT wire-trust-boundary hardening - malformed/hostile CR payloads must be
+# rejected without OOB indexing, NULL derefs, or unbounded reassembly growth.
+CRDT_WIRE_HARDENING_CMOCKA_OBJS = crdt_wire_hardening_cmocka.o test_stub.o ../crdt_types.o ../crdt_state.o ../crdt_hlc.o ../crdt_wire.o ../s2s_chunk.o
+crdt_wire_hardening_cmocka: $(CRDT_WIRE_HARDENING_CMOCKA_OBJS)
+	${CC} -o $@ $(LDFLAGS) $(CRDT_WIRE_HARDENING_CMOCKA_OBJS) $(CMOCKA_LIBS)
 
 .c.o:
 	${CC} ${CFLAGS} ${CPPFLAGS} -c $< -o $@
