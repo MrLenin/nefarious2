@@ -1416,13 +1416,18 @@ process_multiline_batch(struct Client *sptr)
          * would both silently drop.  Deliver the multiline per-line over CR-M to the
          * target user (full content; arrives as individual PRIVMSG/NOTICE on the leaf,
          * not a grouped batch — no loss, no dead-sink).  crdt_route_unicast_try is the
-         * same proven MR-1 unicast path PRIVMSG uses (alias-correct, msgid NULL-safe). */
+         * same proven MR-1 unicast path PRIVMSG uses (alias-correct, msgid NULL-safe).
+         * Mint a FRESH msgid per line (mirroring the channel CR-flood path below):
+         * each line is a distinct message-event, and the receiver's 90s CR-M msgid
+         * dedup would drop lines 2..N as duplicates if they shared one msgid. */
         for (lp = con_ml_messages(con); lp; lp = lp->next) {
           char *text = lp->value.cp + 1;
+          char line_msgid[S2S_MSGID_BUFSIZE];
           if (*text == '\0')
             continue;
+          generate_msgid(line_msgid, sizeof(line_msgid));
           crdt_route_unicast_try(sptr, is_notice ? 'N' : 'P', acptr,
-                                 batch_base_msgid, text);
+                                 line_msgid, text);
         }
       } else if (IsServer(target_server) && IsMultiline(target_server)) {
         /* Send ML tokens to capable server.
