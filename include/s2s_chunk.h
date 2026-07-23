@@ -21,6 +21,13 @@
 /** Max concurrent reassemblies across all links. */
 #define S2S_CHUNK_MAX 64
 
+/** Ceiling on one reassembled stream (bytes of base64 text).  The largest
+ *  legit payload is a full CR F snapshot: CR_SNAP_MAX (256 KiB raw) base64s
+ *  to ~350 KiB; 512 KiB leaves framing headroom while bounding what a peer
+ *  that never sends its final chunk can make us hold (64 slots x 512 KiB).
+ *  On exceed the transfer is aborted and its slot freed (feed returns -1). */
+#define S2S_CHUNK_MAX_LEN (512 * 1024)
+
 /** Feed one base64 chunk for (link, id). @a more != 0 means more chunks follow.
  *  On the final chunk (more == 0) the fully reassembled base64 is handed back
  *  via *out (malloc'd — caller frees) and *out_len, and the entry is consumed.

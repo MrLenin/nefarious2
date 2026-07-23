@@ -603,6 +603,20 @@ void crdt_gossip_beacon(void)
   crdt_gossip_beacon_to(NULL);
 }
 
+/* s2s_chunk_feed failure (reassembly cap exceeded / table full / alloc): the
+ * transfer is dropped; anti-entropy re-serves the state later.  Rate-limited —
+ * a hostile endless stream must not turn the abort itself into log flood. */
+static void crdt_chunk_feed_failed(struct Client *cptr, const char *id)
+{
+  static time_t last_warn;
+  if (CurrentTime == last_warn)
+    return;
+  last_warn = CurrentTime;
+  log_write(LS_SYSTEM, L_WARNING, 0,
+            "CRDT sync: chunk reassembly aborted (id %s from %s) — transfer dropped",
+            id, cli_name(cptr));
+}
+
 int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
 {
   const char *sub;
@@ -650,6 +664,8 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
       return 0;
     r = s2s_chunk_feed(cptr, parv[2], parv[parc - 1], parv[3][0] == '+',
                        &full, &flen);
+    if (r < 0)
+      crdt_chunk_feed_failed(cptr, parv[2]);
     if (r == 1) {
       uint8_t *bin = MyMalloc(flen ? flen : 1);
       int bn = crdt_b64_decode(full, bin, flen ? flen : 1);
@@ -707,6 +723,8 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
       return 0;
     r = s2s_chunk_feed(cptr, parv[2], parv[parc - 1], parv[3][0] == '+',
                        &full, &flen);
+    if (r < 0)
+      crdt_chunk_feed_failed(cptr, parv[2]);
     if (r == 1) {
       uint8_t *bin = MyMalloc(flen ? flen : 1);
       int bn = crdt_b64_decode(full, bin, flen ? flen : 1);

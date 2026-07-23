@@ -44,6 +44,10 @@ static struct chunk_entry *chunk_alloc(void *link, const char *id)
       e->id[sizeof e->id - 1] = '\0';
       e->alloc = 512;
       e->buf = malloc(e->alloc);
+      if (!e->buf) {
+        memset(e, 0, sizeof *e);
+        return NULL;
+      }
       e->buf[0] = '\0';
       e->len = 0;
       return e;
@@ -69,9 +73,26 @@ int s2s_chunk_feed(void *link, const char *id, const char *b64, int more,
       return -1;
   }
   add = strlen(b64);
+  /* Receive-side ceiling: the send side caps its payloads, but the receiver
+   * must not trust the peer to terminate — an endless "more follows" stream
+   * would otherwise grow the slot without bound.  Abort + free on exceed;
+   * the caller treats -1 as "drop this transfer". */
+  if (e->len + add + 1 > S2S_CHUNK_MAX_LEN) {
+    chunk_free(e);
+    return -1;
+  }
   if (e->len + add + 1 > e->alloc) {
-    e->alloc = (e->len + add + 1) * 2;
-    e->buf = realloc(e->buf, e->alloc);
+    size_t na = (e->len + add + 1) * 2;
+    char *nb;
+    if (na > S2S_CHUNK_MAX_LEN + 1)
+      na = S2S_CHUNK_MAX_LEN + 1;
+    nb = realloc(e->buf, na);
+    if (!nb) {                     /* never memcpy after a failed alloc */
+      chunk_free(e);
+      return -1;
+    }
+    e->buf = nb;
+    e->alloc = na;
   }
   memcpy(e->buf + e->len, b64, add + 1);   /* include the NUL */
   e->len += add;
