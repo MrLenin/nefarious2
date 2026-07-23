@@ -288,19 +288,26 @@ void crdt_chan_remove(struct CrdtNetworkState *st, const char *chan,
   uint32_t klen = (uint32_t)strlen(numeric);
   uint32_t clen = (uint32_t)strlen(chan);
   struct CrdtTag removed[64];
-  int n = crdt_orset_remove(&ch->members, numeric, klen, priority, removed, 64);
-  for (int i = 0; i < n; i++) {
-    uint64_t seq = st->next_seq++;
-    struct CrdtOp *op = op_new(st->my_numeric, seq, CRDT_OP_REMOVE,
-                               CRDT_COLL_CHAN_MEMBERS);
-    op->chan = memdup(chan, clen);
-    op->chan_len = clen;
-    op->key = memdup(numeric, klen);
-    op->key_len = klen;
-    op->tag = removed[i];
-    op->priority = priority;
-    record(st, op);
-  }
+  int n;
+  /* crdt_orset_remove reports at most 64 tags per call — loop until a short
+   * round so a member holding more add-tags (join churn) still fully removes
+   * AND every tombstoned tag gets its REMOVE op (an unreported removal never
+   * replicates -> divergence). */
+  do {
+    n = crdt_orset_remove(&ch->members, numeric, klen, priority, removed, 64);
+    for (int i = 0; i < n; i++) {
+      uint64_t seq = st->next_seq++;
+      struct CrdtOp *op = op_new(st->my_numeric, seq, CRDT_OP_REMOVE,
+                                 CRDT_COLL_CHAN_MEMBERS);
+      op->chan = memdup(chan, clen);
+      op->chan_len = clen;
+      op->key = memdup(numeric, klen);
+      op->key_len = klen;
+      op->tag = removed[i];
+      op->priority = priority;
+      record(st, op);
+    }
+  } while (n == 64);
 }
 
 /* Phase 3i: op-recording ban/except add/remove (mirrors crdt_chan_join/remove,
@@ -341,18 +348,21 @@ void crdt_chan_ban_remove(struct CrdtNetworkState *st, const char *chan,
   coll = is_except ? CRDT_COLL_CHAN_EXCEPTS : CRDT_COLL_CHAN_BANS;
   klen = (uint32_t)strlen(mask);
   clen = (uint32_t)strlen(chan);
-  n = crdt_orset_remove(set, mask, klen, priority, removed, 64);
-  for (i = 0; i < n; i++) {
-    uint64_t seq = st->next_seq++;
-    struct CrdtOp *op = op_new(st->my_numeric, seq, CRDT_OP_REMOVE, coll);
-    op->chan = memdup(chan, clen);
-    op->chan_len = clen;
-    op->key = memdup(mask, klen);
-    op->key_len = klen;
-    op->tag = removed[i];
-    op->priority = priority;
-    record(st, op);
-  }
+  /* loop until a short round — see crdt_chan_remove */
+  do {
+    n = crdt_orset_remove(set, mask, klen, priority, removed, 64);
+    for (i = 0; i < n; i++) {
+      uint64_t seq = st->next_seq++;
+      struct CrdtOp *op = op_new(st->my_numeric, seq, CRDT_OP_REMOVE, coll);
+      op->chan = memdup(chan, clen);
+      op->chan_len = clen;
+      op->key = memdup(mask, klen);
+      op->key_len = klen;
+      op->tag = removed[i];
+      op->priority = priority;
+      record(st, op);
+    }
+  } while (n == 64);
 }
 
 /* Tier C F1-c: per-user SILENCE OR-Set (global collection keyed usernumeric\0mask).
@@ -392,16 +402,19 @@ void crdt_silence_remove(struct CrdtNetworkState *st, const char *usernumeric,
   uint32_t klen = silence_key(key, usernumeric, mask);
   struct CrdtTag removed[64];
   int n, i;
-  n = crdt_orset_remove(&st->silences, key, klen, priority, removed, 64);
-  for (i = 0; i < n; i++) {
-    uint64_t seq = st->next_seq++;
-    struct CrdtOp *op = op_new(st->my_numeric, seq, CRDT_OP_REMOVE, CRDT_COLL_SILENCES);
-    op->key = memdup(key, klen);
-    op->key_len = klen;
-    op->tag = removed[i];
-    op->priority = priority;
-    record(st, op);
-  }
+  /* loop until a short round — see crdt_chan_remove */
+  do {
+    n = crdt_orset_remove(&st->silences, key, klen, priority, removed, 64);
+    for (i = 0; i < n; i++) {
+      uint64_t seq = st->next_seq++;
+      struct CrdtOp *op = op_new(st->my_numeric, seq, CRDT_OP_REMOVE, CRDT_COLL_SILENCES);
+      op->key = memdup(key, klen);
+      op->key_len = klen;
+      op->tag = removed[i];
+      op->priority = priority;
+      record(st, op);
+    }
+  } while (n == 64);
 }
 
 /* ------------------------------------------------------------------ */

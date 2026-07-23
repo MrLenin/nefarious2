@@ -285,10 +285,18 @@ static void test_chan_remove_beyond_cap_replicates(void **state)
 {
   (void)state;
   struct CrdtNetworkState s1, s2;
+  struct CrdtUserRecord u;
   int i;
 
   crdt_state_init(&s1, 1);
   crdt_state_init(&s2, 2);
+
+  /* the member must have a user record — visible_members filters on it */
+  memset(&u, 0, sizeof u);
+  strcpy(u.nick, "alice");
+  strcpy(u.ident, "alice");
+  u.server = 1;
+  crdt_user_set(&s1, "AAAAA", &u);
 
   /* 70 add-tags for one member (ban-list-churn shape: re-adds mint fresh tags) */
   for (i = 0; i < 70; i++)

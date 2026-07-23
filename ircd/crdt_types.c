@@ -240,11 +240,16 @@ int crdt_orset_remove(struct CrdtORSet *set, const char *key, uint32_t key_len,
   struct CrdtORSetEntry *e = orset_find(set, key, key_len);
   if (!e) return 0;
   int n = 0;
-  for (uint16_t i = 0; i < e->add_count; i++) {
+  /* Tombstone at most max_out uncovered tags per call so the returned count
+   * can never exceed the caller's out_tags[] (a count past the buffer made
+   * op-minting callers read stack garbage — and a removal that is tombstoned
+   * but never REPORTED mints no op, i.e. never replicates).  Callers loop
+   * until a short round; tomb_find skips the already-covered tags. */
+  for (uint16_t i = 0; i < e->add_count && n < max_out; i++) {
     struct CrdtTag t = e->add_tags[i];
     if (tomb_find(set, t)) continue;        /* already covered */
     tomb_put(set, t, priority);
-    if (out_tags && n < max_out) out_tags[n] = t;
+    if (out_tags) out_tags[n] = t;
     n++;
   }
   return n;

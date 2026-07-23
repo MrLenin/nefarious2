@@ -130,9 +130,13 @@ int crdt_orset_is_explicitly_removed(const struct CrdtORSet *set,
 void crdt_orset_add(struct CrdtORSet *set, const char *key, uint32_t key_len,
                     struct CrdtTag tag);
 
-/** Local remove: tombstone all current (uncovered) add-tags of key with the
- *  given priority. Writes the tombstoned tags into out_tags[] (up to max_out)
- *  so the caller can record remove ops in the oplog. Returns count tombstoned. */
+/** Local remove: tombstone up to @a max_out currently-uncovered add-tags of
+ *  key with the given priority, writing each into out_tags[] so the caller can
+ *  record remove ops in the oplog. Returns the count tombstoned THIS call —
+ *  always <= max_out, and every tombstoned tag is reported exactly once (an
+ *  unreported removal would never replicate). A key can hold more than max_out
+ *  tags: call in a loop until a short round (n < max_out) / 0. max_out must
+ *  be > 0. */
 int crdt_orset_remove(struct CrdtORSet *set, const char *key, uint32_t key_len,
                       uint8_t priority, struct CrdtTag *out_tags, int max_out);
 
