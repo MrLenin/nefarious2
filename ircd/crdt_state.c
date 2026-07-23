@@ -1552,11 +1552,19 @@ void crdt_state_apply_op(struct CrdtNetworkState *st, const struct CrdtOp *op)
     hlc_receive(&st->clock, &op->ts);            /* advance our clock */
   } else {
     struct CrdtLWWMap *map = lww_for(st, op->coll);
-    if (op->type == CRDT_OP_SET)
-      crdt_lwwmap_set(map, op->key, op->key_len, op->val, op->val_len,
-                      op->ts, op->writer);
-    else
-      crdt_lwwmap_delete(map, op->key, op->key_len, op->ts, op->writer);
+    /* unknown collection (an op from a NEWER peer): lww_for returns NULL —
+     * ignore the payload instead of derefing a NULL map, but still fall
+     * through to record + sv_update below so the op relays onward and the
+     * anti-entropy dedup never re-requests it (forward compat: a mixed-
+     * version mesh degrades gracefully).  Mirrors the snapshot decoder's
+     * if (map) guard. */
+    if (map) {
+      if (op->type == CRDT_OP_SET)
+        crdt_lwwmap_set(map, op->key, op->key_len, op->val, op->val_len,
+                        op->ts, op->writer);
+      else
+        crdt_lwwmap_delete(map, op->key, op->key_len, op->ts, op->writer);
+    }
     hlc_receive(&st->clock, &op->ts);        /* advance our clock */
   }
 
