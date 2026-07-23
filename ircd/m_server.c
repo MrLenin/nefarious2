@@ -42,6 +42,7 @@
 #include "numeric.h"
 #include "numnicks.h"
 #include "crdt_shadow.h"   /* Tier2 T2-a: retire a mesh stub on relink */
+#include "crdt_types.h"    /* CRDT_MAX_SERVERS (mr_crdtmesh numeric bound) */
 #include "querycmds.h"
 #include "s_bsd.h"
 #include "s_conf.h"
@@ -719,7 +720,15 @@ int mr_crdtmesh(struct Client* cptr, struct Client* sptr, int parc, char* parv[]
   host = clean_servername(parv[1]);
   if (!host)
     return exit_client_msg(cptr, cptr, &me, "Bogus server name (%s)", parv[1]);
-  if (EmptyString(parv[2]) || strlen(parv[2]) > 3)
+  /* Canonical server numerics are the 2-char base64 NumServ form, and every
+   * CR-plane slot array (state-vector seq[], crdt_beacon[], meshmap) is
+   * indexed [0, CRDT_MAX_SERVERS): a longer numeric decodes past that (3
+   * chars reach 262143) and would alias a REAL server's slot after the
+   * uint16 cast — SV corruption / beacon-liveness misjudgement.  A 3-char
+   * spelling also defeats the canonical-alias check below (FindNServer reads
+   * only the first char of a 3-char token).  Reject both at the handshake. */
+  if (EmptyString(parv[2]) || strlen(parv[2]) > 2 ||
+      base64toint(parv[2]) >= CRDT_MAX_SERVERS)
     return exit_client_msg(cptr, cptr, &me, "Bogus numeric (%s)", parv[2]);
 
   /* Did WE initiate this link?  completed_connection() set STAT_HANDSHAKE on the
