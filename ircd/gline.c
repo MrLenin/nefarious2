@@ -92,13 +92,30 @@ struct Gline* BadChanGlineList = 0;
 	/* Then see if it's expired */			\
 	(gl)->gl_lifetime <= TStime())                  \
       /* Record has expired, so free the G-line */	\
-      gline_free((gl));					\
+      gline_free_expired((gl));					\
     /* See if we need to expire the G-line */		\
     else if ((((gl)->gl_expire > TStime()) ||		\
 	      (((gl)->gl_flags &= ~GLINE_ACTIVE) && 0) ||	\
 	      ((gl)->gl_state = GLOCAL_GLOBAL)) && 0)	\
       ; /* empty statement */				\
     else
+
+/** Mint the doc tombstone, then free an expired G-line. Substituted for gline_free
+ * at the gliter expiry arm ONLY. Wall-clock lifetime expiry is terminal, so the GLINES
+ * doc + every CR F snapshot must not retain the record (the reconcile ADD pass never
+ * re-materializes an expired entry, so this is pure reclamation, not a resurrection --
+ * without it the doc/snapshots grow unbounded). Hooked at the expiry site rather than in
+ * gline_free because gline_free also runs on explicit removal (which already tombstones)
+ * and on doc-driven recreate, where a tombstone here would double-mint. &me is the source
+ * (no client at expiry); crdt_shadow_gline_remove self-skips for local G-lines and under
+ * the reconcile guard.
+ * @param[in] gline Expired G-line to tombstone and free.
+ */
+static void gline_free_expired(struct Gline *gline)
+{
+  crdt_shadow_gline_remove(gline, &me);
+  gline_free(gline);
+}
 
 /** Find canonical user and host for a string.
  * If \a userhost starts with '$', assign \a userhost to *user_p and NULL to *host_p.

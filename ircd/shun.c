@@ -89,13 +89,30 @@ struct Shun* GlobalShunList  = 0;
 	/* Then see if it's expired */			\
 	(sh)->sh_lifetime <= TStime())                  \
       /* Record has expired, so free the Shun */	\
-      shun_free((sh));					\
+      shun_free_expired((sh));					\
     /* See if we need to expire the Shun */		\
     else if ((((sh)->sh_expire > TStime()) ||		\
 	      (((sh)->sh_flags &= ~SHUN_ACTIVE) && 0) ||	\
 	      ((sh)->sh_state = SLOCAL_GLOBAL)) && 0)	\
       ; /* empty statement */				\
     else
+
+/** Mint the doc tombstone, then free an expired Shun. Substituted for shun_free at the
+ * shiter expiry arm ONLY. Wall-clock lifetime expiry is terminal, so the SHUNS doc +
+ * every CR F snapshot must not retain the record (the reconcile ADD pass never
+ * re-materializes an expired entry, so this is pure reclamation, not a resurrection --
+ * without it the doc/snapshots grow unbounded). Hooked at the expiry site rather than in
+ * shun_free because shun_free also runs on explicit removal (which already tombstones)
+ * and on doc-driven recreate, where a tombstone here would double-mint. &me is the source
+ * (no client at expiry); crdt_shadow_shun_remove self-skips for local Shuns and under the
+ * reconcile guard.
+ * @param[in] shun Expired Shun to tombstone and free.
+ */
+static void shun_free_expired(struct Shun *shun)
+{
+  crdt_shadow_shun_remove(shun, &me);
+  shun_free(shun);
+}
 
 /** Find canonical user and host for a string.
  * If \a userhost starts with '$', assign \a userhost to *user_p and NULL to *host_p.

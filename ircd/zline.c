@@ -90,13 +90,30 @@ struct Zline* GlobalZlineList  = 0;
 	/* Then see if it's expired */			\
 	(zl)->zl_lifetime <= TStime())                  \
       /* Record has expired, so free the Z-line */	\
-      zline_free((zl));					\
+      zline_free_expired((zl));					\
     /* See if we need to expire the Z-line */		\
     else if ((((zl)->zl_expire > TStime()) ||		\
 	      (((zl)->zl_flags &= ~ZLINE_ACTIVE) && 0) ||	\
 	      ((zl)->zl_state = ZLOCAL_GLOBAL)) && 0)	\
       ; /* empty statement */				\
     else
+
+/** Mint the doc tombstone, then free an expired Z-line. Substituted for zline_free at
+ * the zliter expiry arm ONLY. Wall-clock lifetime expiry is terminal, so the ZLINES doc +
+ * every CR F snapshot must not retain the record (the reconcile ADD pass never
+ * re-materializes an expired entry, so this is pure reclamation, not a resurrection --
+ * without it the doc/snapshots grow unbounded). Hooked at the expiry site rather than in
+ * zline_free because zline_free also runs on explicit removal (which already tombstones)
+ * and on doc-driven recreate, where a tombstone here would double-mint. &me is the source
+ * (no client at expiry); crdt_shadow_zline_remove self-skips for local Z-lines and under
+ * the reconcile guard.
+ * @param[in] zline Expired Z-line to tombstone and free.
+ */
+static void zline_free_expired(struct Zline *zline)
+{
+  crdt_shadow_zline_remove(zline, &me);
+  zline_free(zline);
+}
 
 /** Create a Zline structure.
  * @param[in] mask Mask.
