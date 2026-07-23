@@ -65,7 +65,12 @@ int crdt_delta_apply(struct CrdtNetworkState *st,
  *        [tomb_count:4] tomb*[tag.origin:2][tag.seq:8][priority:1]
  * apply merges it in (LWW adopt-if-newer, OR-Set union — so the receiver's own
  * newer/unsent state survives) and raises local_sv to the snapshot's SV.
- * encode returns bytes written or -1; apply returns 0 on success, -1 on error. */
+ * encode returns bytes written (>0) on success; on overflow (the document does
+ * not fit in @a cap) it returns a NEGATIVE value whose magnitude is the number
+ * of bytes the full snapshot needs, so the integration caller can warn with
+ * doc-size-vs-cap (crdt_wire stays pure — it never logs).  A caller that only
+ * cares about success/failure still tests the sign.  apply returns 0 on
+ * success, -1 on error. */
 int crdt_snapshot_encode(const struct CrdtNetworkState *st,
                          uint8_t *buf, size_t cap);
 int crdt_snapshot_apply(struct CrdtNetworkState *st,

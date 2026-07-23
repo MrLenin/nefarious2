@@ -94,6 +94,26 @@ static void send_crdt_delta(struct Client *to, const uint8_t *remote_sv,
   MyFree(delta);
 }
 
+/** The document does not fit in CR_SNAP_MAX, so no CR F snapshot can be built.
+ *  A peer below our gc_floor NEEDS a snapshot (the ops it lacks are GC'd, so a
+ *  delta is incomplete) — without it that peer stays permanently DIVERGENT.
+ *  Surface it as an operator warning instead of a silent drop.  Rate-limited:
+ *  anti-entropy re-attempts every cycle, so an uncorrectable overflow must not
+ *  turn into a log flood.  @a need is the byte count the full snapshot requires
+ *  (the magnitude the engine returned). */
+static void crdt_snapshot_overflow_warn(struct Client *to, size_t need)
+{
+  static time_t last_warn;
+  if (CurrentTime == last_warn)
+    return;
+  last_warn = CurrentTime;
+  log_write(LS_SYSTEM, L_WARNING, 0,
+            "CRDT sync: full snapshot for %s does not fit CR_SNAP_MAX "
+            "(doc needs %lu bytes, cap %d) — peer below gc_floor stays DIVERGENT; "
+            "raise CR_SNAP_MAX or chunk the snapshot",
+            cli_name(to), (unsigned long)need, CR_SNAP_MAX);
+}
+
 /** Encode the full document as a snapshot and send it as CR F chunks. Used
  *  when the peer has fallen behind the GC floor (a delta would be incomplete). */
 static void send_crdt_snapshot(struct Client *to)
@@ -107,6 +127,10 @@ static void send_crdt_snapshot(struct Client *to)
     if (bn > 0)
       send_crdt_chunks(to, 'F', b64, bn);
     MyFree(b64);
+  } else if (sn < 0 && crdt_shadow_active()) {
+    /* engine signalled encode overflow (magnitude = bytes needed); shadow_active
+     * implies g_inited, so a negative here is a real doc-too-big, not "CRDT off". */
+    crdt_snapshot_overflow_warn(to, (size_t)(-(long)sn));
   }
   MyFree(snap);
 }

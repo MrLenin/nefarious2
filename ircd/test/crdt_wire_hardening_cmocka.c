@@ -390,6 +390,52 @@ static void test_snapshot_truncation_clean(void **state)
 }
 
 /* ================================================================== */
+/* M4 — snapshot encode SIGNALS overflow (never a silent short-write) */
+/* ================================================================== */
+
+/* An oversized document must not encode to a partial/empty snapshot that the
+ * send path (m_crdt.c send_crdt_snapshot) ships or silently drops as if it were
+ * complete — a peer below the GC floor needs a COMPLETE CR F snapshot or it
+ * stays permanently divergent.  crdt_snapshot_encode therefore signals overflow
+ * with a NEGATIVE return whose magnitude is the bytes the full snapshot needs,
+ * so the integration caller can warn with doc-size-vs-cap (the engine detects;
+ * it never logs). */
+static void test_snapshot_encode_signals_overflow(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s1;
+  uint8_t *big = malloc(65536);
+  uint8_t small[512];
+  char key[24];
+  int i, nsmall, nbig;
+
+  assert_non_null(big);
+  crdt_state_init(&s1, 1);
+  /* enough entries that the encoded doc far exceeds the 512-byte small cap */
+  for (i = 0; i < 200; i++) {
+    snprintf(key, sizeof key, "USER%05d", i);
+    crdt_lwwmap_set(&s1.users, key, (uint32_t)strlen(key),
+                    "nick!ident@host.example", 23, mkhlc(1000 + (uint64_t)i, 0, 1), 1);
+  }
+
+  /* big cap: encodes cleanly -> positive byte count */
+  nbig = crdt_snapshot_encode(&s1, big, 65536);
+  assert_true(nbig > 0);
+
+  /* small cap: OVERFLOW -> must return the overflow status (negative), NOT a
+   * positive short-write and NOT 0 ("nothing to send"). */
+  nsmall = crdt_snapshot_encode(&s1, small, sizeof small);
+  assert_true(nsmall < 0);
+  /* magnitude == the true bytes-needed (the size that DID fit the big cap) and
+   * exceeds the small cap, so the caller can name doc-size vs. cap. */
+  assert_int_equal(-nsmall, nbig);
+  assert_true((size_t)(-nsmall) > sizeof small);
+
+  crdt_state_clear(&s1);
+  free(big);
+}
+
+/* ================================================================== */
 /* C4 — chunk reassembly must be bounded                              */
 /* ================================================================== */
 
@@ -506,6 +552,7 @@ int main(void)
     cmocka_unit_test(test_chan_remove_beyond_cap_replicates),
     cmocka_unit_test(test_op_and_delta_truncation_clean),
     cmocka_unit_test(test_snapshot_truncation_clean),
+    cmocka_unit_test(test_snapshot_encode_signals_overflow),
     cmocka_unit_test(test_chunk_large_stream_under_cap_completes),
     cmocka_unit_test(test_chunk_feed_caps_unterminated_stream),
     cmocka_unit_test(test_apply_op_unknown_coll_ignored),

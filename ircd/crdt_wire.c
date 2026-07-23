@@ -7,6 +7,7 @@
 
 #include "crdt_wire.h"
 
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -14,10 +15,15 @@
 /* big-endian write cursor                                            */
 /* ------------------------------------------------------------------ */
 
-struct wbuf { uint8_t *p; size_t cap; size_t off; int err; };
+/* @a need accumulates the total bytes the encode requires REGARDLESS of
+ * overflow, so an overflowing encoder (crdt_snapshot_encode) can report the
+ * document size vs. cap to its integration caller. @a off stops advancing once
+ * @a err is set; @a need does not. */
+struct wbuf { uint8_t *p; size_t cap; size_t off; int err; size_t need; };
 
 static void wput(struct wbuf *w, const void *src, size_t n)
 {
+  w->need += n;
   if (w->err || w->off + n > w->cap) { w->err = 1; return; }
   memcpy(w->p + w->off, src, n);
   w->off += n;
@@ -76,7 +82,7 @@ static void rget_blob(struct rbuf *r, void **out, size_t n)
 
 int crdt_sv_encode(const struct CrdtStateVector *sv, uint8_t *buf, size_t cap)
 {
-  struct wbuf w = { buf, cap, 0, 0 };
+  struct wbuf w = { buf, cap, 0, 0, 0 };
   uint16_t count = 0;
   int i;
   for (i = 0; i < CRDT_MAX_SERVERS; i++)
@@ -107,7 +113,7 @@ int crdt_sv_decode(struct CrdtStateVector *sv, const uint8_t *buf, size_t len)
 
 int crdt_op_encode(const struct CrdtOp *op, uint8_t *buf, size_t cap)
 {
-  struct wbuf w = { buf, cap, 0, 0 };
+  struct wbuf w = { buf, cap, 0, 0, 0 };
   wput_u16(&w, op->origin);
   wput_u64(&w, op->seq);
   wput_u8(&w, (uint8_t)op->type);
@@ -176,7 +182,7 @@ int crdt_delta_encode(const struct CrdtOpLog *log,
                       const struct CrdtStateVector *remote,
                       uint8_t *buf, size_t cap)
 {
-  struct wbuf w = { buf, cap, 0, 0 };
+  struct wbuf w = { buf, cap, 0, 0, 0 };
   struct CrdtOp *op;
   uint32_t count = 0;
   wput_u32(&w, 0);                 /* count placeholder at offset 0 */
@@ -293,7 +299,7 @@ static void snap_put_orset(struct wbuf *w, const struct CrdtORSet *s)
 int crdt_snapshot_encode(const struct CrdtNetworkState *st,
                          uint8_t *buf, size_t cap)
 {
-  struct wbuf w = { buf, cap, 0, 0 };
+  struct wbuf w = { buf, cap, 0, 0, 0 };
   size_t sv_off, lww_off, chan_off;
   uint32_t lww_total = 0, chan_n = 0;
   int svn, b;
@@ -305,6 +311,7 @@ int crdt_snapshot_encode(const struct CrdtNetworkState *st,
   svn = crdt_sv_encode(&st->local_sv, w.p + w.off, w.cap - w.off);
   if (svn < 0) return -1;
   w.off += (size_t)svn;
+  w.need += (size_t)svn;    /* SV body bypasses wput; count it for the overflow report */
   w.p[sv_off]     = (uint8_t)((unsigned)svn >> 8);
   w.p[sv_off + 1] = (uint8_t)svn;
 
@@ -367,7 +374,16 @@ int crdt_snapshot_encode(const struct CrdtNetworkState *st,
     wpatch_u32(&w, go_off, go_n);
   }
 
-  return w.err ? -1 : (int)w.off;
+  if (w.err) {
+    /* Overflow: the document does not fit in @a cap, so no CR F snapshot can be
+     * built.  Return a NEGATIVE value whose magnitude is the number of bytes the
+     * full snapshot needs, so the integration caller (m_crdt.c send_crdt_snapshot)
+     * can name doc-size-vs-cap in an operator warning rather than silently drop.
+     * The engine stays pure — it detects, it never logs.  Clamp the (astronomical,
+     * never-in-practice) >INT_MAX case so the magnitude survives the int return. */
+    return w.need > (size_t)INT_MAX ? -INT_MAX : -(int)w.need;
+  }
+  return (int)w.off;
 }
 
 /* Decode + merge one OR-Set. Returns 0 ok, -1 malformed. */
