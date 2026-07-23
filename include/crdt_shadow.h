@@ -311,11 +311,13 @@ void crdt_shadow_metadata_suspend(int on);
  *  FEAT_CRDT_ENABLED. */
 void crdt_shadow_gline_add(struct Gline *gline, struct Client *from);
 
-/** Global-state track (GLINE step 2): tombstone a global G-line in the doc (called
- *  before gline_free at the explicit-removal points — deactivate-that-frees /
- *  gline_remove). Same single-writer gate + local self-skip as crdt_shadow_gline_add.
- *  Expiry leaves the record (it carries its own lifetime; the materializer ignores
- *  expired). No-op unless FEAT_CRDT_ENABLED. */
+/** Global-state track (GLINE step 2): tombstone a global G-line in the doc. Called
+ *  before gline_free at the explicit-removal points (deactivate-that-frees /
+ *  gline_remove) AND from gline_free_expired at the wall-clock lifetime-expiry arm of
+ *  the gliter macro (M13: expiry is terminal, so the doc + CR F snapshots must not
+ *  retain the record; the reconcile ADD pass never re-materializes an expired entry).
+ *  Same single-writer gate + local self-skip as crdt_shadow_gline_add. No-op unless
+ *  FEAT_CRDT_ENABLED. */
 void crdt_shadow_gline_remove(struct Gline *gline, struct Client *from);
 
 /** SHUN (global-state track, GLINE sibling): mirror a global Shun into / tombstone it
