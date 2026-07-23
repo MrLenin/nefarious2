@@ -2438,10 +2438,17 @@ static void reconcile_gline_add_cb(const char *key, uint32_t key_len,
         !strcmp(existing->gl_reason ? existing->gl_reason : "", reason))
       return;                            /* materially in sync — echo guard (no churn) */
     /* doc is newer/different: drive the drift (active state + expire/lifetime/reason).
-     * Carry rec->lastmod (NOT TStime) so legacy ordering holds + no ping-pong (HQ1). */
+     * Carry rec->lastmod (NOT TStime) so legacy ordering holds + no ping-pong (HQ1),
+     * but force it past a same-second tie (M12): the gate at gline.c:812 rejects an
+     * EQUAL-lastmod modify as "already have that version" even though the content here
+     * differs (the echo guard above just proved it), so without the bump the doc-winner
+     * would never drive live -> churn + divergence. force_lastmod is only reached in
+     * this content-difference branch (not the create branch below). */
     gline_modify(&me, &me, existing,
                  active_doc ? GLINE_ACTIVATE : GLINE_DEACTIVATE, reason,
-                 (time_t)rec->expire, (time_t)rec->lastmod, (time_t)rec->lifetime,
+                 (time_t)rec->expire,
+                 force_lastmod(GlineLastMod(existing), (time_t)rec->lastmod),
+                 (time_t)rec->lifetime,
                  GLINE_EXPIRE | GLINE_LIFETIME | GLINE_REASON | GLINE_FORCE);
   } else {
     /* not live: materialize. GLINE_FORCE bypasses the expire-window check; the variant
@@ -2601,9 +2608,13 @@ static void reconcile_shun_add_cb(const char *key, uint32_t key_len,
         existing->sh_lifetime == (time_t)rec->lifetime &&
         !strcmp(existing->sh_reason ? existing->sh_reason : "", reason))
       return;                            /* materially in sync — echo guard */
+    /* M12: force lastmod past a same-second tie so shun.c:848's equal-lastmod gate
+     * can't reject this content-differing modify (mirror reconcile_gline_add_cb). */
     shun_modify(&me, &me, existing,
                 active_doc ? SHUN_ACTIVATE : SHUN_DEACTIVATE, reason,
-                (time_t)rec->expire, (time_t)rec->lastmod, (time_t)rec->lifetime,
+                (time_t)rec->expire,
+                force_lastmod(ShunLastMod(existing), (time_t)rec->lastmod),
+                (time_t)rec->lifetime,
                 SHUN_EXPIRE | SHUN_LIFETIME | SHUN_REASON | SHUN_FORCE);
   } else {
     shun_add(&me, &me, mask, reason, (time_t)rec->expire, (time_t)rec->lastmod,
@@ -2738,9 +2749,13 @@ static void reconcile_zline_add_cb(const char *key, uint32_t key_len,
         existing->zl_lifetime == (time_t)rec->lifetime &&
         !strcmp(existing->zl_reason ? existing->zl_reason : "", reason))
       return;                            /* materially in sync — echo guard */
+    /* M12: force lastmod past a same-second tie so zline.c:621's equal-lastmod gate
+     * can't reject this content-differing modify (mirror reconcile_gline_add_cb). */
     zline_modify(&me, &me, existing,
                  active_doc ? ZLINE_ACTIVATE : ZLINE_DEACTIVATE, reason,
-                 (time_t)rec->expire, (time_t)rec->lastmod, (time_t)rec->lifetime,
+                 (time_t)rec->expire,
+                 force_lastmod(ZlineLastMod(existing), (time_t)rec->lastmod),
+                 (time_t)rec->lifetime,
                  ZLINE_EXPIRE | ZLINE_LIFETIME | ZLINE_REASON | ZLINE_FORCE);
   } else {
     zline_add(&me, &me, mask, reason, (time_t)rec->expire, (time_t)rec->lastmod,

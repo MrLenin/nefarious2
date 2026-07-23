@@ -28,6 +28,7 @@
 #include "crdt_state.h"
 #include "crdt_wire.h"
 #include "s2s_chunk.h"
+#include "crdt_shadow.h"    /* M12: force_lastmod (static inline, pure) */
 
 /* ------------------------------------------------------------------ */
 /* helpers                                                            */
@@ -2253,6 +2254,66 @@ static void test_lww_tombstone_gc(void **state)
 }
 
 /* ================================================================== */
+/* M12 — same-second ban lastmod collision (Theme B).                        */
+/* The glines/shuns/zlines docs are HLC-LWW and converge deterministically   */
+/* even when two nodes set the same mask in the same wall-clock second       */
+/* (equal `lastmod`); the defect is downstream, at the legacy *_modify        */
+/* version gate the reconcile drives live (gline.c:812 & twins), which        */
+/* rejects an equal-lastmod modify as "already have that version". That live  */
+/* gate pulls in the whole gline subsystem + Client, so it is LIVE-only; here */
+/* we gate (a) the pure force_lastmod tie-breaker the reconcile now applies,  */
+/* and (b) that the doc itself converges (localizing the bug to the live      */
+/* drive, exactly as the M12 design argues).                                  */
+
+/* force_lastmod: doc ahead -> take the doc; tie or live-ahead -> one past live
+ * (break the tie toward the doc-winner so the equal-lastmod gate can't reject it). */
+static void test_force_lastmod_breaks_tie(void **state)
+{
+  (void)state;
+  assert_int_equal(101, (int)force_lastmod(100, 100));   /* tie       -> live + 1 */
+  assert_int_equal(200, (int)force_lastmod(100, 200));   /* doc ahead -> doc      */
+  assert_int_equal(201, (int)force_lastmod(200, 100));   /* live ahead-> live + 1 */
+}
+
+/* Doc-convergence: two nodes set the SAME mask in the same second with EQUAL
+ * lastmod but DIFFERENT reasons; after a cross-merge both replicas converge to one
+ * winning record (identical digest, identical winning reason), and the tie-inducing
+ * equal lastmod is preserved. Proves the doc is fine -> the churn the finding
+ * describes lives purely in the live gline_modify gate, not in the CRDT. */
+static void test_gline_doc_converges_same_lastmod(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s1, s2;
+  const char *M = "*!*@*.same-second.example";
+  uint32_t ml = (uint32_t)strlen(M);
+  struct CrdtGlineRecord ra, rb;
+  const struct CrdtLWWValue *v1, *v2;
+  const struct CrdtGlineRecord *w1, *w2;
+  crdt_state_init(&s1, 1);
+  crdt_state_init(&s2, 2);
+  memset(&ra, 0, sizeof ra);
+  ra.expire = 5000; ra.lastmod = 500; ra.lifetime = 9999; ra.flags = 1; ra.bits = 0;
+  strcpy(ra.reason, "reason-from-node-1");
+  memcpy(&rb, &ra, sizeof rb);          /* same mask, same lastmod, DIFFERENT reason */
+  strcpy(rb.reason, "reason-from-node-2");
+  crdt_gline_set(&s1, M, &ra);          /* node 1 sets its version */
+  crdt_gline_set(&s2, M, &rb);          /* node 2 sets its version, same second */
+  crdt_state_sync(&s2, &s1);            /* cross-merge both directions */
+  crdt_state_sync(&s1, &s2);
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));   /* converged */
+  v1 = crdt_lwwmap_get(&s1.glines, M, ml);
+  v2 = crdt_lwwmap_get(&s2.glines, M, ml);
+  assert_non_null(v1); assert_non_null(v2);
+  w1 = (const struct CrdtGlineRecord *)v1->data;
+  w2 = (const struct CrdtGlineRecord *)v2->data;
+  assert_string_equal(w1->reason, w2->reason);            /* same winner everywhere */
+  assert_int_equal((int)w1->lastmod, (int)w2->lastmod);
+  assert_int_equal(500, (int)w1->lastmod);                /* the tie-inducing lastmod */
+  crdt_state_clear(&s1);
+  crdt_state_clear(&s2);
+}
+
+/* ================================================================== */
 /* Orphan per-member metadata reclaim (members_status/kick_info for departed
  * members): the parallel LWW entries aren't tombstones, so the normal tombstone GC
  * never reclaims them — crdt_state_reclaim_orphan_member_meta mints DELETE ops for
@@ -2762,6 +2823,8 @@ int main(void)
     cmocka_unit_test(test_silence_op_replicates),
     cmocka_unit_test(test_marker_op_replicates),
     cmocka_unit_test(test_gline_op_replicates),
+    cmocka_unit_test(test_force_lastmod_breaks_tie),
+    cmocka_unit_test(test_gline_doc_converges_same_lastmod),
     cmocka_unit_test(test_metadata_op_replicates),
     cmocka_unit_test(test_bsess_op_replicates),
     cmocka_unit_test(test_bsess_winner),

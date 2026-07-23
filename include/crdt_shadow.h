@@ -29,6 +29,30 @@ struct Shun;
 struct Zline;
 struct Jupe;
 
+/*
+ * M12 (Theme-B, ban lastmod tie-break): when a CRDT reconcile drives a legacy ban
+ * (gline/shun/zline) whose doc-winning content differs from the live copy but whose
+ * @a lastmod EQUALS it, the legacy *_modify version gate treats the equal lastmod as
+ * "already have that version" and rejects the update (gline.c:812 / shun.c:848 /
+ * zline.c:621) — so the doc-winner never drives live and the reconcile churns +
+ * diverges. Break the tie toward the doc-winner: return the doc's lastmod when it
+ * already beats the live one, else force exactly one past the live one. This is the
+ * legacy make_gline force-increase pattern (gline.c:660-665) lifted to the reconcile,
+ * which has the doc's HLC total order behind it — so every node forces the SAME
+ * content and converges (the legacy-only equal-lastmod gate is deliberately left
+ * untouched: it prevents legacy<->legacy ping-pong that has no HLC tiebreak).
+ *
+ * Pure (no Client/CurrentTime dep); `static inline` in the header so the engine cmocka
+ * suite gates it directly. ONLY correct inside a reconcile's echo-guard content-
+ * DIFFERENCE branch (never the create branch, never on a content match — a bump with
+ * no real change would mint pointless live churn). See reconcile_{gline,shun,zline}_
+ * add_cb in crdt_shadow.c.
+ */
+static inline time_t force_lastmod(time_t live_lastmod, time_t doc_lastmod)
+{
+  return (doc_lastmod > live_lastmod) ? doc_lastmod : live_lastmod + 1;
+}
+
 /** Initialise the shadow CRDT document for this server and arm the periodic
  *  verify timer. Idempotent; safe to call once at startup. */
 void crdt_shadow_init(uint16_t my_numeric);
