@@ -220,10 +220,18 @@ extern int metadata_memory_del(struct Client *cptr, const char *key);
  * / metadata_memory_del — never metadata_set_client, which would re-write the
  * store and re-enter the doc mirror).  NO store write, NO doc op, NO umode
  * flag-sync (umode.* doc values can lag true flag state right after burst).
+ * Notify is vis-aware (Task 5, metadata-era2-completion §A6) — see
+ * metadata_notify_subscribers.
  * @param[in] account   Account the converged change applies to.
  * @param[in] key       Metadata key.
  * @param[in] value     STRIPPED value (visibility already decoded), or NULL to remove.
- * @param[in] visibility Decoded visibility (ignored when value==NULL; pass 0).
+ * @param[in] visibility Decoded visibility.  Sets the live entry's visibility
+ *                       when value!=NULL.  Also selects the notify's delivery
+ *                       scope when value==NULL (a remove doesn't otherwise use
+ *                       it) — pass the vis the removed row HAD if cheaply
+ *                       known, else METADATA_VIS_PUBLIC; a value-less unset
+ *                       carries no value, so only delivery breadth is at
+ *                       stake, never content.
  */
 extern void metadata_apply_converged(const char *account, const char *key,
                                      const char *value, int visibility);
@@ -410,18 +418,30 @@ extern void metadata_send_join_notifications(struct Client *joiner, struct Chann
 
 /** Notify local draft/metadata-2 subscribers of a metadata change on @a target.
  * Walks LocalClientArray and sends `:me METADATA <target> <key> * [:value]` to
- * each local client that (a) has CAP_DRAFT_METADATA2, (b) is subscribed to
- * @a key, and (c) can see @a target (shares a channel with / is the target user,
- * or is a member of the target channel).  LOCAL delivery only — no S2S emission.
- * Public-only today (callers gate on METADATA_VIS_PUBLIC); value==NULL/empty is
- * an unset notification.  Exposed for metadata_apply_converged (the doc
- * reconcile's notify half).
+ * each qualifying local client that has CAP_DRAFT_METADATA2 and is subscribed
+ * to @a key.  Recipient scoping depends on @a visibility:
+ *   - METADATA_VIS_PUBLIC: current behavior — the target user/channel itself,
+ *     or any local client sharing a channel with the target user (channel
+ *     targets: any member).
+ *   - METADATA_VIS_PRIVATE: ONLY the target's own subscribed sessions — for
+ *     an account-anchored target this means every LOCAL session authed to the
+ *     SAME account (bouncer aliases + any other concurrent login), not just
+ *     the specific nick @a target resolves to (aliases are removed from the
+ *     nick hash — see the bouncer-architecture skill).  An unauthenticated
+ *     target reduces to exact client identity (no multi-session concept).
+ *     Channel targets have no session "owner" (matches can_view_metadata():
+ *     a channel's private entries have owner==NULL) so nothing is sent.
+ * LOCAL delivery only — no S2S emission.  value==NULL/empty is an unset
+ * notification (wire form unchanged regardless of visibility — a value-less
+ * unset carries no value, so scoping is the only thing visibility affects).
+ * Exposed for metadata_apply_converged (the doc reconcile's notify half).
  * @param[in] target Nick or channel name the change applies to.
  * @param[in] key Metadata key that changed.
  * @param[in] value New value, or NULL/empty for an unset.
+ * @param[in] visibility METADATA_VIS_PUBLIC or METADATA_VIS_PRIVATE.
  */
 extern void metadata_notify_subscribers(const char *target, const char *key,
-                                        const char *value);
+                                        const char *value, int visibility);
 
 /* X3 dependency removed - Nefarious is now authoritative for metadata */
 

@@ -1230,7 +1230,7 @@ int metadata_memory_del(struct Client *cptr, const char *key)
  * caller.  For every LOCAL client authed to @a account (multiple per account is
  * normal — a bouncer session's aliases) the in-memory cli_metadata entry is
  * updated (value!=NULL) or removed (value==NULL) DIRECTLY, then the subscriber
- * notify fires once per network-visible session (nick-hash owner).
+ * notify fires.
  *
  * HARD RULES (A1 + the umode-mirror deferral, metadata-era2-completion §A1 /
  * "Known deferrals discovered in flight"):
@@ -1241,20 +1241,35 @@ int metadata_memory_del(struct Client *cptr, const char *key)
  *     flag state right after burst (the set_user_mode loop/post-loop +r split),
  *     so this touches only the cli_metadata VIEW, never FlagSet — the flags are
  *     authoritative and self-heal on the next toggle.
- *   - Notify matches the existing public-only semantics (the live SET / S2S
- *     apply paths gate on METADATA_VIS_PUBLIC today; Task 5 makes notify
- *     vis-aware).  A value-less delete carries visibility 0 (== PUBLIC) and so
- *     fires an unset notify.
+ *   - Notify is vis-aware (Task 5, metadata-era2-completion §A6).  PUBLIC
+ *     keeps the pre-Task-5 call shape: once per network-visible nick under
+ *     this account (the FindUser-resolves-to-self guard — a hidden bouncer
+ *     alias shares its primary's nick and would otherwise drive a
+ *     NULL-target notify, which skips the channel-share filter and
+ *     over-notifies; "one per nick" is correct for two independent logins of
+ *     the same account, each a distinct visible identity with its own
+ *     channel-mates).  PRIVATE has no per-nick scoping —
+ *     metadata_notify_subscribers fans out by ACCOUNT (every subscribed
+ *     self-session, aliases included), so a single call already reaches
+ *     every self-session no matter which live nick triggers it; call it at
+ *     most once per invocation to avoid redundant duplicate delivery to the
+ *     same self-sessions when an account has more than one live nick.
  *
  * @param[in] account   Account the converged change applies to.
  * @param[in] key       Metadata key.
  * @param[in] value     STRIPPED value (visibility already decoded), or NULL to remove.
- * @param[in] visibility Decoded visibility (ignored when value==NULL; pass 0).
+ * @param[in] visibility Decoded visibility.  Sets the live entry's visibility
+ *                       when value!=NULL.  Also selects the notify's delivery
+ *                       scope when value==NULL (a remove doesn't otherwise use
+ *                       it) — pass the vis the removed row HAD if cheaply
+ *                       known, else METADATA_VIS_PUBLIC; a value-less unset
+ *                       carries no value, so only delivery breadth is at
+ *                       stake, never content.
  */
 void metadata_apply_converged(const char *account, const char *key,
                               const char *value, int visibility)
 {
-  int notify_public = (visibility == METADATA_VIS_PUBLIC);
+  int notified = 0;
   int fd;
 
   if (!account || !*account || !key || !*key)
@@ -1275,12 +1290,19 @@ void metadata_apply_converged(const char *account, const char *key,
     else
       metadata_memory_del(acptr, key);
 
-    /* Notify subscribers about this session's nick, but only when this client
-     * is the nick-hash owner (FindUser resolves to it) — a hidden bouncer alias
-     * would otherwise drive a NULL-target notify, which skips the channel-share
-     * filter and over-notifies.  Public-only, matching the live SET path. */
-    if (notify_public && FindUser(cli_name(acptr)) == acptr)
-      metadata_notify_subscribers(cli_name(acptr), key, value);
+    if (visibility == METADATA_VIS_PUBLIC) {
+      /* Notify subscribers about this session's nick, but only when this
+       * client is the nick-hash owner (FindUser resolves to it) — see the
+       * function header for why. */
+      if (FindUser(cli_name(acptr)) == acptr)
+        metadata_notify_subscribers(cli_name(acptr), key, value, visibility);
+    } else if (!notified) {
+      /* PRIVATE fans out by account inside metadata_notify_subscribers, so
+       * one call (from whichever matching session we reach first) already
+       * covers every self-session — see the function header. */
+      metadata_notify_subscribers(cli_name(acptr), key, value, visibility);
+      notified = 1;
+    }
   }
 
   /* P2 adds the channel branch here (FindChannel(account) -> chptr->metadata

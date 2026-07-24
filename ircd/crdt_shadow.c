@@ -2402,7 +2402,9 @@ void crdt_shadow_reconcile_metadata(void)
       const char *k = d->keys[i];
       const char *nul = memchr(k, '\0', d->klens[i]);
       char account[ACCOUNTLEN + 1], mkey[METADATA_KEY_LEN + 1];
+      char oldval[METADATA_VALUE_LEN + 1];
       uint32_t al, kl;
+      int oldvis;
       if (!nul)
         continue;
       al = (uint32_t)(nul - k);
@@ -2411,6 +2413,15 @@ void crdt_shadow_reconcile_metadata(void)
         continue;
       memcpy(account, k, al); account[al] = '\0';
       memcpy(mkey, nul + 1, kl); mkey[kl] = '\0';
+      /* Read the row's visibility BEFORE the delete below removes it — cheap
+       * (one extra get on a row we're about to write anyway; pure read, no
+       * re-promotion) and lets the Task 5 notify scope a private key's
+       * removal to the owner's own sessions instead of the wider PUBLIC
+       * channel-share fan-out.  Default PUBLIC if the read misses (row
+       * already gone/expired) — a value-less unset carries no value, so the
+       * wider fan-out leaks no content either way, only delivery breadth. */
+      oldvis = METADATA_VIS_PUBLIC;
+      metadata_account_get_vis(account, mkey, oldval, sizeof oldval, &oldvis);
       if (metadata_account_set(account, mkey, NULL, METADATA_VIS_PUBLIC) == 0) { /* delete from store; vis ignored */
         removed++;
         /* Drop the reaped key from every local session's live cli_metadata and
@@ -2418,8 +2429,9 @@ void crdt_shadow_reconcile_metadata(void)
          * SAME tombstone guard as the store reap: the collector only enqueues
          * keys crdt_metadata_is_explicitly_removed reports (never mere absence),
          * so a merely-sync-lagging key is never de-materialized here.  memory +
-         * notify only — no store write, no doc op. */
-        metadata_apply_converged(account, mkey, NULL, 0);
+         * notify only — no store write, no doc op.  Vis-aware since Task 5: a
+         * private key's removal notifies only the owner's own sessions. */
+        metadata_apply_converged(account, mkey, NULL, oldvis);
       }
     }
     if (d->capped)
