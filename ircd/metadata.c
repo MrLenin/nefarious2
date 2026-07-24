@@ -49,6 +49,7 @@
 #include "crdt_shadow.h"   /* Tier C F2-b: mirror permanent account metadata into the doc */
 #include "msg.h"
 #include "numeric.h"
+#include "s_bsd.h"      /* LocalClientArray / HighestFd — metadata_apply_converged walk */
 #include "s_debug.h"
 #include "s_stats.h"
 #include "s_user.h"
@@ -328,37 +329,6 @@ void metadata_lmdb_shutdown(void)
 int metadata_lmdb_is_available(void)
 {
   return metadata_lmdb_available;
-}
-
-/** Decode the visibility prefix from a just-decoded (post-TTL-strip) row
- * value, per the class rule that metadata_account_set_ts encodes by:
- *   - server-managed keys are always stored bare -> read PRIVATE by rule.
- *   - a "P:" / "*:" prefix on any other row is authoritative for that row.
- *   - a bare non-exempt row is either legacy/pre-A2 data or a TTL-class
- *     public row (bare by design) -> reads PUBLIC.
- * @param[in] key Metadata key (used only for the server-managed check).
- * @param[in] decoded The post-TTL-strip value (NUL-terminated).
- * @param[out] stripped Set to the prefix-stripped value pointer (either
- *             @a decoded itself, or @a decoded + 2).
- * @return The decoded visibility.
- */
-static int metadata_decode_visibility(const char *key, char *decoded,
-                                      const char **stripped)
-{
-  if (metadata_key_is_server_managed(key)) {
-    *stripped = decoded;
-    return METADATA_VIS_PRIVATE;
-  }
-  if (decoded[0] == 'P' && decoded[1] == ':') {
-    *stripped = decoded + 2;
-    return METADATA_VIS_PRIVATE;
-  }
-  if (decoded[0] == '*' && decoded[1] == ':') {
-    *stripped = decoded + 2;
-    return METADATA_VIS_PUBLIC;
-  }
-  *stripped = decoded;
-  return METADATA_VIS_PUBLIC;
 }
 
 /** Get account metadata from LMDB, decoding the visibility prefix.
@@ -1072,6 +1042,43 @@ int metadata_sync(void) { return -1; }
 
 #endif /* USE_ROCKSDB */
 
+/** Decode the visibility prefix from a just-decoded (post-TTL-strip) store row
+ * value OR a CRDT doc value (both share this encoding), per the class rule that
+ * metadata_account_set_ts encodes by:
+ *   - server-managed keys are always stored/doc'd bare -> read PRIVATE by rule.
+ *   - a "P:" / "*:" prefix on any other value is authoritative.
+ *   - a bare non-exempt value is either legacy/pre-A2 data or a TTL-class
+ *     public row (bare by design) -> reads PUBLIC.
+ * The SINGLE decoder: metadata_account_get_vis (store read) AND
+ * reconcile_metadata_set_cb (doc split, crdt_shadow.c) both call it, so the
+ * reconcile echo-guard compares like against like.  Kept outside the
+ * USE_ROCKSDB block (no store deps — only the char prefix + the always-compiled
+ * metadata_key_is_server_managed) so it links in a no-backend build too.
+ * @param[in] key Metadata key (used only for the server-managed check).
+ * @param[in] decoded The value to decode (NUL-terminated).
+ * @param[out] stripped Set to the prefix-stripped value pointer (either
+ *             @a decoded itself, or @a decoded + 2).
+ * @return The decoded visibility.
+ */
+int metadata_decode_visibility(const char *key, char *decoded,
+                               const char **stripped)
+{
+  if (metadata_key_is_server_managed(key)) {
+    *stripped = decoded;
+    return METADATA_VIS_PRIVATE;
+  }
+  if (decoded[0] == 'P' && decoded[1] == ':') {
+    *stripped = decoded + 2;
+    return METADATA_VIS_PRIVATE;
+  }
+  if (decoded[0] == '*' && decoded[1] == ':') {
+    *stripped = decoded + 2;
+    return METADATA_VIS_PUBLIC;
+  }
+  *stripped = decoded;
+  return METADATA_VIS_PUBLIC;
+}
+
 /** Shutdown the metadata subsystem. */
 void metadata_shutdown(void)
 {
@@ -1185,6 +1192,99 @@ struct MetadataEntry *metadata_memory_put(struct Client *cptr, const char *key,
   }
 
   return entry;
+}
+
+/** Remove a client's in-memory metadata entry only — no store write, no doc
+ * mirror, no mode-flag sync.  The delete counterpart to metadata_memory_put:
+ * the doc reconcile (metadata_apply_converged) uses it to drop a
+ * converged-away key from live memory without re-entering the write chokepoint
+ * (metadata_set_client would delete the store row AND mint a doc tombstone —
+ * the reconcile caller already reaped the store under g_metadata_reconciling).
+ * @param[in] cptr Client whose in-memory cache loses the entry.
+ * @param[in] key Key name to remove.
+ * @return 1 if an entry was removed, 0 if none matched / bad args.
+ */
+int metadata_memory_del(struct Client *cptr, const char *key)
+{
+  struct MetadataEntry *entry, *prev = NULL;
+
+  if (!cptr || !key)
+    return 0;
+
+  for (entry = cli_metadata(cptr); entry; prev = entry, entry = entry->next) {
+    if (ircd_strcmp(entry->key, key) == 0) {
+      if (prev)
+        prev->next = entry->next;
+      else
+        cli_metadata(cptr) = entry->next;
+      metadata_free_entry(entry);
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/** Materialize a doc-converged account-metadata change into LIVE state, then
+ * notify subscribers.  The memory + notify half of the CRDT doc reconcile
+ * (crdt_shadow_reconcile_metadata) — the store half is already healed by the
+ * caller.  For every LOCAL client authed to @a account (multiple per account is
+ * normal — a bouncer session's aliases) the in-memory cli_metadata entry is
+ * updated (value!=NULL) or removed (value==NULL) DIRECTLY, then the subscriber
+ * notify fires once per network-visible session (nick-hash owner).
+ *
+ * HARD RULES (A1 + the umode-mirror deferral, metadata-era2-completion §A1 /
+ * "Known deferrals discovered in flight"):
+ *   - NO store write, NO doc op: memory + notify only.  It must NOT call
+ *     metadata_set_client (store re-write + doc re-entry) — hence
+ *     metadata_memory_put / metadata_memory_del.
+ *   - NO umode flag-sync from doc values: a "umode.*" doc value can lag true
+ *     flag state right after burst (the set_user_mode loop/post-loop +r split),
+ *     so this touches only the cli_metadata VIEW, never FlagSet — the flags are
+ *     authoritative and self-heal on the next toggle.
+ *   - Notify matches the existing public-only semantics (the live SET / S2S
+ *     apply paths gate on METADATA_VIS_PUBLIC today; Task 5 makes notify
+ *     vis-aware).  A value-less delete carries visibility 0 (== PUBLIC) and so
+ *     fires an unset notify.
+ *
+ * @param[in] account   Account the converged change applies to.
+ * @param[in] key       Metadata key.
+ * @param[in] value     STRIPPED value (visibility already decoded), or NULL to remove.
+ * @param[in] visibility Decoded visibility (ignored when value==NULL; pass 0).
+ */
+void metadata_apply_converged(const char *account, const char *key,
+                              const char *value, int visibility)
+{
+  int notify_public = (visibility == METADATA_VIS_PUBLIC);
+  int fd;
+
+  if (!account || !*account || !key || !*key)
+    return;
+
+  /* User branch: walk every LOCAL client authed to this account.
+   * LocalClientArray holds only MyConnect clients, so this never emits S2S —
+   * live memory + local subscriber notify only. */
+  for (fd = HighestFd; fd >= 0; --fd) {
+    struct Client *acptr = LocalClientArray[fd];
+    if (!acptr || !IsUser(acptr) || !IsAccount(acptr))
+      continue;
+    if (0 != ircd_strcmp(cli_account(acptr), account))
+      continue;
+
+    if (value)
+      metadata_memory_put(acptr, key, value, visibility);
+    else
+      metadata_memory_del(acptr, key);
+
+    /* Notify subscribers about this session's nick, but only when this client
+     * is the nick-hash owner (FindUser resolves to it) — a hidden bouncer alias
+     * would otherwise drive a NULL-target notify, which skips the channel-share
+     * filter and over-notifies.  Public-only, matching the live SET path. */
+    if (notify_public && FindUser(cli_name(acptr)) == acptr)
+      metadata_notify_subscribers(cli_name(acptr), key, value);
+  }
+
+  /* P2 adds the channel branch here (FindChannel(account) -> chptr->metadata
+   * update + notify) — see metadata-era2-completion §B4. */
 }
 
 /** Get metadata for a client.
@@ -1355,13 +1455,17 @@ int metadata_set_client(struct Client *cptr, const char *key, const char *value,
   if (value) {
     /* Set or update */
     if (entry) {
-      /* Update existing */
+      /* Update existing — malloc-check-then-swap (T2 review rider): allocate
+       * and copy the new value FIRST, and only then free the old and swap, so
+       * an allocation failure leaves entry->value intact rather than dangling.
+       * Mirrors metadata_memory_put's ordering. */
+      char *newval = (char *)MyMalloc(strlen(value) + 1);
+      if (!newval)
+        return -1;
+      strcpy(newval, value);
       if (entry->value)
         MyFree(entry->value);
-      entry->value = (char *)MyMalloc(strlen(value) + 1);
-      if (!entry->value)
-        return -1;
-      strcpy(entry->value, value);
+      entry->value = newval;
       entry->visibility = visibility;
     } else {
       /* Create new */
@@ -1634,13 +1738,17 @@ int metadata_set_channel(struct Channel *chptr, const char *key, const char *val
   if (value) {
     /* Set or update */
     if (entry) {
-      /* Update existing */
+      /* Update existing — malloc-check-then-swap (T2 review rider): allocate
+       * and copy the new value FIRST, then free the old and swap, so an
+       * allocation failure leaves entry->value intact rather than dangling.
+       * Mirrors metadata_memory_put's ordering. */
+      char *newval = (char *)MyMalloc(strlen(value) + 1);
+      if (!newval)
+        return -1;
+      strcpy(newval, value);
       if (entry->value)
         MyFree(entry->value);
-      entry->value = (char *)MyMalloc(strlen(value) + 1);
-      if (!entry->value)
-        return -1;
-      strcpy(entry->value, value);
+      entry->value = newval;
       entry->visibility = visibility;
     } else {
       /* Create new */

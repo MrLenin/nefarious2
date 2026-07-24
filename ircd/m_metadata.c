@@ -65,7 +65,8 @@ static int metadata_cmd_sub(struct Client *sptr, int parc, char *parv[]);
 static int metadata_cmd_unsub(struct Client *sptr, int parc, char *parv[]);
 static int metadata_cmd_subs(struct Client *sptr, int parc, char *parv[]);
 static int metadata_cmd_sync(struct Client *sptr, int parc, char *parv[]);
-static void notify_subscribers(const char *target, const char *key, const char *value);
+/* metadata_notify_subscribers (declared in metadata.h) is defined below and
+ * exposed for metadata_apply_converged (the CRDT doc-reconcile notify half). */
 
 /** Check if key is valid per IRCv3 spec (letters, digits, hyphens, underscores, dots, forward slashes)
  * and doesn't start with a digit.
@@ -177,7 +178,7 @@ static int shares_channel(struct Client *a, struct Client *b)
   return 0;
 }
 
-static void notify_subscribers(const char *target, const char *key, const char *value)
+void metadata_notify_subscribers(const char *target, const char *key, const char *value)
 {
   struct Client *acptr;
   struct Client *target_cli = NULL;
@@ -819,7 +820,7 @@ static int metadata_cmd_set(struct Client *sptr, int parc, char *parv[])
 
   /* Notify local subscribers (only for public metadata) */
   if (visibility == METADATA_VIS_PUBLIC) {
-    notify_subscribers(wire_target, key, value);
+    metadata_notify_subscribers(wire_target, key, value);
   }
 
   /* Propagate to other servers with visibility */
@@ -1379,7 +1380,7 @@ int ms_metadata(struct Client *cptr, struct Client *sptr, int parc, char *parv[]
 
   /* Notify local subscribers (only for public metadata) */
   if (visibility == METADATA_VIS_PUBLIC) {
-    notify_subscribers(target, key, value);
+    metadata_notify_subscribers(target, key, value);
   }
 
   /* Propagate to other servers */

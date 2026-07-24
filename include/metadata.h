@@ -201,6 +201,33 @@ extern int metadata_set_client(struct Client *cptr, const char *key, const char 
 extern struct MetadataEntry *metadata_memory_put(struct Client *cptr, const char *key,
                                                   const char *value, int visibility);
 
+/** Remove a client's in-memory metadata entry only — no store write, no doc
+ * mirror, no mode-flag sync.  The delete counterpart to metadata_memory_put,
+ * used by the doc reconcile (metadata_apply_converged) to drop a
+ * converged-away key from live memory without re-entering the write chokepoint.
+ * @param[in] cptr Client whose in-memory cache loses the entry.
+ * @param[in] key Key name to remove.
+ * @return 1 if an entry was removed, 0 if none matched / bad args.
+ */
+extern int metadata_memory_del(struct Client *cptr, const char *key);
+
+/** Materialize a doc-converged account-metadata change into LIVE state, then
+ * fire subscriber notifies — the memory + notify half of the CRDT doc reconcile
+ * (crdt_shadow_reconcile_metadata); the store half is already healed by the
+ * caller.  For every LOCAL client authed to @a account (multiple per account is
+ * normal — bouncer sessions/aliases) the in-memory cli_metadata entry is
+ * updated (value!=NULL) or removed (value==NULL) directly (metadata_memory_put
+ * / metadata_memory_del — never metadata_set_client, which would re-write the
+ * store and re-enter the doc mirror).  NO store write, NO doc op, NO umode
+ * flag-sync (umode.* doc values can lag true flag state right after burst).
+ * @param[in] account   Account the converged change applies to.
+ * @param[in] key       Metadata key.
+ * @param[in] value     STRIPPED value (visibility already decoded), or NULL to remove.
+ * @param[in] visibility Decoded visibility (ignored when value==NULL; pass 0).
+ */
+extern void metadata_apply_converged(const char *account, const char *key,
+                                     const char *value, int visibility);
+
 /** List all metadata for a client.
  * @param[in] cptr Client to list metadata for.
  * @return Head of metadata list (read-only).
@@ -288,6 +315,23 @@ extern int metadata_account_count_keys(const char *account);
  */
 extern int metadata_key_is_server_managed(const char *key);
 
+/** Decode the visibility prefix from a post-TTL-strip store value OR a doc
+ * value, per the class rule metadata_account_set_ts encodes by: server-managed
+ * keys are stored/doc'd bare -> PRIVATE by rule; a leading "P:" -> PRIVATE,
+ * "*:" -> PUBLIC, and a bare non-exempt value -> PUBLIC (legacy / TTL-public).
+ * This is the SINGLE decoder shared by the store read path
+ * (metadata_account_get_vis) and the CRDT doc reconcile split
+ * (crdt_shadow reconcile_metadata_set_cb) — keep it one implementation so the
+ * reconcile echo-guard (get_vis output vs split doc value) stays byte-exact.
+ * @param[in] key Metadata key (used only for the server-managed check).
+ * @param[in] decoded The value to decode (NUL-terminated).
+ * @param[out] stripped Set to the prefix-stripped value pointer (points into
+ *             @a decoded — either @a decoded itself or @a decoded + 2).
+ * @return The decoded visibility (METADATA_VIS_PUBLIC / METADATA_VIS_PRIVATE).
+ */
+extern int metadata_decode_visibility(const char *key, char *decoded,
+                                      const char **stripped);
+
 /** Check if a viewer can see a metadata entry.
  * @param[in] viewer Client viewing the metadata.
  * @param[in] owner Client owning the metadata (NULL for channel metadata).
@@ -363,6 +407,21 @@ extern void metadata_sub_free(struct Client *cptr);
  * @param[in] chptr Channel being joined.
  */
 extern void metadata_send_join_notifications(struct Client *joiner, struct Channel *chptr);
+
+/** Notify local draft/metadata-2 subscribers of a metadata change on @a target.
+ * Walks LocalClientArray and sends `:me METADATA <target> <key> * [:value]` to
+ * each local client that (a) has CAP_DRAFT_METADATA2, (b) is subscribed to
+ * @a key, and (c) can see @a target (shares a channel with / is the target user,
+ * or is a member of the target channel).  LOCAL delivery only — no S2S emission.
+ * Public-only today (callers gate on METADATA_VIS_PUBLIC); value==NULL/empty is
+ * an unset notification.  Exposed for metadata_apply_converged (the doc
+ * reconcile's notify half).
+ * @param[in] target Nick or channel name the change applies to.
+ * @param[in] key Metadata key that changed.
+ * @param[in] value New value, or NULL/empty for an unset.
+ */
+extern void metadata_notify_subscribers(const char *target, const char *key,
+                                        const char *value);
 
 /* X3 dependency removed - Nefarious is now authoritative for metadata */
 

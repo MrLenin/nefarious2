@@ -2312,10 +2312,11 @@ static void reconcile_metadata_set_cb(const char *key, uint32_t key_len,
                                       const struct CrdtLWWValue *val, void *ctx)
 {
   struct reconcile_metadata_ctx *c = ctx;
-  const char *nul;
+  const char *nul, *docraw;
   char account[ACCOUNTLEN + 1], mkey[METADATA_KEY_LEN + 1];
   char cur[METADATA_VALUE_LEN + 1], docval[METADATA_VALUE_LEN + 1];
   uint32_t al, kl;
+  int docvis, curvis;
   if (!val || !val->data || !val->data_len || val->data_len > METADATA_VALUE_LEN)
     return;
   nul = memchr(key, '\0', key_len);          /* key = account\0metakey (opaque split) */
@@ -2328,19 +2329,30 @@ static void reconcile_metadata_set_cb(const char *key, uint32_t key_len,
   memcpy(account, key, al); account[al] = '\0';
   memcpy(mkey, nul + 1, kl); mkey[kl] = '\0';
   memcpy(docval, val->data, val->data_len); docval[val->data_len] = '\0';
-  /* echo guard: skip if the store already holds exactly this value */
-  if (metadata_account_get(account, mkey, cur) == 0 &&
-      strlen(cur) == val->data_len && memcmp(cur, docval, val->data_len) == 0)
+  /* A2 split: the doc value is the SAME vis-prefixed buffer set_ts wrote to the
+   * store (only permanent rows reach the doc), so decode it with the single
+   * store-side decoder — server-managed keys are bare/PRIVATE-by-rule, else
+   * "P:"->PRIVATE, "*:"->PUBLIC, bare->PUBLIC (legacy).  docraw points into
+   * docval, which stays alive for this whole callback. */
+  docvis = metadata_decode_visibility(mkey, docval, &docraw);
+  /* Vis-aware echo guard: get_vis returns the STRIPPED store value + its decoded
+   * vis; compare BOTH against the split doc value.  The pre-A2 guard compared the
+   * stripped store value against the still-prefixed docval, which mismatches every
+   * private row and re-writes it each 30s tick — split first, then compare. */
+  if (metadata_account_get_vis(account, mkey, cur, sizeof cur, &curvis) == 0 &&
+      curvis == docvis && strcmp(cur, docraw) == 0)
     return;
-  /* TEMPORARY SHIM (A2/Task 1): docval is now the vis-prefixed doc buffer
-   * (set_ts prefixes every non-exempt permanent value before mirroring), but
-   * this call passes it straight through with a fixed METADATA_VIS_PUBLIC —
-   * set_ts will re-prefix an already-prefixed private value ("P:" -> "*:P:").
-   * Task 4 splits the prefixed docval into (vis, raw) before this call and
-   * fixes the echo guard above to compare vis-aware. Do not treat this as
-   * done. */
-  if (metadata_account_set_permanent(account, mkey, docval, METADATA_VIS_PUBLIC) == 0)
+  /* Heal the store with the decoded (raw, vis); set_ts re-encodes the prefix and
+   * self-skips its doc mirror (g_metadata_reconciling).  On a REAL store change
+   * ONLY (we are past the echo guard), materialize the converged value into every
+   * local session's live cli_metadata and fire subscriber notifies — the doc-only
+   * delivery half that closes the M8 staleness class.  apply_converged is memory +
+   * notify only (no store write, no doc op, no umode flag-sync) so it cannot
+   * re-enter set_ts / the doc mirror. */
+  if (metadata_account_set_permanent(account, mkey, docraw, docvis) == 0) {
     c->applied++;
+    metadata_apply_converged(account, mkey, docraw, docvis);
+  }
 }
 
 /* DELETE store-walk: collect metadata_cf keys the doc has EXPLICITLY tombstoned
@@ -2399,8 +2411,16 @@ void crdt_shadow_reconcile_metadata(void)
         continue;
       memcpy(account, k, al); account[al] = '\0';
       memcpy(mkey, nul + 1, kl); mkey[kl] = '\0';
-      if (metadata_account_set(account, mkey, NULL, METADATA_VIS_PUBLIC) == 0)   /* delete from store; vis ignored */
+      if (metadata_account_set(account, mkey, NULL, METADATA_VIS_PUBLIC) == 0) { /* delete from store; vis ignored */
         removed++;
+        /* Drop the reaped key from every local session's live cli_metadata and
+         * notify (value=NULL => memory remove + unset notify).  This rides the
+         * SAME tombstone guard as the store reap: the collector only enqueues
+         * keys crdt_metadata_is_explicitly_removed reports (never mere absence),
+         * so a merely-sync-lagging key is never de-materialized here.  memory +
+         * notify only — no store write, no doc op. */
+        metadata_apply_converged(account, mkey, NULL, 0);
+      }
     }
     if (d->capped)
       log_write(LS_SYSTEM, L_DEBUG, 0,
@@ -3924,6 +3944,20 @@ void crdt_shadow_materialize_live(void)
     log_write(LS_SYSTEM, L_NOTICE, 0,
               "CRDT materialize: created %u user(s), %u channel(s) from doc",
               created, chans);
+
+  /* A1/F2-b (+ F2-a rider): drive the doc's account metadata and read-markers
+   * into the local store/memory HERE, not only on the 30s verify tick.
+   * materialize_live is the CR F snapshot apply path (m_crdt.c: the BURST
+   * replacement for a joining CRDT-primary peer), which otherwise left permanent
+   * account metadata + read-markers sitting in the doc for up to a full verify
+   * cycle before they reached metadata_cf / readmarkers_cf and live cli_metadata
+   * (the post-CR-F snapshot latency).  Both reconciles are idempotent +
+   * echo-guarded, so the second run on the verify path (materialize_live runs
+   * here gated !bursting, then reconcile_markers/reconcile_metadata run again a
+   * few lines later) is a cheap no-op.  Each sets its own reconciling flag
+   * internally, so no store write re-enters the doc mirror. */
+  crdt_shadow_reconcile_markers();
+  crdt_shadow_reconcile_metadata();
 }
 
 /* ---- Phase 3l: USER introduce + steady-state CREATE via CRDT (+ §17.7 gateway) ----
