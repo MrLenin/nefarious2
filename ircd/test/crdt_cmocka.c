@@ -15,6 +15,8 @@
  * against just those objects + crdt_hlc.o + test_stub.o (for log_write).
  */
 
+#include "config.h"           /* DEBUGMODE gate — drives the fake-clock case below */
+
 #include <stdarg.h>
 #include <stddef.h>
 #include <setjmp.h>
@@ -466,6 +468,31 @@ static void test_marker_op_replicates(void **state)
   crdt_state_clear(&s2);
   crdt_state_clear(&s3);
 }
+
+#ifdef DEBUGMODE
+/* Timing-race harness hook: the DEBUG-only ircd_fake_clock_offset shifts the
+ * single HLC wall-clock chokepoint (hlc_wall_clock_ms) by offset*1000 ms.  Proves
+ * the hook wiring end to end.  This whole case compiles OUT in a release build,
+ * where the symbol does not exist (the airtight-gating proof, in unit form). */
+static void test_hlc_fake_clock_offset(void **state)
+{
+  (void)state;
+  uint64_t base, shifted;
+  int64_t delta;
+
+  ircd_fake_clock_offset = 0;
+  base = hlc_wall_clock_ms();
+  ircd_fake_clock_offset = 3600;            /* +1h */
+  shifted = hlc_wall_clock_ms();
+  ircd_fake_clock_offset = 0;               /* reset so it can't leak into later cases */
+
+  /* shifted is ~3600000 ms above base, allowing a little real elapsed time
+   * between the two reads (never below the offset, never wildly beyond it). */
+  delta = (int64_t)shifted - (int64_t)base;
+  assert_true(delta >= 3600000);
+  assert_true(delta <  3600000 + 60000);    /* < +1 min of slack */
+}
+#endif /* DEBUGMODE */
 
 /* ================================================================== */
 /* M11: channel topic — MAX-register on topic_time (legacy P10 order), NOT a naked
@@ -3318,6 +3345,9 @@ int main(void)
     cmocka_unit_test(test_chan_ban_op_replicates),
     cmocka_unit_test(test_silence_op_replicates),
     cmocka_unit_test(test_marker_op_replicates),
+#ifdef DEBUGMODE
+    cmocka_unit_test(test_hlc_fake_clock_offset),
+#endif
     cmocka_unit_test(test_topic_skew_topic_time_beats_later_hlc),
     cmocka_unit_test(test_topic_same_second_tiebreak_deterministic),
     cmocka_unit_test(test_topic_digest_lockstep_value_only),

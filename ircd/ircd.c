@@ -1079,7 +1079,11 @@ static int set_userid_if_needed(void) {
  * @param[in] argv Arguments to program execution.
  */
 int main(int argc, char **argv) {
+#ifdef DEBUGMODE
+  CurrentTime = time(NULL) + ircd_fake_clock_offset;  /* harness skew (0 until env read below) */
+#else
   CurrentTime = time(NULL);
+#endif
 
   thisServer.argc = argc;
   thisServer.argv = argv;
@@ -1236,7 +1240,29 @@ int main(int argc, char **argv) {
    * design intent #135 + #254 (one face per session toward legacy). */
   timer_add(timer_init(&bouncer_gate_timer),
             bounce_legacy_burst_gate_callback, 0, TT_PERIODIC, 1);
+
+#ifdef DEBUGMODE
+  /* Timing-race test harness (DEBUG builds only): read a static per-node
+   * wall-clock offset from the environment and apply it at both wall-clock
+   * chokepoints (hlc_wall_clock_ms + every CurrentTime assignment).  Logging is
+   * up by here and the mesh has not started (hlc_init / crdt_shadow_init /
+   * MsgIdCounter seed all follow), so the offset is in force before the first
+   * clock value the mesh observes.  A LOUD warning makes it impossible to be
+   * silently active.  Compiled OUT entirely in a release build. */
+  {
+    const char *fco = getenv("IRCD_FAKE_CLOCK_OFFSET");
+    if (fco && *fco) {
+      ircd_fake_clock_offset = (time_t)atoi(fco);
+      if (ircd_fake_clock_offset)
+        log_write(LS_SYSTEM, L_WARNING, 0,
+                  "*** FAKE CLOCK OFFSET %+ld s ACTIVE (IRCD_FAKE_CLOCK_OFFSET) "
+                  "-- DEBUG BUILD ONLY ***", (long)ircd_fake_clock_offset);
+    }
+  }
+  CurrentTime = time(NULL) + ircd_fake_clock_offset;
+#else
   CurrentTime = time(NULL);
+#endif
 
   SetMe(&me);
   cli_magic(&me) = CLIENT_MAGIC;

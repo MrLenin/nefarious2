@@ -26,6 +26,7 @@
 #include "config.h"
 
 #include "client.h"
+#include "crdt_hlc.h"
 #include "crdt_meshmap.h"
 #include "crdt_shadow.h"
 #include "handlers.h"
@@ -39,6 +40,7 @@
 #include "struct.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* --- helpers ---------------------------------------------------------- */
@@ -274,7 +276,10 @@ static void render_route(struct Client *to)
 /* --- handler ---------------------------------------------------------- */
 
 /** mo_crdt - oper /CRDT [map|peers|status|route] mesh introspection.
- * parv[1] = optional subcommand (first letter dispatched; default map). */
+ * parv[1] = optional subcommand (first letter dispatched; default map).
+ * In DEBUG builds ONLY, "/CRDT clockstep <±secs>" (case 'c') relatively steps this
+ * node's fake wall-clock offset for the timing-race test harness; the subcommand
+ * is compiled out entirely in a release build. */
 int mo_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
 {
   char c = (parc > 1 && parv[1][0]) ? parv[1][0] : 'm';
@@ -293,6 +298,21 @@ int mo_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
     case 'p': render_peers(sptr);  break;
     case 's': render_status(sptr); break;
     case 'r': render_route(sptr);  break;
+#ifdef DEBUGMODE
+    case 'c': {   /* clockstep <±secs> — DEBUG-only relative wall-clock step */
+      int step = (parc > 2 && parv[2]) ? atoi(parv[2]) : 0;
+      ircd_fake_clock_offset += (time_t)step;
+      log_write(LS_SYSTEM, L_WARNING, 0,
+                "*** CRDT clockstep %+d s by %s -> fake clock offset now %+ld s "
+                "-- DEBUG BUILD ONLY ***",
+                step, cli_name(sptr), (long)ircd_fake_clock_offset);
+      sendcmdto_one(&me, CMD_NOTICE, sptr,
+                    "%C :CRDT clockstep: %+d s applied; fake clock offset now "
+                    "%+ld s (DEBUG build only)", sptr, step,
+                    (long)ircd_fake_clock_offset);
+      break;
+    }
+#endif
     case 'm':
     default:  render_map(sptr);    break;
   }

@@ -19,11 +19,30 @@
 /** Global HLC state for this server. */
 static struct HLC global_hlc;
 
+#ifdef DEBUGMODE
+/** DEBUG-only per-node wall-clock offset in seconds, for the timing-race test
+ * harness (crdt-mesh clock injection).  Applied at both wall-clock chokepoints:
+ * this function and the CurrentTime assignments (engine + ircd main).  NON-static
+ * — the integration layer (ircd.c env read, /CRDT clockstep) writes it.  Compiled
+ * OUT entirely in a release (non-DEBUGMODE) build, so a fake clock is impossible
+ * off the test bench. */
+time_t ircd_fake_clock_offset = 0;
+#endif
+
 uint64_t hlc_wall_clock_ms(void)
 {
   struct timeval tv;
+  uint64_t ms;
   gettimeofday(&tv, NULL);
-  return (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+  ms = (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+#ifdef DEBUGMODE
+  /* Skew the whole HLC surface by the harness offset.  A negative offset relies
+   * on well-defined unsigned modular arithmetic (ms is a large epoch value); the
+   * HLC's own now > physical_ms guard keeps a backward step from regressing the
+   * clock — exactly the M2 backward-step behavior the harness exercises. */
+  ms += (uint64_t)ircd_fake_clock_offset * 1000;
+#endif
+  return ms;
 }
 
 struct HLC hlc_local_event(struct HLC *local)

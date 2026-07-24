@@ -29,6 +29,7 @@
 #include "ircd_log.h"
 #include "s_debug.h"
 #include "thread_pool.h"
+#include "crdt_hlc.h"   /* DEBUG-only ircd_fake_clock_offset (CurrentTime chokepoint) */
 
 /* #include <assert.h> -- Now using assert in ircd_log.h */
 #include <errno.h>
@@ -288,7 +289,11 @@ engine_loop(struct Generators *gen)
     Debug((DEBUG_ENGINE, "epoll: delay: %d (%d) %d", timer_next(gen),
            CurrentTime, wait));
     events_used = epoll_wait(epoll_fd, events, events_count, wait);
+#ifdef DEBUGMODE
+    CurrentTime = time(0) + ircd_fake_clock_offset;   /* timing-race harness skew */
+#else
     CurrentTime = time(0);
+#endif
 
     if (events_used < 0) {
       if (errno != EINTR) {

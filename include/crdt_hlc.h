@@ -61,4 +61,13 @@ struct HLC hlc_global_event(void);
 /** @brief Update the global HLC from a received remote timestamp. */
 void hlc_global_receive(const struct HLC *remote);
 
+#ifdef DEBUGMODE
+#include <time.h>   /* time_t */
+/** DEBUG-only per-node wall-clock offset (seconds) for the timing-race test
+ *  harness.  Defined in crdt_hlc.c; applied in hlc_wall_clock_ms() and at the
+ *  CurrentTime chokepoints.  Absent entirely in a release build.  (Only visible
+ *  to translation units that include config.h before this header.) */
+extern time_t ircd_fake_clock_offset;
+#endif
+
 #endif /* INCLUDED_crdt_hlc_h */
