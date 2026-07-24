@@ -717,8 +717,18 @@ static int metadata_cmd_set(struct Client *sptr, int parc, char *parv[])
     }
 
     /* If the account has online connections, update via metadata_set_client
-     * which handles both in-memory and LMDB persistence.  Otherwise write
-     * directly to LMDB for the offline case. */
+     * which handles both in-memory and LMDB persistence.  Otherwise write a
+     * PERMANENT row for the offline case (metadata_account_set_permanent, not
+     * the TTL metadata_account_set): the Tier C F2-b storage chokepoint
+     * mirrors permanent writes into the CRDT doc, so this converges
+     * mesh-wide via Task 4's reconcile (metadata_apply_converged) on every
+     * other node instead of silently decaying after the ~4h TTL purge
+     * sweep.  There is still no S2S MD broadcast for the offline case — an
+     * offline account has no FindUser-resolvable target, so ms_metadata on
+     * peers would just drop it — the doc is the propagation path here.  On
+     * a doc-less legacy topology the write is therefore node-local only:
+     * a documented limitation (spec §A4), unchanged from before except it
+     * no longer evaporates in 4h. */
     {
       struct Client *acptr;
       struct Client *first_online = NULL;
@@ -781,7 +791,7 @@ static int metadata_cmd_set(struct Client *sptr, int parc, char *parv[])
       }
 
       if (!found_online) {
-        int rc = metadata_account_set(account_name, key, value, visibility);
+        int rc = metadata_account_set_permanent(account_name, key, value, visibility);
         if (rc < 0) {
           send_fail(sptr, "METADATA", "INTERNAL_ERROR", key,
                     "Failed to set account metadata");
