@@ -2332,7 +2332,14 @@ static void reconcile_metadata_set_cb(const char *key, uint32_t key_len,
   if (metadata_account_get(account, mkey, cur) == 0 &&
       strlen(cur) == val->data_len && memcmp(cur, docval, val->data_len) == 0)
     return;
-  if (metadata_account_set_permanent(account, mkey, docval) == 0)
+  /* TEMPORARY SHIM (A2/Task 1): docval is now the vis-prefixed doc buffer
+   * (set_ts prefixes every non-exempt permanent value before mirroring), but
+   * this call passes it straight through with a fixed METADATA_VIS_PUBLIC —
+   * set_ts will re-prefix an already-prefixed private value ("P:" -> "*:P:").
+   * Task 4 splits the prefixed docval into (vis, raw) before this call and
+   * fixes the echo guard above to compare vis-aware. Do not treat this as
+   * done. */
+  if (metadata_account_set_permanent(account, mkey, docval, METADATA_VIS_PUBLIC) == 0)
     c->applied++;
 }
 
@@ -2392,7 +2399,7 @@ void crdt_shadow_reconcile_metadata(void)
         continue;
       memcpy(account, k, al); account[al] = '\0';
       memcpy(mkey, nul + 1, kl); mkey[kl] = '\0';
-      if (metadata_account_set(account, mkey, NULL) == 0)   /* delete from store */
+      if (metadata_account_set(account, mkey, NULL, METADATA_VIS_PUBLIC) == 0)   /* delete from store; vis ignored */
         removed++;
     }
     if (d->capped)
