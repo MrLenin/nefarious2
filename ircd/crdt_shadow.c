@@ -3759,6 +3759,11 @@ static struct Client *crdt_materialize_one_user(const char *key, uint32_t key_le
     ircd_strncpy(cli_user(nc)->account, rec->account, ACCOUNTLEN + 1);
     cli_user(nc)->acc_create = (time_t)rec->acc_create;
     SetAccount(nc);
+    /* P1 A3 residue: mesh-materialized remotes need parity with normally-
+     * introduced remotes (which load via the register_user chokepoint or
+     * the +r stamp residue) so GET/LIST serve from memory immediately
+     * instead of waiting on the lazy-fill backstop. */
+    metadata_load_account(nc, cli_user(nc)->account);
   }
   user_apply_umode_str(nc, rec->umodes);         /* sets umode FLAGS only */
   SetUser(nc);
