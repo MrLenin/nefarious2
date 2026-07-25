@@ -294,7 +294,8 @@ enum CrdtCollection {
   CRDT_COLL_SILENCES,      /**< usernumeric\0mask -> per-user silence masks (OR-Set) — Tier C F1-c */
   CRDT_COLL_MARKERS,       /**< markread storage key -> read-marker ts (MAX-register) — Tier C F2-a */
   CRDT_COLL_METADATA,      /**< account\0key -> metadata blob (LWW) — Tier C F2-b */
-  CRDT_COLL_TEMPSHUNS      /**< victim numeric -> CrdtTempshun (LWW) — Tier C F3 */
+  CRDT_COLL_TEMPSHUNS,     /**< victim numeric -> CrdtTempshun (LWW) — Tier C F3 */
+  CRDT_COLL_WEBPUSH        /**< account\0endpoint -> subscription blob (LWW) — Tier C F2-c */
 };
 
 struct CrdtOp {
@@ -380,6 +381,7 @@ struct CrdtNetworkState {
   struct CrdtLWWMap       markers;      /**< markread key -> read-marker ts_ms (MAX-register, Tier C F2-a) */
   struct CrdtLWWMap       metadata;     /**< account\0key -> metadata blob (LWW, Tier C F2-b) */
   struct CrdtLWWMap       tempshuns;    /**< victim numeric -> CrdtTempshun (LWW, Tier C F3) */
+  struct CrdtLWWMap       webpush;      /**< account\0endpoint -> subscription blob (LWW, Tier C F2-c) */
   struct CrdtORSet        silences;     /**< usernumeric\0mask -> per-user silence masks (Tier C F1-c) */
   struct CrdtChannel     *chan_buckets[CRDT_CHAN_BUCKETS];
 };
@@ -647,6 +649,16 @@ int crdt_metadata_is_explicitly_removed(const struct CrdtNetworkState *st,
                                         const char *key, uint32_t klen);
 /** Return the current metadata LWW value (NULL if absent/tombstoned) — for the
  *  reconcile echo-guard read. */
+/** Tier C F2-c: WEBPUSH subscription convergence — plain HLC-LWW on
+ *  account\0endpoint keys (opaque composite), value = "endpoint|p256dh|auth". */
+void crdt_webpush_set(struct CrdtNetworkState *st, const char *key, uint32_t klen,
+                      const void *val, uint32_t vlen);
+void crdt_webpush_del(struct CrdtNetworkState *st, const char *key, uint32_t klen);
+int  crdt_webpush_is_explicitly_removed(const struct CrdtNetworkState *st,
+                                        const char *key, uint32_t klen);
+const struct CrdtLWWValue *crdt_webpush_get(const struct CrdtNetworkState *st,
+                                            const char *key, uint32_t klen);
+
 const struct CrdtLWWValue *crdt_metadata_get(const struct CrdtNetworkState *st,
                                              const char *key, uint32_t klen);
 /** Phase 3k: set/get per-kick metadata (LWW, keyed chan\0numeric). set() records a

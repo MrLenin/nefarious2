@@ -154,6 +154,7 @@ void crdt_state_init(struct CrdtNetworkState *st, uint16_t my_numeric)
   crdt_lwwmap_init(&st->markers);
   crdt_lwwmap_init(&st->metadata);
   crdt_lwwmap_init(&st->tempshuns);
+  crdt_lwwmap_init(&st->webpush);
   crdt_orset_init(&st->silences);
 }
 
@@ -179,6 +180,7 @@ void crdt_state_clear(struct CrdtNetworkState *st)
   crdt_lwwmap_clear(&st->markers);
   crdt_lwwmap_clear(&st->metadata);
   crdt_lwwmap_clear(&st->tempshuns);
+  crdt_lwwmap_clear(&st->webpush);
   crdt_orset_clear(&st->silences);
   for (int b = 0; b < CRDT_CHAN_BUCKETS; b++) {
     struct CrdtChannel *c = st->chan_buckets[b];
@@ -923,6 +925,53 @@ const struct CrdtLWWValue *crdt_metadata_get(const struct CrdtNetworkState *st,
   return crdt_lwwmap_get(&st->metadata, key, klen);
 }
 
+/* Tier C F2-c: WEBPUSH subscription register — op-recording LWW set/del/gate,
+ * cloning crdt_metadata_* on st->webpush (account\0endpoint -> blob). */
+void crdt_webpush_set(struct CrdtNetworkState *st, const char *key, uint32_t klen,
+                      const void *val, uint32_t vlen)
+{
+  struct HLC ts = hlc_local_event(&st->clock);
+  uint64_t seq;
+  struct CrdtOp *op;
+  crdt_lwwmap_set(&st->webpush, key, klen, val, vlen, ts, st->my_numeric);
+  seq = st->next_seq++;
+  op = op_new(st->my_numeric, seq, CRDT_OP_SET, CRDT_COLL_WEBPUSH);
+  op->key = memdup(key, klen);
+  op->key_len = klen;
+  op->val = vlen ? memdup(val, vlen) : NULL;
+  op->val_len = vlen;
+  op->ts = ts;
+  op->writer = st->my_numeric;
+  record(st, op);
+}
+
+void crdt_webpush_del(struct CrdtNetworkState *st, const char *key, uint32_t klen)
+{
+  struct HLC ts = hlc_local_event(&st->clock);
+  uint64_t seq;
+  struct CrdtOp *op;
+  crdt_lwwmap_delete(&st->webpush, key, klen, ts, st->my_numeric);
+  seq = st->next_seq++;
+  op = op_new(st->my_numeric, seq, CRDT_OP_DELETE, CRDT_COLL_WEBPUSH);
+  op->key = memdup(key, klen);
+  op->key_len = klen;
+  op->ts = ts;
+  op->writer = st->my_numeric;
+  record(st, op);
+}
+
+int crdt_webpush_is_explicitly_removed(const struct CrdtNetworkState *st,
+                                       const char *key, uint32_t klen)
+{
+  return crdt_lwwmap_is_deleted(&st->webpush, key, klen);
+}
+
+const struct CrdtLWWValue *crdt_webpush_get(const struct CrdtNetworkState *st,
+                                            const char *key, uint32_t klen)
+{
+  return crdt_lwwmap_get(&st->webpush, key, klen);
+}
+
 /* SHUN (global-state track): op-recording set/del/gate, mirroring crdt_gline_*. */
 void crdt_shun_set(struct CrdtNetworkState *st, const char *mask,
                    const struct CrdtShunRecord *rec)
@@ -1610,6 +1659,7 @@ static struct CrdtLWWMap *lww_for(struct CrdtNetworkState *st,
   case CRDT_COLL_MARKERS:       return &st->markers;
   case CRDT_COLL_METADATA:      return &st->metadata;
   case CRDT_COLL_TEMPSHUNS:     return &st->tempshuns;
+  case CRDT_COLL_WEBPUSH:       return &st->webpush;
   default:                return NULL;
   }
 }
@@ -1980,6 +2030,7 @@ uint64_t crdt_state_digest(const struct CrdtNetworkState *st)
   acc = digest_marker(acc, &st->markers, 20);/* salt 20: Tier C F2-a read-markers */
   acc = digest_lww(acc, &st->metadata, 21);  /* salt 21: Tier C F2-b account metadata */
   acc = digest_lww(acc, &st->tempshuns, 22); /* salt 22: Tier C F3 tempshuns */
+  acc = digest_lww(acc, &st->webpush, 23);   /* salt 23: Tier C F2-c webpush subs */
   acc = digest_orset(acc, &st->silences, "", 0, 19);/* salt 19: Tier C F1-c silences */
   for (bk = 0; bk < CRDT_CHAN_BUCKETS; bk++) {
     struct CrdtChannel *c;
@@ -2039,6 +2090,7 @@ uint64_t crdt_state_digest_materialized(const struct CrdtNetworkState *st)
   acc = digest_marker(acc, &st->markers, 20);/* salt 20: Tier C F2-a read-markers */
   acc = digest_lww(acc, &st->metadata, 21);  /* salt 21: Tier C F2-b account metadata */
   acc = digest_lww(acc, &st->tempshuns, 22); /* salt 22: Tier C F3 tempshuns */
+  acc = digest_lww(acc, &st->webpush, 23);   /* salt 23: Tier C F2-c webpush subs */
   acc = digest_orset_present(acc, &st->silences, "", 0, 19);/* salt 19: Tier C F1-c silences */
   for (bk = 0; bk < CRDT_CHAN_BUCKETS; bk++) {
     struct CrdtChannel *c;

@@ -42,6 +42,7 @@
 #include "mark.h"            /* Tier C F1-b: MARK_* sub-type tags */
 #include "ircd_geoip.h"      /* Tier C F1-b: geoip_apply_mark (rebuild names from codes) */
 #include "metadata.h"        /* Tier C F2-a: metadata_readmarker_set (doc -> readmarkers_cf) */
+#include "webpush_store.h"   /* Tier C F2-c: webpush subscription store (doc <-> LMDB) */
 
 #include <stdarg.h>          /* verify_emit dual log/client targeting */
 #include <stdio.h>
@@ -2264,6 +2265,173 @@ void crdt_shadow_tempshun(struct Client *victim, int active, const char *reason)
   crdt_sync_push();                    /* eager-propagate to CRDT peers */
 }
 
+/* ================================================================== */
+/* Tier C F2-c: WEBPUSH subscription convergence (account\0endpoint LWW) */
+/* ================================================================== */
+/* Endpoint cap + blob size derive from the SHARED webpush_store.h caps (no
+ * drift: bumping the cap there flows here). blob = "endpoint|p256dh|auth". */
+#define WEBPUSH_F2C_BLOB_MAX  (WEBPUSH_MAX_ENDPOINT_LEN + WEBPUSH_MAX_P256DH + \
+                               WEBPUSH_MAX_AUTH + 8)
+#define WEBPUSH_F2C_REAP_MAX  32
+
+/* Build the account\0endpoint doc key; returns length or 0 on overflow. */
+static uint32_t webpush_doc_key(const char *account, const char *endpoint,
+                                char *out, size_t outsz)
+{
+  size_t al = strlen(account), el = strlen(endpoint);
+  if (al == 0 || el == 0 || al + 1 + el > outsz)
+    return 0;
+  memcpy(out, account, al);
+  out[al] = '\0';
+  memcpy(out + al + 1, endpoint, el);
+  return (uint32_t)(al + 1 + el);
+}
+
+/* Mirror a LOCAL/gateway-origin webpush REGISTER into the doc. Called from the
+ * m_webpush command handler (origin) and ms_webpush's legacy-edge branch. No
+ * reconciling-guard needed: the reconcile drives webpush_store_add DIRECTLY (not
+ * through this mirror), so a doc-driven store write never re-enters here. */
+void crdt_shadow_webpush_set(const char *account, const char *endpoint,
+                             const char *blob)
+{
+  char dk[ACCOUNTLEN + WEBPUSH_MAX_ENDPOINT_LEN + 2];
+  uint32_t klen;
+  if (!shadow_on() || !account || !account[0] || !endpoint || !blob)
+    return;
+  klen = webpush_doc_key(account, endpoint, dk, sizeof dk);
+  if (!klen)
+    return;
+  crdt_webpush_set(&g_crdt, dk, klen, blob, (uint32_t)strlen(blob));
+  crdt_sync_push();
+}
+
+/* Mirror a webpush UNREGISTER / expiry into the doc (tombstone) — only for a
+ * sub we actually converged (no spurious tombstones). */
+void crdt_shadow_webpush_remove(const char *account, const char *endpoint)
+{
+  char dk[ACCOUNTLEN + WEBPUSH_MAX_ENDPOINT_LEN + 2];
+  uint32_t klen;
+  const struct CrdtLWWValue *v;
+  if (!shadow_on() || !account || !account[0] || !endpoint)
+    return;
+  klen = webpush_doc_key(account, endpoint, dk, sizeof dk);
+  if (!klen)
+    return;
+  v = crdt_webpush_get(&g_crdt, dk, klen);
+  if (!v || !v->data)
+    return;
+  crdt_webpush_del(&g_crdt, dk, klen);
+  crdt_sync_push();
+}
+
+/* SET-heal: drive each PRESENT doc subscription into webpush_store, echo-guarded
+ * (skip if the store already holds the identical blob — no write churn on the
+ * verify tick / unrelated deltas). */
+struct reconcile_webpush_ctx { unsigned int applied; };
+static void reconcile_webpush_set_cb(const char *key, uint32_t key_len,
+                                     const struct CrdtLWWValue *val, void *ctx)
+{
+  struct reconcile_webpush_ctx *c = ctx;
+  const char *nul;
+  char account[ACCOUNTLEN + 1], endpoint[WEBPUSH_MAX_ENDPOINT_LEN + 1];
+  char blob[WEBPUSH_F2C_BLOB_MAX + 1], cur[WEBPUSH_F2C_BLOB_MAX + 1];
+  uint32_t al, el;
+  if (!val || !val->data || !val->data_len || val->data_len > WEBPUSH_F2C_BLOB_MAX)
+    return;
+  nul = memchr(key, '\0', key_len);            /* key = account\0endpoint */
+  if (!nul)
+    return;
+  al = (uint32_t)(nul - key);
+  el = key_len - al - 1;
+  if (al == 0 || al > ACCOUNTLEN || el == 0 || el > WEBPUSH_MAX_ENDPOINT_LEN)
+    return;
+  memcpy(account, key, al); account[al] = '\0';
+  memcpy(endpoint, nul + 1, el); endpoint[el] = '\0';
+  memcpy(blob, val->data, val->data_len); blob[val->data_len] = '\0';
+  if (webpush_store_get_blob(account, endpoint, cur, sizeof cur) == 0 &&
+      strcmp(cur, blob) == 0)
+    return;                                    /* already materialized, identical */
+  if (webpush_store_add(account, blob) == 0)
+    c->applied++;
+}
+
+/* Delete-walk (invariant 11): LIVE-walk the store; reap any row whose
+ * account\0endpoint doc key is absent/tombstoned. Collect-then-act (no mutation
+ * mid-foreach); loop to drain > REAP_MAX. Static scratch: reconcile is
+ * single-threaded (verify timer / eager path). */
+static struct webpush_reap_ctx {
+  char acct[WEBPUSH_F2C_REAP_MAX][ACCOUNTLEN + 1];
+  char ep[WEBPUSH_F2C_REAP_MAX][WEBPUSH_MAX_ENDPOINT_LEN + 1];
+  int n;
+} g_webpush_reap;
+
+static int webpush_reap_collect(const char *account, const char *stored, void *data)
+{
+  struct webpush_reap_ctx *c = data;
+  const char *bar;
+  char dk[ACCOUNTLEN + WEBPUSH_MAX_ENDPOINT_LEN + 2];
+  char endpoint[WEBPUSH_MAX_ENDPOINT_LEN + 1];
+  uint32_t klen;
+  size_t el;
+  if (c->n >= WEBPUSH_F2C_REAP_MAX)
+    return 0;
+  bar = strchr(stored, '|');                   /* stored = endpoint|p256dh|auth */
+  if (!bar)
+    return 0;
+  el = (size_t)(bar - stored);
+  if (el == 0 || el > WEBPUSH_MAX_ENDPOINT_LEN || strlen(account) > ACCOUNTLEN)
+    return 0;
+  memcpy(endpoint, stored, el); endpoint[el] = '\0';
+  klen = webpush_doc_key(account, endpoint, dk, sizeof dk);
+  if (!klen)
+    return 0;
+  /* Reap ONLY on an EXPLICIT doc tombstone, never on mere absence (invariant
+   * 11). The store is DUAL-populated — the P10 WP broadcast still floods the
+   * tree AND the doc reconcile — so a sub that arrived over WP ahead of its CR
+   * op is merely-absent-not-tombstoned; reaping it would delete a valid
+   * just-registered subscription. A converged UNREGISTER leaves the tombstone
+   * this gate keys on. (Matches reconcile_metadata's store-walk; a restart
+   * orphan whose tombstone was GC'd lingers but self-heals on the next push's
+   * HTTP-410 expiry-remove.) */
+  if (!crdt_webpush_is_explicitly_removed(&g_crdt, dk, klen))
+    return 0;
+  ircd_strncpy(c->acct[c->n], account, ACCOUNTLEN);
+  ircd_strncpy(c->ep[c->n], endpoint, WEBPUSH_MAX_ENDPOINT_LEN);
+  c->n++;
+  return 0;
+}
+
+/* Drive webpush_store from the doc: SET-heal present subs + reap tombstoned rows.
+ * Idempotent + echo-guarded. Dispatched from the eager delta-apply, verify cycle,
+ * and materialize_live (like reconcile_metadata). */
+void crdt_shadow_reconcile_webpush(void)
+{
+  struct reconcile_webpush_ctx sc = { 0 };
+  int i, removed = 0;
+  if (!shadow_on() || !webpush_store_available())
+    return;
+  crdt_lwwmap_foreach(&g_crdt.webpush, reconcile_webpush_set_cb, &sc);
+  do {
+    int round = 0;
+    g_webpush_reap.n = 0;
+    webpush_store_foreach_all(webpush_reap_collect, &g_webpush_reap);
+    for (i = 0; i < g_webpush_reap.n; i++) {
+      if (webpush_store_remove(g_webpush_reap.acct[i], g_webpush_reap.ep[i]) == 0) {
+        removed++;
+        round++;
+      }
+    }
+    /* stop when drained, or when a full batch made no progress (persistent
+     * store error) — never spin re-collecting the same un-removable rows. */
+    if (g_webpush_reap.n < WEBPUSH_F2C_REAP_MAX || round == 0)
+      break;
+  } while (1);
+  if (sc.applied || removed)
+    log_write(LS_SYSTEM, L_INFO, 0,
+              "CRDT F2-c: webpush reconcile applied %u, removed %d (doc->store)",
+              sc.applied, removed);
+}
+
 /* Drive the local readmarkers_cf from the doc (metadata_readmarker_set is newer-wins +
  * idempotent). Dispatched from the verify cycle + eager delta-apply, like reconcile_glines. */
 void crdt_shadow_reconcile_markers(void)
@@ -4051,6 +4219,7 @@ void crdt_shadow_materialize_live(void)
   crdt_shadow_reconcile_markers();
   crdt_shadow_reconcile_metadata();
   crdt_shadow_reconcile_tempshuns();
+  crdt_shadow_reconcile_webpush();
 }
 
 /* ---- Phase 3l: USER introduce + steady-state CREATE via CRDT (+ §17.7 gateway) ----
@@ -5237,6 +5406,7 @@ static void crdt_shadow_verify_cb(struct Event *ev)
   crdt_shadow_reconcile_markers(); /* Tier C F2-a: drive read-markers from doc -> RocksDB */
   crdt_shadow_reconcile_metadata(); /* Tier C F2-b: drive account metadata from doc -> metadata_cf */
   crdt_shadow_reconcile_tempshuns(); /* Tier C F3: apply tempshun flips on the victim's home server */
+  crdt_shadow_reconcile_webpush(); /* Tier C F2-c: drive webpush subs from doc -> LMDB */
   crdt_shadow_reconcile_zlines();  /* ZLINE: drive global Z-lines from doc (+gateway) */
   crdt_shadow_reconcile_jupes();   /* JUPE: drive juped servers from doc (+gateway) */
   bounce_crdt_bsess_sweep();       /* 5-5e M2: mirror local-holder bouncer sessions -> doc (shadow) */

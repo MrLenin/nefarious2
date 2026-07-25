@@ -746,6 +746,7 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
           crdt_shadow_reconcile_markers(); /* Tier C F2-a: drive read-markers from doc -> RocksDB */
           crdt_shadow_reconcile_metadata(); /* Tier C F2-b: drive account metadata from doc -> metadata_cf */
           crdt_shadow_reconcile_tempshuns(); /* Tier C F3: apply tempshun flips on the delta, not the 30s tick */
+          crdt_shadow_reconcile_webpush(); /* Tier C F2-c: converge webpush subs on the delta */
           /* M6c-1 Increment 2: reconcile bouncer sessions EAGERLY on the delta that
            * carries the change, not on the 30s verify timer.  Without this the
            * gateway's HOLDING<->ACTIVE state-apply (and its BS A/D synth toward

@@ -2516,6 +2516,89 @@ static void test_crdt_beacon_tick_stale(void **state)
   assert_int_equal(1, crdt_beacon_tick_stale(0, &miss));  /* miss=3 -> stale */
 }
 
+/* Tier C F2-c (2026-07-25): WEBPUSH subscription convergence. Push subscriptions
+ * are account-anchored persistent state (LMDB), synced today only by P10 WP
+ * tree broadcast/burst — so they never reach an overlay-only leaf and don't
+ * survive a partition (a mobile push for a user whose session lands there
+ * silently fails). Converge them over the doc, the F2-b metadata pattern:
+ * key = account\0endpoint (opaque composite), value = the "endpoint|p256dh|auth"
+ * stored blob, LWW (a re-register rotates keys -> newest wins). */
+static void test_webpush_op_replicates(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s1, s2, s3;
+  char key[600];
+  const struct CrdtLWWValue *v;
+  uint32_t klen;
+  uint8_t buf[8192];
+  int n;
+  /* key = account\0endpoint; endpoints are long HTTPS URLs (<=512) */
+  const char *acct = "alice";
+  const char *ep = "https://push.example.com/subscription/abcdef0123456789";
+  const char *blob1 = "https://push.example.com/subscription/abcdef0123456789|BJx_p256dh_key|auth1";
+  const char *blob2 = "https://push.example.com/subscription/abcdef0123456789|BJx_rotated_key|auth2";
+  size_t al = strlen(acct), el = strlen(ep);
+  memcpy(key, acct, al); key[al] = '\0'; memcpy(key + al + 1, ep, el);
+  klen = (uint32_t)(al + 1 + el);
+
+  crdt_state_init(&s1, 1);
+  crdt_state_init(&s2, 2);
+
+  /* register on s1 -> delta -> s2; blob round-trips byte-exact */
+  crdt_webpush_set(&s1, key, klen, blob1, (uint32_t)strlen(blob1));
+  crdt_state_sync(&s2, &s1);
+  v = crdt_webpush_get(&s2, key, klen);
+  assert_non_null(v); assert_non_null(v->data);
+  assert_int_equal((int)strlen(blob1), (int)v->data_len);
+  assert_memory_equal(blob1, v->data, strlen(blob1));
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+  assert_int_equal(0, crdt_webpush_is_explicitly_removed(&s2, key, klen));
+
+  /* key rotation: re-register same endpoint, newer HLC wins (plain LWW) */
+  crdt_webpush_set(&s1, key, klen, blob2, (uint32_t)strlen(blob2));
+  crdt_state_sync(&s2, &s1);
+  v = crdt_webpush_get(&s2, key, klen);
+  assert_non_null(v); assert_non_null(v->data);
+  assert_memory_equal(blob2, v->data, strlen(blob2));
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+
+  /* snapshot roundtrip preserves a present entry (pins the snap_put_lww line) */
+  crdt_state_init(&s3, 3);
+  n = crdt_snapshot_encode(&s1, buf, sizeof buf);
+  assert_true(n > 0);
+  assert_true(crdt_snapshot_apply(&s3, buf, (size_t)n) >= 0);
+  v = crdt_webpush_get(&s3, key, klen);
+  assert_non_null(v); assert_non_null(v->data);
+  assert_memory_equal(blob2, v->data, strlen(blob2));
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s3));
+
+  /* unregister (tombstone) replicates; explicit-removal gate flips on BOTH */
+  crdt_webpush_del(&s1, key, klen);
+  crdt_state_sync(&s2, &s1);
+  v = crdt_webpush_get(&s2, key, klen);
+  assert_true(v == NULL || v->data == NULL);
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+  assert_int_equal(1, crdt_webpush_is_explicitly_removed(&s1, key, klen));
+  assert_int_equal(1, crdt_webpush_is_explicitly_removed(&s2, key, klen));
+  /* mere ABSENCE is NOT explicit-removal — the store-reap gate keys on this so
+   * a sub that arrived via the P10 WP path ahead of its CR op (present in the
+   * store, absent-not-tombstoned in the doc) is NEVER reaped (invariant 11 /
+   * the review's finding-1 fix). A never-registered endpoint proves it. */
+  {
+    char nk[64];
+    const char *ep2 = "https://push.example.com/subscription/never-registered";
+    size_t el2 = strlen(ep2);
+    memcpy(nk, acct, al); nk[al] = '\0'; memcpy(nk + al + 1, ep2, el2);
+    assert_int_equal(0, crdt_webpush_is_explicitly_removed(&s2, nk,
+                                                           (uint32_t)(al + 1 + el2)));
+    assert_null(crdt_webpush_get(&s2, nk, (uint32_t)(al + 1 + el2)));
+  }
+
+  crdt_state_clear(&s1);
+  crdt_state_clear(&s2);
+  crdt_state_clear(&s3);
+}
+
 /* Tier C F3 (2026-07-25): TEMPSHUN over the mesh — a dedicated LWW collection
  * keyed by victim numeric, ORIGIN-written (the oper's / gateway-entry server;
  * the victim's user record stays home-server single-writer) and applied only
@@ -3512,6 +3595,7 @@ int main(void)
     cmocka_unit_test(test_crdt_beacon_tick_stale),
     cmocka_unit_test(test_accept_beyond_horizon_source),
     cmocka_unit_test(test_tempshun_replicates_and_reaps),
+    cmocka_unit_test(test_webpush_op_replicates),
     cmocka_unit_test(test_gline_doc_converges_same_lastmod),
     cmocka_unit_test(test_metadata_op_replicates),
     cmocka_unit_test(test_bsess_op_replicates),

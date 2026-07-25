@@ -49,6 +49,23 @@ int webpush_store_add(const char *account, const char *stored);
  */
 int webpush_store_remove(const char *account, const char *endpoint);
 
+/* Subscription field caps (shared: m_webpush.c producers + crdt_shadow.c F2-c
+ * doc-key/blob sizing). Keep here so a bump can't silently diverge the two. */
+#define WEBPUSH_MAX_ENDPOINT_LEN 512   /* HTTPS endpoint URL */
+#define WEBPUSH_MAX_P256DH       128   /* base64 p256dh key */
+#define WEBPUSH_MAX_AUTH         32    /* base64 auth secret */
+
+/** Fetch the stored blob ("endpoint|p256dh|auth") for one subscription.
+ * @param[in]  account  Account name.
+ * @param[in]  endpoint Subscription endpoint URL.
+ * @param[out] out      Buffer for the NUL-terminated blob.
+ * @param[in]  outlen   Size of @a out.
+ * @return 0 if found (out filled), -1 if absent/error/too-large.
+ * Tier C F2-c: the doc-reconcile echo-guard reads this to skip re-writing
+ * unchanged subscriptions. */
+int webpush_store_get_blob(const char *account, const char *endpoint,
+                           char *out, size_t outlen);
+
 /*
  * Remove all subscriptions for an account.
  * Returns number of subscriptions removed, or -1 on error.

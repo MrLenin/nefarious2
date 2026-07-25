@@ -394,6 +394,17 @@ void crdt_shadow_sync_user_silences(struct Client *live);
 void crdt_shadow_marker_set(const char *account, const char *target, const char *ts);
 void crdt_shadow_reconcile_markers(void);
 
+/** Tier C F2-c: mirror a webpush REGISTER (set) / UNREGISTER-or-expiry (remove)
+ *  into the doc. Called from the m_webpush command handler (origin) and
+ *  ms_webpush's legacy-edge branch. The victim's mesh peers materialize it into
+ *  their own webpush_store via the reconcile below. */
+void crdt_shadow_webpush_set(const char *account, const char *endpoint,
+                             const char *blob);
+void crdt_shadow_webpush_remove(const char *account, const char *endpoint);
+/** Tier C F2-c: drive the local webpush_store from the doc (SET-heal + reap).
+ *  Part of the reconcile suite (eager + verify + materialize). */
+void crdt_shadow_reconcile_webpush(void);
+
 /** Tier C F3: mint a TEMPSHUN flip into the doc at the ENTRY server (the oper's
  *  server for /TEMPSHUN, the §17.7 gateway edge for X3-sourced TS); the victim's
  *  HOME server applies it via the reconcile suite. active=0 = un-shun (a live

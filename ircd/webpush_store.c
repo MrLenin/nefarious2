@@ -490,6 +490,41 @@ int webpush_store_set_vapid_key(const unsigned char *privkey, size_t privkey_len
   return 0;
 }
 
+int webpush_store_get_blob(const char *account, const char *endpoint,
+                           char *out, size_t outlen)
+{
+  char keybuf[WEBPUSH_KEY_MAX];
+  int keylen;
+  struct db_val val = { NULL, 0 };
+  int rc;
+
+  if (!webpush_db_available || !account || !endpoint || !out || outlen == 0)
+    return -1;
+
+  keylen = build_sub_key(keybuf, sizeof(keybuf), account, endpoint);
+  if (keylen < 0)
+    return -1;
+
+  rc = db_get(webpush_env, webpush_sub_cf, keybuf, (size_t)keylen,
+              /*snap=*/NULL, &val);
+  if (rc == DB_NOTFOUND)
+    return -1;
+  if (rc != DB_OK) {
+    log_write(LS_SYSTEM, L_ERROR, 0,
+              "WebPush store: get blob failed for %s: %s",
+              account, db_strerror(rc));
+    return -1;
+  }
+  if (val.len >= outlen) {          /* need room for the NUL */
+    db_val_free(&val);
+    return -1;
+  }
+  memcpy(out, val.base, val.len);
+  out[val.len] = '\0';
+  db_val_free(&val);
+  return 0;
+}
+
 int webpush_store_get_vapid_key(unsigned char *privkey, size_t *privkey_len)
 {
   struct db_val val = { NULL, 0 };
@@ -562,6 +597,10 @@ int webpush_store_add(const char *account, const char *stored)
 
 int webpush_store_remove(const char *account, const char *endpoint)
 { (void)account; (void)endpoint; return -1; }
+
+int webpush_store_get_blob(const char *account, const char *endpoint,
+                           char *out, size_t outlen)
+{ (void)account; (void)endpoint; (void)out; (void)outlen; return -1; }
 
 int webpush_store_clear(const char *account) { (void)account; return -1; }
 int webpush_store_count(const char *account) { (void)account; return -1; }

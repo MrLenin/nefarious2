@@ -40,6 +40,7 @@
 
 #include "capab.h"
 #include "client.h"
+#include "crdt_shadow.h"  /* Tier C F2-c: converge webpush subscriptions over the mesh */
 #include "hash.h"
 #include "ircd.h"
 #include "ircd_features.h"
@@ -58,14 +59,8 @@
 #include <string.h>
 #include <stdlib.h>
 
-/** Maximum endpoint URL length */
-#define WEBPUSH_MAX_ENDPOINT_LEN 512
-
-/** Maximum p256dh key length (base64) */
-#define WEBPUSH_MAX_P256DH 128
-
-/** Maximum auth secret length (base64) */
-#define WEBPUSH_MAX_AUTH 32
+/* WEBPUSH_MAX_ENDPOINT_LEN / _P256DH / _AUTH now live in webpush_store.h so the
+ * F2-c doc-convergence path (crdt_shadow.c) shares the exact same caps. */
 
 /** Send a FAIL response using standard-replies format.
  * @param[in] sptr Client to send to.
@@ -237,6 +232,11 @@ static int webpush_cmd_register(struct Client *sptr, int parc, char *parv[])
   sendcmdto_serv_butone_v3(&me, CMD_WEBPUSH, NULL, "R %s %s %s %s",
                         cli_user(sptr)->account, endpoint, p256dh, auth);
 
+  /* Tier C F2-c: mirror into the doc so overlay-only leaves + post-partition
+   * nodes converge this subscription (the P10 WP broadcast above only reaches
+   * the tree). This is the origin server — always mint. */
+  crdt_shadow_webpush_set(cli_user(sptr)->account, endpoint, stored);
+
   /* Echo success to client per spec */
   sendrawto_one(sptr, "WEBPUSH REGISTER %s", endpoint);
 
@@ -283,6 +283,9 @@ static int webpush_cmd_unregister(struct Client *sptr, int parc, char *parv[])
   /* Broadcast to all linked servers */
   sendcmdto_serv_butone_v3(&me, CMD_WEBPUSH, NULL, "U %s %s",
                         cli_user(sptr)->account, endpoint);
+
+  /* Tier C F2-c: mirror the removal into the doc (tombstone) — origin server. */
+  crdt_shadow_webpush_remove(cli_user(sptr)->account, endpoint);
 
   /* Echo success to client per spec (silently succeeds even if not registered) */
   sendrawto_one(sptr, "WEBPUSH UNREGISTER %s", endpoint);
@@ -366,6 +369,11 @@ static void notify_send_cb(int result, long http_code, void *data)
     /* Broadcast removal to linked servers */
     sendcmdto_serv_butone_v3(&me, CMD_WEBPUSH, NULL, "U %s %s",
                           ctx->account, ctx->endpoint);
+
+    /* Tier C F2-c: mirror the expiry removal into the doc — this server
+     * detected the dead endpoint (HTTP 410), so it is the authoritative
+     * removal point (LWW-correct network-wide). */
+    crdt_shadow_webpush_remove(ctx->account, ctx->endpoint);
   }
 
   free(ctx);
@@ -723,6 +731,12 @@ int ms_webpush(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
     sendcmdto_serv_butone_v3(sptr, CMD_WEBPUSH, cptr, "R %s %s %s %s",
                           account, endpoint, p256dh, auth_secret);
 
+    /* Tier C F2-c: §17.7 gateway — inject a LEGACY-originated subscription into
+     * the doc so it reaches the mesh. A CRDT-relayed arrival is already in the
+     * doc via the flood -> no re-mint (the F3 entry-node predicate). */
+    if (!IsCrdtAware(cptr))
+      crdt_shadow_webpush_set(account, endpoint, stored);
+
     return 0;
   }
 
@@ -738,6 +752,10 @@ int ms_webpush(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
     /* Propagate to other servers */
     sendcmdto_serv_butone_v3(sptr, CMD_WEBPUSH, cptr, "U %s %s",
                           account, endpoint);
+
+    /* Tier C F2-c: §17.7 gateway — mirror a legacy-originated removal. */
+    if (!IsCrdtAware(cptr))
+      crdt_shadow_webpush_remove(account, endpoint);
 
     return 0;
   }
@@ -755,6 +773,12 @@ int ms_webpush(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
     if (webpush_store_available()) {
       webpush_store_add(account, stored);
     }
+
+    /* Tier C F2-c: §17.7 gateway — a burst from a LEGACY peer at link time
+     * carries subs the mesh may not have; inject them. A CRDT peer's burst is
+     * redundant with the doc (CR F snapshot) -> skip. */
+    if (!IsCrdtAware(cptr))
+      crdt_shadow_webpush_set(account, endpoint, stored);
 
     /* Don't propagate burst entries — they come from a single source during link */
     return 0;
