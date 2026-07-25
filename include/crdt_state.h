@@ -100,6 +100,24 @@ struct CrdtMemberRecord {
   uint16_t oplevel;
 };
 
+#define CRDT_TEMPSHUN_REASONLEN 160
+/* Tier C F3: TEMPSHUN over the mesh — an LWW register keyed by the VICTIM's
+ * 5-char numeric, written by the ENTRY server (the oper's server, or the §17.7
+ * gateway edge for X3-sourced TS; LWW resolves multi-origin flips to the
+ * latest) and APPLIED only by the victim's HOME server, which is the sole
+ * flag holder (m_tempshun applies FLAG_TEMPSHUN only under MyUser). This is
+ * deliberately NOT a CrdtUserRecord field: the user record is home-server
+ * single-writer, but the tempshun verb originates elsewhere — an origin-side
+ * record write would overwrite home-owned fields from a stale materialized
+ * copy and lose the race against any home-side refresh. '-' replicates as
+ * active=0 (never a doc DELETE, so rejoiners converge the un-shun); real
+ * DELETEs are minted only by the user-quit / orphan reaps. u8 + char[]:
+ * no interior or tail padding (memset anyway, invariant 4). */
+struct CrdtTempshun {
+  uint8_t active;                      /**< 1 = shunned, 0 = un-shunned */
+  char    reason[CRDT_TEMPSHUN_REASONLEN];
+};
+
 #define CRDT_KICKREASONLEN 160
 /* Per-kick metadata (Phase 3k): an LWW register keyed chan\0numeric, parallel to
  * the kick's member tombstone. Lets reconcile-remove emit a KICK (with attribution)
@@ -275,7 +293,8 @@ enum CrdtCollection {
   CRDT_COLL_BLEASES,       /**< account\0sessid -> CrdtBouncerLease (comparator-merge) — 5-5e M5 */
   CRDT_COLL_SILENCES,      /**< usernumeric\0mask -> per-user silence masks (OR-Set) — Tier C F1-c */
   CRDT_COLL_MARKERS,       /**< markread storage key -> read-marker ts (MAX-register) — Tier C F2-a */
-  CRDT_COLL_METADATA       /**< account\0key -> metadata blob (LWW) — Tier C F2-b */
+  CRDT_COLL_METADATA,      /**< account\0key -> metadata blob (LWW) — Tier C F2-b */
+  CRDT_COLL_TEMPSHUNS      /**< victim numeric -> CrdtTempshun (LWW) — Tier C F3 */
 };
 
 struct CrdtOp {
@@ -360,6 +379,7 @@ struct CrdtNetworkState {
   struct CrdtLWWMap       bleases;      /**< account\0sessid -> CrdtBouncerLease (5-5e M5) */
   struct CrdtLWWMap       markers;      /**< markread key -> read-marker ts_ms (MAX-register, Tier C F2-a) */
   struct CrdtLWWMap       metadata;     /**< account\0key -> metadata blob (LWW, Tier C F2-b) */
+  struct CrdtLWWMap       tempshuns;    /**< victim numeric -> CrdtTempshun (LWW, Tier C F3) */
   struct CrdtORSet        silences;     /**< usernumeric\0mask -> per-user silence masks (Tier C F1-c) */
   struct CrdtChannel     *chan_buckets[CRDT_CHAN_BUCKETS];
 };
@@ -392,6 +412,22 @@ void crdt_chan_ban_remove(struct CrdtNetworkState *st, const char *chan,
 /** Tier C F1-c: per-user SILENCE mask add/remove on the global silences OR-Set
  *  (keyed usernumeric\0mask). Op-recording (delta-replicating), mirrors
  *  crdt_chan_ban_add/remove. */
+/** Tier C F3: flip a victim's TEMPSHUN state in the doc (entry-server mint;
+ *  active=0 replicates the un-shun as a live entry, never a delete). */
+void crdt_tempshun_set(struct CrdtNetworkState *st, const char *numeric,
+                       int active, const char *reason);
+/** NULL if absent/tombstoned/wrong-sized (mixed-version tolerance). */
+const struct CrdtTempshun *crdt_tempshun_get(const struct CrdtNetworkState *st,
+                                             const char *numeric);
+/** Targeted quit-path reap: mint the tempshun DELETE for a departing user
+ *  (called inside crdt_user_remove; live entry only). */
+void crdt_state_reclaim_user_tempshun(struct CrdtNetworkState *st,
+                                      const char *numeric);
+/** Backstop sweep: mint DELETEs for tempshun entries whose user record is
+ *  FULLY absent (neither live nor pending-tombstone — the silences gate).
+ *  Returns entries reaped. */
+int crdt_state_reclaim_orphan_tempshuns(struct CrdtNetworkState *st);
+
 void crdt_silence_add(struct CrdtNetworkState *st, const char *usernumeric,
                       const char *mask);
 void crdt_silence_remove(struct CrdtNetworkState *st, const char *usernumeric,

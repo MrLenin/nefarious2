@@ -394,6 +394,15 @@ void crdt_shadow_sync_user_silences(struct Client *live);
 void crdt_shadow_marker_set(const char *account, const char *target, const char *ts);
 void crdt_shadow_reconcile_markers(void);
 
+/** Tier C F3: mint a TEMPSHUN flip into the doc at the ENTRY server (the oper's
+ *  server for /TEMPSHUN, the §17.7 gateway edge for X3-sourced TS); the victim's
+ *  HOME server applies it via the reconcile suite. active=0 = un-shun (a live
+ *  doc entry, never a delete). */
+void crdt_shadow_tempshun(struct Client *victim, int active, const char *reason);
+/** Tier C F3: apply doc tempshun state to LOCAL victims (home-server-only flag
+ *  semantics). Part of the reconcile suite; safe/no-op elsewhere. */
+void crdt_shadow_reconcile_tempshuns(void);
+
 /** Tier C F2-b: account metadata (MD) convergence. crdt_shadow_metadata_set mirrors a
  *  PERMANENT account-metadata set (or a delete of a doc-present key) into the doc
  *  (plain LWW, opaque account\0key); TTL-bound sets are skipped (per-server caches).

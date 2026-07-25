@@ -2201,6 +2201,69 @@ static void reconcile_marker_cb(const char *key, uint32_t key_len,
     c->applied++;
 }
 
+/* Tier C F3: TEMPSHUN doc->live. Only the victim's HOME server applies the
+ * flag (m_tempshun's MyUser-only semantics: remote copies never carry it);
+ * every other node's walk is a no-op for that key. Drift-applied with the
+ * handler's own transition notices so a doc-delivered shun looks exactly like
+ * a tree-delivered one to opers and the victim. Pure flag+notify — no store,
+ * no doc mint (nothing here re-enters the engine). */
+static void reconcile_tempshun_cb(const char *key, uint32_t key_len,
+                                  const struct CrdtLWWValue *val, void *ctx)
+{
+  struct Client *acptr;
+  const struct CrdtTempshun *ts;
+  const char *reason;
+  char num[8];
+  (void)ctx;
+  if (!val || !val->data || val->data_len != sizeof(struct CrdtTempshun))
+    return;                            /* wrong-sized = other-version peer: skip */
+  if (key_len >= sizeof num)
+    return;
+  memcpy(num, key, key_len);
+  num[key_len] = '\0';
+  if (!(acptr = findNUser(num)))
+    return;
+  if (!MyUser(acptr) || IsBouncerAlias(acptr))
+    return;                            /* the HOME server is the sole flag holder */
+  ts = (const struct CrdtTempshun *)val->data;
+  reason = ts->reason[0] ? ts->reason : "no reason";
+  if (ts->active && !IsTempShun(acptr)) {
+    if (!feature_bool(FEAT_HIS_SHUN_REASON))
+      sendcmdto_one(&me, CMD_NOTICE, acptr, "%C :You are shunned: %s",
+                    acptr, reason);
+    sendto_opmask_butone_global(&me, SNO_GLINE,
+                                "Temporary shun applied to %s (%s)",
+                                get_client_name(acptr, SHOW_IP), reason);
+    SetTempShun(acptr);
+  } else if (!ts->active && IsTempShun(acptr)) {
+    sendto_opmask_butone_global(&me, SNO_GLINE,
+                                "Temporary shun removed from %s (%s)",
+                                get_client_name(acptr, SHOW_IP), reason);
+    ClearTempShun(acptr);
+  }
+}
+
+void crdt_shadow_reconcile_tempshuns(void)
+{
+  if (!shadow_on())
+    return;
+  crdt_lwwmap_foreach(&g_crdt.tempshuns, reconcile_tempshun_cb, NULL);
+}
+
+/* Tier C F3: mint a TEMPSHUN flip into the doc at the ENTRY server (the oper's
+ * server for /TEMPSHUN, the §17.7 gateway edge for X3-sourced TS). LWW resolves
+ * multi-origin flips to the latest; the home server applies via the reconcile
+ * above. The legacy P10 relay is untouched (tree interop). */
+void crdt_shadow_tempshun(struct Client *victim, int active, const char *reason)
+{
+  char num[16];
+  if (!shadow_on() || !cli_user(victim))
+    return;
+  crdt_tempshun_set(&g_crdt, user_numeric(victim, num, sizeof num),
+                    active, reason);
+  crdt_sync_push();                    /* eager-propagate to CRDT peers */
+}
+
 /* Drive the local readmarkers_cf from the doc (metadata_readmarker_set is newer-wins +
  * idempotent). Dispatched from the verify cycle + eager delta-apply, like reconcile_glines. */
 void crdt_shadow_reconcile_markers(void)
@@ -3987,6 +4050,7 @@ void crdt_shadow_materialize_live(void)
    * internally, so no store write re-enters the doc mirror. */
   crdt_shadow_reconcile_markers();
   crdt_shadow_reconcile_metadata();
+  crdt_shadow_reconcile_tempshuns();
 }
 
 /* ---- Phase 3l: USER introduce + steady-state CREATE via CRDT (+ §17.7 gateway) ----
@@ -5111,6 +5175,14 @@ static void crdt_shadow_gc(void)
                 "CRDT GC: reclaimed %d orphan silence mask(s) (departed users)",
                 orph);
   }
+  {
+    /* Tier C F3: same backstop for tempshun registers (departed victims). */
+    int orph = crdt_state_reclaim_orphan_tempshuns(&g_crdt);
+    if (orph > 0)
+      log_write(LS_SYSTEM, L_NOTICE, 0,
+                "CRDT GC: reclaimed %d orphan tempshun register(s) (departed users)",
+                orph);
+  }
   freed = crdt_state_gc(&g_crdt, &gmin);
   if (freed > 0)
     log_write(LS_SYSTEM, L_NOTICE, 0,
@@ -5164,6 +5236,7 @@ static void crdt_shadow_verify_cb(struct Event *ev)
   crdt_shadow_reconcile_shuns();   /* SHUN: drive global Shuns from doc (+gateway) */
   crdt_shadow_reconcile_markers(); /* Tier C F2-a: drive read-markers from doc -> RocksDB */
   crdt_shadow_reconcile_metadata(); /* Tier C F2-b: drive account metadata from doc -> metadata_cf */
+  crdt_shadow_reconcile_tempshuns(); /* Tier C F3: apply tempshun flips on the victim's home server */
   crdt_shadow_reconcile_zlines();  /* ZLINE: drive global Z-lines from doc (+gateway) */
   crdt_shadow_reconcile_jupes();   /* JUPE: drive juped servers from doc (+gateway) */
   bounce_crdt_bsess_sweep();       /* 5-5e M2: mirror local-holder bouncer sessions -> doc (shadow) */

@@ -153,6 +153,7 @@ void crdt_state_init(struct CrdtNetworkState *st, uint16_t my_numeric)
   crdt_lwwmap_init(&st->bleases);
   crdt_lwwmap_init(&st->markers);
   crdt_lwwmap_init(&st->metadata);
+  crdt_lwwmap_init(&st->tempshuns);
   crdt_orset_init(&st->silences);
 }
 
@@ -177,6 +178,7 @@ void crdt_state_clear(struct CrdtNetworkState *st)
   crdt_lwwmap_clear(&st->bleases);
   crdt_lwwmap_clear(&st->markers);
   crdt_lwwmap_clear(&st->metadata);
+  crdt_lwwmap_clear(&st->tempshuns);
   crdt_orset_clear(&st->silences);
   for (int b = 0; b < CRDT_CHAN_BUCKETS; b++) {
     struct CrdtChannel *c = st->chan_buckets[b];
@@ -237,6 +239,9 @@ void crdt_user_remove(struct CrdtNetworkState *st, const char *numeric)
    * ops get seqs immediately after the user DELETE and before any numeric-reuse SET,
    * closing the numeric-reuse bleed via per-origin in-order delivery. */
   crdt_state_reclaim_user_silences(st, numeric);
+  /* Tier C F3: same reasoning for the tempshun register (numeric-reuse would
+   * otherwise inherit the predecessor's shun). */
+  crdt_state_reclaim_user_tempshun(st, numeric);
 }
 
 /* Phase 3m: 1 iff this numeric has an explicit user delete-tombstone in the doc
@@ -1604,6 +1609,7 @@ static struct CrdtLWWMap *lww_for(struct CrdtNetworkState *st,
   case CRDT_COLL_BLEASES:       return &st->bleases;
   case CRDT_COLL_MARKERS:       return &st->markers;
   case CRDT_COLL_METADATA:      return &st->metadata;
+  case CRDT_COLL_TEMPSHUNS:     return &st->tempshuns;
   default:                return NULL;
   }
 }
@@ -1973,6 +1979,7 @@ uint64_t crdt_state_digest(const struct CrdtNetworkState *st)
   acc = digest_blease(acc, &st->bleases, 18);/* salt 18: 5-5e M5 lease (value-only) */
   acc = digest_marker(acc, &st->markers, 20);/* salt 20: Tier C F2-a read-markers */
   acc = digest_lww(acc, &st->metadata, 21);  /* salt 21: Tier C F2-b account metadata */
+  acc = digest_lww(acc, &st->tempshuns, 22); /* salt 22: Tier C F3 tempshuns */
   acc = digest_orset(acc, &st->silences, "", 0, 19);/* salt 19: Tier C F1-c silences */
   for (bk = 0; bk < CRDT_CHAN_BUCKETS; bk++) {
     struct CrdtChannel *c;
@@ -2031,6 +2038,7 @@ uint64_t crdt_state_digest_materialized(const struct CrdtNetworkState *st)
   acc = digest_blease(acc, &st->bleases, 18);/* salt 18: 5-5e M5 lease (value-only) */
   acc = digest_marker(acc, &st->markers, 20);/* salt 20: Tier C F2-a read-markers */
   acc = digest_lww(acc, &st->metadata, 21);  /* salt 21: Tier C F2-b account metadata */
+  acc = digest_lww(acc, &st->tempshuns, 22); /* salt 22: Tier C F3 tempshuns */
   acc = digest_orset_present(acc, &st->silences, "", 0, 19);/* salt 19: Tier C F1-c silences */
   for (bk = 0; bk < CRDT_CHAN_BUCKETS; bk++) {
     struct CrdtChannel *c;
@@ -2323,6 +2331,113 @@ int crdt_state_reclaim_orphan_silences(struct CrdtNetworkState *st)
 /* ------------------------------------------------------------------ */
 /* causal-stability GC                                                */
 /* ------------------------------------------------------------------ */
+
+/* ------------------------------------------------------------------ */
+/* Tier C F3: TEMPSHUN register (victim numeric -> CrdtTempshun, LWW)  */
+/* ------------------------------------------------------------------ */
+
+void crdt_tempshun_set(struct CrdtNetworkState *st, const char *numeric,
+                       int active, const char *reason)
+{
+  struct CrdtTempshun rec;
+  struct HLC ts = hlc_local_event(&st->clock);
+  uint32_t klen = (uint32_t)strlen(numeric);
+  uint64_t seq;
+  struct CrdtOp *op;
+  memset(&rec, 0, sizeof rec);          /* deterministic wire bytes (inv. 4) */
+  rec.active = active ? 1 : 0;
+  if (reason)
+    strncpy(rec.reason, reason, sizeof rec.reason - 1);
+  crdt_lwwmap_set(&st->tempshuns, numeric, klen, &rec, sizeof rec,
+                  ts, st->my_numeric);
+  seq = st->next_seq++;
+  op = op_new(st->my_numeric, seq, CRDT_OP_SET, CRDT_COLL_TEMPSHUNS);
+  op->key = memdup(numeric, klen);
+  op->key_len = klen;
+  op->val = memdup(&rec, sizeof rec);
+  op->val_len = sizeof rec;
+  op->ts = ts;
+  op->writer = st->my_numeric;
+  record(st, op);
+}
+
+const struct CrdtTempshun *crdt_tempshun_get(const struct CrdtNetworkState *st,
+                                             const char *numeric)
+{
+  const struct CrdtLWWValue *v =
+    crdt_lwwmap_get(&st->tempshuns, numeric, (uint32_t)strlen(numeric));
+  return (v && v->data && v->data_len == sizeof(struct CrdtTempshun))
+           ? (const struct CrdtTempshun *)v->data : NULL;
+}
+
+/* Mint the doc DELETE for one tempshun entry (reap path only — a '-' flip is
+ * a live active=0 SET, never a delete). */
+static void tempshun_mint_delete(struct CrdtNetworkState *st,
+                                 const char *numeric, uint32_t klen)
+{
+  struct HLC ts = hlc_local_event(&st->clock);
+  uint64_t seq = st->next_seq++;
+  struct CrdtOp *op = op_new(st->my_numeric, seq, CRDT_OP_DELETE,
+                             CRDT_COLL_TEMPSHUNS);
+  crdt_lwwmap_delete(&st->tempshuns, numeric, klen, ts, st->my_numeric);
+  op->key = memdup(numeric, klen);
+  op->key_len = klen;
+  op->ts = ts;
+  op->writer = st->my_numeric;
+  record(st, op);
+}
+
+void crdt_state_reclaim_user_tempshun(struct CrdtNetworkState *st,
+                                      const char *numeric)
+{
+  uint32_t klen = (uint32_t)strlen(numeric);
+  const struct CrdtLWWValue *v = crdt_lwwmap_get(&st->tempshuns, numeric, klen);
+  if (v && v->data)                     /* live entry only (inv. 5/11) */
+    tempshun_mint_delete(st, numeric, klen);
+}
+
+#define TEMPSHUN_REAP_MAX 64
+struct tempshun_reap_ctx {
+  struct CrdtNetworkState *st;
+  char num[TEMPSHUN_REAP_MAX][8];      /* 5-char numeric + NUL */
+  uint32_t nlen[TEMPSHUN_REAP_MAX];
+  int n;
+};
+
+static void tempshun_reap_collect_cb(const char *key, uint32_t key_len,
+                                     const struct CrdtLWWValue *val, void *ctx)
+{
+  struct tempshun_reap_ctx *c = (struct tempshun_reap_ctx *)ctx;
+  (void)val;
+  if (c->n >= TEMPSHUN_REAP_MAX || key_len >= sizeof c->num[0])
+    return;
+  /* the silences gate (inv. 5): user live, or removal not yet causally
+   * stable -> keep; reap only the FULLY-absent. */
+  if (crdt_lwwmap_get(&c->st->users, key, key_len) != NULL ||
+      crdt_lwwmap_is_deleted(&c->st->users, key, key_len))
+    return;
+  memcpy(c->num[c->n], key, key_len);
+  c->num[c->n][key_len] = '\0';
+  c->nlen[c->n] = key_len;
+  c->n++;
+}
+
+int crdt_state_reclaim_orphan_tempshuns(struct CrdtNetworkState *st)
+{
+  struct tempshun_reap_ctx c;
+  int total = 0, i;
+  if (crdt_lwwmap_size(&st->tempshuns) == 0)  /* common case: none */
+    return 0;
+  do {
+    c.st = st;
+    c.n = 0;
+    crdt_lwwmap_foreach(&st->tempshuns, tempshun_reap_collect_cb, &c);
+    for (i = 0; i < c.n; i++)
+      tempshun_mint_delete(st, c.num[i], c.nlen[i]);
+    total += c.n;
+  } while (c.n == TEMPSHUN_REAP_MAX);
+  return total;
+}
 
 int crdt_state_gc(struct CrdtNetworkState *st,
                   const struct CrdtStateVector *stable)

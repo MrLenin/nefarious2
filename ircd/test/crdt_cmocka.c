@@ -2516,6 +2516,77 @@ static void test_crdt_beacon_tick_stale(void **state)
   assert_int_equal(1, crdt_beacon_tick_stale(0, &miss));  /* miss=3 -> stale */
 }
 
+/* Tier C F3 (2026-07-25): TEMPSHUN over the mesh — a dedicated LWW collection
+ * keyed by victim numeric, ORIGIN-written (the oper's / gateway-entry server;
+ * the victim's user record stays home-server single-writer) and applied only
+ * by the victim's HOME server reconcile, where parse-time enforcement lives.
+ * X3's OpServ emits TEMPSHUN USER-sourced, so under tree-retirement the P10 TS
+ * token dies at the fake-direction guard beyond the tree horizon (the
+ * live-confirmed gap-A class) — the doc is the delivery. Gates: '+' and '-'
+ * both REPLICATE ('-' is active=0, never a doc delete — rejoiners must
+ * converge the un-shun); the latest flip LWW-wins across a partition; the
+ * entry is reaped when its user dies (quit-path mint) or is orphaned
+ * (backstop sweep), and reclaim leaves live-user entries alone. */
+static void test_tempshun_replicates_and_reaps(void **state)
+{
+  struct CrdtNetworkState s1, s2;
+  const struct CrdtTempshun *ts;
+  (void)state;
+  crdt_state_init(&s1, 1);
+  crdt_state_init(&s2, 2);
+
+  /* victim exists on both (home = server 2 conceptually; engine is agnostic) */
+  struct CrdtUserRecord u = mkuser("victim", 2, "vic", 0x0C0C0C0C);
+  crdt_user_set(&s2, "ADAAA", &u);
+  assert_int_equal(1, crdt_state_sync(&s1, &s2));
+
+  /* + minted at the ORIGIN (s1, the oper side) -> home (s2) converges it */
+  crdt_tempshun_set(&s1, "ADAAA", 1, "spamming");
+  assert_int_equal(1, crdt_state_sync(&s2, &s1));
+  ts = crdt_tempshun_get(&s2, "ADAAA");
+  assert_non_null(ts);
+  assert_int_equal(1, ts->active);
+  assert_string_equal("spamming", ts->reason);
+
+  /* - replicates as active=0 (entry stays present, no doc delete) */
+  crdt_tempshun_set(&s1, "ADAAA", 0, "appealed");
+  assert_int_equal(1, crdt_state_sync(&s2, &s1));
+  ts = crdt_tempshun_get(&s2, "ADAAA");
+  assert_non_null(ts);
+  assert_int_equal(0, ts->active);
+  assert_true(crdt_state_equal(&s1, &s2));
+
+  /* concurrent flip across a partition: later write wins on BOTH replicas */
+  crdt_tempshun_set(&s1, "ADAAA", 1, "re-shun");
+  crdt_tempshun_set(&s2, "ADAAA", 0, "home says no");
+  crdt_state_sync(&s1, &s2);
+  crdt_state_sync(&s2, &s1);
+  assert_true(crdt_state_equal(&s1, &s2));
+  assert_int_equal(crdt_tempshun_get(&s1, "ADAAA")->active,
+                   crdt_tempshun_get(&s2, "ADAAA")->active);
+
+  /* orphan sweep leaves a LIVE user's entry alone (invariant-5 gate) */
+  assert_int_equal(0, crdt_state_reclaim_orphan_tempshuns(&s1));
+  assert_non_null(crdt_tempshun_get(&s1, "ADAAA"));
+
+  /* user-quit reap: removing the user mints the tempshun DELETE too, and it
+   * replicates (no resurrection from the peer's copy) */
+  crdt_user_remove(&s2, "ADAAA");
+  crdt_state_sync(&s1, &s2);
+  assert_null(crdt_tempshun_get(&s1, "ADAAA"));
+  assert_null(crdt_tempshun_get(&s2, "ADAAA"));
+  assert_true(crdt_state_equal(&s1, &s2));
+
+  /* orphan backstop: an entry whose user record is fully gone gets reaped by
+   * the sweep (mint a real doc DELETE) even without the quit-path mint */
+  crdt_tempshun_set(&s1, "AEAAA", 1, "ghost");   /* no such user anywhere */
+  assert_true(crdt_state_reclaim_orphan_tempshuns(&s1) >= 1);
+  assert_null(crdt_tempshun_get(&s1, "AEAAA"));
+
+  crdt_state_clear(&s1);
+  crdt_state_clear(&s2);
+}
+
 /* Account-prop leaf defect (2026-07-24): parse.c's fake-direction guard
  * (cli_from(from) != cptr) drops every P10 command SOURCED from a synthetic
  * mesh anchor (Case-B STAT_MESH_SERVER, cli_from = self dead-sink, never the
@@ -3440,6 +3511,7 @@ int main(void)
     cmocka_unit_test(test_force_lastmod_breaks_tie),
     cmocka_unit_test(test_crdt_beacon_tick_stale),
     cmocka_unit_test(test_accept_beyond_horizon_source),
+    cmocka_unit_test(test_tempshun_replicates_and_reaps),
     cmocka_unit_test(test_gline_doc_converges_same_lastmod),
     cmocka_unit_test(test_metadata_op_replicates),
     cmocka_unit_test(test_bsess_op_replicates),

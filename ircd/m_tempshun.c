@@ -82,6 +82,7 @@
 #include "config.h"
 
 #include "client.h"
+#include "crdt_shadow.h" /* Tier C F3: mint TEMPSHUN flips into the doc */
 #include "hash.h"
 #include "ircd.h"
 #include "ircd_features.h"
@@ -153,6 +154,14 @@ int ms_tempshun(struct Client* cptr, struct Client* sptr, int parc, char* parv[]
                           (remove ? '-' : '+'), acptr, reason);
   }
 
+  /* Tier C F3: mint into the doc only where the token ENTERED the mesh — a
+   * non-CRDT arrival link (the §17.7 gateway edge; X3's OpServ sources TS
+   * USER-sourced, which tree-retirement fake-direction-drops beyond one hop,
+   * so the doc is what reaches a far victim's home server). A CRDT-aware
+   * arrival means an upstream CRDT node already minted it. */
+  if (!IsCrdtAware(cptr))
+    crdt_shadow_tempshun(acptr, !remove, reason);
+
   return 0;
 }
 
@@ -221,6 +230,11 @@ int mo_tempshun(struct Client* cptr, struct Client* sptr, int parc, char* parv[]
     sendcmdto_serv_butone(sptr, CMD_TEMPSHUN, cptr, "%c %C :%s",
                           (remove ? '-' : '+'), acptr, reason);
   }
+
+  /* Tier C F3: a local oper IS the entry point — always mint the doc flip
+   * (the victim's home server applies it via the reconcile; the P10 relay
+   * above still serves tree/legacy peers). */
+  crdt_shadow_tempshun(acptr, !remove, reason);
 
   return 0;
 }
