@@ -209,7 +209,10 @@ static void render_status(struct Client *to)
   crdt_shadow_presence_diff(to);         /* Tier-2 S1: mesh-map BFS vs beacon-set vs P10 divergences */
 
   for (a = GlobalClientList; a; a = cli_next(a)) {
-    if (!IsServer(a))
+    /* IsServer is exact STAT_SERVER — a mesh stub is STAT_MESH_SERVER, so it
+     * must be admitted here too or the stub branch below is unreachable
+     * (the count read "0 stub" even mid-partition). */
+    if (!IsServer(a) && !IsMeshStub(a))
       continue;
     if (IsMeshStub(a)) {
       stub++;
