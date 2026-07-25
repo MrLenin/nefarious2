@@ -368,6 +368,15 @@ int ms_nick(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
   assert(0 != sptr);
   assert(IsServer(cptr));
 
+  /* A beyond-horizon mesh anchor's user presence is doc-owned (materialized
+   * by the CRDT reconcile) — its tree NICK introduction is redundant and
+   * would collide with the materialized copy, and the nick-change branches
+   * below assume a user sptr (cli_user derefs). Drop it: parse.c's
+   * beyond-horizon exemption admits stub-sourced commands wholesale; NICK is
+   * the one core-lifecycle token whose stub edition must not be processed. */
+  if (IsMeshStub(sptr))
+    return 0;
+
   if ((IsServer(sptr) && parc < 8) || parc < 3)
   {
     sendto_opmask_butone(0, SNO_OLDSNO, "bad NICK param count for %s from %C",

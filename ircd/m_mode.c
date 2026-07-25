@@ -277,7 +277,10 @@ ms_mode(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
 
   ClrFlag(sptr, FLAG_TS8);
 
-  if (IsServer(sptr)) {
+  /* A beyond-horizon mesh anchor (services on a tree-retired leaf) must take
+   * the server branch: it has cli_user == NULL, so the else-branch's
+   * cli_user(sptr)->server deref would crash (invariant #2). */
+  if (IsServer(sptr) || IsMeshStub(sptr)) {
     if (find_conf_byhost(cli_confs(cptr), cli_name(sptr), CONF_UWORLD))
       modebuf_init(&mbuf, sptr, cptr, chptr,
 		   (MODEBUF_DEST_CHANNEL | /* Send mode to clients */

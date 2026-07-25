@@ -107,7 +107,10 @@ int ms_mark(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
 {
   struct Client* acptr;
 
-  if (!IsServer(sptr))
+  /* Accept a beyond-horizon mesh anchor too: X3 sources every MARK from its
+   * server numeric, which resolves to the anchor on a tree-retired leaf
+   * (parse.c only admits it off a trusted CRDT server link). */
+  if (!IsServer(sptr) && !IsMeshStub(sptr))
     return protocol_violation(sptr, "MARK from non-server %s", cli_name(sptr));
 
   if (!strcmp(parv[2], MARK_WEBIRC)) {

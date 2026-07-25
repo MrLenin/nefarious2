@@ -87,7 +87,10 @@ int ms_privs(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
   int modified = 0;
   char *tmp;
 
-  if (IsServer(sptr)) {
+  /* A beyond-horizon mesh anchor is a server source: without it a stub falls
+   * into the query branch below and X3's PRIVS grants are silently never
+   * applied on tree-retired leaves. */
+  if (IsServer(sptr) || IsMeshStub(sptr)) {
     acptr = parc > 1 ? findNUser(parv[1]) : NULL;
 
     if (!acptr)

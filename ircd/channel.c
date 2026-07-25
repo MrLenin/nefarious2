@@ -2301,7 +2301,11 @@ void make_zombie(struct Membership* member, struct Client* who,
   }
   if (cli_from(who) == cptr)        /* True on servers 1, 5 and 6 */
   {
-    struct Client *acptr = IsServer(sptr) ? sptr : (cli_user(sptr))->server;
+    /* Mesh anchors take the server arm (cli_user is NULL); their cli_serv->up
+     * is &me (synthetic) or the retained parent (converted stub), so the
+     * uplink walk below terminates normally. */
+    struct Client *acptr = (IsServer(sptr) || IsMeshStub(sptr)) ?
+                           sptr : (cli_user(sptr))->server;
     for (; acptr != &me; acptr = (cli_serv(acptr))->up)
       if (acptr == (cli_user(who))->server)   /* Case d) (server 5) */
       {
@@ -5057,8 +5061,12 @@ mode_parse(struct ModeBuf *mbuf, struct Client *cptr, struct Client *sptr,
         break;
 
       case 'z': /* deal with persistant (EXMODE_PERSIST) channels */
-        if (!IsBurst(sptr) && ((IsServer(sptr) && !IsService(sptr)) ||
-           (!IsServer(sptr) && !IsService(cli_user(sptr)->server))))
+        /* Mesh anchors count as servers here: cli_user is NULL, so the
+         * user-side IsService deref would crash. A stub carries no
+         * FLAG_SERVICE, so it falls to break (mode skipped), matching the
+         * pre-exemption drop. */
+        if (!IsBurst(sptr) && ((IsServer(sptr) || IsMeshStub(sptr)) ?
+             !IsService(sptr) : !IsService(cli_user(sptr)->server)))
           break;
         mode_parse_exmode(&state, flag_p);
         if ((state.dir == MODE_DEL) && (chptr->users == 0))
