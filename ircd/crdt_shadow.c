@@ -2233,10 +2233,20 @@ void crdt_shadow_metadata_suspend(int on)
  * (account is actually a "#chan" cache-key string) converge exactly like account keys
  * — same opaque composite, same generic LWW path; the doc has no notion of key shape.
  * TTL-class channel writes (today's only channel writer, the ms_metadata cache) are
- * excluded by the mirror's !permanent gate (metadata.c:527 -> crdt_shadow_metadata_set,
+ * excluded by the mirror's !permanent gate (metadata.c:534 -> crdt_shadow_metadata_set,
  * here at :2272), NOT by this function on key shape — so a pre-B2 (old) peer whose
  * reconcile writes a channel row back to the store never materializes it into live
- * memory (channel doc-reconcile doesn't exist yet); version-tolerant by construction. */
+ * memory (channel doc-reconcile doesn't exist yet); version-tolerant by construction.
+ *
+ * First-segment cap is CHANNELLEN, not ACCOUNTLEN: B1 (+R channel metadata,
+ * metadata_set_channel's persist leg) makes this slot hold a real channel name up to
+ * CHANNELLEN(200), not just an account (<=ACCOUNTLEN=15) — bounding on ACCOUNTLEN alone
+ * would silently drop any channel name longer than 15 bytes from the doc (this function
+ * returns 0, metadata_account_set_ts's mirror call is a no-op, no error surfaces
+ * anywhere). Every buffer/check downstream that splits this same opaque key
+ * (crdt_shadow_metadata_set's dk, reconcile_metadata_set_cb, crdt_shadow_reconcile_metadata's
+ * DELETE pass + its del_ctx.keys collector) must size/gate on CHANNELLEN too, for the
+ * same reason. */
 static uint32_t metadata_doc_key(const char *account, const char *key,
                                  char *buf, size_t n)
 {
@@ -2246,7 +2256,7 @@ static uint32_t metadata_doc_key(const char *account, const char *key,
   al = (uint32_t)strlen(account);
   kl = (uint32_t)strlen(key);
   klen = al + 1 + kl;
-  if (al > ACCOUNTLEN || kl > METADATA_KEY_LEN || klen > n)
+  if (al > CHANNELLEN || kl > METADATA_KEY_LEN || klen > n)
     return 0;
   memcpy(buf, account, al); buf[al] = '\0'; memcpy(buf + al + 1, key, kl);
   return klen;
@@ -2261,7 +2271,7 @@ static uint32_t metadata_doc_key(const char *account, const char *key,
 void crdt_shadow_metadata_set(const char *account, const char *key,
                               const char *value, int permanent)
 {
-  char dk[ACCOUNTLEN + METADATA_KEY_LEN + 4];
+  char dk[CHANNELLEN + METADATA_KEY_LEN + 4];  /* account-or-channel slot; see metadata_doc_key */
   uint32_t klen;
   if (!shadow_on() || g_metadata_reconciling || g_metadata_remote_applying)
     return;
@@ -2317,7 +2327,8 @@ static void reconcile_metadata_set_cb(const char *key, uint32_t key_len,
 {
   struct reconcile_metadata_ctx *c = ctx;
   const char *nul, *docraw;
-  char account[ACCOUNTLEN + 1], mkey[METADATA_KEY_LEN + 1];
+  /* account-or-channel slot; CHANNELLEN is the wider cap — see metadata_doc_key */
+  char account[CHANNELLEN + 1], mkey[METADATA_KEY_LEN + 1];
   char cur[METADATA_VALUE_LEN + 1], docval[METADATA_VALUE_LEN + 1];
   uint32_t al, kl;
   int docvis, curvis;
@@ -2328,7 +2339,7 @@ static void reconcile_metadata_set_cb(const char *key, uint32_t key_len,
     return;
   al = (uint32_t)(nul - key);
   kl = key_len - al - 1;
-  if (al == 0 || al > ACCOUNTLEN || kl == 0 || kl > METADATA_KEY_LEN)
+  if (al == 0 || al > CHANNELLEN || kl == 0 || kl > METADATA_KEY_LEN)
     return;
   memcpy(account, key, al); account[al] = '\0';
   memcpy(mkey, nul + 1, kl); mkey[kl] = '\0';
@@ -2364,7 +2375,8 @@ static void reconcile_metadata_set_cb(const char *key, uint32_t key_len,
  * never doc-present). Collect-then-act (metadata_account_foreach_key holds a live db
  * iterator; the deletes run after it closes). */
 struct reconcile_metadata_del_ctx {
-  char keys[CRDT_METADATA_REMOVE_MAX][ACCOUNTLEN + METADATA_KEY_LEN + 4];
+  /* account-or-channel slot; CHANNELLEN is the wider cap — see metadata_doc_key */
+  char keys[CRDT_METADATA_REMOVE_MAX][CHANNELLEN + METADATA_KEY_LEN + 4];
   uint32_t klens[CRDT_METADATA_REMOVE_MAX];
   int nr;
   int capped;
@@ -2405,7 +2417,8 @@ void crdt_shadow_reconcile_metadata(void)
     for (i = 0; i < d->nr; i++) {
       const char *k = d->keys[i];
       const char *nul = memchr(k, '\0', d->klens[i]);
-      char account[ACCOUNTLEN + 1], mkey[METADATA_KEY_LEN + 1];
+      /* account-or-channel slot; CHANNELLEN is the wider cap — see metadata_doc_key */
+      char account[CHANNELLEN + 1], mkey[METADATA_KEY_LEN + 1];
       char oldval[METADATA_VALUE_LEN + 1];
       uint32_t al, kl;
       int oldvis;
@@ -2413,7 +2426,7 @@ void crdt_shadow_reconcile_metadata(void)
         continue;
       al = (uint32_t)(nul - k);
       kl = d->klens[i] - al - 1;
-      if (al == 0 || al > ACCOUNTLEN || kl == 0 || kl > METADATA_KEY_LEN)
+      if (al == 0 || al > CHANNELLEN || kl == 0 || kl > METADATA_KEY_LEN)
         continue;
       memcpy(account, k, al); account[al] = '\0';
       memcpy(mkey, nul + 1, kl); mkey[kl] = '\0';

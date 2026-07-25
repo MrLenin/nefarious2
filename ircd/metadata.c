@@ -343,7 +343,11 @@ int metadata_account_get_vis(const char *account, const char *key,
                              char *value, size_t value_len, int *visibility)
 {
   struct db_val val = { NULL, 0 };
-  char keybuf[ACCOUNTLEN + METADATA_KEY_LEN + 2];
+  /* @a account is an account name (<=ACCOUNTLEN) OR, since B1/B2's opaque
+   * "#chan\0key" reuse, a channel name (<=CHANNELLEN) — size for the wider
+   * of the two so a channel target doesn't silently fail the length check
+   * in build_lmdb_key below. */
+  char keybuf[CHANNELLEN + METADATA_KEY_LEN + 2];
   char decoded[METADATA_VALUE_LEN];
   const void *raw;
   size_t rawlen;
@@ -446,7 +450,10 @@ static int metadata_account_set_ts(const char *account, const char *key,
                                     int visibility)
 {
   struct db_writebatch *wb;
-  char keybuf[ACCOUNTLEN + METADATA_KEY_LEN + 2];
+  /* @a account: account name (<=ACCOUNTLEN) or, since B1, a channel name
+   * (<=CHANNELLEN) passed in by metadata_set_channel's +R persist leg — see
+   * the keybuf comment in metadata_account_get_vis above. */
+  char keybuf[CHANNELLEN + METADATA_KEY_LEN + 2];
   char prefixed[METADATA_VALUE_LEN + 8]; /* room for the 2-byte P:/ *: prefix */
   char encoded[METADATA_VALUE_LEN + 32]; /* Extra space for TTL prefix */
   const char *stored_value;
@@ -682,7 +689,12 @@ int metadata_readmarker_set(const char *account, const char *target, const char 
 struct MetadataEntry *metadata_account_list(const char *account)
 {
   struct db_iter *it;
-  char prefix[ACCOUNTLEN + 2];
+  /* @a account: account name or (B1) a channel name via the #chan\0key
+   * reuse — same widened cap as metadata_account_get_vis/set_ts; this is
+   * metadata_channel_load's backing call (metadata-era2-completion §B3),
+   * so it must accept a full-length channel name too, even though that
+   * caller isn't wired up yet. */
+  char prefix[CHANNELLEN + 2];
   int prefixlen;
   struct MetadataEntry *head = NULL, *tail = NULL, *entry;
   int rc;
@@ -695,7 +707,7 @@ struct MetadataEntry *metadata_account_list(const char *account)
     return NULL;
 
   prefixlen = strlen(account);
-  if (prefixlen >= ACCOUNTLEN)
+  if (prefixlen >= CHANNELLEN)
     return NULL;
   memcpy(prefix, account, prefixlen);
   prefix[prefixlen++] = KEY_SEP;
@@ -1224,6 +1236,86 @@ int metadata_memory_del(struct Client *cptr, const char *key)
   return 0;
 }
 
+/** Insert or update a channel's in-memory metadata entry WITHOUT touching
+ * the persistent store or the CRDT doc — the channel counterpart to
+ * metadata_memory_put().  Factored out of metadata_set_channel()'s body so
+ * the list-handling (find-or-create in chptr->metadata, update value +
+ * visibility) lives in exactly one place: metadata_set_channel() calls this
+ * for its memory half, then does its own (+R-gated) persist leg.  Also the
+ * promotion primitive for the GET-fallback cache fill (m_metadata.c) — a
+ * read must not persist or doc-mint, so it calls this, never
+ * metadata_set_channel() directly, mirroring metadata_memory_put's role in
+ * the user GET-fallback.
+ *
+ * @param[in] chptr Channel whose in-memory cache gets the entry.
+ * @param[in] key Key name.
+ * @param[in] value Value to cache (non-NULL — a delete goes through
+ *                   metadata_channel_memory_del()).
+ * @param[in] visibility Visibility level.
+ * @return The new-or-updated entry, or NULL on bad args / allocation failure.
+ */
+struct MetadataEntry *metadata_channel_memory_put(struct Channel *chptr, const char *key,
+                                                   const char *value, int visibility)
+{
+  struct MetadataEntry *entry;
+
+  if (!chptr || !key || !value)
+    return NULL;
+
+  for (entry = chptr->metadata; entry; entry = entry->next) {
+    if (ircd_strcmp(entry->key, key) == 0)
+      break;
+  }
+
+  if (entry) {
+    char *newval = (char *)MyMalloc(strlen(value) + 1);
+    if (!newval)
+      return NULL;
+    strcpy(newval, value);
+    if (entry->value)
+      MyFree(entry->value);
+    entry->value = newval;
+    entry->visibility = visibility;
+  } else {
+    entry = create_entry(key, value);
+    if (!entry)
+      return NULL;
+    entry->visibility = visibility;
+    entry->next = chptr->metadata;
+    chptr->metadata = entry;
+  }
+
+  return entry;
+}
+
+/** Remove a channel's in-memory metadata entry only — no store write, no doc
+ * mirror.  The delete counterpart to metadata_channel_memory_put(): the
+ * memory half metadata_set_channel() calls before its own (+R-gated)
+ * persist leg. Mirrors metadata_memory_del()'s shape for chptr->metadata.
+ * @param[in] chptr Channel whose in-memory cache loses the entry.
+ * @param[in] key Key name to remove.
+ * @return 1 if an entry was removed, 0 if none matched / bad args.
+ */
+int metadata_channel_memory_del(struct Channel *chptr, const char *key)
+{
+  struct MetadataEntry *entry, *prev = NULL;
+
+  if (!chptr || !key)
+    return 0;
+
+  for (entry = chptr->metadata; entry; prev = entry, entry = entry->next) {
+    if (ircd_strcmp(entry->key, key) == 0) {
+      if (prev)
+        prev->next = entry->next;
+      else
+        chptr->metadata = entry->next;
+      metadata_free_entry(entry);
+      return 1;
+    }
+  }
+  return 0;
+}
+
 /** Materialize a doc-converged account-metadata change into LIVE state, then
  * notify subscribers.  The memory + notify half of the CRDT doc reconcile
  * (crdt_shadow_reconcile_metadata) — the store half is already healed by the
@@ -1737,7 +1829,32 @@ struct MetadataEntry *metadata_get_channel(struct Channel *chptr, const char *ke
   return NULL;
 }
 
-/** Set metadata for a channel.
+/** Set metadata for a channel — THE persist chokepoint for +R channel
+ * metadata (B1).
+ *
+ * Memory half: delegates to metadata_channel_memory_put()/
+ * metadata_channel_memory_del() (find-or-create/update, or remove) so the
+ * list-handling lives in exactly one place, shared with the GET-fallback
+ * cache-fill promotion in m_metadata.c.
+ *
+ * Persist half: iff the channel is registered (MODE_REGISTERED), the
+ * change also goes through metadata_account_set_permanent(chptr->chname,
+ * key, value, visibility) — chptr->chname in the account slot reuses the
+ * whole P1 machinery as-is (opaque "#chan\0key" store row, A2
+ * visibility-prefixed) and doc-mirrors it at the single chokepoint
+ * (metadata_account_set_ts -> crdt_shadow_metadata_set, metadata.c:534):
+ * value!=NULL sets/updates the permanent row; value==NULL deletes it and
+ * mints a doc tombstone iff the key was doc-present. Not +R: memory only,
+ * unchanged.
+ *
+ * Runs on relayed applies too (ms_metadata, m_metadata.c): every node
+ * persists its own store row from the applied value — only the ORIGIN
+ * mints a doc op, because ms_metadata already brackets its apply in
+ * crdt_shadow_metadata_suspend(1)/(0) (m_metadata.c:1404/:1447), which
+ * makes the storage-layer mirror inside metadata_account_set_ts a no-op
+ * for the re-entrant call. That suspend bracket is what gives this
+ * chokepoint its single-writer split — nothing below re-implements it.
+ *
  * @param[in] chptr Channel to set metadata on.
  * @param[in] key Key name.
  * @param[in] value Value to set (NULL to delete).
@@ -1746,51 +1863,19 @@ struct MetadataEntry *metadata_get_channel(struct Channel *chptr, const char *ke
  */
 int metadata_set_channel(struct Channel *chptr, const char *key, const char *value, int visibility)
 {
-  struct MetadataEntry *entry, *prev = NULL;
-
   if (!chptr || !key)
     return -1;
 
-  /* Find existing entry */
-  for (entry = chptr->metadata; entry; prev = entry, entry = entry->next) {
-    if (ircd_strcmp(entry->key, key) == 0)
-      break;
+  if (value) {
+    if (!metadata_channel_memory_put(chptr, key, value, visibility))
+      return -1;
+  } else {
+    metadata_channel_memory_del(chptr, key);
   }
 
-  if (value) {
-    /* Set or update */
-    if (entry) {
-      /* Update existing — malloc-check-then-swap (T2 review rider): allocate
-       * and copy the new value FIRST, then free the old and swap, so an
-       * allocation failure leaves entry->value intact rather than dangling.
-       * Mirrors metadata_memory_put's ordering. */
-      char *newval = (char *)MyMalloc(strlen(value) + 1);
-      if (!newval)
-        return -1;
-      strcpy(newval, value);
-      if (entry->value)
-        MyFree(entry->value);
-      entry->value = newval;
-      entry->visibility = visibility;
-    } else {
-      /* Create new */
-      entry = create_entry(key, value);
-      if (!entry)
-        return -1;
-      entry->visibility = visibility;
-      entry->next = chptr->metadata;
-      chptr->metadata = entry;
-    }
-  } else {
-    /* Delete */
-    if (entry) {
-      if (prev)
-        prev->next = entry->next;
-      else
-        chptr->metadata = entry->next;
-      metadata_free_entry(entry);
-    }
-  }
+  /* +R persist leg — see function header. */
+  if ((chptr->mode.mode & MODE_REGISTERED) && metadata_lmdb_is_available())
+    metadata_account_set_permanent(chptr->chname, key, value, visibility);
 
   return 0;
 }
