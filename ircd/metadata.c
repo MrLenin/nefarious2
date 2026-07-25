@@ -1316,38 +1316,66 @@ int metadata_channel_memory_del(struct Channel *chptr, const char *key)
   return 0;
 }
 
-/** Materialize a doc-converged account-metadata change into LIVE state, then
- * notify subscribers.  The memory + notify half of the CRDT doc reconcile
- * (crdt_shadow_reconcile_metadata) — the store half is already healed by the
- * caller.  For every LOCAL client authed to @a account (multiple per account is
- * normal — a bouncer session's aliases) the in-memory cli_metadata entry is
- * updated (value!=NULL) or removed (value==NULL) DIRECTLY, then the subscriber
- * notify fires.
+/** Materialize a doc-converged account-OR-channel metadata change into LIVE
+ * state, then notify subscribers.  The memory + notify half of the CRDT doc
+ * reconcile (crdt_shadow_reconcile_metadata) — the store half is already
+ * healed by the caller.  @a account is the opaque doc/store slot the caller
+ * split from "account\0key" (reconcile_metadata_set_cb / the delete
+ * store-walk): either a real account name, or — since B1/B2 — a channel
+ * name (IsChannelName), which reuses the identical slot (metadata-era2-
+ * completion §B2).  This function branches on that shape:
+ *
+ * ACCOUNT branch: for every LOCAL client authed to @a account (multiple per
+ * account is normal — a bouncer session's aliases) the in-memory
+ * cli_metadata entry is updated (value!=NULL) or removed (value==NULL)
+ * DIRECTLY, then the subscriber notify fires.
+ *
+ * CHANNEL branch (P2/B4, metadata-era2-completion §B4): if
+ * FindChannel(@a account) resolves to a locally-live channel, its
+ * chptr->metadata entry is updated/removed DIRECTLY via
+ * metadata_channel_memory_put / metadata_channel_memory_del — the channel
+ * twin of metadata_memory_put / metadata_memory_del, also memory-only, also
+ * with no notify of its own — so this function fires
+ * metadata_notify_subscribers(account, ...) explicitly right after, exactly
+ * mirroring the account branch's explicit notify call below.  If the
+ * channel isn't locally live (FindChannel miss), this is a correct
+ * store-only no-op: memory materializes later, either when a +R create runs
+ * (B3) or lazily via the read-only GET fallback.  Either way the channel
+ * branch returns without falling into the account walk below.
  *
  * HARD RULES (A1 + the umode-mirror deferral, metadata-era2-completion §A1 /
- * "Known deferrals discovered in flight"):
- *   - NO store write, NO doc op: memory + notify only.  It must NOT call
- *     metadata_set_client (store re-write + doc re-entry) — hence
- *     metadata_memory_put / metadata_memory_del.
- *   - NO umode flag-sync from doc values: a "umode.*" doc value can lag true
- *     flag state right after burst (the set_user_mode loop/post-loop +r split),
- *     so this touches only the cli_metadata VIEW, never FlagSet — the flags are
+ * "Known deferrals discovered in flight"; §B4 extends the same rules to the
+ * channel branch):
+ *   - NO store write, NO doc op, for EITHER branch: memory + notify only.
+ *     The account branch must NOT call metadata_set_client (store re-write +
+ *     doc re-entry) — hence metadata_memory_put / metadata_memory_del; the
+ *     channel branch must NOT call metadata_set_channel for the same reason
+ *     — hence metadata_channel_memory_put / metadata_channel_memory_del.
+ *   - NO umode flag-sync from doc values (account branch only — a channel
+ *     has no umode concept): a "umode.*" doc value can lag true flag state
+ *     right after burst (the set_user_mode loop/post-loop +r split), so
+ *     this touches only the cli_metadata VIEW, never FlagSet — the flags are
  *     authoritative and self-heal on the next toggle.
- *   - Notify is vis-aware (Task 5, metadata-era2-completion §A6).  PUBLIC
- *     keeps the pre-Task-5 call shape: once per network-visible nick under
- *     this account (the FindUser-resolves-to-self guard — a hidden bouncer
- *     alias shares its primary's nick and would otherwise drive a
- *     NULL-target notify, which skips the channel-share filter and
- *     over-notifies; "one per nick" is correct for two independent logins of
- *     the same account, each a distinct visible identity with its own
- *     channel-mates).  PRIVATE has no per-nick scoping —
+ *   - Notify is vis-aware (Task 5, metadata-era2-completion §A6) for both
+ *     branches.  Account/PUBLIC keeps the pre-Task-5 call shape: once per
+ *     network-visible nick under this account (the FindUser-resolves-to-self
+ *     guard — a hidden bouncer alias shares its primary's nick and would
+ *     otherwise drive a NULL-target notify, which skips the channel-share
+ *     filter and over-notifies; "one per nick" is correct for two independent
+ *     logins of the same account, each a distinct visible identity with its
+ *     own channel-mates).  Account/PRIVATE has no per-nick scoping —
  *     metadata_notify_subscribers fans out by ACCOUNT (every subscribed
  *     self-session, aliases included), so a single call already reaches
  *     every self-session no matter which live nick triggers it; call it at
  *     most once per invocation to avoid redundant duplicate delivery to the
- *     same self-sessions when an account has more than one live nick.
+ *     same self-sessions when an account has more than one live nick.  The
+ *     channel branch calls it exactly once per invocation too — channel
+ *     membership fan-out (and the PRIVATE-channel-has-no-owner no-op) is
+ *     handled inside metadata_notify_subscribers itself, so one call already
+ *     covers every subscribed member.
  *
- * @param[in] account   Account the converged change applies to.
+ * @param[in] account   Account, or — when IsChannelName(account) — the
+ *                       channel name, the converged change applies to.
  * @param[in] key       Metadata key.
  * @param[in] value     STRIPPED value (visibility already decoded), or NULL to remove.
  * @param[in] visibility Decoded visibility.  Sets the live entry's visibility
@@ -1366,6 +1394,24 @@ void metadata_apply_converged(const char *account, const char *key,
 
   if (!account || !*account || !key || !*key)
     return;
+
+  /* Channel branch (P2/B4) — see the function header.  A channel account
+   * slot never also matches a live user account, so this always returns
+   * rather than falling into the account walk below. */
+  if (IsChannelName(account)) {
+    struct Channel *chptr = FindChannel(account);
+    if (chptr) {
+      if (value)
+        metadata_channel_memory_put(chptr, key, value, visibility);
+      else
+        metadata_channel_memory_del(chptr, key);
+      /* Explicit notify — metadata_channel_memory_put/_del are pure list
+       * ops with no notify of their own (Task 2/B1 review), so this call is
+       * the channel twin of the account branch's notify call below. */
+      metadata_notify_subscribers(account, key, value, visibility);
+    }
+    return;
+  }
 
   /* User branch: walk every LOCAL client authed to this account.
    * LocalClientArray holds only MyConnect clients, so this never emits S2S —
@@ -1396,9 +1442,6 @@ void metadata_apply_converged(const char *account, const char *key,
       notified = 1;
     }
   }
-
-  /* P2 adds the channel branch here (FindChannel(account) -> chptr->metadata
-   * update + notify) — see metadata-era2-completion §B4. */
 }
 
 /** Get metadata for a client.

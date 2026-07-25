@@ -233,18 +233,34 @@ extern struct MetadataEntry *metadata_channel_memory_put(struct Channel *chptr, 
  */
 extern int metadata_channel_memory_del(struct Channel *chptr, const char *key);
 
-/** Materialize a doc-converged account-metadata change into LIVE state, then
- * fire subscriber notifies — the memory + notify half of the CRDT doc reconcile
- * (crdt_shadow_reconcile_metadata); the store half is already healed by the
- * caller.  For every LOCAL client authed to @a account (multiple per account is
- * normal — bouncer sessions/aliases) the in-memory cli_metadata entry is
- * updated (value!=NULL) or removed (value==NULL) directly (metadata_memory_put
- * / metadata_memory_del — never metadata_set_client, which would re-write the
- * store and re-enter the doc mirror).  NO store write, NO doc op, NO umode
- * flag-sync (umode.* doc values can lag true flag state right after burst).
- * Notify is vis-aware (Task 5, metadata-era2-completion §A6) — see
+/** Materialize a doc-converged account-OR-channel metadata change into LIVE
+ * state, then fire subscriber notifies — the memory + notify half of the CRDT
+ * doc reconcile (crdt_shadow_reconcile_metadata); the store half is already
+ * healed by the caller.  @a account is the opaque "account\0key" doc/store
+ * slot split by the caller: either a real account name, or — since B1/B2 —
+ * a channel name (IsChannelName), which reuses the identical slot.
+ *
+ * ACCOUNT branch: for every LOCAL client authed to @a account (multiple per
+ * account is normal — bouncer sessions/aliases) the in-memory cli_metadata
+ * entry is updated (value!=NULL) or removed (value==NULL) directly
+ * (metadata_memory_put / metadata_memory_del — never metadata_set_client,
+ * which would re-write the store and re-enter the doc mirror).
+ *
+ * CHANNEL branch (P2/B4): if FindChannel(@a account) resolves to a
+ * locally-live channel, its chptr->metadata entry is updated/removed
+ * directly (metadata_channel_memory_put / metadata_channel_memory_del —
+ * never metadata_set_channel, same reasoning), then the channel subscriber
+ * notify fires explicitly (those primitives carry no notify of their own).
+ * A FindChannel miss is a correct store-only no-op — memory materializes
+ * later via a +R create or the read-only GET fallback.
+ *
+ * NO store write, NO doc op, for EITHER branch.  NO umode flag-sync (umode.*
+ * doc values can lag true flag state right after burst; account branch
+ * only — channels have no umode concept).  Notify is vis-aware (Task 5,
+ * metadata-era2-completion §A6) for both branches — see
  * metadata_notify_subscribers.
- * @param[in] account   Account the converged change applies to.
+ * @param[in] account   Account, or — when IsChannelName(account) — the
+ *                       channel name, the converged change applies to.
  * @param[in] key       Metadata key.
  * @param[in] value     STRIPPED value (visibility already decoded), or NULL to remove.
  * @param[in] visibility Decoded visibility.  Sets the live entry's visibility
