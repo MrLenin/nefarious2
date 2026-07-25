@@ -90,6 +90,45 @@ static inline int crdt_beacon_tick_stale(int seen, uint8_t *miss)
   return *miss >= CRDT_BEACON_MISS_TICKS;
 }
 
+/*
+ * Account-prop leaf defect (2026-07-24): under tree-retirement a CRDT leaf's
+ * P10 tree is truncated, but its hub still tree-relays commands SOURCED from
+ * servers beyond that horizon (services: AC, SVSMODE, ...). The leaf resolves
+ * such a source to its doc-materialized mesh anchor (STAT_MESH_SERVER, cli_from
+ * = self dead-sink — never the arriving link), so parse.c's fake-direction
+ * guard (cli_from(from) != cptr) rejected every such command as spoofed:
+ * accounts were never stamped on leaves (WHOIS 330 empty), breaking every
+ * account-anchored feature there. The doc cannot heal it — reconcile carries
+ * no account clause and skips local users — so the guard must admit these.
+ *
+ * The exemption predicate: accept a beyond-horizon source ONLY when (a) it is
+ * a mesh stub/anchor that is itself mesh-plane-owned (CRDT-aware), AND (b) the
+ * message arrived on a real P10 server link that is a CRDT peer. A CRDT peer
+ * already holds full doc-write authority, so this stays inside the existing
+ * trust boundary; every legitimate fake-direction drop (a real server on the
+ * wrong link, a legacy or hostile peer sourcing a stub) still fires.
+ * SECURITY: never relax this to the stub check alone — without the
+ * CRDT-server link gate a legacy peer could forge services-sourced commands.
+ *
+ * Pure (no Client dep); `static inline` so the engine cmocka suite gates the
+ * full 16-row truth table (exactly one row accepts). Call sites extract the
+ * booleans via CrdtAcceptBeyondHorizonSource below.
+ */
+static inline int crdt_accept_beyond_horizon(int from_is_mesh_stub,
+                                             int from_is_crdt_aware,
+                                             int link_is_server,
+                                             int link_is_crdt_aware)
+{
+  return from_is_mesh_stub && from_is_crdt_aware
+      && link_is_server && link_is_crdt_aware;
+}
+
+/* Client-typed extraction for the parse.c guard sites. Expands client.h
+ * macros at the call site so this header stays Client-free (engine purity). */
+#define CrdtAcceptBeyondHorizonSource(from, cptr) \
+  crdt_accept_beyond_horizon(IsMeshStub(from), IsCrdtAware(from), \
+                             IsServer(cptr), IsCrdtAware(cptr))
+
 /** Initialise the shadow CRDT document for this server and arm the periodic
  *  verify timer. Idempotent; safe to call once at startup. */
 void crdt_shadow_init(uint16_t my_numeric);

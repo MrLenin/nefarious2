@@ -28,6 +28,7 @@
 #include "capab.h"
 #include "class.h"
 #include "crdt_hlc.h"
+#include "crdt_shadow.h"
 #include "client.h"
 #include "forwarded_label.h"
 #include "channel.h"
@@ -1941,8 +1942,12 @@ int parse_server(struct Client *cptr, char *buffer, char *bufend)
       else
         return 0;
     }
-    else if (cli_from(from) != cptr)
+    else if (cli_from(from) != cptr &&
+             !CrdtAcceptBeyondHorizonSource(from, cptr))
     {
+      /* Exemption: a doc-materialized mesh anchor's cli_from is a self
+       * dead-sink, never the arriving link — accept it from a trusted CRDT
+       * server link (predicate + security bound in crdt_shadow.h). */
       ++ServerStats->is_wrdi;
       Debug((DEBUG_NOTICE, "Fake direction: Message (%s) coming from (%s)",
           buffer, cli_name(cptr)));
@@ -2024,8 +2029,13 @@ int parse_server(struct Client *cptr, char *buffer, char *bufend)
     /* Let para[0] point to the name of the sender */
     para[0] = cli_name(from);
 
-    if (cli_from(from) != cptr)
+    if (cli_from(from) != cptr &&
+        !CrdtAcceptBeyondHorizonSource(from, cptr))
     {
+      /* Same beyond-horizon exemption as the named-prefix guard above: a mesh
+       * anchor sourced over a trusted CRDT server link is legitimate
+       * tree-relay, not a spoof (services AC/SVSMODE/... to a tree-retired
+       * leaf resolve to the anchor, whose cli_from is a self dead-sink). */
       ServerStats->is_wrdi++;
       Debug((DEBUG_NOTICE, "Fake direction: Message (%s) coming from (%s)",
           buffer, cli_name(cptr)));

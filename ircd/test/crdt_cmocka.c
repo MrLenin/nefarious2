@@ -2460,6 +2460,34 @@ static void test_crdt_beacon_tick_stale(void **state)
   assert_int_equal(1, crdt_beacon_tick_stale(0, &miss));  /* miss=3 -> stale */
 }
 
+/* Account-prop leaf defect (2026-07-24): parse.c's fake-direction guard
+ * (cli_from(from) != cptr) drops every P10 command SOURCED from a synthetic
+ * mesh anchor (Case-B STAT_MESH_SERVER, cli_from = self dead-sink, never the
+ * arriving link) — so services-sourced AC/SVSMODE/... tree-relayed to a
+ * tree-retired CRDT leaf were rejected as spoofed and accounts never stamped
+ * on leaves (WHOIS 330 empty). crdt_accept_beyond_horizon is the pure
+ * exemption predicate; this truth table is its security spec: exactly ONE of
+ * the 16 rows accepts. Any additional accepting row is a spoof hole (a
+ * legacy/hostile peer forging services-sourced commands); any fewer and the
+ * exemption is dead (the leaf defect returns). */
+static void test_accept_beyond_horizon_source(void **state)
+{
+  int stub, aware, lsrv, laware;
+  (void)state;
+  for (stub = 0; stub <= 1; ++stub)
+    for (aware = 0; aware <= 1; ++aware)
+      for (lsrv = 0; lsrv <= 1; ++lsrv)
+        for (laware = 0; laware <= 1; ++laware)
+          assert_int_equal(stub && aware && lsrv && laware,
+                           crdt_accept_beyond_horizon(stub, aware,
+                                                      lsrv, laware));
+  /* the named constraint rows from the design pass, re-asserted explicitly: */
+  assert_int_equal(0, crdt_accept_beyond_horizon(1, 1, 1, 0)); /* legacy server link: NEVER (the "IsMeshStub alone" hole) */
+  assert_int_equal(0, crdt_accept_beyond_horizon(1, 1, 0, 1)); /* non-server link (overlay/client conn) */
+  assert_int_equal(0, crdt_accept_beyond_horizon(1, 0, 1, 1)); /* stub not mesh-plane-owned (proxied legacy) */
+  assert_int_equal(0, crdt_accept_beyond_horizon(0, 1, 1, 1)); /* real server, wrong direction = the classic spoof the guard exists for */
+}
+
 /* Doc-convergence: two nodes set the SAME mask in the same second with EQUAL
  * lastmod but DIFFERENT reasons; after a cross-merge both replicas converge to one
  * winning record (identical digest, identical winning reason), and the tie-inducing
@@ -3355,6 +3383,7 @@ int main(void)
     cmocka_unit_test(test_gline_op_replicates),
     cmocka_unit_test(test_force_lastmod_breaks_tie),
     cmocka_unit_test(test_crdt_beacon_tick_stale),
+    cmocka_unit_test(test_accept_beyond_horizon_source),
     cmocka_unit_test(test_gline_doc_converges_same_lastmod),
     cmocka_unit_test(test_metadata_op_replicates),
     cmocka_unit_test(test_bsess_op_replicates),

@@ -151,8 +151,13 @@ int ms_account(struct Client* cptr, struct Client* sptr, int parc,
 
   /* B0/MR-3d: accept IsMe too — the services-anchor bridge re-injects a tunneled LOC reply
    * via ms_account(&me, &me, ...) on the destination leaf (sptr=&me, IsMe not IsServer).
-   * Safe: ms_account is a server-only handler (CR-X delivers it), unforgeable by a client. */
-  if (!IsServer(sptr) && !IsMe(sptr))
+   * Safe: ms_account is a server-only handler (CR-X delivers it), unforgeable by a client.
+   * Accept IsMeshStub too — on a tree-retired leaf the services server resolves to its
+   * doc-materialized mesh anchor (STAT_MESH_SERVER, not STAT_SERVER), and parse.c's
+   * beyond-horizon exemption only admits it off a trusted CRDT server link (crdt_shadow.h).
+   * Downstream is stub-safe: acptr carries the %C/notify legs, and %C treats a stub as a
+   * server (ircd_snprintf.c). */
+  if (!IsServer(sptr) && !IsMe(sptr) && !IsMeshStub(sptr))
     return protocol_violation(cptr, "ACCOUNT from non-server %s",
 			      cli_name(sptr));
 
