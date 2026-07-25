@@ -56,13 +56,42 @@ modern authentication. Highlights:
 
   S2S / PROTOCOL
   - IRCv3-aware S2S framework with link-time capability negotiation —
-    new tokens (MD/MDQ for metadata, MR for read markers, TG for TAGMSG,
+    new tokens (MD for metadata, MR for read markers, TG for TAGMSG,
     BX for bouncer ops, CI for cache invalidation, SASL for auth relay)
     are gated on peer capability and silently ignored by legacy peers.
   - Compact ,C<client_tags> segment piggybacks IRCv3 client tags on
     existing P10 messages without inflating the wire format.
   - Federated chathistory with msgid consistency; multiline limits
     enforced at S2S boundaries.
+
+  CRDT MESH  (crdt-mesh branch — experimental, opt-in)
+  A conflict-free replicated data type (CRDT) is a data structure whose
+  replicas can be updated independently and always merge back to the same
+  value regardless of the order updates arrive in. This branch makes the
+  network's shared state one such document, replicated over a mesh instead
+  of burst down the P10 tree.
+  - Network state — users, channels, memberships, modes, topics, bans —
+    converges by commutative merge (last-write-wins maps + observed-remove
+    sets + a hybrid logical clock). Any single partition heals on its own,
+    with no designated re-synchroniser, no netburst storm, and no "losing
+    side" of a split whose state gets discarded.
+  - Redundant CRDT overlay links carry state — and live PRIVMSG / NOTICE /
+    TAGMSG — between servers over paths the P10 tree does not have. A
+    dropped link no longer splits the network's view or silences the users
+    stranded behind it: they stay visible and reachable through the mesh.
+  - For users, account-anchored data converges network-wide and survives
+    partitions and restarts: metadata, read markers, SILENCE masks and
+    bouncer sessions set on one server are agreed by every server, and are
+    restored on relink or reconnect rather than lost to a split.
+  - Fully additive and feature-gated (FEAT_CRDT_*, all default off): a
+    stock build is byte-for-byte upstream P10. The legacy tree is retained
+    for routing and bridged to non-CRDT peers by a P10<->CRDT gateway, so
+    legacy servers interoperate unchanged.
+  - Observable: a 30-second verify cycle logs a materialized-state digest
+    (the real convergence metric); the oper /CRDT command exposes mesh
+    topology, peers, and presence.
+  Deep dives: doc/CRDT_MESH_IMPLEMENTATION.md (architecture & code) and
+  doc/CRDT_S2S_PROTOCOL.md (on-the-wire protocol).
 
   NOTIFICATIONS
   - Web Push (RFC 8030) with VAPID-based key provisioning, for offline
