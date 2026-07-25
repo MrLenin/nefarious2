@@ -252,7 +252,8 @@ extern int metadata_channel_memory_del(struct Channel *chptr, const char *key);
  * never metadata_set_channel, same reasoning), then the channel subscriber
  * notify fires explicitly (those primitives carry no notify of their own).
  * A FindChannel miss is a correct store-only no-op — memory materializes
- * later via a +R create or the read-only GET fallback.
+ * later via a +R create (B3, metadata_channel_load hydrates chptr->metadata
+ * from the store) or the read-only GET fallback.
  *
  * NO store write, NO doc op, for EITHER branch.  NO umode flag-sync (umode.*
  * doc values can lag true flag state right after burst; account branch
@@ -317,6 +318,17 @@ extern struct MetadataEntry *metadata_get_channel(struct Channel *chptr, const c
  * @return 0 on success, -1 on error.
  */
 extern int metadata_set_channel(struct Channel *chptr, const char *key, const char *value, int visibility);
+
+/** Hydrate a channel's in-memory metadata (chptr->metadata) from the
+ * persistent store — the LOAD half of the B3 ±R transition hook.  Inserts
+ * every stored "#chan\0key" row not already present in memory via
+ * metadata_channel_memory_put (memory-only, NO notify — hydration, not a
+ * change event); rows already in memory are left untouched.  Frees the
+ * transient list it fetches.  At burst/restart memory is empty, so this
+ * materializes the full persisted set (the restart-hydration path).
+ * @param[in] chptr Channel to hydrate.
+ */
+extern void metadata_channel_load(struct Channel *chptr);
 
 /** List all metadata for a channel.
  * @param[in] chptr Channel to list metadata for.
