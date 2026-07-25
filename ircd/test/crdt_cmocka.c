@@ -767,6 +767,62 @@ static void test_metadata_op_replicates(void **state)
     crdt_state_clear(&s4);
   }
 
+  /* B2 regression lock: channel-shaped opaque keys (#chan\0key) converge exactly
+   * like the account-shaped key above — the engine is key-agnostic (no IsChannelName
+   * check anywhere in crdt_state.c/crdt_types.c). The doc-key exclusion that today
+   * blocks these lives in the integration layer (crdt_shadow.c's metadata_doc_key),
+   * not here; this locks the engine side so B2's exclusion drop is provably safe. */
+  {
+    char ckey[96];
+    uint32_t cklen;
+    const struct CrdtLWWValue *cv;
+    /* key = #chan\0metakey, same NUL-separated composite shape as account\0metakey */
+    memcpy(ckey, "#p2chan", 7); ckey[7] = '\0'; memcpy(ckey + 8, "topic-lang", 10);
+    cklen = 7 + 1 + 10;
+
+    /* set on s1 -> delta -> s2; value blob round-trips byte-exact */
+    crdt_metadata_set(&s1, ckey, cklen, "en-US", 5);
+    crdt_state_sync(&s2, &s1);
+    cv = crdt_metadata_get(&s2, ckey, cklen);
+    assert_non_null(cv); assert_non_null(cv->data);
+    assert_int_equal(5, (int)cv->data_len);
+    assert_memory_equal("en-US", cv->data, 5);
+    assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+    assert_int_equal(0, crdt_metadata_is_explicitly_removed(&s1, ckey, cklen));
+    assert_int_equal(0, crdt_metadata_is_explicitly_removed(&s2, ckey, cklen));
+
+    /* LWW overwrite FROM THE SECOND NODE (s2 writes, not s1) -> delta -> s1; proves
+     * the engine has no writer-origin bias, only HLC order (plain LWW) */
+    crdt_metadata_set(&s2, ckey, cklen, "en-GB", 5);
+    crdt_state_sync(&s1, &s2);
+    cv = crdt_metadata_get(&s1, ckey, cklen);
+    assert_non_null(cv); assert_non_null(cv->data);
+    assert_int_equal(5, (int)cv->data_len);
+    assert_memory_equal("en-GB", cv->data, 5);
+    assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+
+    /* delete (tombstone) replicates -> gone; explicit-removal gate flips on both */
+    crdt_metadata_del(&s1, ckey, cklen);
+    crdt_state_sync(&s2, &s1);
+    cv = crdt_metadata_get(&s2, ckey, cklen);
+    assert_true(cv == NULL || cv->data == NULL);
+    assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+    assert_int_equal(1, crdt_metadata_is_explicitly_removed(&s1, ckey, cklen));
+    assert_int_equal(1, crdt_metadata_is_explicitly_removed(&s2, ckey, cklen));
+
+    /* snapshot (CR F) roundtrip carrying the tombstone reconstructs it as
+     * explicitly-removed on a fresh replica (the cold-join backfill path) */
+    {
+      struct CrdtNetworkState s5;
+      crdt_state_init(&s5, 5);
+      n = crdt_snapshot_encode(&s1, buf, sizeof buf);
+      assert_true(n > 0);
+      assert_true(crdt_snapshot_apply(&s5, buf, (size_t)n) >= 0);
+      assert_int_equal(1, crdt_metadata_is_explicitly_removed(&s5, ckey, cklen));
+      crdt_state_clear(&s5);
+    }
+  }
+
   crdt_state_clear(&s1);
   crdt_state_clear(&s2);
   crdt_state_clear(&s3);

@@ -2229,15 +2229,19 @@ void crdt_shadow_metadata_suspend(int on)
 }
 
 /* Build the opaque doc key account\0metakey (byte-identical to the metadata_cf storage
- * key, KEY_SEP='\0'), or return 0 if it must not enter the doc. */
+ * key, KEY_SEP='\0'), or return 0 if it must not enter the doc. §B2: channel keys
+ * (account is actually a "#chan" cache-key string) converge exactly like account keys
+ * — same opaque composite, same generic LWW path; the doc has no notion of key shape.
+ * TTL-class channel writes (today's only channel writer, the ms_metadata cache) are
+ * excluded by the mirror's !permanent gate (metadata.c:527 -> crdt_shadow_metadata_set,
+ * here at :2272), NOT by this function on key shape — so a pre-B2 (old) peer whose
+ * reconcile writes a channel row back to the store never materializes it into live
+ * memory (channel doc-reconcile doesn't exist yet); version-tolerant by construction. */
 static uint32_t metadata_doc_key(const char *account, const char *key,
                                  char *buf, size_t n)
 {
   uint32_t al, kl, klen;
   if (!account || !*account || !key || !*key)
-    return 0;
-  /* never converge channel metadata (its own track) — only true accounts */
-  if (IsChannelName(account))
     return 0;
   al = (uint32_t)strlen(account);
   kl = (uint32_t)strlen(key);
