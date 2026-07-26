@@ -22,6 +22,7 @@
 /* Common includes needed by both USE_LIBKC and stub/P10 handler paths */
 #include "sasl_webhook.h"
 #include "sasl_auth.h"
+#include "handlers.h"   /* crdt_gossip_message — CI mesh copy (S2S-audit gap B) */
 #include "client.h"
 #include "ircd_log.h"
 #include "msg.h"
@@ -43,6 +44,30 @@
 
 #include <jansson.h>
 #include <kc/kc_webhook.h>
+
+/* CI dual-plane broadcast (S2S-audit gap B, SECURITY): the tree-only CI token
+ * never reaches overlay-only / tree-retired CRDT nodes, leaving their POSITIVE
+ * SASL auth cache serving a revoked/changed credential for up to pos_ttl (300s).
+ * Emit BOTH planes: the v3 tree copy (legacy fork peers cannot ride the mesh)
+ * and one mesh CR M 'I' broadcast (msgid-deduped flood; a node reached via both
+ * planes invalidates twice — idempotent).  MR-2b WALLOPS is the precedent; like
+ * it, the mesh receiver delivers LOCALLY ONLY (no legacy re-emit -> no
+ * dual-plane echo loop; legacy rides the origin's tree copy).  @a mesh_mint is
+ * 0 on the ms_cacheinval relay leg when the CI arrived FROM a CRDT peer (it
+ * already rode the mesh; re-minting per tree hop would storm fresh msgids) and
+ * 1 at the origin/§17.7 legacy gateway edge.  crdt_gossip_message self-gates
+ * (shadow active + FEAT_CRDT_ROUTE_BCAST + bcast-stable), so this is additive:
+ * mesh off -> exactly the old tree-only behavior. */
+static void ci_broadcast(struct Client *from, struct Client *one,
+                         const char *username, int mesh_mint)
+{
+  sendcmdto_serv_butone_v3(from, CMD_CACHEINVAL, one, "%s", username);
+  if (mesh_mint) {
+    char msgidbuf[64];
+    generate_msgid(msgidbuf, sizeof msgidbuf);
+    crdt_gossip_message(&me, 'I', "*", msgidbuf, username);
+  }
+}
 
 static struct sasl_webhook_stats wh_stats;
 static int webhook_initialized = 0;
@@ -134,7 +159,7 @@ static void handle_credential_event(const struct kc_webhook_event *event)
               "WEBHOOK: Password change for %s — invalidating auth caches",
               event->username);
     sasl_cache_invalidate_user(event->username);
-    sendcmdto_serv_butone_v3(&me, CMD_CACHEINVAL, NULL, "%s", event->username);
+    ci_broadcast(&me, NULL, event->username, 1);
     wh_stats.cache_invalidations++;
   }
   else if (event->operation_type == KC_WH_OP_DELETE && event->representation) {
@@ -148,7 +173,7 @@ static void handle_credential_event(const struct kc_webhook_event *event)
     } else {
       /* Password deleted — invalidate caches */
       sasl_cache_invalidate_user(event->username);
-      sendcmdto_serv_butone_v3(&me, CMD_CACHEINVAL, NULL, "%s", event->username);
+      ci_broadcast(&me, NULL, event->username, 1);
       wh_stats.cache_invalidations++;
     }
   }
@@ -169,7 +194,7 @@ static void handle_user_event(const struct kc_webhook_event *event)
               "WEBHOOK: Account deleted: %s — invalidating caches",
               event->username);
     sasl_cache_invalidate_user(event->username);
-    sendcmdto_serv_butone_v3(&me, CMD_CACHEINVAL, NULL, "%s", event->username);
+    ci_broadcast(&me, NULL, event->username, 1);
     wh_stats.cache_invalidations++;
 
     /* Default: deauth (AC U). KILL_ON_DELETE escalates to disconnect. */
@@ -184,7 +209,7 @@ static void handle_user_event(const struct kc_webhook_event *event)
                 "WEBHOOK: Account disabled: %s — invalidating caches",
                 event->username);
       sasl_cache_invalidate_user(event->username);
-      sendcmdto_serv_butone_v3(&me, CMD_CACHEINVAL, NULL, "%s", event->username);
+      ci_broadcast(&me, NULL, event->username, 1);
       wh_stats.cache_invalidations++;
 
       /* Default: deauth (AC U). KILL_ON_DISABLE escalates to disconnect. */
@@ -340,8 +365,11 @@ int ms_cacheinval(struct Client *cptr, struct Client *sptr, int parc, char *parv
   /* Invalidate local auth caches for this user */
   sasl_cache_invalidate_user(username);
 
-  /* Relay to all other servers (flood-fill) */
-  sendcmdto_serv_butone_v3(sptr, CMD_CACHEINVAL, cptr, "%s", username);
+  /* Relay to all other servers (flood-fill); mesh-mint ONLY at the §17.7 legacy
+   * gateway edge (CI arrived from a non-CRDT peer, so the mesh has not seen it).
+   * A CRDT-peer arrival already rode the mesh — re-minting per tree hop would
+   * flood fresh msgids for the same event. */
+  ci_broadcast(sptr, cptr, username, !IsCrdtAware(cptr));
 
   return 0;
 }

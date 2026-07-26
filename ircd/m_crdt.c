@@ -33,6 +33,7 @@
 #include "channel.h"      /* Tier2 T2-b: Membership (CR M channel deliver); MR-5-1 add_invite */
 #include "hash.h"         /* Tier2 T2-b: FindChannel (CR M channel deliver) */
 #include "s_misc.h"       /* MR-5-1: exit_client_msg (mesh-routed KILL home delivery) */
+#include "sasl_auth.h"    /* sasl_cache_invalidate_user (CR M cmd I — CI over mesh) */
 
 #include "crdt_shadow.h"
 #include "crdt_meshmap.h"  /* MR-1: crdt_meshmap_nexthop + crdt_route_action */
@@ -856,6 +857,20 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
                                                      * (%:#C handles server + stub) */
       if (wsrc)
         sendwallto_local(wsrc, WALL_WALLOPS, m_text);    /* deliver to local +w opers */
+    } else if (m_cmd[0] == 'I') {          /* CI: SASL auth-cache invalidation (S2S-audit
+                                            * gap B, SECURITY — the tree-only CI token
+                                            * never reached overlay-only / tree-retired
+                                            * nodes, whose POSITIVE cache then served a
+                                            * revoked credential for up to pos_ttl).
+                                            * LOCAL invalidate only, MR-2b W precedent:
+                                            * no legacy re-emit (legacy rides the
+                                            * origin's tree copy; re-emitting here would
+                                            * open a dual-plane echo loop), no channel
+                                            * delivery.  The shared flood relay below
+                                            * carries it mesh-wide, msgid-deduped. */
+      log_write(LS_SYSTEM, L_INFO, 0,
+                "CRDT CI: mesh auth-cache invalidation for %s", m_text);
+      sasl_cache_invalidate_user(m_text);
     } else if (target[0] == '#' || target[0] == '&') {    /* channel delivery */
       struct Channel *ch = FindChannel(target);
       struct Membership *memb;
