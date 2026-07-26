@@ -2381,6 +2381,76 @@ int crdt_state_reclaim_orphan_silences(struct CrdtNetworkState *st)
 }
 
 /* ------------------------------------------------------------------ */
+/* Orphan-reap 2026-07-26: partition-cycle channel-member residue      */
+/* ------------------------------------------------------------------ */
+/* A member who QUITs while a partitioned node still holds their membership add-tags
+ * leaks those tags back into the CONVERGED doc at heal: the member-remove tombstones
+ * go causally stable and are GC'd on the connected side during the darkness, and the
+ * healed node's still-present adds re-merge network-wide (OR-Set union;
+ * crdt_snapshot_apply is merge-keep, and no SV-justified-absence purge exists at the
+ * ORSet layer).  Characterization live repro: #ghostchar real=1 crdt=8 steady-state
+ * on every node after three partition cycles; a 110-quit healthy-path control leaked
+ * 0.  The USERS collection is immune, so the user anchor is the reclaim oracle:
+ * sweep members whose owning user is FULLY absent (the silences-sweep oracle:
+ * get==NULL AND !is_deleted -> removal causally stable), minting crdt_chan_remove —
+ * the exact op the part/kick hooks use, never a raw orset_remove, so every reaped
+ * tag replicates as a delta and rides the tombstone GC.
+ *
+ * Sync-lag safe: a user record always precedes its member entries (same-origin
+ * in-order ops; snapshots encode users before channels), so member-present +
+ * user-wholly-absent is never a legitimate in-flight state.  Partition-safe by
+ * §17.3: a split peer's users are never tombstoned -> stay present -> memberships
+ * untouched.  Multi-writer benign: idempotent, tag-tombstone dedup'd, GC'd.
+ * Per-channel collect-then-act (foreach completes before any remove on that set);
+ * bounded per channel per pass, survivors caught next cycle. */
+#define MEMBER_REAP_MAX 64
+struct member_reap_ctx {
+  struct CrdtNetworkState *st;
+  char num[MEMBER_REAP_MAX][CRDT_NUMERICLEN + 1];
+  int  n;
+};
+
+static void member_residue_collect_cb(const char *key, uint32_t key_len, void *ctx)
+{
+  struct member_reap_ctx *c = (struct member_reap_ctx *)ctx;
+  if (c->n >= MEMBER_REAP_MAX || key_len == 0 || key_len >= sizeof c->num[0])
+    return;
+  if (crdt_lwwmap_get(&c->st->users, key, key_len) != NULL ||
+      crdt_lwwmap_is_deleted(&c->st->users, key, key_len))
+    return;                              /* user live, or removal not yet stable */
+  memcpy(c->num[c->n], key, key_len);
+  c->num[c->n][key_len] = '\0';
+  c->n++;
+}
+
+int crdt_state_reclaim_orphan_members(struct CrdtNetworkState *st)
+{
+  static struct member_reap_ctx c;       /* static: avoids a large stack frame */
+  char cname[512];                       /* ch->name is len-delimited, NOT NUL'd */
+  struct CrdtChannel *ch;
+  unsigned int b;
+  int i, total = 0;
+  c.st = st;
+  for (b = 0; b < CRDT_CHAN_BUCKETS; b++)
+    for (ch = st->chan_buckets[b]; ch; ch = ch->next) {
+      if (crdt_orset_size(&ch->members) == 0)
+        continue;
+      if (ch->name_len == 0 || ch->name_len >= sizeof cname)
+        continue;
+      c.n = 0;
+      crdt_orset_foreach(&ch->members, member_residue_collect_cb, &c);
+      if (c.n == 0)
+        continue;
+      memcpy(cname, ch->name, ch->name_len);
+      cname[ch->name_len] = '\0';        /* crdt_chan_remove strlen()s its args */
+      for (i = 0; i < c.n; i++)
+        crdt_chan_remove(st, cname, c.num[i], CRDT_PRIORITY_USER);
+      total += c.n;
+    }
+  return total;
+}
+
+/* ------------------------------------------------------------------ */
 /* causal-stability GC                                                */
 /* ------------------------------------------------------------------ */
 

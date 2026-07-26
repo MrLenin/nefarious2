@@ -5345,6 +5345,19 @@ static void crdt_shadow_gc(void)
                 orph);
   }
   {
+    /* Orphan-reap 2026-07-26: partition-cycle member residue — membership add-tags
+     * of users wholly gone from the users collection (their member-remove tombstones
+     * were GC'd across a partition; the healed node's still-present adds re-merged
+     * network-wide).  GC-cycle-only like its sibling reclaims: the residue is inert
+     * doc state, no live gate races it (the F3 eager-suite rule is for new
+     * collections, not sweeps). */
+    int orph = crdt_state_reclaim_orphan_members(&g_crdt);
+    if (orph > 0)
+      log_write(LS_SYSTEM, L_NOTICE, 0,
+                "CRDT GC: reclaimed %d orphan channel member(s) (departed users)",
+                orph);
+  }
+  {
     /* Tier C F3: same backstop for tempshun registers (departed victims). */
     int orph = crdt_state_reclaim_orphan_tempshuns(&g_crdt);
     if (orph > 0)

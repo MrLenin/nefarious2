@@ -3189,6 +3189,131 @@ static void test_orphan_silences_reap_exception_mask(void **state)
 }
 
 /* ================================================================== */
+/* Orphan-reap 2026-07-26: partition-cycle channel-member residue.  A member who
+ * QUITs while a partitioned node still holds their membership add-tags leaks the
+ * tags back into the CONVERGED doc at heal: the member-remove tombstones are GC'd
+ * on the connected side during the darkness, and the healed node's still-present
+ * adds re-merge network-wide (OR-Set union; crdt_snapshot_apply is merge-keep, no
+ * SV-justified-absence purge exists at the ORSet layer).  Live repro: #ghostchar
+ * real=1 crdt=8 steady-state on every node after three partition cycles; a
+ * 110-quit healthy-path control leaked 0.  The users collection is immune, so the
+ * USER anchor is the reclaim oracle: sweep members whose owning user is FULLY
+ * absent (get==NULL AND !is_deleted -> removal causally stable, the silences-sweep
+ * oracle), minting crdt_chan_remove (the part/kick op path, never raw orset). */
+
+/* RECLAIMED: the leak shape — member present, user wholly absent.  crdt_user_remove
+ * does NOT sweep memberships (that is the live part-hooks' job), so user-remove +
+ * stability-GC constructs the residue exactly. */
+static void test_orphan_members_reclaimed(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s;
+  struct CrdtUserRecord u;
+  struct CrdtStateVector stable;
+  uint64_t sv_before;
+  memset(&u, 0, sizeof u);
+  crdt_state_init(&s, 1);
+  crdt_user_set(&s, "AAAAB", &u);
+  crdt_chan_join(&s, "#c", "AAAAB");
+  crdt_user_remove(&s, "AAAAB");           /* QUIT: user tombstone, NO member remove */
+  crdt_sv_init(&stable); crdt_sv_update(&stable, 1, 1000);
+  crdt_state_gc(&s, &stable);              /* tombstone GC'd -> user wholly absent */
+  assert_null(crdt_user_get(&s, "AAAAB"));
+  assert_false(crdt_lwwmap_is_deleted(&s.users, "AAAAB", 5));
+  assert_true(crdt_orset_contains(&crdt_state_channel(&s, "#c", 0)->members,
+                                  "AAAAB", 5));
+  sv_before = s.local_sv.seq[1];
+  assert_int_equal(1, crdt_state_reclaim_orphan_members(&s));
+  assert_true(s.local_sv.seq[1] > sv_before);  /* REMOVE op minted (replicates) */
+  assert_false(crdt_orset_contains(&crdt_state_channel(&s, "#c", 0)->members,
+                                   "AAAAB", 5));
+  assert_int_equal(0, crdt_state_reclaim_orphan_members(&s));  /* idempotent */
+  crdt_state_clear(&s);
+}
+
+/* KEPT: a live user's membership is never swept. */
+static void test_orphan_members_kept_while_user_live(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s;
+  struct CrdtUserRecord u;
+  memset(&u, 0, sizeof u);
+  crdt_state_init(&s, 1);
+  crdt_user_set(&s, "AAAAB", &u);
+  crdt_chan_join(&s, "#c", "AAAAB");
+  assert_int_equal(0, crdt_state_reclaim_orphan_members(&s));
+  assert_true(crdt_orset_contains(&crdt_state_channel(&s, "#c", 0)->members,
+                                  "AAAAB", 5));
+  crdt_state_clear(&s);
+}
+
+/* KEPT: while the user's delete-tombstone is still present (removal NOT yet
+ * causally stable) the sweep must not act — the home's own member-removes own that
+ * window, and a lagging peer may not have seen the user yet.  The LWW analog of
+ * "kept while OR-Set tombstone present". */
+static void test_orphan_members_kept_while_user_tombstone(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s;
+  struct CrdtUserRecord u;
+  struct HLC hi = { 0xFFFFFFFFFFFFULL, 0, 1 };   /* far-future -> delete wins */
+  memset(&u, 0, sizeof u);
+  crdt_state_init(&s, 1);
+  crdt_user_set(&s, "AAAAB", &u);
+  crdt_chan_join(&s, "#c", "AAAAB");
+  crdt_lwwmap_delete(&s.users, "AAAAB", 5, hi, 1);   /* op-less: tombstone, not GC'd */
+  assert_true(crdt_lwwmap_is_deleted(&s.users, "AAAAB", 5));
+  assert_int_equal(0, crdt_state_reclaim_orphan_members(&s));
+  assert_true(crdt_orset_contains(&crdt_state_channel(&s, "#c", 0)->members,
+                                  "AAAAB", 5));
+  crdt_state_clear(&s);
+}
+
+/* THE LIVE-REPRO SHAPE: healed node B holds the residue (member add present, user
+ * wholly absent); mainland A is fully clean.  B's snapshot re-merges the residue
+ * into A (the leak crossing the wire — OR-Set union keeps B's add-tags).  The
+ * reclaim on A mints REMOVE ops whose tag-tombstones ride A's snapshot back to B:
+ * both sides end clean and digest-converged. */
+static void test_orphan_members_residue_converges(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState a, b;
+  static uint8_t buf[262144];
+  struct CrdtUserRecord u;
+  struct CrdtStateVector stable;
+  int n;
+  memset(&u, 0, sizeof u);
+  crdt_state_init(&a, 1);
+  crdt_state_init(&b, 2);
+  /* B: the healed node — join survived the partition, the quit's member-removes
+   * and the user tombstone were GC'd elsewhere; locally: user gone, adds remain */
+  crdt_user_set(&b, "AAAAB", &u);
+  crdt_chan_join(&b, "#c", "AAAAB");
+  crdt_user_remove(&b, "AAAAB");
+  crdt_sv_init(&stable); crdt_sv_update(&stable, 2, 1000);
+  crdt_state_gc(&b, &stable);
+  assert_null(crdt_user_get(&b, "AAAAB"));
+  /* the leak crosses the wire: B's snapshot merges into clean A */
+  n = crdt_snapshot_encode(&b, buf, sizeof buf);
+  assert_true(n > 0);
+  assert_int_equal(0, crdt_snapshot_apply(&a, buf, (size_t)n));
+  assert_true(crdt_orset_contains(&crdt_state_channel(&a, "#c", 0)->members,
+                                  "AAAAB", 5));          /* residue re-imported */
+  /* the reclaim heals A; its tombstones ride the next snapshot back to B */
+  assert_int_equal(1, crdt_state_reclaim_orphan_members(&a));
+  n = crdt_snapshot_encode(&a, buf, sizeof buf);
+  assert_true(n > 0);
+  assert_int_equal(0, crdt_snapshot_apply(&b, buf, (size_t)n));
+  assert_false(crdt_orset_contains(&crdt_state_channel(&a, "#c", 0)->members,
+                                   "AAAAB", 5));
+  assert_false(crdt_orset_contains(&crdt_state_channel(&b, "#c", 0)->members,
+                                   "AAAAB", 5));
+  assert_true(crdt_state_digest(&a) == crdt_state_digest(&b));
+  crdt_state_clear(&a);
+  crdt_state_clear(&b);
+}
+
+/* ================================================================== */
 /* Fix A (digest-aware anti-entropy): the state vector counts ops per origin but
  * does NOT summarise content/HLC, so two replicas can share an SV yet hold
  * different content (e.g. a CR F snapshot HLC-merge or ctime incarnation change
@@ -3571,6 +3696,10 @@ int main(void)
     cmocka_unit_test(test_orphan_silences_kept_while_user_tombstone),
     cmocka_unit_test(test_silence_numeric_reuse_no_bleed),
     cmocka_unit_test(test_orphan_silences_reap_exception_mask),
+    cmocka_unit_test(test_orphan_members_reclaimed),
+    cmocka_unit_test(test_orphan_members_kept_while_user_live),
+    cmocka_unit_test(test_orphan_members_kept_while_user_tombstone),
+    cmocka_unit_test(test_orphan_members_residue_converges),
     cmocka_unit_test(test_A_convergence),
     cmocka_unit_test(test_B_collision_different_user_oldest_wins),
     cmocka_unit_test(test_B_collision_same_user_newest_wins),

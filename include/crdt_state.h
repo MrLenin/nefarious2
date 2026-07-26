@@ -737,6 +737,16 @@ void crdt_state_reclaim_user_silences(struct CrdtNetworkState *st,
  *  never fired. Returns the count reclaimed. Safe + idempotent to call each GC cycle. */
 int  crdt_state_reclaim_orphan_silences(struct CrdtNetworkState *st);
 
+/** Orphan-reap 2026-07-26: reclaim channel-member OR-Set entries whose owning user
+ *  is FULLY absent from the users map (the silences-sweep oracle: get==NULL AND
+ *  !is_deleted -> removal causally stable) by minting crdt_chan_remove — the
+ *  partition-cycle member-residue leak (a member's remove-tombstones GC'd across a
+ *  partition; the healed node's still-present add-tags re-merge network-wide).
+ *  Partition-safe by §17.3 (a split peer's users are never tombstoned, so their
+ *  memberships are untouched). Returns the count reclaimed. Safe + idempotent to
+ *  call each GC cycle. */
+int  crdt_state_reclaim_orphan_members(struct CrdtNetworkState *st);
+
 /* ---- queries ---- */
 struct CrdtChannel *crdt_state_channel(struct CrdtNetworkState *st,
                                        const char *chan, int create);
