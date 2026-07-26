@@ -3313,6 +3313,68 @@ static void test_orphan_members_residue_converges(void **state)
   crdt_state_clear(&b);
 }
 
+/* OWNER SWEEP contract (the USER-layer resurrection, characterization run 4): peer A
+ * re-imports MY (origin-2) stale user record via its snapshot after my quit-tombstone
+ * was GC'd during A's partition — the network-wide zombie.  The OWNER minting a fresh
+ * crdt_user_remove is the clean kill: the re-delete's same-origin seq/HLC is newer
+ * than the re-imported SET, its tombstone rides the next exchange back to A, and both
+ * sides end wholly absent + digest-converged.  This encodes the engine half of
+ * crdt_shadow_own_user_sweep (the findNUser/burst/debounce half is integration-layer,
+ * live-gated — cmocka cannot construct Clients). */
+static void test_owner_remove_beats_snapshot_reimport(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState a, b;
+  static uint8_t buf[262144];
+  struct CrdtUserRecord u;
+  struct CrdtStateVector stable;
+  int n;
+  memset(&u, 0, sizeof u);
+  u.server = 2;                        /* owner = node 2 (B) */
+  crdt_state_init(&a, 1);
+  crdt_state_init(&b, 2);
+  /* B (owner) mints the user; A learns it via snapshot */
+  crdt_user_set(&b, "ABAAB", &u);
+  n = crdt_snapshot_encode(&b, buf, sizeof buf);
+  assert_true(n > 0);
+  assert_int_equal(0, crdt_snapshot_apply(&a, buf, (size_t)n));
+  assert_non_null(crdt_user_get(&a, "ABAAB"));
+  /* user quits on B; A (partitioned) misses it; tombstone goes stable + GC'd on B */
+  crdt_user_remove(&b, "ABAAB");
+  crdt_sv_init(&stable); crdt_sv_update(&stable, 2, 1000);
+  crdt_state_gc(&b, &stable);
+  assert_null(crdt_user_get(&b, "ABAAB"));
+  assert_false(crdt_lwwmap_is_deleted(&b.users, "ABAAB", 5));   /* wholly absent */
+  /* heal: A's snapshot re-imports the stale record into the OWNER — the zombie */
+  n = crdt_snapshot_encode(&a, buf, sizeof buf);
+  assert_true(n > 0);
+  assert_int_equal(0, crdt_snapshot_apply(&b, buf, (size_t)n));
+  assert_non_null(crdt_user_get(&b, "ABAAB"));                  /* resurrected */
+  /* the owner sweep decision: B re-mints the delete (fresh seq/HLC wins LWW) */
+  crdt_user_remove(&b, "ABAAB");
+  assert_null(crdt_user_get(&b, "ABAAB"));
+  /* B's tombstone rides the next exchange back to A */
+  n = crdt_snapshot_encode(&b, buf, sizeof buf);
+  assert_true(n > 0);
+  assert_int_equal(0, crdt_snapshot_apply(&a, buf, (size_t)n));
+  assert_null(crdt_user_get(&a, "ABAAB"));
+  assert_true(crdt_state_digest(&a) == crdt_state_digest(&b));
+  /* GC semantics split by delivery path: B's tombstone is OP-BACKED (it minted the
+   * delete) -> reclaimed once stable.  A's arrived VIA SNAPSHOT (no local op) and
+   * crdt_lwwmap_gc_deleted only fires when the matching DELETE op is reclaimed, so
+   * A RETAINS it — the op-less-tombstone stickiness.  That is the SAFE direction
+   * (a lingering tombstone cannot resurrect anyone; it is an accidental
+   * anti-resurrection anchor) but it is permanent local residue until a future
+   * exchange — recorded here so a change to either behavior is a conscious one. */
+  crdt_sv_update(&stable, 1, 2000); crdt_sv_update(&stable, 2, 2000);
+  crdt_state_gc(&a, &stable); crdt_state_gc(&b, &stable);
+  assert_false(crdt_lwwmap_is_deleted(&b.users, "ABAAB", 5));  /* op-backed: reclaimed */
+  assert_true(crdt_lwwmap_is_deleted(&a.users, "ABAAB", 5));   /* op-less: retained */
+  assert_null(crdt_user_get(&a, "ABAAB"));   /* still reads as gone — no zombie */
+  crdt_state_clear(&a);
+  crdt_state_clear(&b);
+}
+
 /* ================================================================== */
 /* Fix A (digest-aware anti-entropy): the state vector counts ops per origin but
  * does NOT summarise content/HLC, so two replicas can share an SV yet hold
@@ -3700,6 +3762,7 @@ int main(void)
     cmocka_unit_test(test_orphan_members_kept_while_user_live),
     cmocka_unit_test(test_orphan_members_kept_while_user_tombstone),
     cmocka_unit_test(test_orphan_members_residue_converges),
+    cmocka_unit_test(test_owner_remove_beats_snapshot_reimport),
     cmocka_unit_test(test_A_convergence),
     cmocka_unit_test(test_B_collision_different_user_oldest_wins),
     cmocka_unit_test(test_B_collision_same_user_newest_wins),

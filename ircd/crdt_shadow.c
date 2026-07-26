@@ -1002,6 +1002,95 @@ static void crdt_shadow_stale_user_scan(void)
   }
 }
 
+/* Orphan-reap OWNER SWEEP (2026-07-26): a doc user record whose OWNER is ME but for
+ * which I hold no live Client is self-evidently stale — I am the single writer for
+ * my own users, so no other node can legitimately account for it.  Live repro (the
+ * characterization's run 4): heal-after-complete-tombstone-GC re-imports
+ * quit-during-partition users network-wide as UNKILLABLE doc-present zombies —
+ * a non-owner KILL exits the local materialized Client without minting a tombstone
+ * (single-writer self-skip) and reconcile re-materializes it next tick, while the
+ * owner's quit path can never fire without a live client.  The owner minting the
+ * DELETE is the only clean kill: same-origin monotonic seqs make a concurrent
+ * numeric-reuse SET win LWW (delete seq k < re-add seq k+1, applied in-order
+ * everywhere), and peers' tombstone-driven reconcile_user_removes finishes the
+ * network-wide de-materialize.  Also the catch-all for restart re-import residue
+ * (my pre-crash records pulled back from peers' snapshots) and teardown paths that
+ * free a live Client without the shadow hook (bounce_detach hs_client NULL, KILL —
+ * P3-5b2 follow-up item 2).  A standing sweep beats one-shot cleanup: a partitioned
+ * peer re-importing the record after our tombstone GC'd is simply caught again.
+ *
+ * DESTRUCTIVE (mints real tombstones) -> dedicated kill-switch
+ * FEAT_CRDT_OWNER_SWEEP.  Safety gates: !bursting (resync in flight) + a 2-pass
+ * debounce (registration is NOT a window — a local record is minted only after the
+ * client is numeric-hashed — but the debounce cheaply covers windows not yet
+ * imagined).  Bounded per pass; a reaped record turns tombstone so it self-drops
+ * from the next pass's candidate walk.  The engine-side convergence contract
+ * (owner re-delete beats a snapshot re-import) is cmocka-encoded in
+ * test_owner_remove_beats_snapshot_reimport; the findNUser/burst/debounce half is
+ * integration-layer, verified LIVE (cmocka cannot construct Clients). */
+#define OWN_SWEEP_MAX 64
+struct own_sweep_ctx {
+  uint16_t me;
+  char cand[OWN_SWEEP_MAX][CRDT_NUMERICLEN];
+  int  n;
+};
+
+static void own_sweep_collect_cb(const char *key, uint32_t key_len,
+                                 const struct CrdtLWWValue *val, void *ctx)
+{
+  struct own_sweep_ctx *c = (struct own_sweep_ctx *)ctx;
+  const struct CrdtUserRecord *rec;
+  char num[CRDT_NUMERICLEN];
+  if (c->n >= OWN_SWEEP_MAX || !val->data ||
+      val->data_len != sizeof(struct CrdtUserRecord))
+    return;                                /* full, or foreign shape */
+  rec = (const struct CrdtUserRecord *)val->data;
+  if (rec->server != c->me)
+    return;                                /* not my origin — its owner sweeps it */
+  if (key_len == 0 || key_len >= sizeof num)
+    return;
+  memcpy(num, key, key_len);
+  num[key_len] = '\0';
+  if (findNUser(num))
+    return;                                /* live client (incl. held) — healthy */
+  memcpy(c->cand[c->n], num, key_len + 1);
+  c->n++;
+}
+
+static void crdt_shadow_own_user_sweep(void)
+{
+  static char pending[OWN_SWEEP_MAX][CRDT_NUMERICLEN];
+  static int pending_n;
+  static struct own_sweep_ctx c;
+  struct Client *acptr;
+  int i, j, reaped = 0;
+  if (!shadow_on() || !feature_bool(FEAT_CRDT_OWNER_SWEEP))
+    return;
+  for (acptr = GlobalClientList; acptr; acptr = cli_next(acptr))
+    if (IsServer(acptr) && IsBurstOrBurstAck(acptr))
+      return;                              /* resync in flight — defer the pass
+                                            * (pending survives, so no debounce reset) */
+  c.me = (uint16_t)base64toint(cli_yxx(&me));
+  c.n = 0;
+  crdt_lwwmap_foreach(&g_crdt.users, own_sweep_collect_cb, &c);
+  for (i = 0; i < c.n; i++) {
+    for (j = 0; j < pending_n; j++)
+      if (strcmp(c.cand[i], pending[j]) == 0)
+        break;
+    if (j >= pending_n)
+      continue;                            /* first sighting — 2-pass debounce */
+    log_write(LS_SYSTEM, L_NOTICE, 0,
+              "CRDT owner-sweep: reaping own-origin user record %s (no live client)",
+              c.cand[i]);
+    crdt_user_remove(&g_crdt, c.cand[i]);
+    reaped++;
+  }
+  memcpy(pending, c.cand, sizeof pending);
+  pending_n = c.n;
+  if (reaped)
+    crdt_sync_push();                      /* eager-propagate the tombstones */
+}
+
 /* 5-5e M5: liveness-lease wrappers + the beacon-freshness liveness signal. */
 const struct CrdtBouncerLease *crdt_shadow_blease_get(const char *account,
                                                       const char *sessid)
@@ -5414,6 +5503,7 @@ static void crdt_shadow_verify_cb(struct Event *ev)
   crdt_shadow_reconcile_bans();    /* Phase 3i: channel bans/excepts (+b/+e) */
   crdt_shadow_reconcile_user_removes(); /* Phase 3m: QUIT / delete-on-leave (after channel cleanup) */
   crdt_shadow_stale_user_scan();   /* orphan-reap Inc 1: detect-and-log stale-materialization ghosts (absent-from-doc) the tombstone-only reap left behind */
+  crdt_shadow_own_user_sweep();    /* orphan-reap owner sweep: reap MY-origin doc records with no live client (resurrection zombies / restart residue / hookless teardowns) */
   crdt_shadow_reconcile_glines();  /* GLINE step 3: drive global G-lines from doc (+gateway) */
   crdt_shadow_reconcile_shuns();   /* SHUN: drive global Shuns from doc (+gateway) */
   crdt_shadow_reconcile_markers(); /* Tier C F2-a: drive read-markers from doc -> RocksDB */
