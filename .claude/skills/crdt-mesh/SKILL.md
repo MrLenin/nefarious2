@@ -77,8 +77,11 @@ described in many notes below.)
   AUTO-DISSOLVES the marker the moment the server returns (dissolve runs BEFORE any reap; never a
   link ban). `crdt_shadow_own_user_reassert` (tick+EOB) is the recovery completion: a live local
   registered user with an absent/tombstoned record is always wrong → re-mint (heals
-  wrong-decommission-while-partitioned-alive; known collateral: channel memberships are not
-  re-asserted — user survives but is parted).**
+  wrong-decommission-while-partitioned-alive). **Membership re-assert (`cb88069`): a doc-driven
+  PART may NEVER remove a LIVE local member — every legitimate local removal applies live-first,
+  so a tombstone that still finds a live MyUser member without KICK attribution is reap residue:
+  the reconcile-remove refuses and re-mints join+status in place (fresh add-tag beats old
+  tombstones; mainland re-JOINs). Remote KICK-via-doc still applies via the kick_info gate.**
 - **Digest vs mdigest** — `crdt_state_digest` (the Fix-A wire digest, on CR S) hashes LIVE content
   ONLY: LWW tombstones and OR-Set covered-tags/tombstones are SKIPPED (**GC-INVARIANT since
   2026-07-26** — hashing per-node GC bookkeeping into the reconciliation trigger drove a live
