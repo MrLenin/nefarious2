@@ -183,6 +183,13 @@ int ms_end_of_burst(struct Client* cptr, struct Client* sptr, int parc, char* pa
    * (findNUser skips already-live users), so calling it on every EOB is safe + cheap. */
   crdt_shadow_reconcile_users();
 
+  /* Orphan-reap owner sweep, eager pass: the estab snapshot exchange is exactly when
+   * a stale OWN-origin record re-imports (restart residue / resurrection zombie), and
+   * EOB is the moment the !bursting gate clears.  Running the sweep here (and again on
+   * each further settle event) completes the 2-pass debounce in seconds instead of two
+   * 30s verify ticks.  Self-gated + idempotent, so every-EOB is safe + cheap. */
+  crdt_shadow_own_user_sweep();
+
   if (MyConnect(sptr)) {
     sendcmdto_one(&me, CMD_END_OF_BURST_ACK, sptr, "");
 

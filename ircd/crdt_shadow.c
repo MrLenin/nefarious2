@@ -1057,7 +1057,7 @@ static void own_sweep_collect_cb(const char *key, uint32_t key_len,
   c->n++;
 }
 
-static void crdt_shadow_own_user_sweep(void)
+void crdt_shadow_own_user_sweep(void)
 {
   static char pending[OWN_SWEEP_MAX][CRDT_NUMERICLEN];
   static int pending_n;

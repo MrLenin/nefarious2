@@ -789,6 +789,13 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
          * because no CR F is received in that case). */
         if (feature_bool(FEAT_CRDT_PRIMARY) && IsBurstOrBurstAck(cptr))
           crdt_shadow_materialize_live();
+        /* Orphan-reap owner sweep, eager pass: a CR F merge is the ONLY path a
+         * stale OWN-origin record can re-import (merge-keep; deltas are SV-deduped
+         * ops), so sweep right after each steady-state apply — the Fix-A exchange
+         * storm typically applies 2+ snapshots within seconds, completing the
+         * 2-pass debounce near-instantly.  Self-gates on !bursting (the mid-burst
+         * apply defers to the EOB call). */
+        crdt_shadow_own_user_sweep();
       }
       MyFree(bin);
     }

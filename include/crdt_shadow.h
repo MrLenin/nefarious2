@@ -555,6 +555,15 @@ void crdt_shadow_reconcile_users(void);
  *  SQUIT stays on P10. No-op unless FEAT_CRDT_PRIMARY. */
 void crdt_shadow_reconcile_user_removes(void);
 
+/** Orphan-reap owner sweep: reap OWN-origin doc user records with no live Client by
+ *  minting the DELETE (resurrection zombies / restart re-import residue / hookless
+ *  teardowns). Self-gates (shadow + FEAT_CRDT_OWNER_SWEEP + !bursting) + 2-pass
+ *  debounce, so calling it at every settle point is safe + cheap. Runs on the verify
+ *  tick, at EOB (the re-import lands with the estab exchange), and after a
+ *  non-burst CR F snapshot apply (the Fix-A steady-state re-import) — the eager
+ *  points let both debounce passes complete in seconds instead of two 30s ticks. */
+void crdt_shadow_own_user_sweep(void);
+
 /** Phase 3f: drive live channel membership (the JOIN/add direction) from the doc
  *  members OR-Set + §17.7 gateway to legacy. Adds present-in-doc-not-live members
  *  into already-live channels only (never creates a channel); op/voice + the
