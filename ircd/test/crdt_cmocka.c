@@ -2205,10 +2205,12 @@ static void test_snapshot_recovers_gc_gap(void **state)
   crdt_state_clear(&s2);
 }
 
-/* The materialized digest is invariant under GC (it hashes only present
- * elements), while the full digest is not (it hashes reclaimable tombstones).
- * This is why two replicas with identical live state but different GC progress
- * agree on mdigest but not digest -- mdigest is the real convergence metric. */
+/* BOTH digests are invariant under GC (2026-07-26): mdigest hashes only
+ * present elements, and the Fix-A wire digest now skips LWW tombstones and
+ * OR-Set covered-tags/tombstones too.  GC progress is per-node bookkeeping —
+ * hashing it into the Fix-A trigger drove a live permanent full-snapshot
+ * oscillation between reclaimed-vs-retained nodes (the two-replica skew shape
+ * is pinned in test_digest_gc_invariant; this is the single-state flavor). */
 static void test_materialized_digest_gc_invariant(void **state)
 {
   (void)state;
@@ -2224,7 +2226,7 @@ static void test_materialized_digest_gc_invariant(void **state)
   m_after = crdt_state_digest_materialized(&s);
   full_after = crdt_state_digest(&s);
   assert_int_equal(m_before, m_after);        /* materialized: unchanged by GC */
-  assert_int_not_equal(full_before, full_after); /* full: tombstone reclaimed */
+  assert_int_equal(full_before, full_after);  /* Fix-A digest: ALSO unchanged */
   crdt_state_clear(&s);
 }
 
@@ -3410,6 +3412,47 @@ static void test_decommission_replicates(void **state)
   crdt_state_clear(&b);
 }
 
+/* GC-INVARIANT Fix-A digest (the oscillation fix, 2026-07-26): tombstone
+ * presence is per-node GC bookkeeping that snapshot exchange can never
+ * converge — hashing it into the CR S digest drove a PERMANENT full-snapshot
+ * oscillation live (all 5 nodes, every tick, after a decommission cycle's
+ * remove-churn: nodes that had reclaimed vs re-received tombstones disagreed
+ * forever).  Two replicas with IDENTICAL live content must hash EQUAL no
+ * matter which tombstone subsets each has reclaimed — both for LWW delete-
+ * tombstones and OR-Set covered-tags/tombstones. */
+static void test_digest_gc_invariant(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState a, b;
+  static uint8_t buf[262144];
+  struct CrdtUserRecord u;
+  struct CrdtStateVector stable;
+  int n;
+  memset(&u, 0, sizeof u);
+  crdt_state_init(&a, 1);
+  crdt_state_init(&b, 2);
+  /* identical history on both: user + member added then removed (via delta) */
+  crdt_user_set(&a, "ADAAB", &u);
+  crdt_chan_join(&a, "#gci", "ADAAB");
+  crdt_user_remove(&a, "ADAAB");
+  crdt_chan_remove(&a, "#gci", "ADAAB", CRDT_PRIORITY_USER);
+  n = crdt_delta_encode(&a.oplog, &b.local_sv, buf, sizeof buf);
+  assert_true(n > 0);
+  crdt_delta_apply(&b, buf, (size_t)n);
+  assert_true(crdt_state_digest(&a) == crdt_state_digest(&b));  /* converged */
+  /* B reclaims its tombstones; A does not (GC timing skew) */
+  crdt_sv_init(&stable);
+  crdt_sv_update(&stable, 1, 1000); crdt_sv_update(&stable, 2, 1000);
+  crdt_state_gc(&b, &stable);
+  assert_true(crdt_lwwmap_is_deleted(&a.users, "ADAAB", 5));    /* A: retained */
+  assert_false(crdt_lwwmap_is_deleted(&b.users, "ADAAB", 5));   /* B: reclaimed */
+  /* the fix: identical live content -> identical Fix-A digest despite the skew
+   * (pre-fix these differed and Fix-A exchanged full snapshots forever) */
+  assert_true(crdt_state_digest(&a) == crdt_state_digest(&b));
+  crdt_state_clear(&a);
+  crdt_state_clear(&b);
+}
+
 /* Relink safety: reap a decommissioned server's user record, then the server
  * returns and a client registers on the SAME numeric — the fresh SET's later
  * HLC must beat the reap tombstone whether the tombstone is still live or
@@ -3831,6 +3874,7 @@ int main(void)
     cmocka_unit_test(test_orphan_members_kept_while_user_tombstone),
     cmocka_unit_test(test_orphan_members_residue_converges),
     cmocka_unit_test(test_owner_remove_beats_snapshot_reimport),
+    cmocka_unit_test(test_digest_gc_invariant),
     cmocka_unit_test(test_decommission_replicates),
     cmocka_unit_test(test_decommission_reap_and_return),
     cmocka_unit_test(test_A_convergence),

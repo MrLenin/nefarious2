@@ -1871,6 +1871,17 @@ static uint64_t hash_tag(uint64_t h, const struct CrdtTag *tg)
   return h;
 }
 
+/* LIVE-content LWW digest: tombstones are SKIPPED.  Tombstone presence is
+ * per-node GC bookkeeping that snapshot exchange can never converge (merge-keep
+ * can only ADD a tombstone to a peer, which the peer then reclaims again if
+ * op-backed — or retains forever if snapshot-delivered/op-less).  Hashing it
+ * into the Fix-A trigger therefore cannot repair anything and instead drives a
+ * PERMANENT full-snapshot oscillation once nodes' GC timing diverges (observed
+ * live 2026-07-26: all 5 nodes exchanging snapshots every tick between a
+ * with-tombstones and a without-tombstones digest after a decommission cycle).
+ * A tombstone-free map hashes identically to the pre-fix algorithm (the flag
+ * byte, always 0 for live entries, is still hashed) — mixed-version meshes only
+ * churn while tombstones are actually in flight. */
 static uint64_t digest_lww(uint64_t acc, const struct CrdtLWWMap *m, uint8_t ns)
 {
   uint32_t b;
@@ -1878,14 +1889,14 @@ static uint64_t digest_lww(uint64_t acc, const struct CrdtLWWMap *m, uint8_t ns)
     struct CrdtLWWEntry *e;
     for (e = m->buckets[b]; e; e = e->ht_next) {
       uint64_t h = FNV64_OFFSET;
+      if (e->deleted)
+        continue;                /* GC-invariant: see header comment */
       h = fnv64(h, &ns, 1);
       h = fnv64(h, e->key, e->key_len);
       h = fnv64(h, &e->deleted, sizeof e->deleted);
-      if (!e->deleted) {
-        h = fnv64(h, e->val.data, e->val.data_len);
-        h = hash_hlc(h, &e->val.ts);
-        h = fnv64(h, &e->val.writer, sizeof e->val.writer);
-      }
+      h = fnv64(h, e->val.data, e->val.data_len);
+      h = hash_hlc(h, &e->val.ts);
+      h = fnv64(h, &e->val.writer, sizeof e->val.writer);
       acc ^= h;
     }
   }
@@ -1980,6 +1991,12 @@ static uint64_t digest_topic(uint64_t acc, const struct CrdtLWWMap *m, uint8_t n
   return acc;
 }
 
+/* LIVE-content OR-Set digest: hash only UNCOVERED add-tags and no tombstone
+ * list — covered tags + tombstones are per-node GC bookkeeping (same rationale
+ * as digest_lww above; the OR-Set side was the live oscillation's carrier).
+ * A tombstone-free set hashes identically to the pre-fix algorithm.  Keeps
+ * per-tag granularity (unlike digest_orset_present) so concurrent same-key
+ * adds still register as content. */
 static uint64_t digest_orset(uint64_t acc, const struct CrdtORSet *s,
                              const char *cname, uint32_t cnlen, uint8_t ns)
 {
@@ -1990,23 +2007,14 @@ static uint64_t digest_orset(uint64_t acc, const struct CrdtORSet *s,
     for (e = s->buckets[b]; e; e = e->ht_next)
       for (i = 0; i < e->add_count; i++) {
         uint64_t h = FNV64_OFFSET;
+        if (crdt_orset_tag_covered(s, e->add_tags[i]))
+          continue;              /* removed — GC bookkeeping, not content */
         h = fnv64(h, &ns, 1);
         h = fnv64(h, cname, cnlen);
         h = fnv64(h, e->key, e->key_len);
         h = hash_tag(h, &e->add_tags[i]);
         acc ^= h;
       }
-  }
-  for (b = 0; b < s->tomb_nbuckets; b++) {
-    struct CrdtTombstone *t;
-    for (t = s->tomb[b]; t; t = t->ht_next) {
-      uint64_t h = FNV64_OFFSET;
-      h = fnv64(h, &ns, 1);
-      h = fnv64(h, cname, cnlen);
-      h = hash_tag(h, &t->tag);
-      h = fnv64(h, &t->priority, 1);
-      acc ^= h;
-    }
   }
   return acc;
 }

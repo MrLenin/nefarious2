@@ -164,6 +164,11 @@ uint32_t crdt_orset_size(const struct CrdtORSet *set);
 /** Number of live tombstones (for memory/GC measurement). */
 uint32_t crdt_orset_tomb_count(const struct CrdtORSet *set);
 
+/** 1 iff @a tag is covered by a tombstone (removed).  For GC-invariant digests:
+ *  a covered add-tag and its tombstone are per-node GC bookkeeping, not
+ *  observable content. */
+int crdt_orset_tag_covered(const struct CrdtORSet *set, struct CrdtTag tag);
+
 typedef void (*crdt_orset_iter_fn)(const char *key, uint32_t key_len,
                                    void *ctx);
 /** Visit every PRESENT element. */

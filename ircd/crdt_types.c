@@ -261,6 +261,11 @@ void crdt_orset_merge_remove(struct CrdtORSet *set, struct CrdtTag tag,
   tomb_put(set, tag, priority);
 }
 
+int crdt_orset_tag_covered(const struct CrdtORSet *set, struct CrdtTag tag)
+{
+  return tomb_find(set, tag) != NULL;
+}
+
 int crdt_orset_gc(struct CrdtORSet *set, const struct CrdtStateVector *stable)
 {
   /* Phase 1: drop add-tags that are tombstoned AND causally stable. */
