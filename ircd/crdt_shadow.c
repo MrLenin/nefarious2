@@ -5388,10 +5388,38 @@ void crdt_shadow_reconcile_removes(void)
           if (IsMemberAlias(m))            /* aliases aren't real members (handled elsewhere) */
             continue;
           user_numeric(m->user, num, sizeof num);
-          if (crdt_orset_is_explicitly_removed(&dc->members, num, strlen(num))) {
-            victim = m->user;
-            break;
+          if (!crdt_orset_is_explicitly_removed(&dc->members, num, strlen(num)))
+            continue;
+          /* Membership RE-ASSERT (2026-07-26): every legitimate removal of a LOCAL
+           * member applies LIVE-FIRST (voluntary PART / REMOVE / SVSPART hit the
+           * live state before their doc mint, so by reconcile time the member is
+           * already gone) — a doc tombstone that still finds a LIVE MyUser member
+           * and carries no KICK attribution is therefore presumptively reap
+           * residue (decommission / orphan-members sweep of a wrongly-presumed-
+           * dead server healing over its still-connected users).  I am the
+           * authority for my own users' presence: refuse the de-part and re-mint
+           * the membership + status instead (crdt_shadow_join — a fresh add-tag
+           * beats the old tombstones by OR-Set semantics and restores the member
+           * network-wide; the mainland re-JOINs the materialized copy).  A remote
+           * KICK-via-doc (mesh-only kicker) still applies via the kick_info gate
+           * below — fall through to victim selection for those. */
+          if (MyUser(m->user)) {
+            const struct CrdtLWWValue *kv = crdt_kick_info_get(&g_crdt, nbuf, num);
+            const struct CrdtLWWValue *mv = crdt_member_status_get(&g_crdt, nbuf, num);
+            int is_kick = kv && kv->data &&
+                          kv->data_len == sizeof(struct CrdtKickInfo) &&
+                          (!mv || hlc_compare(&kv->ts, &mv->ts) > 0);
+            if (!is_kick) {
+              log_write(LS_SYSTEM, L_NOTICE, 0,
+                        "CRDT membership re-assert: re-minting %s on %s "
+                        "(live local member, unattributed doc removal)",
+                        num, nbuf);
+              crdt_shadow_join(chptr, m->user, m->status);
+              continue;                    /* not a victim — keep scanning */
+            }
           }
+          victim = m->user;
+          break;
         }
         if (!victim)
           break;                           /* no tombstoned-but-live members remain */
