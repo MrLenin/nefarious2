@@ -3376,6 +3376,74 @@ static void test_owner_remove_beats_snapshot_reimport(void **state)
 }
 
 /* ================================================================== */
+/* DECOMMISSION — operator-asserted permanent-absence marker ("jupe without the
+ * jupe part"): a standing doc record that says server S is gone, licensing any
+ * node to reap S's user/bconn residue, WITHOUT blocking S from relinking.  The
+ * record auto-dissolves when S returns (shadow layer).  These tests cover the
+ * engine mechanics: the record replicates like any LWW entry, and — the
+ * relink-safety contract — a returning server's FRESH registration SET beats
+ * the reap's older tombstone, so decommission-then-return can never suppress a
+ * real reconnecting user. */
+static void test_decommission_replicates(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState a, b;
+  static uint8_t buf[262144];
+  int n;
+  crdt_state_init(&a, 1);
+  crdt_state_init(&b, 2);
+  crdt_decomm_set(&a, "AB", "someoper", "provider shutdown");
+  assert_non_null(crdt_decomm_get(&a, "AB"));
+  n = crdt_snapshot_encode(&a, buf, sizeof buf);
+  assert_true(n > 0);
+  assert_int_equal(0, crdt_snapshot_apply(&b, buf, (size_t)n));
+  assert_non_null(crdt_decomm_get(&b, "AB"));       /* marker replicated */
+  assert_string_equal("someoper", crdt_decomm_get(&b, "AB")->oper);
+  /* dissolve (server returned / manual remove) replicates too */
+  crdt_decomm_remove(&a, "AB");
+  assert_null(crdt_decomm_get(&a, "AB"));
+  n = crdt_snapshot_encode(&a, buf, sizeof buf);
+  assert_true(n > 0);
+  assert_int_equal(0, crdt_snapshot_apply(&b, buf, (size_t)n));
+  assert_null(crdt_decomm_get(&b, "AB"));
+  crdt_state_clear(&a);
+  crdt_state_clear(&b);
+}
+
+/* Relink safety: reap a decommissioned server's user record, then the server
+ * returns and a client registers on the SAME numeric — the fresh SET's later
+ * HLC must beat the reap tombstone whether the tombstone is still live or
+ * already GC'd.  (The shadow sweep also skips reaping entirely while the
+ * server is present; this pins the engine-level ordering underneath.) */
+static void test_decommission_reap_and_return(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState a;
+  struct CrdtUserRecord u;
+  struct CrdtStateVector stable;
+  memset(&u, 0, sizeof u);
+  u.server = 27;                       /* owner = "AB" numerically */
+  crdt_state_init(&a, 1);
+  crdt_user_set(&a, "ABAAB", &u);
+  crdt_decomm_set(&a, "AB", "someoper", "hw failure");
+  /* the standing sweep's act: reap the dead server's record */
+  crdt_user_remove(&a, "ABAAB");
+  assert_null(crdt_user_get(&a, "ABAAB"));
+  /* return WHILE the tombstone is still live: fresh SET wins LWW */
+  crdt_user_set(&a, "ABAAB", &u);
+  assert_non_null(crdt_user_get(&a, "ABAAB"));
+  /* reap again, GC the tombstone (wholly absent), return again: still fine */
+  crdt_user_remove(&a, "ABAAB");
+  crdt_sv_init(&stable); crdt_sv_update(&stable, 1, 1000);
+  crdt_state_gc(&a, &stable);
+  assert_null(crdt_user_get(&a, "ABAAB"));
+  assert_false(crdt_lwwmap_is_deleted(&a.users, "ABAAB", 5));
+  crdt_user_set(&a, "ABAAB", &u);
+  assert_non_null(crdt_user_get(&a, "ABAAB"));
+  crdt_state_clear(&a);
+}
+
+/* ================================================================== */
 /* Fix A (digest-aware anti-entropy): the state vector counts ops per origin but
  * does NOT summarise content/HLC, so two replicas can share an SV yet hold
  * different content (e.g. a CR F snapshot HLC-merge or ctime incarnation change
@@ -3763,6 +3831,8 @@ int main(void)
     cmocka_unit_test(test_orphan_members_kept_while_user_tombstone),
     cmocka_unit_test(test_orphan_members_residue_converges),
     cmocka_unit_test(test_owner_remove_beats_snapshot_reimport),
+    cmocka_unit_test(test_decommission_replicates),
+    cmocka_unit_test(test_decommission_reap_and_return),
     cmocka_unit_test(test_A_convergence),
     cmocka_unit_test(test_B_collision_different_user_oldest_wins),
     cmocka_unit_test(test_B_collision_same_user_newest_wins),

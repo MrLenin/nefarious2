@@ -155,6 +155,7 @@ void crdt_state_init(struct CrdtNetworkState *st, uint16_t my_numeric)
   crdt_lwwmap_init(&st->metadata);
   crdt_lwwmap_init(&st->tempshuns);
   crdt_lwwmap_init(&st->webpush);
+  crdt_lwwmap_init(&st->decommissions);
   crdt_orset_init(&st->silences);
 }
 
@@ -181,6 +182,7 @@ void crdt_state_clear(struct CrdtNetworkState *st)
   crdt_lwwmap_clear(&st->metadata);
   crdt_lwwmap_clear(&st->tempshuns);
   crdt_lwwmap_clear(&st->webpush);
+  crdt_lwwmap_clear(&st->decommissions);
   crdt_orset_clear(&st->silences);
   for (int b = 0; b < CRDT_CHAN_BUCKETS; b++) {
     struct CrdtChannel *c = st->chan_buckets[b];
@@ -1660,6 +1662,7 @@ static struct CrdtLWWMap *lww_for(struct CrdtNetworkState *st,
   case CRDT_COLL_METADATA:      return &st->metadata;
   case CRDT_COLL_TEMPSHUNS:     return &st->tempshuns;
   case CRDT_COLL_WEBPUSH:       return &st->webpush;
+  case CRDT_COLL_DECOMMISSIONS: return &st->decommissions;
   default:                return NULL;
   }
 }
@@ -2031,6 +2034,7 @@ uint64_t crdt_state_digest(const struct CrdtNetworkState *st)
   acc = digest_lww(acc, &st->metadata, 21);  /* salt 21: Tier C F2-b account metadata */
   acc = digest_lww(acc, &st->tempshuns, 22); /* salt 22: Tier C F3 tempshuns */
   acc = digest_lww(acc, &st->webpush, 23);   /* salt 23: Tier C F2-c webpush subs */
+  acc = digest_lww(acc, &st->decommissions, 24); /* salt 24: decommission markers */
   acc = digest_orset(acc, &st->silences, "", 0, 19);/* salt 19: Tier C F1-c silences */
   for (bk = 0; bk < CRDT_CHAN_BUCKETS; bk++) {
     struct CrdtChannel *c;
@@ -2091,6 +2095,7 @@ uint64_t crdt_state_digest_materialized(const struct CrdtNetworkState *st)
   acc = digest_lww(acc, &st->metadata, 21);  /* salt 21: Tier C F2-b account metadata */
   acc = digest_lww(acc, &st->tempshuns, 22); /* salt 22: Tier C F3 tempshuns */
   acc = digest_lww(acc, &st->webpush, 23);   /* salt 23: Tier C F2-c webpush subs */
+  acc = digest_lww(acc, &st->decommissions, 24); /* salt 24: decommission markers */
   acc = digest_orset_present(acc, &st->silences, "", 0, 19);/* salt 19: Tier C F1-c silences */
   for (bk = 0; bk < CRDT_CHAN_BUCKETS; bk++) {
     struct CrdtChannel *c;
@@ -2490,6 +2495,56 @@ const struct CrdtTempshun *crdt_tempshun_get(const struct CrdtNetworkState *st,
     crdt_lwwmap_get(&st->tempshuns, numeric, (uint32_t)strlen(numeric));
   return (v && v->data && v->data_len == sizeof(struct CrdtTempshun))
            ? (const struct CrdtTempshun *)v->data : NULL;
+}
+
+/* ------------------------------------------------------------------ */
+/* DECOMMISSION — operator-asserted permanent absence of a server      */
+/* ------------------------------------------------------------------ */
+/* "Jupe without the jupe part": a standing marker that licenses any node to
+ * reap the server's user/bconn residue (crdt_shadow_decomm_sweep) WITHOUT
+ * blocking relink; the shadow layer auto-dissolves it when the server
+ * returns.  Relink-safe by LWW: a returning client's fresh registration SET
+ * carries a later HLC than any reap tombstone (test_decommission_reap_and_
+ * return pins this). */
+void crdt_decomm_set(struct CrdtNetworkState *st, const char *srvnum,
+                     const char *oper, const char *reason)
+{
+  struct CrdtDecommission rec;
+  struct HLC ts = hlc_local_event(&st->clock);
+  uint32_t klen = (uint32_t)strlen(srvnum);
+  uint64_t seq;
+  struct CrdtOp *op;
+  memset(&rec, 0, sizeof rec);          /* deterministic wire bytes (inv. 4) */
+  if (oper)
+    strncpy(rec.oper, oper, sizeof rec.oper - 1);
+  if (reason)
+    strncpy(rec.reason, reason, sizeof rec.reason - 1);
+  crdt_lwwmap_set(&st->decommissions, srvnum, klen, &rec, sizeof rec,
+                  ts, st->my_numeric);
+  seq = st->next_seq++;
+  op = op_new(st->my_numeric, seq, CRDT_OP_SET, CRDT_COLL_DECOMMISSIONS);
+  op->key = memdup(srvnum, klen);
+  op->key_len = klen;
+  op->val = memdup(&rec, sizeof rec);
+  op->val_len = sizeof rec;
+  op->ts = ts;
+  op->writer = st->my_numeric;
+  record(st, op);
+}
+
+const struct CrdtDecommission *crdt_decomm_get(const struct CrdtNetworkState *st,
+                                               const char *srvnum)
+{
+  const struct CrdtLWWValue *v =
+    crdt_lwwmap_get(&st->decommissions, srvnum, (uint32_t)strlen(srvnum));
+  return (v && v->data && v->data_len == sizeof(struct CrdtDecommission))
+           ? (const struct CrdtDecommission *)v->data : NULL;
+}
+
+void crdt_decomm_remove(struct CrdtNetworkState *st, const char *srvnum)
+{
+  mint_meta_delete(st, &st->decommissions, CRDT_COLL_DECOMMISSIONS,
+                   srvnum, (uint32_t)strlen(srvnum));
 }
 
 /* Mint the doc DELETE for one tempshun entry (reap path only — a '-' flip is

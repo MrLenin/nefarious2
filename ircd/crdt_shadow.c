@@ -1091,6 +1091,239 @@ void crdt_shadow_own_user_sweep(void)
     crdt_sync_push();                      /* eager-propagate the tombstones */
 }
 
+/* Own-record RE-ASSERT (the recovery completion for the sweeps): a LIVE local
+ * registered user whose doc record is absent-or-tombstoned is ALWAYS wrong — the
+ * record was minted at registration and only I may legitimately remove it.  The
+ * cases that create it: a wrongly-decommissioned-while-partitioned server heals
+ * and merges the reap tombstones over its still-connected users; or any future
+ * path that loses a record.  Re-mint via crdt_shadow_user_add (idempotent full-
+ * record SET, fresh HLC -> beats any stale tombstone by LWW).  This upgrades the
+ * verify count-detector ("shadow user missing") from log-only to self-healing
+ * for the MyUser half; remote missing users stay log-only (their owner
+ * re-asserts).  No debounce: the predicate is exact and the act idempotent —
+ * a repeated re-assert fighting a repeated delete is a bug we WANT loud. */
+void crdt_shadow_own_user_reassert(void)
+{
+  struct Client *acptr;
+  char num[CRDT_NUMERICLEN];
+  int minted = 0;
+  if (!shadow_on())
+    return;
+  for (acptr = GlobalClientList; acptr; acptr = cli_next(acptr))
+    if (IsServer(acptr) && IsBurstOrBurstAck(acptr))
+      return;                              /* resync in flight — defer the pass */
+  for (acptr = GlobalClientList; acptr; acptr = cli_next(acptr)) {
+    if (!MyUser(acptr) || IsBouncerAlias(acptr) || !cli_user(acptr) ||
+        !cli_yxx(acptr)[0])
+      continue;
+    user_numeric(acptr, num, sizeof num);
+    if (crdt_user_get(&g_crdt, num))
+      continue;                            /* record present — healthy */
+    log_write(LS_SYSTEM, L_NOTICE, 0,
+              "CRDT own-user re-assert: re-minting record for live local %s (%s)",
+              num, cli_name(acptr));
+    crdt_shadow_user_add(acptr);           /* fresh SET; sync_push inside */
+    minted++;
+  }
+  (void)minted;
+}
+
+/* DECOMMISSION standing sweep + auto-dissolve ("jupe without the jupe part").
+ * An operator asserts a server is permanently gone (hardware death, provider
+ * loss) via /CRDT decommission; the marker is a standing doc record, so nodes
+ * that were partitioned/below-floor during the assertion still reap the residue
+ * when they next see it (a one-shot reap would be undone by merge-keep snapshot
+ * re-import — the resurrection lesson).  While the marker stands, every node
+ * reaps user records (rec->server) and bouncer-conn records (rec->host) owned
+ * by the decommissioned server; the reclaim family (members/silences/tempshuns/
+ * member-meta) cascades from the user tombstones.  Sessions and LEASES are
+ * deliberately NOT touched — the bouncer revive path owns those.
+ *
+ * NOT a link ban: if the server returns, the FIRST branch below dissolves the
+ * marker (any node may mint the delete; LWW).  The skip-if-present guard runs
+ * BEFORE any reap so a relink-vs-sweep race can never reap a returning server's
+ * fresh records — and those carry later HLCs than any reap tombstone anyway
+ * (test_decommission_reap_and_return).  A wrongly-decommissioned-but-alive
+ * server heals itself on relink: marker dissolves + own_user_reassert re-mints
+ * its records.  Gated with the owner sweep's kill-switch (same destructive-reap
+ * family). */
+#define DECOMM_MAX_SRV   8                 /* markers handled per pass */
+struct decomm_reap_ctx {
+  struct CrdtNetworkState *st;
+  uint16_t srv[DECOMM_MAX_SRV];
+  int      nsrv;
+  /* user-record candidates */
+  char unum[OWN_SWEEP_MAX][CRDT_NUMERICLEN];
+  int  nu;
+  /* bconn candidates (account\0sessid\0connnum key split) */
+  char bacc[OWN_SWEEP_MAX][ACCOUNTLEN + 1];
+  char bsid[OWN_SWEEP_MAX][64];
+  char bnum[OWN_SWEEP_MAX][16];
+  int  nb;
+};
+
+static int decomm_srv_match(const struct decomm_reap_ctx *c, uint16_t host)
+{
+  int i;
+  for (i = 0; i < c->nsrv; i++)
+    if (c->srv[i] == host)
+      return 1;
+  return 0;
+}
+
+static void decomm_collect_srv_cb(const char *key, uint32_t key_len,
+                                  const struct CrdtLWWValue *val, void *ctx)
+{
+  struct decomm_reap_ctx *c = (struct decomm_reap_ctx *)ctx;
+  char srvnum[3];
+  unsigned int n;
+  if (c->nsrv >= DECOMM_MAX_SRV || !val->data || key_len == 0 || key_len > 2)
+    return;
+  memcpy(srvnum, key, key_len);
+  srvnum[key_len] = '\0';
+  n = (unsigned int)base64toint(srvnum);
+  if (n >= CRDT_MAX_SERVERS)
+    return;
+  c->srv[c->nsrv++] = (uint16_t)n;
+}
+
+static void decomm_collect_user_cb(const char *key, uint32_t key_len,
+                                   const struct CrdtLWWValue *val, void *ctx)
+{
+  struct decomm_reap_ctx *c = (struct decomm_reap_ctx *)ctx;
+  const struct CrdtUserRecord *rec;
+  if (c->nu >= OWN_SWEEP_MAX || !val->data ||
+      val->data_len != sizeof(struct CrdtUserRecord))
+    return;
+  rec = (const struct CrdtUserRecord *)val->data;
+  if (!decomm_srv_match(c, rec->server))
+    return;
+  if (key_len == 0 || key_len >= sizeof c->unum[0])
+    return;
+  memcpy(c->unum[c->nu], key, key_len);
+  c->unum[c->nu][key_len] = '\0';
+  c->nu++;
+}
+
+static void decomm_collect_bconn_cb(const char *key, uint32_t key_len,
+                                    const struct CrdtLWWValue *val, void *ctx)
+{
+  struct decomm_reap_ctx *c = (struct decomm_reap_ctx *)ctx;
+  const struct CrdtBouncerConn *rec;
+  const char *p1, *p2;
+  uint32_t alen, slen, nlen;
+  if (c->nb >= OWN_SWEEP_MAX || !val->data ||
+      val->data_len != sizeof(struct CrdtBouncerConn))
+    return;
+  rec = (const struct CrdtBouncerConn *)val->data;
+  if (!decomm_srv_match(c, rec->host))
+    return;
+  p1 = memchr(key, '\0', key_len); if (!p1) return;
+  alen = (uint32_t)(p1 - key);
+  p2 = memchr(p1 + 1, '\0', key_len - alen - 1); if (!p2) return;
+  slen = (uint32_t)(p2 - (p1 + 1));
+  nlen = key_len - alen - 1 - slen - 1;
+  if (alen > ACCOUNTLEN || slen >= sizeof c->bsid[0] || nlen == 0 ||
+      nlen >= sizeof c->bnum[0])
+    return;
+  memcpy(c->bacc[c->nb], key, alen);      c->bacc[c->nb][alen] = '\0';
+  memcpy(c->bsid[c->nb], p1 + 1, slen);   c->bsid[c->nb][slen] = '\0';
+  memcpy(c->bnum[c->nb], p2 + 1, nlen);   c->bnum[c->nb][nlen] = '\0';
+  c->nb++;
+}
+
+void crdt_shadow_decomm_sweep(void)
+{
+  static struct decomm_reap_ctx c;
+  struct Client *acptr;
+  char srvnum[3];
+  int i, minted = 0, bursting = 0;
+  if (!shadow_on() || !feature_bool(FEAT_CRDT_OWNER_SWEEP))
+    return;
+  if (crdt_lwwmap_size(&g_crdt.decommissions) == 0)
+    return;                                /* overwhelming common case */
+  c.st = &g_crdt;
+  c.nsrv = 0;
+  crdt_lwwmap_foreach(&g_crdt.decommissions, decomm_collect_srv_cb, &c);
+  if (c.nsrv == 0)
+    return;
+  /* AUTO-DISSOLVE first (runs even mid-burst — removing a marker for a present
+   * server is always right, and doing it before any reap closes the race). */
+  for (i = 0; i < c.nsrv; i++) {
+    struct Client *srv;
+    inttobase64(srvnum, c.srv[i], 2);
+    srvnum[2] = '\0';
+    srv = FindNServer(srvnum);
+    if ((srv && (IsServer(srv) || IsMeshStub(srv))) ||
+        crdt_shadow_server_beacon_fresh(c.srv[i])) {
+      log_write(LS_SYSTEM, L_NOTICE, 0,
+                "CRDT decommission: dissolving marker for %s (server returned)",
+                srvnum);
+      crdt_decomm_remove(&g_crdt, srvnum);
+      c.srv[i] = 0xFFFF;                   /* out of every reap match below */
+      minted++;
+    }
+  }
+  for (acptr = GlobalClientList; acptr; acptr = cli_next(acptr))
+    if (IsServer(acptr) && IsBurstOrBurstAck(acptr)) { bursting = 1; break; }
+  if (!bursting) {
+    c.nu = c.nb = 0;
+    crdt_lwwmap_foreach(&g_crdt.users, decomm_collect_user_cb, &c);
+    crdt_lwwmap_foreach(&g_crdt.bconns, decomm_collect_bconn_cb, &c);
+    for (i = 0; i < c.nu; i++) {
+      log_write(LS_SYSTEM, L_NOTICE, 0,
+                "CRDT decomm-sweep: reaping user record %s (decommissioned server)",
+                c.unum[i]);
+      crdt_user_remove(&g_crdt, c.unum[i]);
+      minted++;
+    }
+    for (i = 0; i < c.nb; i++) {
+      log_write(LS_SYSTEM, L_NOTICE, 0,
+                "CRDT decomm-sweep: reaping bconn %s/%s/%s (decommissioned server)",
+                c.bacc[i], c.bsid[i], c.bnum[i]);
+      crdt_bconn_del(&g_crdt, c.bacc[i], c.bsid[i], c.bnum[i]);
+      minted++;
+    }
+  }
+  if (minted)
+    crdt_sync_push();
+}
+
+/* /CRDT decommission wrappers (m_crdtinfo.c cannot reach g_crdt directly).
+ * Return: 0 = done; 1 = refused, server present; 2 = refused, beacon fresh;
+ * 3 = no such marker (unmark). */
+int crdt_shadow_decomm_mark(const char *srvnum, const char *oper,
+                            const char *reason)
+{
+  struct Client *srv;
+  unsigned int n;
+  if (!shadow_on())
+    return 1;
+  srv = FindNServer(srvnum);
+  if (srv && (IsServer(srv) || IsMeshStub(srv)))
+    return 1;                              /* reachable — refuse */
+  n = (unsigned int)base64toint(srvnum);
+  if (n < CRDT_MAX_SERVERS && crdt_shadow_server_beacon_fresh((uint16_t)n))
+    return 2;                              /* mesh-reachable — refuse */
+  crdt_decomm_set(&g_crdt, srvnum, oper, reason);
+  crdt_sync_push();
+  return 0;
+}
+
+int crdt_shadow_decomm_unmark(const char *srvnum)
+{
+  if (!shadow_on() || !crdt_decomm_get(&g_crdt, srvnum))
+    return 3;
+  crdt_decomm_remove(&g_crdt, srvnum);
+  crdt_sync_push();
+  return 0;
+}
+
+const struct CrdtDecommission *crdt_shadow_decomm_query(const char *srvnum)
+{
+  return shadow_on() ? crdt_decomm_get(&g_crdt, srvnum) : NULL;
+}
+
 /* 5-5e M5: liveness-lease wrappers + the beacon-freshness liveness signal. */
 const struct CrdtBouncerLease *crdt_shadow_blease_get(const char *account,
                                                       const char *sessid)
@@ -5504,6 +5737,8 @@ static void crdt_shadow_verify_cb(struct Event *ev)
   crdt_shadow_reconcile_user_removes(); /* Phase 3m: QUIT / delete-on-leave (after channel cleanup) */
   crdt_shadow_stale_user_scan();   /* orphan-reap Inc 1: detect-and-log stale-materialization ghosts (absent-from-doc) the tombstone-only reap left behind */
   crdt_shadow_own_user_sweep();    /* orphan-reap owner sweep: reap MY-origin doc records with no live client (resurrection zombies / restart residue / hookless teardowns) */
+  crdt_shadow_own_user_reassert(); /* recovery completion: re-mint records of live local users the doc lost (wrong-decommission heal) */
+  crdt_shadow_decomm_sweep();      /* decommission standing sweep: reap residue of operator-asserted-dead servers; auto-dissolve on return */
   crdt_shadow_reconcile_glines();  /* GLINE step 3: drive global G-lines from doc (+gateway) */
   crdt_shadow_reconcile_shuns();   /* SHUN: drive global Shuns from doc (+gateway) */
   crdt_shadow_reconcile_markers(); /* Tier C F2-a: drive read-markers from doc -> RocksDB */

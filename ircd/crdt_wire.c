@@ -337,6 +337,7 @@ int crdt_snapshot_encode(const struct CrdtNetworkState *st,
   snap_put_lww(&w, &st->metadata, (uint8_t)CRDT_COLL_METADATA, &lww_total);   /* Tier C F2-b */
   snap_put_lww(&w, &st->tempshuns, (uint8_t)CRDT_COLL_TEMPSHUNS, &lww_total); /* Tier C F3 */
   snap_put_lww(&w, &st->webpush, (uint8_t)CRDT_COLL_WEBPUSH, &lww_total);     /* Tier C F2-c */
+  snap_put_lww(&w, &st->decommissions, (uint8_t)CRDT_COLL_DECOMMISSIONS, &lww_total); /* decommission markers */
   wpatch_u32(&w, lww_off, lww_total);
 
   /* channels: members / bans / excepts */

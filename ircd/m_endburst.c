@@ -189,6 +189,8 @@ int ms_end_of_burst(struct Client* cptr, struct Client* sptr, int parc, char* pa
    * each further settle event) completes the 2-pass debounce in seconds instead of two
    * 30s verify ticks.  Self-gated + idempotent, so every-EOB is safe + cheap. */
   crdt_shadow_own_user_sweep();
+  crdt_shadow_own_user_reassert();  /* heal-after-wrong-decommission: re-mint our live users over merged-in reap tombstones NOW, not on the next tick */
+  crdt_shadow_decomm_sweep();       /* dissolve markers for returned servers / reap freshly-learned decommissions at the settle point */
 
   if (MyConnect(sptr)) {
     sendcmdto_one(&me, CMD_END_OF_BURST_ACK, sptr, "");

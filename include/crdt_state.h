@@ -118,6 +118,17 @@ struct CrdtTempshun {
   char    reason[CRDT_TEMPSHUN_REASONLEN];
 };
 
+/* Operator-asserted permanent-absence marker for a server ("jupe without the
+ * jupe part"): while present, any node may reap the server's user/bconn doc
+ * residue; it does NOT block relink and auto-dissolves when the server
+ * returns.  All-char fields: no interior padding (memset anyway, inv. 4). */
+#define CRDT_DECOMM_OPERLEN   32
+#define CRDT_DECOMM_REASONLEN 120
+struct CrdtDecommission {
+  char oper[CRDT_DECOMM_OPERLEN];      /**< who asserted it (audit) */
+  char reason[CRDT_DECOMM_REASONLEN];  /**< why (audit) */
+};
+
 #define CRDT_KICKREASONLEN 160
 /* Per-kick metadata (Phase 3k): an LWW register keyed chan\0numeric, parallel to
  * the kick's member tombstone. Lets reconcile-remove emit a KICK (with attribution)
@@ -295,7 +306,8 @@ enum CrdtCollection {
   CRDT_COLL_MARKERS,       /**< markread storage key -> read-marker ts (MAX-register) — Tier C F2-a */
   CRDT_COLL_METADATA,      /**< account\0key -> metadata blob (LWW) — Tier C F2-b */
   CRDT_COLL_TEMPSHUNS,     /**< victim numeric -> CrdtTempshun (LWW) — Tier C F3 */
-  CRDT_COLL_WEBPUSH        /**< account\0endpoint -> subscription blob (LWW) — Tier C F2-c */
+  CRDT_COLL_WEBPUSH,       /**< account\0endpoint -> subscription blob (LWW) — Tier C F2-c */
+  CRDT_COLL_DECOMMISSIONS  /**< 2-char server numeric -> CrdtDecommission (LWW) — operator-asserted permanent absence */
 };
 
 struct CrdtOp {
@@ -382,6 +394,7 @@ struct CrdtNetworkState {
   struct CrdtLWWMap       metadata;     /**< account\0key -> metadata blob (LWW, Tier C F2-b) */
   struct CrdtLWWMap       tempshuns;    /**< victim numeric -> CrdtTempshun (LWW, Tier C F3) */
   struct CrdtLWWMap       webpush;      /**< account\0endpoint -> subscription blob (LWW, Tier C F2-c) */
+  struct CrdtLWWMap       decommissions; /**< 2-char server numeric -> CrdtDecommission (LWW) */
   struct CrdtORSet        silences;     /**< usernumeric\0mask -> per-user silence masks (Tier C F1-c) */
   struct CrdtChannel     *chan_buckets[CRDT_CHAN_BUCKETS];
 };
@@ -429,6 +442,18 @@ void crdt_state_reclaim_user_tempshun(struct CrdtNetworkState *st,
  *  FULLY absent (neither live nor pending-tombstone — the silences gate).
  *  Returns entries reaped. */
 int crdt_state_reclaim_orphan_tempshuns(struct CrdtNetworkState *st);
+
+/** Decommission: operator-asserted permanent absence of server @a srvnum (2-char
+ *  numeric).  Standing doc record: while present, the shadow decomm-sweep reaps
+ *  the server's user/bconn residue; it never blocks relink and the shadow layer
+ *  auto-dissolves it (crdt_decomm_remove) when the server returns. */
+void crdt_decomm_set(struct CrdtNetworkState *st, const char *srvnum,
+                     const char *oper, const char *reason);
+/** NULL if absent/tombstoned/wrong-sized (mixed-version tolerance). */
+const struct CrdtDecommission *crdt_decomm_get(const struct CrdtNetworkState *st,
+                                               const char *srvnum);
+/** Dissolve the marker (server returned, or manual cancel). Op-recording. */
+void crdt_decomm_remove(struct CrdtNetworkState *st, const char *srvnum);
 
 void crdt_silence_add(struct CrdtNetworkState *st, const char *usernumeric,
                       const char *mask);

@@ -564,6 +564,24 @@ void crdt_shadow_reconcile_user_removes(void);
  *  points let both debounce passes complete in seconds instead of two 30s ticks. */
 void crdt_shadow_own_user_sweep(void);
 
+/** Own-record re-assert: re-mint the doc record of any LIVE local registered user
+ *  whose record is absent/tombstoned (always wrong — e.g. a wrongly-decommissioned
+ *  server healing over its reap tombstones). Idempotent; self-gates on !bursting. */
+void crdt_shadow_own_user_reassert(void);
+
+/** Decommission standing sweep + auto-dissolve: while an operator's decommission
+ *  marker stands, reap the server's user/bconn doc residue; dissolve the marker the
+ *  moment the server is present or mesh-reachable again. Self-gates (shadow +
+ *  FEAT_CRDT_OWNER_SWEEP + skip-if-present-first + !bursting for the reap half). */
+void crdt_shadow_decomm_sweep(void);
+
+/** /CRDT decommission command backends. mark: 0=done, 1=refused (server present),
+ *  2=refused (beacon fresh). unmark: 0=done, 3=no such marker. */
+int crdt_shadow_decomm_mark(const char *srvnum, const char *oper,
+                            const char *reason);
+int crdt_shadow_decomm_unmark(const char *srvnum);
+const struct CrdtDecommission *crdt_shadow_decomm_query(const char *srvnum);
+
 /** Phase 3f: drive live channel membership (the JOIN/add direction) from the doc
  *  members OR-Set + §17.7 gateway to legacy. Adds present-in-doc-not-live members
  *  into already-live channels only (never creates a channel); op/voice + the

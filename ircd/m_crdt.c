@@ -758,6 +758,7 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
            * after convergence are no-ops (no BS A/D storm).  NO local-holder sweep
            * here -- eager ingest is doc->live only; the sweep stays verify-timer. */
           crdt_shadow_reconcile_bouncer();
+          crdt_shadow_decomm_sweep();      /* decommission markers reap eagerly on the delta that carries them (F3 lesson); empty-map early-out makes this ~free */
         }
       }
       MyFree(bin);

@@ -30,6 +30,8 @@
 #include "crdt_meshmap.h"
 #include "crdt_shadow.h"
 #include "handlers.h"
+#include "hash.h"
+#include "ircd_string.h"
 #include "ircd.h"
 #include "ircd_log.h"
 #include "ircd_snprintf.h"
@@ -301,6 +303,61 @@ int mo_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
     case 'p': render_peers(sptr);  break;
     case 's': render_status(sptr); break;
     case 'r': render_route(sptr);  break;
+    case 'd': {
+      /* decommission <server|2char-numeric> [remove|<reason...>] — operator-
+       * asserted permanent absence ("jupe without the jupe part"): licenses the
+       * standing decomm-sweep to reap the server's doc residue, never blocks
+       * relink, auto-dissolves if the server returns.  Refused while the target
+       * is reachable (present or beacon-fresh) so it cannot be fat-fingered
+       * onto a live server. */
+      const char *arg = (parc > 2 && parv[2][0]) ? parv[2] : NULL;
+      struct Client *asrv;
+      char srvnum[3];
+      int rc;
+      if (!arg) {
+        sendcmdto_one(&me, CMD_NOTICE, sptr,
+                      "%C :Usage: CRDT decommission <server|2char-numeric> "
+                      "[remove|<reason>]", sptr);
+        break;
+      }
+      asrv = FindServer(arg);
+      if (asrv) {
+        srvnum[0] = cli_yxx(asrv)[0];
+        srvnum[1] = cli_yxx(asrv)[1];
+        srvnum[2] = '\0';
+      } else if (strlen(arg) == 2) {
+        srvnum[0] = arg[0]; srvnum[1] = arg[1]; srvnum[2] = '\0';
+      } else {
+        sendcmdto_one(&me, CMD_NOTICE, sptr,
+                      "%C :CRDT decommission: no such server '%s' — for a "
+                      "long-gone server use its 2-char numeric", sptr, arg);
+        break;
+      }
+      if (parc > 3 && 0 == ircd_strcmp(parv[3], "remove")) {
+        rc = crdt_shadow_decomm_unmark(srvnum);
+        sendcmdto_one(&me, CMD_NOTICE, sptr,
+                      rc == 0 ? "%C :CRDT decommission: marker for %s removed"
+                              : "%C :CRDT decommission: no marker for %s",
+                      sptr, srvnum);
+        break;
+      }
+      rc = crdt_shadow_decomm_mark(srvnum, cli_name(sptr),
+                                   (parc > 3) ? parv[parc - 1] : "");
+      if (rc == 0) {
+        log_write(LS_SYSTEM, L_NOTICE, 0,
+                  "CRDT decommission: %s marked by %s (%s)",
+                  srvnum, cli_name(sptr), (parc > 3) ? parv[parc - 1] : "-");
+        sendcmdto_one(&me, CMD_NOTICE, sptr,
+                      "%C :CRDT decommission: %s marked — residue will be "
+                      "reaped; marker auto-dissolves if the server returns",
+                      sptr, srvnum);
+      } else {
+        sendcmdto_one(&me, CMD_NOTICE, sptr,
+                      "%C :CRDT decommission: refused — %s is %s", sptr, srvnum,
+                      rc == 1 ? "present/linked" : "mesh-reachable (beacon fresh)");
+      }
+      break;
+    }
 #ifdef DEBUGMODE
     case 'c': {   /* clockstep <±secs> — DEBUG-only relative wall-clock step */
       int step = (parc > 2 && parv[2]) ? atoi(parv[2]) : 0;
