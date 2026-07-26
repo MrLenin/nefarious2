@@ -69,11 +69,25 @@ described in many notes below.)
   teardowns; live-gated via docker-kill owner death). Op-less-tombstone stickiness (pinned by
   `test_owner_remove_beats_snapshot_reimport`): a snapshot-delivered LWW tombstone has no local oplog
   op so `crdt_state_gc` never reclaims it — safe (anti-resurrection anchor) but permanent local
-  residue; a change to either behavior must be conscious.**
-- **Digest vs mdigest** — `crdt_state_digest` hashes the DOC (LWW vals + HLCs + OR-Set);
-  `crdt_state_digest_materialized` (mdigest) hashes the live materialized view (GC-invariant, the real
-  convergence metric — the verify NOTICE logs both). **The digest is NOT on the wire by default** (it's
-  a local diagnostic) — except Fix A now carries it on CR S (see below).
+  residue; a change to either behavior must be conscious.** **DECOMMISSION (2026-07-26,
+  "jupe without the jupe part"): `CRDT_COLL_DECOMMISSIONS` standing marker (2-char srvnum →
+  {oper,reason}) minted via oper `/CRDT decommission <server|numeric> [remove|<reason>]` (refused
+  while target present/beacon-fresh); `crdt_shadow_decomm_sweep` (tick+eager+EOB) reaps the marked
+  server's user records + bconns (sessions/leases untouched — revive path owns them) and
+  AUTO-DISSOLVES the marker the moment the server returns (dissolve runs BEFORE any reap; never a
+  link ban). `crdt_shadow_own_user_reassert` (tick+EOB) is the recovery completion: a live local
+  registered user with an absent/tombstoned record is always wrong → re-mint (heals
+  wrong-decommission-while-partitioned-alive; known collateral: channel memberships are not
+  re-asserted — user survives but is parted).**
+- **Digest vs mdigest** — `crdt_state_digest` (the Fix-A wire digest, on CR S) hashes LIVE content
+  ONLY: LWW tombstones and OR-Set covered-tags/tombstones are SKIPPED (**GC-INVARIANT since
+  2026-07-26** — hashing per-node GC bookkeeping into the reconciliation trigger drove a live
+  PERMANENT full-snapshot oscillation between reclaimed-vs-retained nodes; snapshot exchange cannot
+  converge tombstone presence, so it must not be compared). `crdt_state_digest_materialized`
+  (mdigest) hashes the live materialized view (also GC-invariant, the convergence oracle — the
+  verify NOTICE logs both). Related pinned fact: a snapshot-delivered LWW tombstone has no local
+  oplog op and is NEVER reclaimed by `crdt_state_gc` (op-less stickiness — safe anti-resurrection
+  anchor, permanent local residue; `test_owner_remove_beats_snapshot_reimport`).
 - **`CrdtMsgidDedup`** (R3) — time-windowed open-addressing hash set; `crdt_dedup_check_add(d,id,now,
   window)` → 1 if seen within `window`, else records. Replaces the old count-bounded ring.
 
