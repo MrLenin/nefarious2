@@ -52,9 +52,19 @@ described in many notes below.)
   dedup/anti-entropy key. **Summarises op COUNTS, not content** (see the SV-invisible-divergence rule).
 - **Oplog** — the replicated op stream (CRDT_OP_SET / CRDT_OP_DELETE), chunked + gossiped as deltas.
 - **Causal-stability GC** (`crdt_state_gc`) — frees ops/tombstones every peer has seen (`stable` =
-  component-wise min SV across all connected CRDT peers). Reclaims oplog + LWW delete-tombstones +
-  OR-Set tombstones. Also `crdt_state_reclaim_orphan_member_meta` (members_status/kick_info of fully-
-  departed members → mints DELETE ops).
+  component-wise min SV across all connected CRDT peers; live `IsCrdtSyncTarget` links ONLY — a split
+  peer leaves the set at link-death; zero peers → GC skips entirely). Reclaims oplog + LWW
+  delete-tombstones + OR-Set tombstones. Sibling orphan reclaims (all GC-cycle, all mint real ops):
+  `crdt_state_reclaim_orphan_member_meta` (members_status/kick_info of fully-departed members),
+  `_orphan_chan_meta` (topic/modes/chanmeta of fully-gone channels), `_orphan_silences` +
+  `_orphan_tempshuns` (user-anchored: owner wholly absent), `_orphan_members` (2026-07-26: membership
+  add-tags of wholly-absent users — the partition-cycle member-residue leak; heal re-merges a healed
+  node's still-present adds after the remove-tombstones were GC'd during the darkness). **KNOWN OPEN
+  (live-reproduced 2026-07-26): the same GC'd-tombstone/merge-keep hole at the USERS layer makes
+  quit-during-partition users RESURRECT network-wide as unkillable doc-present zombies when heal lands
+  after complete mainland tombstone GC (timing-dependent; KILL can't clean them — non-owner exits
+  self-skip the tombstone and reconcile re-materializes). Fix = owner-side sweep (own-origin records
+  with no live client → mint DELETE), not yet built.**
 - **Digest vs mdigest** — `crdt_state_digest` hashes the DOC (LWW vals + HLCs + OR-Set);
   `crdt_state_digest_materialized` (mdigest) hashes the live materialized view (GC-invariant, the real
   convergence metric — the verify NOTICE logs both). **The digest is NOT on the wire by default** (it's
