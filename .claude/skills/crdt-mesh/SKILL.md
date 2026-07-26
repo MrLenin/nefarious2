@@ -59,12 +59,17 @@ described in many notes below.)
   `_orphan_chan_meta` (topic/modes/chanmeta of fully-gone channels), `_orphan_silences` +
   `_orphan_tempshuns` (user-anchored: owner wholly absent), `_orphan_members` (2026-07-26: membership
   add-tags of wholly-absent users — the partition-cycle member-residue leak; heal re-merges a healed
-  node's still-present adds after the remove-tombstones were GC'd during the darkness). **KNOWN OPEN
-  (live-reproduced 2026-07-26): the same GC'd-tombstone/merge-keep hole at the USERS layer makes
-  quit-during-partition users RESURRECT network-wide as unkillable doc-present zombies when heal lands
-  after complete mainland tombstone GC (timing-dependent; KILL can't clean them — non-owner exits
-  self-skip the tombstone and reconcile re-materializes). Fix = owner-side sweep (own-origin records
-  with no live client → mint DELETE), not yet built.**
+  node's still-present adds after the remove-tombstones were GC'd during the darkness). **The USERS-layer
+  twin (live-reproduced 2026-07-26: quit-during-partition users RESURRECT network-wide as unkillable
+  doc-present zombies when heal lands after complete mainland tombstone GC; KILL can't clean them —
+  non-owner exits self-skip the tombstone and reconcile re-materializes) is closed by
+  `crdt_shadow_own_user_sweep` (crdt_shadow.c, verify tick, kill-switch `FEAT_CRDT_OWNER_SWEEP`):
+  each node reaps its OWN-origin user records with no live Client by minting the DELETE itself
+  (single-writer clean; !bursting + 2-pass debounce; also covers restart re-import residue + hookless
+  teardowns; live-gated via docker-kill owner death). Op-less-tombstone stickiness (pinned by
+  `test_owner_remove_beats_snapshot_reimport`): a snapshot-delivered LWW tombstone has no local oplog
+  op so `crdt_state_gc` never reclaims it — safe (anti-resurrection anchor) but permanent local
+  residue; a change to either behavior must be conscious.**
 - **Digest vs mdigest** — `crdt_state_digest` hashes the DOC (LWW vals + HLCs + OR-Set);
   `crdt_state_digest_materialized` (mdigest) hashes the live materialized view (GC-invariant, the real
   convergence metric — the verify NOTICE logs both). **The digest is NOT on the wire by default** (it's
