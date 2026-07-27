@@ -555,8 +555,40 @@ static void crdt_services_reemit(struct Client *srcsrv, struct Client *dsrv, cha
     case 'R': sendcmdto_one(src, CMD_REGREPLY, dsrv, "%s", body); break;
     case 'Q': sendcmdto_one(src, CMD_XQUERY,   dsrv, "%s", body); break;
     case 'Y': sendcmdto_one(src, CMD_XREPLY,   dsrv, "%s", body); break;
+    /* 5-5f B3: chathistory federation frame (query or reply) leaving the mesh
+     * for a legacy server we hold a live P10 link to.  This IS the return leg
+     * of the gateway slice: the owner tunnels its replies addressed to the
+     * requesting legacy server, and they land here as ordinary P10 CH lines
+     * sourced from the real owner, so the requester's find_fed_request()
+     * matches exactly as if the two had been directly linked. */
+    case 'H': sendcmdto_one(src, CMD_CHATHISTORY, dsrv, "%s", body); break;
     default: break;
   }
+}
+
+/* 5-5f B3 (gateway slice): hand a chathistory federation frame to the CR-X
+ * carrier, addressed to server @a dstyxx (cmd 'H').  Routing, msgid dedup,
+ * TTL, the destination's local re-inject and the gateway's re-emit-to-legacy
+ * leg are all existing CR-X machinery — this only selects the carrier.
+ *
+ * Returns 1 if the mesh accepted it, 0 if the carrier is unavailable.  A 0 is
+ * load-bearing for the caller: a query that cannot be tunnelled MUST still be
+ * accounted for (the 5-5c invariant — never leave servers_pending uncredited,
+ * or the pre-Phase-0 wedge returns). */
+int crdt_ch_tunnel_try(const char *dstyxx, const char *body)
+{
+  if (!feature_bool(FEAT_CRDT_SERVICES_BRIDGE) || !crdt_shadow_active()
+      || !dstyxx || !dstyxx[0] || !body || !body[0])
+    return 0;
+  crdt_services_emit(cli_yxx(&me), dstyxx, 'H', body);
+  return 1;
+}
+
+/* Reply leg of the above — fire-and-forget: a reply that cannot be tunnelled
+ * has no second carrier to try, and falls to the requester's fed timeout. */
+void crdt_ch_tunnel_reply(const char *dstyxx, const char *body)
+{
+  crdt_ch_tunnel_try(dstyxx, body);
 }
 
 /* Destination leaf: re-inject the tunneled body into the LOCAL services handler (the token in
@@ -1223,7 +1255,11 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
     if (dstnum == ournum) {                /* (a) we are the destination -> local re-inject */
       char bodybuf[BUFSIZE];
       ircd_strncpy(bodybuf, x_body, sizeof bodybuf);
-      crdt_services_reinject(x_cmd, bodybuf);
+      if (x_cmd == 'H')                  /* 5-5f B3: chathistory needs the reply
+                                          * tunnel armed around its dispatch */
+        crdt_ch_tunnel_dispatch(bodybuf);
+      else
+        crdt_services_reinject(x_cmd, bodybuf);
       log_write(LS_SYSTEM, L_INFO, 0, "Tier B CR-X: re-injected locally cmd=%c", x_cmd);
       return 0;
     }

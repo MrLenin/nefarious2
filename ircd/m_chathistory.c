@@ -66,8 +66,17 @@
 static int is_ulined_server(struct Client *server);
 int has_chathistory_advertisement(struct Client *server);
 void broadcast_channel_advertisement(const char *channel);
+/* 5-5f B3: CR-X chathistory carrier (m_crdt.c) + the handler we re-inject into.
+ * Declared locally rather than via handlers.h: that header types
+ * forward_history_write's 5th parameter as int while the definition below uses
+ * enum HistoryMessageType (ABI-identical, but C sees conflicting types). */
+extern void crdt_ch_tunnel_reply(const char *dstyxx, const char *body);
+extern int  crdt_ch_tunnel_try(const char *dstyxx, const char *body);
+extern int  ms_chathistory(struct Client *cptr, struct Client *sptr,
+                           int parc, char *parv[]);
 #include <string.h>
 #include <stdlib.h>
+#include <stdarg.h>       /* 5-5f B3: va_list (ch_reply_out) */
 #include <openssl/evp.h>
 #ifdef USE_ZSTD
 #include <zstd.h>
@@ -82,6 +91,58 @@ void broadcast_channel_advertisement(const char *channel);
  */
 #define CH_CHUNK_RAW_SIZE 300
 #define CH_CHUNK_B64_SIZE 400
+
+/** 5-5f B3 (gateway slice): reply-tunnel context.
+ *
+ * A federated query whose origin is unreachable by P10 from here (it arrived
+ * over the CR-X tunnel, so there is no arrival link to answer down) must send
+ * its replies back through the mesh.  ch_tunnel_dst holds the destination
+ * server numeric — taken from the reqid prefix, which start_fed_query mints as
+ * <originYXX><counter> — for the duration of one tunneled dispatch.  While it
+ * is set, ch_reply_out() wraps each reply into a CR-X frame instead of a P10
+ * line, and the chunker uses the smaller tunnel budget below.
+ *
+ * Single-threaded and strictly scoped to one crdt_ch_tunnel_dispatch() call
+ * (set on entry, cleared on exit); ms_chathistory never recurses into itself.
+ */
+static char ch_tunnel_dst[3];
+static int  ch_tunnel_on;
+
+/** Max base64 chunk when replies ride the CR-X tunnel.
+ * The CR-X wrapper (":XX CR X <msgid> <src> <dst> H <ttl> :") costs ~40 bytes
+ * on top of the CH reply's own ~130 bytes of metadata, and the 512-byte P10
+ * body cap is immutable — so tunneled chunks must be smaller than the 400 a
+ * bare CH line can carry.  Never inflate the wrapper instead. */
+#define CH_CHUNK_B64_TUNNEL_SIZE 300
+
+/** Active base64 chunk budget (tunnel-aware). */
+static size_t ch_chunk_b64_size(void)
+{
+  return ch_tunnel_on ? CH_CHUNK_B64_TUNNEL_SIZE : CH_CHUNK_B64_SIZE;
+}
+
+/** Emit one federation reply line (R/B/Z/T/E) to @a to.
+ *
+ * Formats first, then ships: down the P10 link normally, or into the CR-X
+ * tunnel toward ch_tunnel_dst when a tunneled query is being answered.  The
+ * pre-formatted body is passed as a "%s" argument (never as a pattern), so
+ * message content containing '%' is safe — the crdt_services_reemit rule.
+ */
+static void ch_reply_out(struct Client *to, const char *pattern, ...)
+{
+  char body[BUFSIZE];
+  va_list vl;
+
+  va_start(vl, pattern);
+  ircd_vsnprintf(0, body, sizeof(body), pattern, vl);
+  va_end(vl);
+
+  if (ch_tunnel_on) {
+    crdt_ch_tunnel_reply(ch_tunnel_dst, body);
+    return;
+  }
+  sendcmdto_one(&me, CMD_CHATHISTORY, to, "%s", body);
+}
 
 /** Check if content needs base64 encoding.
  * Note: New multiline content uses \x1F separators, but we must still check for
@@ -140,11 +201,11 @@ static void send_ch_response(struct Client *sptr, const char *reqid,
    */
   if (msg->raw_content && msg->raw_content_len > 0) {
     size_t b64_len = ((msg->raw_content_len + 2) / 3) * 4 + 1;
-    if (b64_len <= CH_CHUNK_B64_SIZE) {
+    if (b64_len <= ch_chunk_b64_size()) {
       char *b64 = MyMalloc(b64_len);
       if (b64) {
         ch_base64_encode((const char *)msg->raw_content, msg->raw_content_len, b64);
-        sendcmdto_one(&me, CMD_CHATHISTORY, sptr, "Z %s %s %s %d %s %s :%s",
+        ch_reply_out(sptr, "Z %s %s %s %d %s %s :%s",
                       reqid, msg->msgid, msg->timestamp, msg->type,
                       msg->sender, account, b64);
         MyFree(b64);
@@ -157,7 +218,7 @@ static void send_ch_response(struct Client *sptr, const char *reqid,
   /* Check if content needs base64 encoding */
   if (!ch_needs_encoding(content)) {
     /* Simple case: send as-is */
-    sendcmdto_one(&me, CMD_CHATHISTORY, sptr, "R %s %s %s %d %s %s :%s",
+    ch_reply_out(sptr, "R %s %s %s %d %s %s :%s",
                   reqid, msg->msgid, msg->timestamp, msg->type,
                   msg->sender, account, content);
     return;
@@ -169,7 +230,7 @@ static void send_ch_response(struct Client *sptr, const char *reqid,
   char *b64 = MyMalloc(b64_len);
   if (!b64) {
     /* Fallback: send truncated without encoding */
-    sendcmdto_one(&me, CMD_CHATHISTORY, sptr, "R %s %s %s %d %s %s :%s",
+    ch_reply_out(sptr, "R %s %s %s %d %s %s :%s",
                   reqid, msg->msgid, msg->timestamp, msg->type,
                   msg->sender, account, "[content too large]");
     return;
@@ -179,8 +240,8 @@ static void send_ch_response(struct Client *sptr, const char *reqid,
   size_t b64_total = strlen(b64);
 
   /* If it fits in one message, send complete B message (no + marker) */
-  if (b64_total <= CH_CHUNK_B64_SIZE) {
-    sendcmdto_one(&me, CMD_CHATHISTORY, sptr, "B %s %s %s %d %s %s :%s",
+  if (b64_total <= ch_chunk_b64_size()) {
+    ch_reply_out(sptr, "B %s %s %s %d %s %s :%s",
                   reqid, msg->msgid, msg->timestamp, msg->type,
                   msg->sender, account, b64);
     MyFree(b64);
@@ -193,7 +254,8 @@ static void send_ch_response(struct Client *sptr, const char *reqid,
 
   while (offset < b64_total) {
     size_t remaining = b64_total - offset;
-    size_t chunk_size = (remaining > CH_CHUNK_B64_SIZE) ? CH_CHUNK_B64_SIZE : remaining;
+    size_t budget = ch_chunk_b64_size();
+    size_t chunk_size = (remaining > budget) ? budget : remaining;
     int more = (offset + chunk_size < b64_total);
     char chunk[CH_CHUNK_B64_SIZE + 1];
 
@@ -203,12 +265,12 @@ static void send_ch_response(struct Client *sptr, const char *reqid,
     if (first) {
       /* First chunk: include all metadata, + marker if more coming */
       if (more) {
-        sendcmdto_one(&me, CMD_CHATHISTORY, sptr, "B %s %s %s %d %s %s + :%s",
+        ch_reply_out(sptr, "B %s %s %s %d %s %s + :%s",
                       reqid, msg->msgid, msg->timestamp, msg->type,
                       msg->sender, account, chunk);
       } else {
         /* Single chunk that just barely needed encoding */
-        sendcmdto_one(&me, CMD_CHATHISTORY, sptr, "B %s %s %s %d %s %s :%s",
+        ch_reply_out(sptr, "B %s %s %s %d %s %s :%s",
                       reqid, msg->msgid, msg->timestamp, msg->type,
                       msg->sender, account, chunk);
       }
@@ -216,11 +278,11 @@ static void send_ch_response(struct Client *sptr, const char *reqid,
     } else {
       /* Continuation chunk: just reqid, msgid, and marker */
       if (more) {
-        sendcmdto_one(&me, CMD_CHATHISTORY, sptr, "B %s %s + :%s",
+        ch_reply_out(sptr, "B %s %s + :%s",
                       reqid, msg->msgid, chunk);
       } else {
         /* Final chunk: no + marker */
-        sendcmdto_one(&me, CMD_CHATHISTORY, sptr, "B %s %s :%s",
+        ch_reply_out(sptr, "B %s %s :%s",
                       reqid, msg->msgid, chunk);
       }
     }
@@ -4456,6 +4518,55 @@ static void forward_fed_reply(struct Client *sptr, struct Client *cptr,
   sendcmdto_one(sptr, CMD_CHATHISTORY, origin, "%s", buf);
 }
 
+/** 5-5f B3 (gateway slice): dispatch a chathistory frame that arrived over the
+ * CR-X tunnel, and arm the reply tunnel around it.
+ *
+ * @a body is the verbatim P10 param tail, split here by P10 rules (space
+ * separated; a leading ':' opens the trailing param).  parv[0] is a prefix
+ * placeholder — ms_chathistory routes on the body, not the prefix.
+ *
+ * For a query we arm ch_tunnel_dst with the request ORIGIN (the reqid's
+ * two-character prefix, minted by start_fed_query) rather than whoever
+ * forwarded it: replies then retrace the mesh to the asker, and the gateway
+ * holding a live legacy link to it re-emits them as ordinary P10.  Replies
+ * arriving here (we are the origin) are terminal and emit nothing, so they are
+ * dispatched with the tunnel disarmed.  Context is cleared unconditionally —
+ * ms_chathistory never recurses into itself.
+ */
+void crdt_ch_tunnel_dispatch(char *body)
+{
+  char *parv[MAXPARA + 3];
+  int parc = 0;
+  char *s = body;
+
+  parv[parc++] = cli_name(&me);
+  while (*s && parc < MAXPARA + 2) {
+    while (*s == ' ')
+      *s++ = '\0';
+    if (!*s)
+      break;
+    if (*s == ':') {              /* trailing param: rest of line verbatim */
+      parv[parc++] = ++s;
+      break;
+    }
+    parv[parc++] = s;
+    while (*s && *s != ' ')
+      s++;
+  }
+  parv[parc] = NULL;
+  if (parc < 3)
+    return;
+
+  /* Q <target> <sub> <ref> <limit> <reqid> [<dest>] -> reqid is parv[6] */
+  if (parv[1][0] == 'Q' && !parv[1][1] && parc >= 7 && strlen(parv[6]) >= 3) {
+    ircd_strncpy(ch_tunnel_dst, parv[6], sizeof(ch_tunnel_dst));
+    ch_tunnel_on = 1;
+  }
+  ms_chathistory(&me, &me, parc, parv);
+  ch_tunnel_on = 0;
+  ch_tunnel_dst[0] = '\0';
+}
+
 int ms_chathistory(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
 {
   char *subcmd;
@@ -4511,11 +4622,23 @@ int ms_chathistory(struct Client *cptr, struct Client *sptr, int parc, char *par
         /* A dest that resolves to a mesh stub/anchor has no live P10 route
          * from here — forwarding would dead-sink and wedge the requester
          * until its fed timeout (it counted this server as dispatched).
-         * Answer E 0 on its behalf so accounting completes promptly; 5-5f
-         * B3 replaces this with a CR tunnel toward the anchored owner. */
+         *
+         * 5-5f B3 (gateway slice): tunnel the query to the anchored owner
+         * over the CR-X carrier so the requester gets the REAL history back.
+         * The owner re-injects it locally and tunnels its replies to the
+         * origin (the reqid prefix); this gateway re-emits those as ordinary
+         * P10.  Only when the carrier is unavailable do we fall back to
+         * answering E 0 on the dest's behalf — never leave the requester's
+         * servers_pending uncredited (the 5-5c invariant), since that is the
+         * wedge Phase 0 removed.  A tunnelled query lost in flight still
+         * falls back to the requester's fed timeout. */
         if (IsMeshStub(dest)) {
-          sendcmdto_one(&me, CMD_CHATHISTORY,
-                        ch_fed_reply_target(sptr, cptr), "E %s 0", reqid);
+          char qbody[BUFSIZE];
+          ircd_snprintf(0, qbody, sizeof(qbody), "Q %s %s %s %d %s %s",
+                        target, query_subcmd_str, ref, limit, reqid,
+                        dest_numeric);
+          if (!crdt_ch_tunnel_try(dest_numeric, qbody))
+            ch_reply_out(ch_fed_reply_target(sptr, cptr), "E %s 0", reqid);
           return 0;
         }
         /* Forward to destination via P10 routing — don't process locally */
@@ -4577,14 +4700,14 @@ int ms_chathistory(struct Client *cptr, struct Client *sptr, int parc, char *par
       int fetch_limit;
 
       if (!history_is_available()) {
-        sendcmdto_one(&me, CMD_CHATHISTORY, reply_to, "E %s 0", reqid);
+        ch_reply_out(reply_to, "E %s 0", reqid);
         return 0;
       }
 
       /* Parse dual timestamp from ref: <ts1>,<ts2> */
       comma = strchr(ref, ',');
       if (!comma) {
-        sendcmdto_one(&me, CMD_CHATHISTORY, reply_to, "E %s 0", reqid);
+        ch_reply_out(reply_to, "E %s 0", reqid);
         return 0;
       }
       *comma = '\0';
@@ -4599,18 +4722,18 @@ int ms_chathistory(struct Client *cptr, struct Client *sptr, int parc, char *par
 
       tgt_count = history_query_targets(ts1_buf, ts2_buf, fetch_limit, &targets);
       if (tgt_count <= 0) {
-        sendcmdto_one(&me, CMD_CHATHISTORY, reply_to, "E %s 0", reqid);
+        ch_reply_out(reply_to, "E %s 0", reqid);
         return 0;
       }
 
       /* Send CH T responses */
       for (tgt = targets; tgt; tgt = tgt->next) {
-        sendcmdto_one(&me, CMD_CHATHISTORY, reply_to, "T %s %s %s",
+        ch_reply_out(reply_to, "T %s %s %s",
                       reqid, tgt->target, tgt->last_timestamp);
       }
 
       /* End marker */
-      sendcmdto_one(&me, CMD_CHATHISTORY, reply_to, "E %s %d", reqid, tgt_count);
+      ch_reply_out(reply_to, "E %s %d", reqid, tgt_count);
       history_free_targets(targets);
       return 0;
     }
@@ -4618,19 +4741,19 @@ int ms_chathistory(struct Client *cptr, struct Client *sptr, int parc, char *par
     /* Only process for channels (not PMs) */
     if (!IsChannelName(target)) {
       /* Send empty response for PMs */
-      sendcmdto_one(&me, CMD_CHATHISTORY, reply_to, "E %s 0", reqid);
+      ch_reply_out(reply_to, "E %s 0", reqid);
       return 0;
     }
 
     /* Check if we have history backend */
     if (!history_is_available()) {
-      sendcmdto_one(&me, CMD_CHATHISTORY, reply_to, "E %s 0", reqid);
+      ch_reply_out(reply_to, "E %s 0", reqid);
       return 0;
     }
 
     /* Parse S2S reference format (T..., M..., *) */
     if (parse_s2s_reference(ref, &ref_type, &ref_value) != 0) {
-      sendcmdto_one(&me, CMD_CHATHISTORY, reply_to, "E %s 0", reqid);
+      ch_reply_out(reply_to, "E %s 0", reqid);
       return 0;
     }
 
@@ -4656,25 +4779,25 @@ int ms_chathistory(struct Client *cptr, struct Client *sptr, int parc, char *par
         int lrc = history_lookup_message(target, ref_value, &single_msg);
         if (lrc == 0 && single_msg) {
           send_ch_response(reply_to, reqid, single_msg);
-          sendcmdto_one(&me, CMD_CHATHISTORY, reply_to, "E %s 1", reqid);
+          ch_reply_out(reply_to, "E %s 1", reqid);
           history_free_messages(single_msg);
         } else {
-          sendcmdto_one(&me, CMD_CHATHISTORY, reply_to, "E %s 0", reqid);
+          ch_reply_out(reply_to, "E %s 0", reqid);
           if (single_msg)
             history_free_messages(single_msg);
         }
       } else {
-        sendcmdto_one(&me, CMD_CHATHISTORY, reply_to, "E %s 0", reqid);
+        ch_reply_out(reply_to, "E %s 0", reqid);
       }
       return 0;
     } else {
       /* Unsupported subcommand for federation */
-      sendcmdto_one(&me, CMD_CHATHISTORY, reply_to, "E %s 0", reqid);
+      ch_reply_out(reply_to, "E %s 0", reqid);
       return 0;
     }
 
     if (count <= 0) {
-      sendcmdto_one(&me, CMD_CHATHISTORY, reply_to, "E %s 0", reqid);
+      ch_reply_out(reply_to, "E %s 0", reqid);
       return 0;
     }
 
@@ -4688,7 +4811,7 @@ int ms_chathistory(struct Client *cptr, struct Client *sptr, int parc, char *par
     }
 
     /* Send end marker */
-    sendcmdto_one(&me, CMD_CHATHISTORY, reply_to, "E %s %d", reqid, count);
+    ch_reply_out(reply_to, "E %s %d", reqid, count);
 
     history_free_messages(messages);
   }

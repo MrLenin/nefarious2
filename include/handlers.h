@@ -361,6 +361,15 @@ extern int crdt_route_unicast_try(struct Client* from, char cmd, struct Client* 
 extern int crdt_route_services_try(struct Client* dstsrv, char p10cmd, const char* body);
 extern int crdt_route_services_reply_try(struct Client* tgt, char p10cmd, const char* body);
 extern int crdt_route_services_reply_by_num(const char* srvnum, char p10cmd, const char* body);
+
+/* 5-5f B3 (gateway slice): chathistory federation over the CR-X carrier.
+ * _try tunnels a frame toward a server numeric (0 = carrier unavailable, the
+ * caller must then account for the request itself); _reply is the fire-and-
+ * forget reply leg; _dispatch re-injects a tunnelled frame locally with the
+ * reply tunnel armed. */
+extern int  crdt_ch_tunnel_try(const char* dstyxx, const char* body);
+extern void crdt_ch_tunnel_reply(const char* dstyxx, const char* body);
+extern void crdt_ch_tunnel_dispatch(char* body);
 /** Tier2 full-partition liveness: gossip an ephemeral CR H liveness beacon
  *  (CR H <ourYXX> <CurrentTime>) over every CRDT transport.  Receivers track
  *  the last beacon per server; a mesh stub whose beacon goes stale is retired. */
