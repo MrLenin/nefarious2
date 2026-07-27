@@ -4405,6 +4405,57 @@ int chathistory_auto_replay_fed(struct Client *sptr, time_t since_time, int limi
  * parv[1] = subcommand (Q, R, Z, or E)
  * parv[2+] = parameters based on subcommand
  */
+/* Phase 0 of 5-5f: the origin of a federated query may resolve locally to a
+ * mesh stub/anchor whose cli_from is a dead-sink connection (tree-retired, or
+ * never tree-introduced on a CR-snapshot link). Replies routed at it are
+ * silently discarded by the dead-connection send guards. Route such replies
+ * via the link the query arrived on — the P10 path the query itself took.
+ * Replaced by the CR tunnel in 5-5f B3 once the tree is fully retired. */
+static struct Client *ch_fed_reply_target(struct Client *sptr, struct Client *cptr)
+{
+  struct Client *route = cli_from(sptr);
+  if (IsMeshStub(sptr) || !route || IsDead(route) || cli_fd(route) < 0)
+    return cptr;
+  return sptr;
+}
+
+/* Forward a federation reply (R/B/Z/T/E) that matches no local FedRequest
+ * toward the origin server encoded in the reqid prefix (reqid = <yy><counter>,
+ * minted by start_fed_query). Replies carry no destination field, so
+ * multi-hop topologies need this hop-by-hop relay; without it a reply dies at
+ * the first intermediate server. Drops (matching prior behavior) when the
+ * origin is unknown, local (stale reply after timeout), routed through a mesh
+ * anchor (5-5f B3 territory), or would bounce back out the arrival link. */
+static void forward_fed_reply(struct Client *sptr, struct Client *cptr,
+                              int parc, char *parv[])
+{
+  struct Client *origin;
+  char yy[3];
+  char buf[BUFSIZE];
+  char *out = buf;
+  char *end = buf + sizeof(buf);
+  int i;
+
+  /* parv[2] = reqid for every reply subcommand; shortest frame is E (parc 4) */
+  if (parc < 4 || EmptyString(parv[2]) || strlen(parv[2]) < 3)
+    return;
+  yy[0] = parv[2][0];
+  yy[1] = parv[2][1];
+  yy[2] = '\0';
+  origin = FindNServer(yy);
+  if (!origin || origin == &me || !IsServer(origin))
+    return;
+  if (cli_from(origin) == cptr)
+    return;
+
+  /* Rebuild "<sub> <p2> ... :<last>" faithfully; only the trailing param can
+   * contain spaces, so param positions and parc survive the round trip. */
+  for (i = 1; i < parc - 1; i++)
+    out += ircd_snprintf(0, out, end - out, "%s%s", i > 1 ? " " : "", parv[i]);
+  ircd_snprintf(0, out, end - out, " :%s", parv[parc - 1]);
+  sendcmdto_one(sptr, CMD_CHATHISTORY, origin, "%s", buf);
+}
+
 int ms_chathistory(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
 {
   char *subcmd;
@@ -4413,8 +4464,11 @@ int ms_chathistory(struct Client *cptr, struct Client *sptr, int parc, char *par
   assert(0 != cptr);
   assert(0 != sptr);
 
-  /* Sender must be a server */
-  if (!IsServer(sptr))
+  /* Sender must be a server — or a mesh stub/anchor: on this branch a legacy
+   * server's local representation can be STAT_MESH_SERVER (parse admits it
+   * via the beyond-horizon exemption), and an IsServer-exact gate silently
+   * discards every federated query it originates (hard-invariant 2). */
+  if (!IsServer(sptr) && !IsMeshStub(sptr))
     return 0;
 
   if (parc < 2)
@@ -4433,9 +4487,12 @@ int ms_chathistory(struct Client *cptr, struct Client *sptr, int parc, char *par
     struct HistoryMessage *msg;
     enum HistoryRefType ref_type;
     const char *ref_value;
+    struct Client *reply_to;
 
     if (parc < 7)
       return 0;
+
+    reply_to = ch_fed_reply_target(sptr, cptr);
 
     target = parv[2];
     query_subcmd_str = parv[3];
@@ -4451,6 +4508,16 @@ int ms_chathistory(struct Client *cptr, struct Client *sptr, int parc, char *par
     if (dest_numeric) {
       struct Client *dest = FindNServer(dest_numeric);
       if (dest && dest != &me) {
+        /* A dest that resolves to a mesh stub/anchor has no live P10 route
+         * from here — forwarding would dead-sink and wedge the requester
+         * until its fed timeout (it counted this server as dispatched).
+         * Answer E 0 on its behalf so accounting completes promptly; 5-5f
+         * B3 replaces this with a CR tunnel toward the anchored owner. */
+        if (IsMeshStub(dest)) {
+          sendcmdto_one(&me, CMD_CHATHISTORY,
+                        ch_fed_reply_target(sptr, cptr), "E %s 0", reqid);
+          return 0;
+        }
         /* Forward to destination via P10 routing — don't process locally */
         sendcmdto_one(sptr, CMD_CHATHISTORY, dest, "Q %s %s %s %d %s %s",
                       target, query_subcmd_str, ref, limit, reqid,
@@ -4510,14 +4577,14 @@ int ms_chathistory(struct Client *cptr, struct Client *sptr, int parc, char *par
       int fetch_limit;
 
       if (!history_is_available()) {
-        sendcmdto_one(&me, CMD_CHATHISTORY, sptr, "E %s 0", reqid);
+        sendcmdto_one(&me, CMD_CHATHISTORY, reply_to, "E %s 0", reqid);
         return 0;
       }
 
       /* Parse dual timestamp from ref: <ts1>,<ts2> */
       comma = strchr(ref, ',');
       if (!comma) {
-        sendcmdto_one(&me, CMD_CHATHISTORY, sptr, "E %s 0", reqid);
+        sendcmdto_one(&me, CMD_CHATHISTORY, reply_to, "E %s 0", reqid);
         return 0;
       }
       *comma = '\0';
@@ -4532,18 +4599,18 @@ int ms_chathistory(struct Client *cptr, struct Client *sptr, int parc, char *par
 
       tgt_count = history_query_targets(ts1_buf, ts2_buf, fetch_limit, &targets);
       if (tgt_count <= 0) {
-        sendcmdto_one(&me, CMD_CHATHISTORY, sptr, "E %s 0", reqid);
+        sendcmdto_one(&me, CMD_CHATHISTORY, reply_to, "E %s 0", reqid);
         return 0;
       }
 
       /* Send CH T responses */
       for (tgt = targets; tgt; tgt = tgt->next) {
-        sendcmdto_one(&me, CMD_CHATHISTORY, sptr, "T %s %s %s",
+        sendcmdto_one(&me, CMD_CHATHISTORY, reply_to, "T %s %s %s",
                       reqid, tgt->target, tgt->last_timestamp);
       }
 
       /* End marker */
-      sendcmdto_one(&me, CMD_CHATHISTORY, sptr, "E %s %d", reqid, tgt_count);
+      sendcmdto_one(&me, CMD_CHATHISTORY, reply_to, "E %s %d", reqid, tgt_count);
       history_free_targets(targets);
       return 0;
     }
@@ -4551,19 +4618,19 @@ int ms_chathistory(struct Client *cptr, struct Client *sptr, int parc, char *par
     /* Only process for channels (not PMs) */
     if (!IsChannelName(target)) {
       /* Send empty response for PMs */
-      sendcmdto_one(&me, CMD_CHATHISTORY, sptr, "E %s 0", reqid);
+      sendcmdto_one(&me, CMD_CHATHISTORY, reply_to, "E %s 0", reqid);
       return 0;
     }
 
     /* Check if we have history backend */
     if (!history_is_available()) {
-      sendcmdto_one(&me, CMD_CHATHISTORY, sptr, "E %s 0", reqid);
+      sendcmdto_one(&me, CMD_CHATHISTORY, reply_to, "E %s 0", reqid);
       return 0;
     }
 
     /* Parse S2S reference format (T..., M..., *) */
     if (parse_s2s_reference(ref, &ref_type, &ref_value) != 0) {
-      sendcmdto_one(&me, CMD_CHATHISTORY, sptr, "E %s 0", reqid);
+      sendcmdto_one(&me, CMD_CHATHISTORY, reply_to, "E %s 0", reqid);
       return 0;
     }
 
@@ -4588,26 +4655,26 @@ int ms_chathistory(struct Client *cptr, struct Client *sptr, int parc, char *par
         struct HistoryMessage *single_msg = NULL;
         int lrc = history_lookup_message(target, ref_value, &single_msg);
         if (lrc == 0 && single_msg) {
-          send_ch_response(sptr, reqid, single_msg);
-          sendcmdto_one(&me, CMD_CHATHISTORY, sptr, "E %s 1", reqid);
+          send_ch_response(reply_to, reqid, single_msg);
+          sendcmdto_one(&me, CMD_CHATHISTORY, reply_to, "E %s 1", reqid);
           history_free_messages(single_msg);
         } else {
-          sendcmdto_one(&me, CMD_CHATHISTORY, sptr, "E %s 0", reqid);
+          sendcmdto_one(&me, CMD_CHATHISTORY, reply_to, "E %s 0", reqid);
           if (single_msg)
             history_free_messages(single_msg);
         }
       } else {
-        sendcmdto_one(&me, CMD_CHATHISTORY, sptr, "E %s 0", reqid);
+        sendcmdto_one(&me, CMD_CHATHISTORY, reply_to, "E %s 0", reqid);
       }
       return 0;
     } else {
       /* Unsupported subcommand for federation */
-      sendcmdto_one(&me, CMD_CHATHISTORY, sptr, "E %s 0", reqid);
+      sendcmdto_one(&me, CMD_CHATHISTORY, reply_to, "E %s 0", reqid);
       return 0;
     }
 
     if (count <= 0) {
-      sendcmdto_one(&me, CMD_CHATHISTORY, sptr, "E %s 0", reqid);
+      sendcmdto_one(&me, CMD_CHATHISTORY, reply_to, "E %s 0", reqid);
       return 0;
     }
 
@@ -4617,11 +4684,11 @@ int ms_chathistory(struct Client *cptr, struct Client *sptr, int parc, char *par
      * - CH B: base64 encoded response (with chunking if needed)
      */
     for (msg = messages; msg; msg = msg->next) {
-      send_ch_response(sptr, reqid, msg);
+      send_ch_response(reply_to, reqid, msg);
     }
 
     /* Send end marker */
-    sendcmdto_one(&me, CMD_CHATHISTORY, sptr, "E %s %d", reqid, count);
+    sendcmdto_one(&me, CMD_CHATHISTORY, reply_to, "E %s %d", reqid, count);
 
     history_free_messages(messages);
   }
@@ -4644,8 +4711,10 @@ int ms_chathistory(struct Client *cptr, struct Client *sptr, int parc, char *par
 
     /* Find the request */
     req = find_fed_request(reqid);
-    if (!req)
-      return 0;  /* Request not found or already completed */
+    if (!req) {
+      forward_fed_reply(sptr, cptr, parc, parv);
+      return 0;
+    }
 
     /* Add message to federated results */
     add_fed_message(req, msgid, timestamp, type, sender, account, content);
@@ -4671,8 +4740,10 @@ int ms_chathistory(struct Client *cptr, struct Client *sptr, int parc, char *par
 
     /* Find the request */
     req = find_fed_request(reqid);
-    if (!req)
+    if (!req) {
+      forward_fed_reply(sptr, cptr, parc, parv);
       return 0;
+    }
 
 #ifdef USE_ZSTD
     /* Decode base64 then decompress */
@@ -4745,8 +4816,10 @@ int ms_chathistory(struct Client *cptr, struct Client *sptr, int parc, char *par
 
     /* Find the request */
     req = find_fed_request(reqid);
-    if (!req)
+    if (!req) {
+      forward_fed_reply(sptr, cptr, parc, parv);
       return 0;
+    }
 
     /* Determine message format based on parc:
      * parc=5: continuation "B <reqid> <msgid> :<b64>" (final)
@@ -4817,8 +4890,10 @@ int ms_chathistory(struct Client *cptr, struct Client *sptr, int parc, char *par
     last_timestamp = parv[4];
 
     req = find_fed_request(reqid);
-    if (!req)
+    if (!req) {
+      forward_fed_reply(sptr, cptr, parc, parv);
       return 0;
+    }
 
     add_fed_target(req, target, last_timestamp);
   }
@@ -4836,8 +4911,10 @@ int ms_chathistory(struct Client *cptr, struct Client *sptr, int parc, char *par
 
     /* Find the request */
     req = find_fed_request(reqid);
-    if (!req)
+    if (!req) {
+      forward_fed_reply(sptr, cptr, parc, parv);
       return 0;
+    }
 
     /* Decrement pending count */
     req->servers_pending--;

@@ -334,7 +334,11 @@ int ms_silence(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
   if (parc < 3 || EmptyString(parv[2]))
     return need_more_params(sptr, "SILENCE");
 
-  if (IsServer(sptr)) {
+  /* A mesh stub/anchor source (services reached via the §17.7 gateway on a
+   * tree-retired leaf) must take the server branch: falling through would
+   * hand a cli_user()-less stub to forward_silences/apply_silence (NULL
+   * deref, hard-invariant 2). */
+  if (IsServer(sptr) || IsMeshStub(sptr)) {
     struct Client *acptr = findNUser(parv[1]);
 
     /* User not found to silently return. */

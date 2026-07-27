@@ -112,7 +112,10 @@ int ms_fake(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
   if (parc < 3)
     return need_more_params(sptr, "FAKE");
 
-  if (!IsServer(sptr))
+  /* Accept mesh stub/anchor sources (services via the §17.7 gateway on a
+   * tree-retired leaf) — FAKE has no doc backstop, so rejecting the stub
+   * silently loses the fakehost on this node (same shape as the MARK fix). */
+  if (!IsServer(sptr) && !IsMeshStub(sptr))
     return protocol_violation(cptr, "FAKE from non-server %s",
                               cli_name(sptr));
 
