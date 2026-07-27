@@ -167,10 +167,10 @@ int history_pm_identity_matches(struct Client *cli, const char *half, size_t hal
  * @param[in] msgid Message ID (same one sent to clients via echo-message).
  * @param[in] timestamp ISO 8601 timestamp.
  */
-static void store_channel_history(struct Client *sptr, struct Channel *chptr,
-                                   const char *text, enum HistoryMessageType type,
-                                   const char *msgid, const char *timestamp,
-                                   const char *client_tags)
+void store_channel_history(struct Client *sptr, struct Channel *chptr,
+                           const char *text, enum HistoryMessageType type,
+                           const char *msgid, const char *timestamp,
+                           const char *client_tags)
 {
   char sender[HISTORY_SENDER_LEN];
   const char *account;

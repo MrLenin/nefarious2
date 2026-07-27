@@ -34,6 +34,8 @@
 #include "hash.h"         /* Tier2 T2-b: FindChannel (CR M channel deliver) */
 #include "s_misc.h"       /* MR-5-1: exit_client_msg (mesh-routed KILL home delivery) */
 #include "sasl_auth.h"    /* sasl_cache_invalidate_user (CR M cmd I — CI over mesh) */
+#include "ircd_relay.h"   /* 5-5f B1: store_channel_history (CR-M witness store) */
+#include "history.h"      /* 5-5f B1: HISTORY_PRIVMSG/NOTICE type enum */
 
 #include "crdt_shadow.h"
 #include "crdt_meshmap.h"  /* MR-1: crdt_meshmap_nexthop + crdt_route_action */
@@ -43,6 +45,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <sys/time.h>     /* 5-5f B1: gettimeofday (witness-store timestamp) */
 
 #define CR_DELTA_MAX  65536     /* max raw delta we encode in one exchange */
 #define CR_SNAP_MAX   262144    /* max raw full snapshot (CR F) */
@@ -897,6 +900,38 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
                           srcsrv ? cli_name(srcsrv) : srcyxx, cmdstr, target,
                           m_text);
         }
+#ifdef USE_ROCKSDB
+      /* 5-5f B1: witness-store the mesh-delivered message with the SAME
+       * semantics as the P10 relay path — store_channel_history applies the
+       * local-interest walk, +P, REQUIRE_AUTH and +Y gates internally — so
+       * mesh steady state keeps a copy on every node with a local member,
+       * restoring pre-R6a storage redundancy (without this, R6a tree-demote
+       * leaves exactly ONE stored copy network-wide: the origin's).
+       * First-arrival only (we are inside the chan_local dedup, so a
+       * tree-first double-arrival never double-stores); the origin msgid on
+       * the frame keys storage network-consistently (exact federation
+       * dedup); arrival-time timestamp mirrors server_relay_channel_message.
+       * Skip TAGMSG (tree parity: never stored) and mesh-stub sources — a
+       * stub's cli_from is itself, so MyConnect(stub) is true and would
+       * defeat store_channel_history's local-interest gate. */
+      if (ch && !is_tag && (m_cmd[0] == 'P' || m_cmd[0] == 'N')
+          && m_msgid[0] && strcmp(m_msgid, "*") != 0) {
+        struct Client *wsptr = srcu ? srcu
+            : ((srcsrv && !MyConnect(srcsrv)) ? srcsrv : NULL);
+        if (wsptr) {
+          char wts[32];
+          struct timeval wtv;
+          gettimeofday(&wtv, NULL);
+          ircd_snprintf(0, wts, sizeof(wts), "%lu.%03lu",
+                        (unsigned long)wtv.tv_sec,
+                        (unsigned long)(wtv.tv_usec / 1000));
+          store_channel_history(wsptr, ch, m_text,
+                                (m_cmd[0] == 'N') ? HISTORY_NOTICE
+                                                  : HISTORY_PRIVMSG,
+                                m_msgid, wts, NULL);
+        }
+      }
+#endif
       /* R6b (gateway CR-M -> legacy bridge): re-emit this channel message to LEGACY P10
        * peers (forbid CRDT-aware — they got the CR-M flood).  Being inside the !dup_local
        * block means CR-M was the FIRST arrival here, i.e. the TREE did not carry this msgid

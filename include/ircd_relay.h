@@ -55,4 +55,18 @@ extern void history_pm_identity(struct Client *cli, char *buf, size_t buflen);
 extern int  history_pm_identity_matches(struct Client *cli,
                                         const char *half, size_t half_len);
 
+#ifdef USE_ROCKSDB
+struct Channel;
+enum HistoryMessageType;
+/* Store a channel message with the standard witness gate (local-interest,
+ * +P, REQUIRE_AUTH, +Y gap).  Exported for 5-5f B1: the CR-M mesh-delivery
+ * path witness-stores with the SAME semantics as the P10 relay path, so
+ * every node with a local member keeps a copy (restoring pre-mesh storage
+ * redundancy under R6a tree-demote). */
+extern void store_channel_history(struct Client *sptr, struct Channel *chptr,
+                                   const char *text, enum HistoryMessageType type,
+                                   const char *msgid, const char *timestamp,
+                                   const char *client_tags);
+#endif
+
 #endif /* INCLUDED_IRCD_RELAY_H */
