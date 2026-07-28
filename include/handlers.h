@@ -367,6 +367,7 @@ extern int crdt_route_services_reply_by_num(const char* srvnum, char p10cmd, con
  * caller must then account for the request itself); _reply is the fire-and-
  * forget reply leg; _dispatch re-injects a tunnelled frame locally with the
  * reply tunnel armed. */
+extern int  crdt_ch_tunnel_avail(void);
 extern int  crdt_ch_tunnel_try(const char* dstyxx, const char* body);
 extern void crdt_ch_tunnel_reply(const char* dstyxx, const char* body);
 extern void crdt_ch_tunnel_dispatch(char* body);

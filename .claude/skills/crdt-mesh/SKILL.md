@@ -22,10 +22,15 @@ Connect block; the `pgrep` healthcheck greens before the 4496 listener (valgrind
 targets-before-initiators or autoconnect gets "refused" → backoff; force a stuck P10 uplink with oper
 `CONNECT`; overlays only re-autoconnect on the 10-min `try_connections` cycle (can't force via CONNECT)
 — never restart 3+ nodes at once.
-**A just-restarted OVERLAY-ONLY node logs nothing until its overlays reconnect** — that is not a
-stall. nef7 has no P10 links, so until the `try_connections` cycle re-forms its CR overlays (minutes,
-not seconds) there is no traffic and no verify-tick output beyond `Server Ready`. Confirm liveness with
-oper `/CRDT status` (it answers from the live shadow) rather than concluding the log is misrouted.
+**A just-restarted quiet node that logs NOTHING after `Server Ready` (no 30s verify NOTICEs) was in
+an event-loop COMA, not merely waiting for overlays** — root-caused 2026-07-28 via `/proc/PID/syscall`:
+`engine_epoll.c` passed a NEGATIVE timeout (next-timer overdue after the slow valgrind boot) to
+`epoll_wait`, which treats any negative as INFINITE; a node with no clients and no inbound links (it
+initiates its overlays) then sleeps until the first external packet — nef7 slept 91 min and woke on a
+probe connect. FIXED (clamp overdue→0) in BOTH trees' engine_epoll.c; the sibling engines
+(poll/select/kqueue/devpoll) share the pattern and are NOT yet fixed (unused on Linux, each has its
+own timeout semantics). If a node goes silent on an old binary: one TCP connect to its client port
+wakes it. Verify ticks every 30s in the log are the liveness signal.
  (Older 3-node star nef3+nef4/nef5+overlay is the subset still
 described in many notes below.)
 

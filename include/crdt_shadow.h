@@ -574,6 +574,12 @@ void crdt_shadow_ch_storage_publish(void);
 /** 5-5f B2 read side: 1 if the doc says @a srvnum stores history (fills
  *  @a retention_out), else 0.  Fallback behind the legacy CH A S table. */
 int crdt_shadow_ch_storage_lookup(const char *srvnum, unsigned int *retention_out);
+/** 5-5f B2 part 2: enumerate every doc-advertised storage server (live entries
+ *  only; skips stores==0).  @a srvnum is the two-char server numeric, always
+ *  NUL-terminated for the callback's lifetime. */
+typedef void (*crdt_ch_storage_iter_fn)(const char *srvnum,
+                                        unsigned int retention, void *ctx);
+void crdt_shadow_ch_storage_foreach(crdt_ch_storage_iter_fn fn, void *ctx);
 
 /** Decommission standing sweep + auto-dissolve: while an operator's decommission
  *  marker stands, reap the server's user/bconn doc residue; dissolve the marker the

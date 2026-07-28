@@ -577,11 +577,21 @@ static void crdt_services_reemit(struct Client *srcsrv, struct Client *dsrv, cha
  * or the pre-Phase-0 wedge returns). */
 int crdt_ch_tunnel_try(const char *dstyxx, const char *body)
 {
-  if (!feature_bool(FEAT_CRDT_SERVICES_BRIDGE) || !crdt_shadow_active()
-      || !dstyxx || !dstyxx[0] || !body || !body[0])
+  if (!crdt_ch_tunnel_avail() || !dstyxx || !dstyxx[0] || !body || !body[0])
     return 0;
   crdt_services_emit(cli_yxx(&me), dstyxx, 'H', body);
   return 1;
+}
+
+/* 5-5f B2 part 2: is the CR-X carrier usable at all?  Deterministic within a
+ * tick, so the federation dispatcher can decide at COUNT time whether a
+ * mesh-stub storage server is reachable — count and dispatch then agree by
+ * construction and servers_pending never carries a target that tunnel_try
+ * would refuse (the 5-5c never-uncredited invariant, settled up front instead
+ * of by post-hoc decrement). */
+int crdt_ch_tunnel_avail(void)
+{
+  return feature_bool(FEAT_CRDT_SERVICES_BRIDGE) && crdt_shadow_active();
 }
 
 /* Reply leg of the above — fire-and-forget: a reply that cannot be tunnelled

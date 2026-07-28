@@ -73,6 +73,7 @@ void broadcast_channel_advertisement(const char *channel);
  * enum HistoryMessageType (ABI-identical, but C sees conflicting types). */
 extern void crdt_ch_tunnel_reply(const char *dstyxx, const char *body);
 extern int  crdt_ch_tunnel_try(const char *dstyxx, const char *body);
+extern int  crdt_ch_tunnel_avail(void);
 extern int  ms_chathistory(struct Client *cptr, struct Client *sptr,
                            int parc, char *parv[]);
 #include <string.h>
@@ -1262,6 +1263,21 @@ struct ChathistoryAd {
 /** Global array of server advertisements, indexed by server numeric */
 static struct ChathistoryAd *server_ads[MAX_AD_SERVERS];
 
+/** One federation dispatch target, produced by collect_storage_targets(). */
+struct ChFedTarget {
+  char yxx[3];            /**< Destination server numeric. */
+  unsigned char tunnel;   /**< 1 = mesh-only, dispatch over CR-X; 0 = live P10. */
+};
+
+/* Static collect buffers: the ircd is single-threaded and nothing between a
+ * collect and its dispatch loop re-enters the collector (both live in the
+ * same synchronous call chain), so one shared buffer is safe and keeps 5KB
+ * off every query's stack. */
+static struct ChFedTarget fed_target_buf[MAX_AD_SERVERS];
+static unsigned char fed_target_seen[MAX_AD_SERVERS];
+
+static int collect_storage_targets(const char *target, time_t query_time);
+
 /** Check if we should trigger federation query.
  * Returns 1 if we should federate, 0 otherwise.
  */
@@ -1975,7 +1991,7 @@ static struct FedRequest *start_fed_targets_query(
   char s2s_ref[64];
   int i, server_count;
 
-  server_count = count_storage_servers(NULL, 0);
+  server_count = collect_storage_targets(NULL, 0);
   if (server_count == 0)
     return NULL;
 
@@ -2028,30 +2044,29 @@ static struct FedRequest *start_fed_targets_query(
             feature_int(FEAT_CHATHISTORY_TIMEOUT));
   req->timer_active = 1;
 
-  /* Send targeted queries to all storage servers in the network */
+  /* Send targeted queries to every collected storage target (fed_target_buf,
+   * filled by the collect_storage_targets() call that seeded server_count —
+   * count and dispatch agree by construction).  Mesh-only targets ride the
+   * CR-X tunnel (5-5f B2 part 2, replacing the 5-5c skip). */
   {
-    int si;
-    for (si = 0; si < MAX_AD_SERVERS; si++) {
-      struct ChathistoryAd *ad = server_ads[si];
-      struct Client *server;
-      char dest_yxx[4];
-
-      if (!ad || !ad->has_advertisement || !ad->is_storage_server)
-        continue;
-
-      inttobase64(dest_yxx, si, 2);
-      server = FindNServer(dest_yxx);
-      if (!server || server == &me)
-        continue;
-
-      if (IsMeshStub(server))   /* 5-5c: mesh-only anchor — P10 query dead-sinks; see count_storage_servers */
-        continue;
-
-      if (is_ulined_server(server))
-        continue;
-
-      sendcmdto_one(&me, CMD_CHATHISTORY, server, "Q * T %s %d %s %s",
-                    s2s_ref, limit, reqid, dest_yxx);
+    int ti;
+    for (ti = 0; ti < server_count; ti++) {
+      if (fed_target_buf[ti].tunnel) {
+        char qbody[BUFSIZE];
+        ircd_snprintf(0, qbody, sizeof(qbody), "Q * T %s %d %s %s",
+                      s2s_ref, limit, reqid, fed_target_buf[ti].yxx);
+        if (!crdt_ch_tunnel_try(fed_target_buf[ti].yxx, qbody))
+          req->servers_pending--;   /* can't happen (avail-gated at collect,
+                                     * same tick); insurance for the 5-5c
+                                     * never-uncredited invariant */
+      } else {
+        struct Client *server = FindNServer(fed_target_buf[ti].yxx);
+        if (server && server != &me)
+          sendcmdto_one(&me, CMD_CHATHISTORY, server, "Q * T %s %d %s %s",
+                        s2s_ref, limit, reqid, fed_target_buf[ti].yxx);
+        else
+          req->servers_pending--;
+      }
     }
   }
 
@@ -3729,21 +3744,112 @@ static int count_servers(void)
   return count;
 }
 
-/** Count servers that have advertised chathistory storage capability.
- * Only servers that sent CH A S are counted - these actually store history.
- * Optionally filters by retention window and channel advertisements.
- * @param[in] target Target channel/nick for Layer 1 filtering.
- * @param[in] query_time Timestamp for retention filtering (0 = no filter).
- * @return Number of storage-capable servers.
- */
-static int count_storage_servers(const char *target, time_t query_time)
+/* struct ChFedTarget, fed_target_buf[], and fed_target_seen[] are defined
+ * above (near the federation forward declarations) for visibility in
+ * start_fed_targets_query(). */
+
+struct ChDocTargetCtx {
+  time_t query_time;
+  int count;
+};
+
+/** Doc-walk half of collect_storage_targets() — see there. */
+static void collect_doc_target(const char *srvnum, unsigned int retention,
+                               void *vctx)
 {
-  int count = 0;
+  struct ChDocTargetCtx *ctx = (struct ChDocTargetCtx *)vctx;
+  struct Client *server;
+  int idx = base64toint(srvnum);
+  int tunnel;
+
+  if (idx < 0 || idx >= MAX_AD_SERVERS || fed_target_seen[idx])
+    return;
+  fed_target_seen[idx] = 1;
+
+  server = FindNServer(srvnum);
+  if (server == &me)
+    return;
+
+  if (!server) {
+    /* No local Client for this doc-known server.  That is NOT "unreachable":
+     * under meshmap routing a CRDT peer beyond the direct links may have no
+     * anchor at all (live-gate finding 2026-07-28 — on nef7 the doc knew AD
+     * but FindNServer returned NULL, silently dropping the one server that
+     * held the history).  Reachability is a LOCAL determination made from
+     * FindNServer OR a fresh CR H beacon (hard-invariant 10), and the CR-X
+     * carrier routes by numeric without needing a local struct.  Stale/absent
+     * beacon -> genuinely unreachable right now -> skip (counting it would
+     * wedge the requester until the fed timeout). */
+    if (!crdt_ch_tunnel_avail()
+        || !crdt_shadow_server_beacon_fresh((uint16_t)idx))
+      return;
+    /* Retention from the doc record directly — there is no Client to hand
+     * to server_retention_covers().  0 = unlimited, same convention. */
+    if (ctx->query_time != 0 && retention != 0
+        && ctx->query_time < CurrentTime - (time_t)retention * 86400)
+      return;
+    tunnel = 1;
+  } else {
+    if (IsMeshStub(server) && !crdt_ch_tunnel_avail())
+      return;
+    if (is_ulined_server(server))
+      return;
+    if (ctx->query_time != 0 && !server_retention_covers(server, ctx->query_time))
+      return;
+    tunnel = IsMeshStub(server) ? 1 : 0;
+  }
+
+  fed_target_buf[ctx->count].yxx[0] = srvnum[0];
+  fed_target_buf[ctx->count].yxx[1] = srvnum[1];
+  fed_target_buf[ctx->count].yxx[2] = '\0';
+  fed_target_buf[ctx->count].tunnel = (unsigned char)tunnel;
+  ctx->count++;
+}
+
+/** Collect every storage-capable federation target into fed_target_buf.
+ *
+ * Two sources, in precedence order:
+ *  1. The legacy CH A S table (server_ads[]) — authoritative for P10-linked
+ *     peers.
+ *  2. The CRDT doc (5-5f B2) — the only source that can describe a server
+ *     with no P10 link: CH A S rides EOB and clear_server_ad() (s_misc.c:319)
+ *     drops the entry the moment a server exits the tree, so an overlay-only
+ *     or anchored node is invisible to source 1 no matter how much history it
+ *     holds.  Doc entries also backfill real P10 servers whose ad went
+ *     missing (empirically patchy across restarts).
+ *
+ * A mesh-only target (STAT_MESH_SERVER — a targeted P10 `CH Q` at it would
+ * dead-sink on the retired-connection guards) is included with .tunnel set
+ * when the CR-X carrier is available, replacing the 5-5c unconditional skip;
+ * with the carrier down it is skipped exactly as before.  Reachability is
+ * settled HERE, at count time, so servers_pending never carries a target the
+ * dispatch loop cannot actually reach (the 5-5c never-uncredited invariant).
+ * Every dispatcher MUST seed servers_pending from this function's return and
+ * dispatch from fed_target_buf — never from a walk of its own.
+ *
+ * The Layer 1 channel-list filter is intentionally NOT applied: CH A F is
+ * burst-time-only and never refreshed, so filtering by it breaks federation
+ * for every post-burst channel.  The bloom-filter design at
+ * .claude/plans/federation-dedup-s2s-msgid.md will revive a principled
+ * per-target filter when it lands; @a target is retained for that path.
+ *
+ * @param[in] target Target channel/nick (reserved for the bloom-filter path).
+ * @param[in] query_time Timestamp for retention filtering (0 = no filter).
+ * @return Number of targets written to fed_target_buf.
+ */
+static int collect_storage_targets(const char *target, time_t query_time)
+{
+  struct ChDocTargetCtx ctx;
   int i;
   char buf[4];
 
-  /* Iterate all known storage servers in the network (not just direct links).
-   * server_ads[] is populated via CH A S propagation and tracks all servers. */
+  (void)target;
+
+  memset(fed_target_seen, 0, sizeof(fed_target_seen));
+  ctx.query_time = query_time;
+  ctx.count = 0;
+
+  /* Source 1: the legacy CH A S table. */
   for (i = 0; i < MAX_AD_SERVERS; i++) {
     struct ChathistoryAd *ad = server_ads[i];
     struct Client *server;
@@ -3751,49 +3857,41 @@ static int count_storage_servers(const char *target, time_t query_time)
     if (!ad || !ad->has_advertisement || !ad->is_storage_server)
       continue;
 
-    /* Resolve numeric index to server struct */
+    /* The legacy table answered for this server — doc walk must not
+     * second-guess it (no dual writer, no double add). */
+    fed_target_seen[i] = 1;
+
     server = FindNServer(inttobase64(buf, i, 2));
     if (!server || server == &me)
       continue;
-
-    /* 5-5c: skip mesh-only anchors (tree-retirement / partition). A STAT_MESH_SERVER
-     * is reachable only over the CR overlay, not P10, so a targeted `CH Q` to it
-     * dead-sinks — counting it inflates servers_pending and wedges the FedRequest on a
-     * reply that never comes until the full FEAT_CHATHISTORY_TIMEOUT. Skipping it lets
-     * the request complete as soon as the reachable servers reply (incomplete, but no
-     * latency wedge). MUST stay in lockstep with the dispatch loops (start_fed_query,
-     * start_fed_targets_query, the auto-replay loop). 5-5f replaces this skip with a
-     * CR-M tunnel toward the storage owner so anchored stores become reachable again. */
-    if (IsMeshStub(server))
+    if (IsMeshStub(server) && !crdt_ch_tunnel_avail())
       continue;
-
-    /* Skip U-lined servers (services) */
     if (is_ulined_server(server))
       continue;
-
-    /* Skip servers whose retention doesn't cover query time */
     if (query_time != 0 && !server_retention_covers(server, query_time))
       continue;
 
-    /* Layer 1 channel-list filter is intentionally NOT applied here:
-     * CH A F is emitted once at burst-time and not refreshed when new
-     * channels are created.  Filtering by it would render every
-     * post-burst channel unreachable via federation — the test
-     * channel "client1 creates #X on primary, client2 queries from
-     * leaf" always fails because #X didn't exist when primary sent
-     * its CH A F.  The plan for a properly-refreshed channel
-     * presence filter is the bloom-filter design at
-     * .claude/plans/federation-dedup-s2s-msgid.md (deferred).  Until
-     * that lands, we federate to every storage-capable peer and let
-     * the remote return an empty batch if it has nothing for the
-     * channel — a small extra cost vs. silently breaking federation
-     * for new channels. */
-    (void)target;  /* parameter retained for future bloom-filter path */
-
-    count++;
+    fed_target_buf[ctx.count].yxx[0] = buf[0];
+    fed_target_buf[ctx.count].yxx[1] = buf[1];
+    fed_target_buf[ctx.count].yxx[2] = '\0';
+    fed_target_buf[ctx.count].tunnel = IsMeshStub(server) ? 1 : 0;
+    ctx.count++;
   }
 
-  return count;
+  /* Source 2: the doc. */
+  crdt_shadow_ch_storage_foreach(collect_doc_target, &ctx);
+
+  return ctx.count;
+}
+
+/** Count storage-capable federation targets (see collect_storage_targets()).
+ * @param[in] target Target channel/nick (reserved for the bloom-filter path).
+ * @param[in] query_time Timestamp for retention filtering (0 = no filter).
+ * @return Number of storage-capable servers.
+ */
+static int count_storage_servers(const char *target, time_t query_time)
+{
+  return collect_storage_targets(target, query_time);
 }
 
 /** Send a federation query to storage servers
@@ -3848,11 +3946,9 @@ static struct FedRequest *start_fed_query(struct Client *sptr, const char *targe
     /* For HISTORY_REF_MSGID or HISTORY_REF_NONE, query_time stays 0 (no filter) */
   }
 
-  /* Count storage-capable servers that cover the query timeframe.
-   * Only servers that have sent CH A S are counted.
-   * Layer 1: Also filters by channel advertisements if present.
-   */
-  server_count = count_storage_servers(target, query_time);
+  /* Collect storage-capable targets that cover the query timeframe
+   * (legacy CH A S table + doc-discovered mesh servers). */
+  server_count = collect_storage_targets(target, query_time);
   if (server_count == 0)
     return NULL;  /* No storage servers to query */
 
@@ -3900,45 +3996,36 @@ static struct FedRequest *start_fed_query(struct Client *sptr, const char *targe
             feature_int(FEAT_CHATHISTORY_TIMEOUT));
   req->timer_active = 1;
 
-  /* Send targeted queries to all storage servers in the network.
-   * Uses dest_numeric for multi-hop routing — intermediates forward
-   * without processing, only the destination processes the query.
+  /* Send targeted queries to every collected storage target (fed_target_buf,
+   * filled by the collect_storage_targets() call that seeded server_count —
+   * count and dispatch agree by construction).  Uses dest_numeric for
+   * multi-hop routing — intermediates forward without processing, only the
+   * destination processes the query.  Mesh-only targets ride the CR-X tunnel
+   * (5-5f B2 part 2, replacing the 5-5c skip).
    *
    * CH Q <target> <subcmd:1char> <ref:T/M prefix> <limit> <reqid> <dest_numeric>
    */
   {
-    int si;
-    for (si = 0; si < MAX_AD_SERVERS; si++) {
-      struct ChathistoryAd *ad = server_ads[si];
-      struct Client *server;
-      char dest_yxx[4];
-
-      if (!ad || !ad->has_advertisement || !ad->is_storage_server)
-        continue;
-
-      inttobase64(dest_yxx, si, 2);
-      server = FindNServer(dest_yxx);
-      if (!server || server == &me)
-        continue;
-
-      if (IsMeshStub(server))   /* 5-5c: mesh-only anchor — P10 query dead-sinks; see count_storage_servers */
-        continue;
-
-      if (is_ulined_server(server))
-        continue;
-
-      if (query_time != 0 && !server_retention_covers(server, query_time))
-        continue;
-
-      /* Layer 1 channel-list filter intentionally NOT applied here —
-       * see the matching rationale in count_storage_servers(): CH A F
-       * is burst-time only and silently breaks federation for any
-       * channel created post-burst.  Keep this loop in sync with the
-       * counter; the bloom-filter design at
-       * .claude/plans/federation-dedup-s2s-msgid.md will revive a
-       * principled per-target filter when it lands. */
-      sendcmdto_one(&me, CMD_CHATHISTORY, server, "Q %s %c %s %d %s %s",
-                    target, s2s_subcmd, s2s_ref, limit, reqid, dest_yxx);
+    int ti;
+    for (ti = 0; ti < server_count; ti++) {
+      if (fed_target_buf[ti].tunnel) {
+        char qbody[BUFSIZE];
+        ircd_snprintf(0, qbody, sizeof(qbody), "Q %s %c %s %d %s %s",
+                      target, s2s_subcmd, s2s_ref, limit, reqid,
+                      fed_target_buf[ti].yxx);
+        if (!crdt_ch_tunnel_try(fed_target_buf[ti].yxx, qbody))
+          req->servers_pending--;   /* can't happen (avail-gated at collect,
+                                     * same tick); insurance for the 5-5c
+                                     * never-uncredited invariant */
+      } else {
+        struct Client *server = FindNServer(fed_target_buf[ti].yxx);
+        if (server && server != &me)
+          sendcmdto_one(&me, CMD_CHATHISTORY, server, "Q %s %c %s %d %s %s",
+                        target, s2s_subcmd, s2s_ref, limit, reqid,
+                        fed_target_buf[ti].yxx);
+        else
+          req->servers_pending--;
+      }
     }
   }
 
@@ -4129,7 +4216,6 @@ int start_redact_fed_query(struct Client *sptr, struct Channel *chptr,
   char reqid[32];
   char s2s_ref[HISTORY_MSGID_LEN + 2];  /* M<msgid>\0 */
   int i, server_count;
-  struct DLink *lp;
 
   /* Check if federation is enabled */
   if (!feature_bool(FEAT_CHATHISTORY_FEDERATION))
@@ -4138,8 +4224,8 @@ int start_redact_fed_query(struct Client *sptr, struct Channel *chptr,
   /* Build S2S reference: M<msgid> */
   ircd_snprintf(0, s2s_ref, sizeof(s2s_ref), "M%s", msgid);
 
-  /* Count storage servers (no time filter for msgid lookups) */
-  server_count = count_storage_servers(target, 0);
+  /* Collect storage targets (no time filter for msgid lookups) */
+  server_count = collect_storage_targets(target, 0);
   if (server_count == 0)
     return -1;
 
@@ -4188,17 +4274,34 @@ int start_redact_fed_query(struct Client *sptr, struct Channel *chptr,
             feature_int(FEAT_CHATHISTORY_TIMEOUT));
   req->timer_active = 1;
 
-  /* Send CH Q X to storage servers */
-  for (lp = cli_serv(&me)->down; lp; lp = lp->next) {
-    struct Client *server = lp->value.cptr;
-
-    if (is_ulined_server(server))
-      continue;
-    if (!has_chathistory_advertisement(server))
-      continue;
-
-    sendcmdto_one(&me, CMD_CHATHISTORY, server, "Q %s X %s 1 %s",
-                  target, s2s_ref, reqid);
+  /* Send CH Q X to every collected storage target.  This dispatcher used to
+   * walk only DIRECT down-links while servers_pending was seeded from the
+   * network-wide count — any storage server >1 hop away silently inflated the
+   * pending count and wedged every federated REDACT until the fed timeout.
+   * Dest-addressed dispatch from the same collect that produced server_count
+   * fixes both: multi-hop targets are actually queried (intermediates forward
+   * on dest_numeric) and count == dispatch by construction.  Mesh-only
+   * targets ride the CR-X tunnel (5-5f B2 part 2). */
+  {
+    int ti;
+    for (ti = 0; ti < server_count; ti++) {
+      if (fed_target_buf[ti].tunnel) {
+        char qbody[BUFSIZE];
+        ircd_snprintf(0, qbody, sizeof(qbody), "Q %s X %s 1 %s %s",
+                      target, s2s_ref, reqid, fed_target_buf[ti].yxx);
+        if (!crdt_ch_tunnel_try(fed_target_buf[ti].yxx, qbody))
+          req->servers_pending--;   /* can't happen (avail-gated at collect,
+                                     * same tick); insurance for the 5-5c
+                                     * never-uncredited invariant */
+      } else {
+        struct Client *server = FindNServer(fed_target_buf[ti].yxx);
+        if (server && server != &me)
+          sendcmdto_one(&me, CMD_CHATHISTORY, server, "Q %s X %s 1 %s %s",
+                        target, s2s_ref, reqid, fed_target_buf[ti].yxx);
+        else
+          req->servers_pending--;
+      }
+    }
   }
 
   return 0;
@@ -4289,7 +4392,7 @@ static void autoreplay_next_channel(struct AutoReplayContext *ctx)
     }
 
     /* No local history or insufficient — federate */
-    server_count = count_storage_servers(channame, 0);
+    server_count = collect_storage_targets(channame, 0);
     if (server_count == 0)
       continue;  /* No storage servers, skip this channel */
 
@@ -4331,28 +4434,29 @@ static void autoreplay_next_channel(struct AutoReplayContext *ctx)
               feature_int(FEAT_CHATHISTORY_TIMEOUT));
     req->timer_active = 1;
 
-    /* Send LATEST * query to all storage servers */
+    /* Send LATEST * query to every collected storage target (fed_target_buf,
+     * from the collect_storage_targets() call that seeded server_count —
+     * count and dispatch agree by construction).  Mesh-only targets ride the
+     * CR-X tunnel (5-5f B2 part 2, replacing the 5-5c skip). */
     {
-      int si;
-      for (si = 0; si < MAX_AD_SERVERS; si++) {
-        struct ChathistoryAd *ad = server_ads[si];
-        struct Client *server;
-        char dest_yxx[4];
-
-        if (!ad || !ad->has_advertisement || !ad->is_storage_server)
-          continue;
-
-        inttobase64(dest_yxx, si, 2);
-        server = FindNServer(dest_yxx);
-        if (!server || server == &me)
-          continue;
-        if (IsMeshStub(server))   /* 5-5c: mesh-only anchor — P10 query dead-sinks; see count_storage_servers */
-          continue;
-        if (is_ulined_server(server))
-          continue;
-
-        sendcmdto_one(&me, CMD_CHATHISTORY, server, "Q %s L * %d %s %s",
-                      channame, ctx->limit, reqid, dest_yxx);
+      int ti;
+      for (ti = 0; ti < server_count; ti++) {
+        if (fed_target_buf[ti].tunnel) {
+          char qbody[BUFSIZE];
+          ircd_snprintf(0, qbody, sizeof(qbody), "Q %s L * %d %s %s",
+                        channame, ctx->limit, reqid, fed_target_buf[ti].yxx);
+          if (!crdt_ch_tunnel_try(fed_target_buf[ti].yxx, qbody))
+            req->servers_pending--;   /* can't happen (avail-gated at collect,
+                                       * same tick); insurance for the 5-5c
+                                       * never-uncredited invariant */
+        } else {
+          struct Client *server = FindNServer(fed_target_buf[ti].yxx);
+          if (server && server != &me)
+            sendcmdto_one(&me, CMD_CHATHISTORY, server, "Q %s L * %d %s %s",
+                          channame, ctx->limit, reqid, fed_target_buf[ti].yxx);
+          else
+            req->servers_pending--;
+        }
       }
     }
 
@@ -4499,15 +4603,11 @@ static struct Client *ch_fed_reply_target(struct Client *sptr, struct Client *cp
  * local (stale reply after timeout), or would bounce back out the arrival
  * link.
  *
- * ASYMMETRY, deliberate and still open: a reply whose origin resolves to a
- * mesh anchor is also dropped (the !IsServer test below), even though the
- * QUERY direction no longer drops its anchored counterpart — the B3 gateway
- * slice tunnels those over CR-X (crdt_ch_tunnel_try, used at the Q-forward).
- * The symmetric completion is to tunnel here too instead of dropping. It is
- * NOT done yet because this whole anchored-counterpart family has no live
- * trigger until B2: clear_server_ad() (s_misc.c:319) drops a server's storage
- * ad the moment it exits the tree, so nothing ever queries an anchored server
- * in the first place. Do it as part of B2, where it can actually be gated. */
+ * An origin that resolves to a mesh stub/anchor is tunneled over CR-X instead
+ * of forwarded — the P10 route at it dead-sinks (5-5f B2 part 2; this is the
+ * reply-direction symmetry of the tunnel dispatch the B3 gateway slice added
+ * at the Q-forward).  Fire-and-forget like every reply-tunnel hop: a lost
+ * reply falls to the requester's fed timeout. */
 static void forward_fed_reply(struct Client *sptr, struct Client *cptr,
                               int parc, char *parv[])
 {
@@ -4525,9 +4625,7 @@ static void forward_fed_reply(struct Client *sptr, struct Client *cptr,
   yy[1] = parv[2][1];
   yy[2] = '\0';
   origin = FindNServer(yy);
-  if (!origin || origin == &me || !IsServer(origin))
-    return;
-  if (cli_from(origin) == cptr)
+  if (!origin || origin == &me)
     return;
 
   /* Rebuild "<sub> <p2> ... :<last>" faithfully; only the trailing param can
@@ -4535,6 +4633,13 @@ static void forward_fed_reply(struct Client *sptr, struct Client *cptr,
   for (i = 1; i < parc - 1; i++)
     out += ircd_snprintf(0, out, end - out, "%s%s", i > 1 ? " " : "", parv[i]);
   ircd_snprintf(0, out, end - out, " :%s", parv[parc - 1]);
+
+  if (IsMeshStub(origin)) {
+    crdt_ch_tunnel_reply(yy, buf);
+    return;
+  }
+  if (!IsServer(origin) || cli_from(origin) == cptr)
+    return;
   sendcmdto_one(sptr, CMD_CHATHISTORY, origin, "%s", buf);
 }
 
@@ -4598,8 +4703,12 @@ int ms_chathistory(struct Client *cptr, struct Client *sptr, int parc, char *par
   /* Sender must be a server — or a mesh stub/anchor: on this branch a legacy
    * server's local representation can be STAT_MESH_SERVER (parse admits it
    * via the beyond-horizon exemption), and an IsServer-exact gate silently
-   * discards every federated query it originates (hard-invariant 2). */
-  if (!IsServer(sptr) && !IsMeshStub(sptr))
+   * discards every federated query it originates (hard-invariant 2).  &me is
+   * admitted too: crdt_ch_tunnel_dispatch() re-injects tunneled frames as
+   * ms_chathistory(&me, &me, ...), and STAT_ME is neither STAT_SERVER nor
+   * STAT_MESH_SERVER — without this, every frame that crossed the CR-X
+   * tunnel died right here. */
+  if (!IsServer(sptr) && !IsMeshStub(sptr) && !IsMe(sptr))
     return 0;
 
   if (parc < 2)

@@ -1168,6 +1168,46 @@ int crdt_shadow_ch_storage_lookup(const char *srvnum, unsigned int *retention_ou
   return 1;
 }
 
+/* 5-5f B2 part 2: doc-side storage-server enumeration.  The federation
+ * dispatch path needs the FULL set of storage servers, not a point lookup —
+ * count_storage_servers() iterates the legacy server_ads[] table directly and
+ * never consults has_chathistory_advertisement(), so the lookup fallback alone
+ * left doc-only servers (overlay-only / anchored) invisible to the one
+ * consumer that decides who gets queried.  This walks the doc's live entries
+ * (crdt_lwwmap_foreach skips tombstones, which is correct here — enumeration
+ * is CREATE-direction, inv. 11 concerns removal reconciles).  Keys are stored
+ * unterminated (memdup of key_len); re-terminate into a local buf. */
+struct ChStorageIterShim {
+  crdt_ch_storage_iter_fn fn;
+  void *ctx;
+};
+
+static void ch_storage_iter_shim(const char *key, uint32_t key_len,
+                                 const struct CrdtLWWValue *val, void *ctx)
+{
+  struct ChStorageIterShim *shim = (struct ChStorageIterShim *)ctx;
+  const struct CrdtChStorage *rec;
+  char num[4];
+  if (!val->data || val->data_len != sizeof(struct CrdtChStorage))
+    return;
+  rec = (const struct CrdtChStorage *)val->data;
+  if (!rec->stores || key_len == 0 || key_len >= sizeof(num))
+    return;
+  memcpy(num, key, key_len);
+  num[key_len] = '\0';
+  shim->fn(num, (unsigned int)rec->retention_days, shim->ctx);
+}
+
+void crdt_shadow_ch_storage_foreach(crdt_ch_storage_iter_fn fn, void *ctx)
+{
+  struct ChStorageIterShim shim;
+  if (!shadow_on() || !fn)
+    return;
+  shim.fn = fn;
+  shim.ctx = ctx;
+  crdt_lwwmap_foreach(&g_crdt.ch_storage, ch_storage_iter_shim, &shim);
+}
+
 void crdt_shadow_own_user_reassert(void)
 {
   struct Client *acptr;
