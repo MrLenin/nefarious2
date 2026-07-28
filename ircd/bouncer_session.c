@@ -1013,6 +1013,53 @@ int bounce_session_has_plaintext(struct Client *cptr)
 #endif
 }
 
+/** Recover a session's hs_client from its recorded ghost numeric.
+ *
+ * A replica's hs_client can legitimately be NULL while hs_ghost_numeric is
+ * still valid: BS C deliberately leaves the pointer NULL, and both
+ * bounce_null_hs_client_pointing_at() (Client free — the primary's server
+ * SQUITs and relinks, or a collision kill) and a refused
+ * bounce_hs_client_assign_checked() install leave it NULL while the numeric
+ * was written unconditionally.  Without this recovery the caller cannot tell
+ * "primary lives elsewhere" from "no primary at all" and manufactures a
+ * PARALLEL PRIMARY for a session that already has one.
+ *
+ * Composition risk (audit site): the numeric is built from hs_origin +
+ * hs_ghost_numeric, and hs_origin can diverge from where the ghost actually
+ * lives after a cross-server rebind — the hazard hard-invariant 3 warns about
+ * for BS-token handlers.  This is NOT a BS-token handler (no live sender
+ * exists at registration time), and the two fields stay aligned for the cases
+ * that reach here: HOLDING-on-this-server has hs_origin == cli_yxx(&me) by
+ * construction, HOLDING/ACTIVE-as-replica is created with hs_origin == the
+ * BS C sender's prefix, matching its hs_ghost_numeric source.  A mis-composed
+ * numeric therefore either fails to resolve (safe) or resolves to a client of
+ * ANOTHER account, which bounce_hs_client_assign_checked refuses.  The
+ * residual case — resolving a different connection of the SAME account —
+ * still yields an ALIAS outcome, which is strictly better than the
+ * parallel-primary this prevents.
+ *
+ * If you change how BS A / BS D / BS C store ghost_numeric, or add a path
+ * that mutates hs_origin without updating hs_ghost_numeric, audit this
+ * function and BOTH of its callers.
+ *
+ * @param[in,out] session Session whose hs_client may be recovered.
+ * @param[in] site_label Short tag for the refusal log line.
+ */
+static void bounce_resolve_hs_client_from_ghost(struct BouncerSession *session,
+                                                const char *site_label)
+{
+  char full_numeric[6];
+  struct Client *candidate;
+
+  if (!session || session->hs_client || !session->hs_ghost_numeric[0])
+    return;
+
+  ircd_snprintf(0, full_numeric, sizeof(full_numeric), "%s%s",
+                session->hs_origin, session->hs_ghost_numeric);
+  candidate = findNUser(full_numeric);
+  bounce_hs_client_assign_checked(session, candidate, site_label);
+}
+
 /** SASL-triggered automatic resume.
  * Called from register_user() after SASL auth sets the account
  * but before the client is introduced to the network.
@@ -1106,14 +1153,7 @@ int bounce_auto_resume(struct Client *cptr, struct BouncerSession **out_session,
        * If you change either BS A or BS D to store ghost_numeric
        * differently, or you add a path that mutates hs_origin without
        * also updating hs_ghost_numeric, audit this site. */
-      if (!session->hs_client && session->hs_ghost_numeric[0]) {
-        char full_numeric[6];
-        struct Client *candidate;
-        ircd_snprintf(0, full_numeric, sizeof(full_numeric), "%s%s",
-                      session->hs_origin, session->hs_ghost_numeric);
-        candidate = findNUser(full_numeric);
-        bounce_hs_client_assign_checked(session, candidate, "HELD resume");
-      }
+      bounce_resolve_hs_client_from_ghost(session, "HELD resume");
       if (managing_server && session->hs_client
           && session->hs_alias_count < BOUNCER_MAX_ALIASES) {
         *out_session = session;
@@ -1272,6 +1312,12 @@ int bounce_auto_resume(struct Client *cptr, struct BouncerSession **out_session,
       }
       {
       struct Client *managing_server = FindNServer(session->hs_origin);
+      /* Same recovery the HELD branch does — without it an ACTIVE session
+       * whose hs_client went NULL (primary's server SQUIT+relink, collision
+       * kill, or a refused BS A install) falls through to orphan reclaim and
+       * makes this connection a SECOND primary for a session that still has
+       * one elsewhere. */
+      bounce_resolve_hs_client_from_ghost(session, "ACTIVE resume");
       if (managing_server && session->hs_client
           && session->hs_alias_count < BOUNCER_MAX_ALIASES) {
         *out_session = session;
