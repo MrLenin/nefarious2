@@ -92,6 +92,8 @@
 #include "numnicks.h"
 #include "s_user.h"
 #include "send.h"
+#include "handlers.h"   /* Cluster A: crdt_wall_demote/flood */
+#include "ircd_snprintf.h"
 
 /* #include <assert.h> -- Now using assert in ircd_log.h */
 
@@ -119,9 +121,20 @@ int m_wallvoices(struct Client* cptr, struct Client* sptr, int parc, char* parv[
           check_target_limit(sptr, chptr, chptr->chname, 0))
         return 0;
       RevealDelayedJoinIfNeeded(sptr, chptr);
+      {
+        /* Cluster A: R6a demote — suppress the tree relay to CRDT peers when the
+         * CR-M flood below will carry this wall to them (same predicate both
+         * sides, so exactly one plane delivers). */
+        int wmesh = crdt_wall_demote(chptr);
       sendcmdto_channel_butone(sptr, CMD_WALLVOICES, chptr, cptr,
 			       SKIP_DEAF | SKIP_BURST | SKIP_NONVOICES, 
 			       '\0', "%H :+ %s", chptr, parv[parc - 1]);
+        if (wmesh) {
+          char wbody[BUFSIZE];
+          ircd_snprintf(0, wbody, sizeof(wbody), "+ %s", parv[parc - 1]);
+          crdt_wall_flood(sptr, 'v', chptr, wbody);
+        }
+      }
     }
     else
       send_reply(sptr, ERR_CANNOTSENDTOCHAN, parv[1]);
@@ -146,9 +159,20 @@ int ms_wallvoices(struct Client* cptr, struct Client* sptr, int parc, char* parv
 
   if (!IsLocalChannel(parv[1]) && (chptr = FindChannel(parv[1]))) {
     if (client_can_send_to_channel(sptr, chptr, 1)) {
+      {
+        /* Cluster A: R6a demote — suppress the tree relay to CRDT peers when the
+         * CR-M flood below will carry this wall to them (same predicate both
+         * sides, so exactly one plane delivers). */
+        int wmesh = crdt_wall_demote(chptr);
       sendcmdto_channel_butone(sptr, CMD_WALLVOICES, chptr, cptr,
 			       SKIP_DEAF | SKIP_BURST | SKIP_NONVOICES, 
 			       '\0', "%H :%s", chptr, parv[parc - 1]);
+        if (wmesh) {
+          char wbody[BUFSIZE];
+          ircd_snprintf(0, wbody, sizeof(wbody), "%s", parv[parc - 1]);
+          crdt_wall_flood(sptr, 'v', chptr, wbody);
+        }
+      }
     } else
       send_reply(sptr, ERR_CANNOTSENDTOCHAN, parv[1]);
   }

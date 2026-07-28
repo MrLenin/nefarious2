@@ -367,6 +367,13 @@ extern int crdt_route_services_reply_by_num(const char* srvnum, char p10cmd, con
  * caller must then account for the request itself); _reply is the fire-and-
  * forget reply leg; _dispatch re-injects a tunnelled frame locally with the
  * reply tunnel armed. */
+/* Cluster A targeted-WALL emit (R6a demote + CR-M flood).  demote() scans the
+ * channel and suppresses the tree relay to CRDT peers (returns 1 if so); the
+ * caller then relays and calls flood() under the SAME predicate.  @a body is
+ * the final client-facing text INCLUDING the "@ "/"% "/"+ " prefix. */
+extern int  crdt_wall_demote(struct Channel* chptr);
+extern void crdt_wall_flood(struct Client* from, char cmd, struct Channel* chptr,
+                            const char* body);
 extern int  crdt_ch_tunnel_avail(void);
 extern int  crdt_ch_tunnel_try(const char* dstyxx, const char* body);
 extern void crdt_ch_tunnel_reply(const char* dstyxx, const char* body);

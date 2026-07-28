@@ -597,6 +597,50 @@ int crdt_ch_tunnel_try(const char *dstyxx, const char *body)
  * construction and servers_pending never carries a target that tunnel_try
  * would refuse (the 5-5c never-uncredited invariant, settled up front instead
  * of by post-hoc decrement). */
+/* Cluster A targeted-WALL emit (WALLCHOPS/VOICES/HOPS), R6a shape.
+ *
+ * crdt_wall_demote() scans the channel exactly like relay_channel_message's
+ * R6a gate; if any member is on a REMOTE CRDT-aware server (or a mesh stub,
+ * or we are partitioned), it suppresses the now-redundant tree relay to
+ * CRDT-aware directions and returns 1 — the caller then relays (legacy
+ * directions only) and calls crdt_wall_flood() with the SAME predicate, so
+ * demote and flood can never disagree and produce a double- or zero-delivery.
+ *
+ * Unlike PRIVMSG this needs no cross-plane msgid dedup: walls carry no msgid
+ * on the P10 wire, and the demote guarantees the tree copy never reaches a
+ * CRDT peer, so exactly one plane delivers.  The receiver still marks the
+ * (freshly minted) msgid via the shared chan_local dedup, which is harmless.
+ *
+ * @a body is the FINAL client-facing text INCLUDING the "@ "/"% "/"+ "
+ * prefix, so the receiver emits it verbatim. */
+int crdt_wall_demote(struct Channel *chptr)
+{
+  struct Membership *memb;
+  int sk;
+  if (!chptr || !feature_bool(FEAT_CRDT_ROUTE_WALL) || !feature_bool(FEAT_CRDT_PRIMARY))
+    return 0;
+  sk = crdt_have_mesh_stub();            /* partitioned -> CR-M is the carrier */
+  for (memb = chptr->members; !sk && memb; memb = memb->next_member) {
+    struct Client *csrv = cli_user(memb->user) ? cli_user(memb->user)->server : NULL;
+    if (csrv && csrv != &me &&
+        (IsMeshStub(csrv) || (IsServer(csrv) && IsCrdtAware(csrv))))
+      sk = 1;
+  }
+  if (sk)
+    sendcmdto_set_skip_crdt_servers();
+  return sk;
+}
+
+void crdt_wall_flood(struct Client *from, char cmd, struct Channel *chptr,
+                     const char *body)
+{
+  char msgidbuf[64];
+  if (!from || !chptr || !body)
+    return;
+  generate_msgid(msgidbuf, sizeof msgidbuf);
+  crdt_gossip_message(from, cmd, chptr->chname, msgidbuf, body);
+}
+
 int crdt_ch_tunnel_avail(void)
 {
   return feature_bool(FEAT_CRDT_SERVICES_BRIDGE) && crdt_shadow_active();
