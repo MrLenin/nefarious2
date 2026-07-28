@@ -1102,6 +1102,72 @@ void crdt_shadow_own_user_sweep(void)
  * for the MyUser half; remote missing users stay log-only (their owner
  * re-asserts).  No debounce: the predicate is exact and the act idempotent —
  * a repeated re-assert fighting a repeated delete is a bug we WANT loud. */
+/* 5-5f B2: publish OUR chathistory storage capability into the doc.
+ *
+ * Single-writer by construction — a server only ever describes itself, keyed
+ * by its own numeric — so this needs no conflict handling beyond LWW.
+ *
+ * WRITE ONLY ON CHANGE.  The doc value is compared against the live feature
+ * state first and a matching entry is left completely alone: an unconditional
+ * re-mint every 30s tick would append an op per server per tick forever,
+ * churning the oplog and (because each SET carries a fresh HLC) the digest
+ * with it.  That makes this cheap enough to sit on the verify path and to be
+ * called eagerly from the delta path (the F3 lesson: a collection that only
+ * converges on the 30s tick races every live gate).
+ *
+ * Withdrawal is a real DELETE tombstone, never a local drop (inv. 5), so a
+ * peer's snapshot cannot resurrect a capability we turned off. */
+void crdt_shadow_ch_storage_publish(void)
+{
+  const struct CrdtChStorage *cur;
+  char num[3];
+  uint32_t stores, retention;
+
+  if (!shadow_on() || !cli_yxx(&me)[0])
+    return;
+  num[0] = cli_yxx(&me)[0];
+  num[1] = cli_yxx(&me)[1];
+  num[2] = '\0';
+
+  stores    = feature_bool(FEAT_CHATHISTORY_STORE) ? 1u : 0u;
+  retention = (uint32_t)feature_int(FEAT_CHATHISTORY_RETENTION);
+  cur       = crdt_chstore_get(&g_crdt, num);
+
+  if (!stores) {
+    if (cur) {                             /* storage turned off -> withdraw */
+      log_write(LS_SYSTEM, L_NOTICE, 0,
+                "CRDT CH-storage: withdrawing capability for %s", num);
+      crdt_chstore_remove(&g_crdt, num);
+      crdt_sync_push();
+    }
+    return;
+  }
+  if (cur && cur->stores && cur->retention_days == retention)
+    return;                                /* unchanged — no op, no churn */
+  log_write(LS_SYSTEM, L_NOTICE, 0,
+            "CRDT CH-storage: publishing capability for %s (retention %u)",
+            num, (unsigned)retention);
+  crdt_chstore_set(&g_crdt, num, stores, retention);
+  crdt_sync_push();
+}
+
+/* 5-5f B2 read side: does the DOC say server @a srvnum stores channel history?
+ * Returns 1 and fills @a retention_out when so, else 0.  m_chathistory.c uses
+ * this as a fallback behind the legacy CH A S table (which stays authoritative
+ * for P10-linked peers), so the two sources never both write one struct. */
+int crdt_shadow_ch_storage_lookup(const char *srvnum, unsigned int *retention_out)
+{
+  const struct CrdtChStorage *rec;
+  if (!shadow_on() || !srvnum || !srvnum[0])
+    return 0;
+  rec = crdt_chstore_get(&g_crdt, srvnum);
+  if (!rec || !rec->stores)
+    return 0;
+  if (retention_out)
+    *retention_out = (unsigned int)rec->retention_days;
+  return 1;
+}
+
 void crdt_shadow_own_user_reassert(void)
 {
   struct Client *acptr;
@@ -5766,6 +5832,7 @@ static void crdt_shadow_verify_cb(struct Event *ev)
   crdt_shadow_stale_user_scan();   /* orphan-reap Inc 1: detect-and-log stale-materialization ghosts (absent-from-doc) the tombstone-only reap left behind */
   crdt_shadow_own_user_sweep();    /* orphan-reap owner sweep: reap MY-origin doc records with no live client (resurrection zombies / restart residue / hookless teardowns) */
   crdt_shadow_own_user_reassert(); /* recovery completion: re-mint records of live local users the doc lost (wrong-decommission heal) */
+  crdt_shadow_ch_storage_publish(); /* 5-5f B2: publish our CH storage capability (change-gated, so idle ticks are free) */
   crdt_shadow_decomm_sweep();      /* decommission standing sweep: reap residue of operator-asserted-dead servers; auto-dissolve on return */
   crdt_shadow_reconcile_glines();  /* GLINE step 3: drive global G-lines from doc (+gateway) */
   crdt_shadow_reconcile_shuns();   /* SHUN: drive global Shuns from doc (+gateway) */

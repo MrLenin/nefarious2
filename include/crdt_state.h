@@ -129,6 +129,26 @@ struct CrdtDecommission {
   char reason[CRDT_DECOMM_REASONLEN];  /**< why (audit) */
 };
 
+/* 5-5f B2: per-server chathistory STORAGE CAPABILITY, keyed by 2-char server
+ * numeric.  Capability only — "server S stores history, retention N" — which
+ * is O(#servers).  Per-CHANNEL availability ("S has #foo") is explicitly NOT
+ * modelled here: that is O(#channels) and, with tens of thousands of channels
+ * after test churn, is the spam that got CH A F disabled.
+ *
+ * Why a doc collection rather than the legacy CH A S table: that ad is sent
+ * once, at EOB over a REAL P10 link, and is dropped the instant the server
+ * exits the tree (clear_server_ad, s_misc.c:319).  An anchored or
+ * overlay-only node therefore can neither advertise nor be asked.  A doc
+ * entry converges to every node over the mesh, needs no EOB, and survives the
+ * exit that clears the legacy table.
+ *
+ * Both fields are uint32 so the struct has NO implicit padding (inv. 4:
+ * padding would ride the wire uninitialised); memset before filling anyway. */
+struct CrdtChStorage {
+  uint32_t stores;          /**< nonzero if the server stores channel history */
+  uint32_t retention_days;  /**< 0 = unknown/unlimited */
+};
+
 #define CRDT_KICKREASONLEN 160
 /* Per-kick metadata (Phase 3k): an LWW register keyed chan\0numeric, parallel to
  * the kick's member tombstone. Lets reconcile-remove emit a KICK (with attribution)
@@ -307,7 +327,8 @@ enum CrdtCollection {
   CRDT_COLL_METADATA,      /**< account\0key -> metadata blob (LWW) — Tier C F2-b */
   CRDT_COLL_TEMPSHUNS,     /**< victim numeric -> CrdtTempshun (LWW) — Tier C F3 */
   CRDT_COLL_WEBPUSH,       /**< account\0endpoint -> subscription blob (LWW) — Tier C F2-c */
-  CRDT_COLL_DECOMMISSIONS  /**< 2-char server numeric -> CrdtDecommission (LWW) — operator-asserted permanent absence */
+  CRDT_COLL_DECOMMISSIONS, /**< 2-char server numeric -> CrdtDecommission (LWW) — operator-asserted permanent absence */
+  CRDT_COLL_CH_STORAGE     /**< 2-char server numeric -> CrdtChStorage (LWW) — 5-5f B2 chathistory storage capability */
 };
 
 struct CrdtOp {
@@ -395,6 +416,7 @@ struct CrdtNetworkState {
   struct CrdtLWWMap       tempshuns;    /**< victim numeric -> CrdtTempshun (LWW, Tier C F3) */
   struct CrdtLWWMap       webpush;      /**< account\0endpoint -> subscription blob (LWW, Tier C F2-c) */
   struct CrdtLWWMap       decommissions; /**< 2-char server numeric -> CrdtDecommission (LWW) */
+  struct CrdtLWWMap       ch_storage;    /**< 2-char server numeric -> CrdtChStorage (LWW) — 5-5f B2 */
   struct CrdtORSet        silences;     /**< usernumeric\0mask -> per-user silence masks (Tier C F1-c) */
   struct CrdtChannel     *chan_buckets[CRDT_CHAN_BUCKETS];
 };
@@ -454,6 +476,19 @@ const struct CrdtDecommission *crdt_decomm_get(const struct CrdtNetworkState *st
                                                const char *srvnum);
 /** Dissolve the marker (server returned, or manual cancel). Op-recording. */
 void crdt_decomm_remove(struct CrdtNetworkState *st, const char *srvnum);
+
+/** 5-5f B2: advertise server @a srvnum's chathistory storage capability into
+ *  the doc.  Op-recording (inv. 3) so it replicates by delta, not only by a
+ *  CR F snapshot.  Idempotent-by-LWW: re-minting the same values is harmless,
+ *  and a later call always wins over an earlier one. */
+void crdt_chstore_set(struct CrdtNetworkState *st, const char *srvnum,
+                      uint32_t stores, uint32_t retention_days);
+/** NULL if absent/tombstoned/wrong-sized (mixed-version tolerance). */
+const struct CrdtChStorage *crdt_chstore_get(const struct CrdtNetworkState *st,
+                                             const char *srvnum);
+/** Withdraw the capability (storage disabled, or server decommissioned).
+ *  Mints a real DELETE tombstone — never a local free (inv. 5). */
+void crdt_chstore_remove(struct CrdtNetworkState *st, const char *srvnum);
 
 void crdt_silence_add(struct CrdtNetworkState *st, const char *usernumeric,
                       const char *mask);

@@ -48,6 +48,7 @@
 #include "ircd_reply.h"
 #include "metadata.h"
 #include "ircd_snprintf.h"
+#include "crdt_shadow.h"   /* 5-5f B2: doc-backed CH storage capability lookup */
 #include "ircd_string.h"
 #include "list.h"
 #include "msg.h"
@@ -2808,11 +2809,17 @@ static struct ChathistoryAd *get_server_ad(struct Client *server)
 int has_chathistory_advertisement(struct Client *server)
 {
   int idx = server_ad_index(server);
-  if (idx < 0)
-    return 0;
-  if (!server_ads[idx])
-    return 0;
-  return server_ads[idx]->has_advertisement && server_ads[idx]->is_storage_server;
+  if (idx >= 0 && server_ads[idx]
+      && server_ads[idx]->has_advertisement
+      && server_ads[idx]->is_storage_server)
+    return 1;
+  /* 5-5f B2 fallback: the doc.  The legacy table above stays authoritative for
+   * P10-linked peers (no dual writer on one struct), but it cannot describe a
+   * server with no P10 link — CH A S rides EOB, and clear_server_ad()
+   * (s_misc.c:319) drops the entry the moment the server exits the tree.  So
+   * an overlay-only or anchored node was invisible here no matter how much
+   * history it held.  The doc entry has no such lifecycle. */
+  return server ? crdt_shadow_ch_storage_lookup(cli_yxx(server), NULL) : 0;
 }
 
 /** Get retention days for a server.
@@ -2821,12 +2828,14 @@ int has_chathistory_advertisement(struct Client *server)
  */
 int server_retention_days(struct Client *server)
 {
+  unsigned int doc_retention = 0;
   int idx = server_ad_index(server);
-  if (idx < 0)
-    return -1;
-  if (!server_ads[idx] || !server_ads[idx]->has_advertisement)
-    return -1;
-  return server_ads[idx]->retention_days;
+  if (idx >= 0 && server_ads[idx] && server_ads[idx]->has_advertisement)
+    return server_ads[idx]->retention_days;
+  /* 5-5f B2 fallback, same rationale as has_chathistory_advertisement(). */
+  if (server && crdt_shadow_ch_storage_lookup(cli_yxx(server), &doc_retention))
+    return (int)doc_retention;
+  return -1;
 }
 
 /** Clear advertisement entry for a server (on SQUIT).

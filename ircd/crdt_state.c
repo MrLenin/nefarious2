@@ -156,6 +156,7 @@ void crdt_state_init(struct CrdtNetworkState *st, uint16_t my_numeric)
   crdt_lwwmap_init(&st->tempshuns);
   crdt_lwwmap_init(&st->webpush);
   crdt_lwwmap_init(&st->decommissions);
+  crdt_lwwmap_init(&st->ch_storage);
   crdt_orset_init(&st->silences);
 }
 
@@ -183,6 +184,7 @@ void crdt_state_clear(struct CrdtNetworkState *st)
   crdt_lwwmap_clear(&st->tempshuns);
   crdt_lwwmap_clear(&st->webpush);
   crdt_lwwmap_clear(&st->decommissions);
+  crdt_lwwmap_clear(&st->ch_storage);
   crdt_orset_clear(&st->silences);
   for (int b = 0; b < CRDT_CHAN_BUCKETS; b++) {
     struct CrdtChannel *c = st->chan_buckets[b];
@@ -1663,6 +1665,7 @@ static struct CrdtLWWMap *lww_for(struct CrdtNetworkState *st,
   case CRDT_COLL_TEMPSHUNS:     return &st->tempshuns;
   case CRDT_COLL_WEBPUSH:       return &st->webpush;
   case CRDT_COLL_DECOMMISSIONS: return &st->decommissions;
+  case CRDT_COLL_CH_STORAGE: return &st->ch_storage;
   default:                return NULL;
   }
 }
@@ -2043,6 +2046,7 @@ uint64_t crdt_state_digest(const struct CrdtNetworkState *st)
   acc = digest_lww(acc, &st->tempshuns, 22); /* salt 22: Tier C F3 tempshuns */
   acc = digest_lww(acc, &st->webpush, 23);   /* salt 23: Tier C F2-c webpush subs */
   acc = digest_lww(acc, &st->decommissions, 24); /* salt 24: decommission markers */
+  acc = digest_lww(acc, &st->ch_storage, 25);    /* salt 25: 5-5f B2 CH storage capability */
   acc = digest_orset(acc, &st->silences, "", 0, 19);/* salt 19: Tier C F1-c silences */
   for (bk = 0; bk < CRDT_CHAN_BUCKETS; bk++) {
     struct CrdtChannel *c;
@@ -2104,6 +2108,7 @@ uint64_t crdt_state_digest_materialized(const struct CrdtNetworkState *st)
   acc = digest_lww(acc, &st->tempshuns, 22); /* salt 22: Tier C F3 tempshuns */
   acc = digest_lww(acc, &st->webpush, 23);   /* salt 23: Tier C F2-c webpush subs */
   acc = digest_lww(acc, &st->decommissions, 24); /* salt 24: decommission markers */
+  acc = digest_lww(acc, &st->ch_storage, 25);    /* salt 25: 5-5f B2 CH storage capability */
   acc = digest_orset_present(acc, &st->silences, "", 0, 19);/* salt 19: Tier C F1-c silences */
   for (bk = 0; bk < CRDT_CHAN_BUCKETS; bk++) {
     struct CrdtChannel *c;
@@ -2552,6 +2557,56 @@ const struct CrdtDecommission *crdt_decomm_get(const struct CrdtNetworkState *st
 void crdt_decomm_remove(struct CrdtNetworkState *st, const char *srvnum)
 {
   mint_meta_delete(st, &st->decommissions, CRDT_COLL_DECOMMISSIONS,
+                   srvnum, (uint32_t)strlen(srvnum));
+}
+
+/* ------------------------------------------------------------------ */
+/* CH STORAGE CAPABILITY — 5-5f B2                                     */
+/* ------------------------------------------------------------------ */
+/* Per-server "I store channel history, retention N", keyed by 2-char server
+ * numeric.  Capability only: O(#servers), never O(#channels) — see the struct
+ * comment for why per-channel availability stays out of the doc.
+ *
+ * This exists because the legacy CH A S table cannot describe a server with
+ * no P10 link: the ad rides EOB, and clear_server_ad() (s_misc.c:319) drops it
+ * the moment the server exits the tree.  The doc entry is independent of that
+ * lifecycle, so an anchored / overlay-only node stays discoverable. */
+void crdt_chstore_set(struct CrdtNetworkState *st, const char *srvnum,
+                      uint32_t stores, uint32_t retention_days)
+{
+  struct CrdtChStorage rec;
+  struct HLC ts = hlc_local_event(&st->clock);
+  uint32_t klen = (uint32_t)strlen(srvnum);
+  uint64_t seq;
+  struct CrdtOp *op;
+  memset(&rec, 0, sizeof rec);          /* deterministic wire bytes (inv. 4) */
+  rec.stores = stores;
+  rec.retention_days = retention_days;
+  crdt_lwwmap_set(&st->ch_storage, srvnum, klen, &rec, sizeof rec,
+                  ts, st->my_numeric);
+  seq = st->next_seq++;
+  op = op_new(st->my_numeric, seq, CRDT_OP_SET, CRDT_COLL_CH_STORAGE);
+  op->key = memdup(srvnum, klen);
+  op->key_len = klen;
+  op->val = memdup(&rec, sizeof rec);
+  op->val_len = sizeof rec;
+  op->ts = ts;
+  op->writer = st->my_numeric;
+  record(st, op);
+}
+
+const struct CrdtChStorage *crdt_chstore_get(const struct CrdtNetworkState *st,
+                                             const char *srvnum)
+{
+  const struct CrdtLWWValue *v =
+    crdt_lwwmap_get(&st->ch_storage, srvnum, (uint32_t)strlen(srvnum));
+  return (v && v->data && v->data_len == sizeof(struct CrdtChStorage))
+           ? (const struct CrdtChStorage *)v->data : NULL;
+}
+
+void crdt_chstore_remove(struct CrdtNetworkState *st, const char *srvnum)
+{
+  mint_meta_delete(st, &st->ch_storage, CRDT_COLL_CH_STORAGE,
                    srvnum, (uint32_t)strlen(srvnum));
 }
 

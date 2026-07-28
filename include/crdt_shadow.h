@@ -568,6 +568,12 @@ void crdt_shadow_own_user_sweep(void);
  *  whose record is absent/tombstoned (always wrong — e.g. a wrongly-decommissioned
  *  server healing over its reap tombstones). Idempotent; self-gates on !bursting. */
 void crdt_shadow_own_user_reassert(void);
+/** 5-5f B2: publish/withdraw THIS server's chathistory storage capability in
+ *  the doc (change-gated; safe to call on both the verify tick and eagerly). */
+void crdt_shadow_ch_storage_publish(void);
+/** 5-5f B2 read side: 1 if the doc says @a srvnum stores history (fills
+ *  @a retention_out), else 0.  Fallback behind the legacy CH A S table. */
+int crdt_shadow_ch_storage_lookup(const char *srvnum, unsigned int *retention_out);
 
 /** Decommission standing sweep + auto-dissolve: while an operator's decommission
  *  marker stands, reap the server's user/bconn doc residue; dissolve the marker the

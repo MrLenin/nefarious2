@@ -191,6 +191,7 @@ int ms_end_of_burst(struct Client* cptr, struct Client* sptr, int parc, char* pa
   crdt_shadow_own_user_sweep();
   crdt_shadow_own_user_reassert();  /* heal-after-wrong-decommission: re-mint our live users over merged-in reap tombstones NOW, not on the next tick */
   crdt_shadow_decomm_sweep();       /* dissolve markers for returned servers / reap freshly-learned decommissions at the settle point */
+  crdt_shadow_ch_storage_publish(); /* 5-5f B2: publish our CH storage capability at the settle point so a fresh peer learns it now, not on the next 30s tick (F3 lesson); change-gated, so it is a no-op once published */
 
   if (MyConnect(sptr)) {
     sendcmdto_one(&me, CMD_END_OF_BURST_ACK, sptr, "");

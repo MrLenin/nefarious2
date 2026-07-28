@@ -3386,6 +3386,141 @@ static void test_owner_remove_beats_snapshot_reimport(void **state)
  * relink-safety contract — a returning server's FRESH registration SET beats
  * the reap's older tombstone, so decommission-then-return can never suppress a
  * real reconnecting user. */
+/* ------------------------------------------------------------------ */
+/* 5-5f B2 — per-server chathistory storage capability (CH_STORAGE)    */
+/* ------------------------------------------------------------------ */
+/* Discovery today rides CH A S at EOB over a REAL P10 link, and legacy drops
+ * the ad the moment a server exits (clear_server_ad, s_misc.c:319).  So an
+ * anchored / overlay-only node can neither advertise nor be asked — which is
+ * why the B3 tunnel has no live trigger.  This collection carries capability
+ * (NOT per-channel availability: the scale rule is O(#servers), never
+ * O(#channels)) so it converges to every node including link-less ones, and
+ * survives the exit that clears the legacy table. */
+static void test_chstorage_replicates(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState a, b;
+  static uint8_t buf[262144];
+  const struct CrdtChStorage *r;
+  int n;
+  crdt_state_init(&a, 1);
+  crdt_state_init(&b, 2);
+
+  crdt_chstore_set(&a, "AB", 1, 7);
+  r = crdt_chstore_get(&a, "AB");
+  assert_non_null(r);
+  assert_int_equal(1, r->stores);
+  assert_int_equal(7, r->retention_days);
+
+  n = crdt_snapshot_encode(&a, buf, sizeof buf);
+  assert_true(n > 0);
+  assert_int_equal(0, crdt_snapshot_apply(&b, buf, (size_t)n));
+  r = crdt_chstore_get(&b, "AB");
+  assert_non_null(r);                        /* capability replicated */
+  assert_int_equal(1, r->stores);
+  assert_int_equal(7, r->retention_days);
+
+  /* withdrawal replicates too (feature turned off / server decommissioned) */
+  crdt_chstore_remove(&a, "AB");
+  assert_null(crdt_chstore_get(&a, "AB"));
+  n = crdt_snapshot_encode(&a, buf, sizeof buf);
+  assert_true(n > 0);
+  assert_int_equal(0, crdt_snapshot_apply(&b, buf, (size_t)n));
+  assert_null(crdt_chstore_get(&b, "AB"));
+  crdt_state_clear(&a);
+  crdt_state_clear(&b);
+}
+
+/* HARD INVARIANT 3: state cut over to CRDT transport MUST go through the
+ * op-recording setter, or it replicates ONLY via a CR F snapshot and never via
+ * a delta — silent partial replication.  Pin it: sync by DELTA alone. */
+static void test_chstorage_delta_replicates(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState a, b;
+  static uint8_t buf[65536];
+  const struct CrdtChStorage *r;
+  int n;
+  crdt_state_init(&a, 1);
+  crdt_state_init(&b, 2);
+
+  crdt_chstore_set(&a, "AB", 1, 30);
+  n = crdt_delta_encode(&a.oplog, &b.local_sv, buf, sizeof buf);
+  assert_true(n > 0);                        /* the setter recorded an op */
+  assert_true(crdt_delta_apply(&b, buf, (size_t)n) > 0);  /* returns #ops */
+  r = crdt_chstore_get(&b, "AB");
+  assert_non_null(r);
+  assert_int_equal(30, r->retention_days);
+
+  /* and the withdrawal is delta-visible as well */
+  crdt_chstore_remove(&a, "AB");
+  n = crdt_delta_encode(&a.oplog, &b.local_sv, buf, sizeof buf);
+  assert_true(n > 0);
+  assert_true(crdt_delta_apply(&b, buf, (size_t)n) > 0);
+  assert_null(crdt_chstore_get(&b, "AB"));
+  crdt_state_clear(&a);
+  crdt_state_clear(&b);
+}
+
+/* LWW on a capability flip: the later write wins regardless of arrival order,
+ * so a server toggling FEAT_CHATHISTORY_STORE converges to its latest state
+ * even when an older snapshot arrives afterwards. */
+static void test_chstorage_lww_flip(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState a, b;
+  static uint8_t buf[262144];
+  const struct CrdtChStorage *r;
+  int n;
+  crdt_state_init(&a, 1);
+  crdt_state_init(&b, 2);
+
+  crdt_chstore_set(&a, "AB", 1, 7);
+  n = crdt_snapshot_encode(&a, buf, sizeof buf);
+  assert_int_equal(0, crdt_snapshot_apply(&b, buf, (size_t)n));
+
+  /* A turns storage off (later HLC) */
+  crdt_chstore_set(&a, "AB", 0, 0);
+  n = crdt_snapshot_encode(&a, buf, sizeof buf);
+  assert_int_equal(0, crdt_snapshot_apply(&b, buf, (size_t)n));
+  r = crdt_chstore_get(&b, "AB");
+  assert_non_null(r);
+  assert_int_equal(0, r->stores);            /* newer write won */
+
+  /* replaying B's own older view back into A must NOT resurrect stores=1 */
+  n = crdt_snapshot_encode(&b, buf, sizeof buf);
+  assert_int_equal(0, crdt_snapshot_apply(&a, buf, (size_t)n));
+  r = crdt_chstore_get(&a, "AB");
+  assert_non_null(r);
+  assert_int_equal(0, r->stores);
+  crdt_state_clear(&a);
+  crdt_state_clear(&b);
+}
+
+/* GC-invariant digest (the 2026-07-26 oscillation fix) must hold for this
+ * collection too: two replicas with identical LIVE capability must hash equal
+ * even when only one still carries the withdrawal tombstone. */
+static void test_chstorage_digest_gc_invariant(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState a, b;
+  static uint8_t buf[262144];
+  int n;
+  crdt_state_init(&a, 1);
+  crdt_state_init(&b, 2);
+
+  crdt_chstore_set(&a, "AB", 1, 7);
+  crdt_chstore_set(&a, "CD", 1, 3);
+  crdt_chstore_remove(&a, "CD");             /* A holds a tombstone for CD */
+  n = crdt_snapshot_encode(&a, buf, sizeof buf);
+  assert_int_equal(0, crdt_snapshot_apply(&b, buf, (size_t)n));
+
+  /* identical live content (AB only) -> identical digest */
+  assert_int_equal(crdt_state_digest(&a), crdt_state_digest(&b));
+  crdt_state_clear(&a);
+  crdt_state_clear(&b);
+}
+
 static void test_decommission_replicates(void **state)
 {
   (void)state;
@@ -3877,6 +4012,10 @@ int main(void)
     cmocka_unit_test(test_digest_gc_invariant),
     cmocka_unit_test(test_decommission_replicates),
     cmocka_unit_test(test_decommission_reap_and_return),
+    cmocka_unit_test(test_chstorage_replicates),
+    cmocka_unit_test(test_chstorage_delta_replicates),
+    cmocka_unit_test(test_chstorage_lww_flip),
+    cmocka_unit_test(test_chstorage_digest_gc_invariant),
     cmocka_unit_test(test_A_convergence),
     cmocka_unit_test(test_B_collision_different_user_oldest_wins),
     cmocka_unit_test(test_B_collision_same_user_newest_wins),
