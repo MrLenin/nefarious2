@@ -1569,13 +1569,29 @@ int whisper(struct Client* source, const char* nick, const char* channel,
     return 0;
   }
           
+  /* S2S-audit Cluster A: the whisper delivery was a bare sendcmdto_one —
+   * the ONE directed-message path that bypassed the mesh router, so a
+   * CPRIVMSG/CNOTICE to a mesh-only target silently dead-sank while an
+   * ordinary PM to the same user was carried.  Route the cross-server leg
+   * through crdt_route_unicast_try like every other targeted delivery
+   * (it self-gates: local/legacy targets return 0 -> the P10 send below
+   * runs unchanged).  Mint a real msgid for the CR attempt — CR-M dedup
+   * keys off it, and the "*" placeholder is single-use per window. */
   if (is_notice)
-    sendcmdto_one(source, CMD_NOTICE, dest, "%C :%s", dest, text);
+  {
+    char wmid[64];
+    generate_msgid(wmid, sizeof(wmid));
+    if (!crdt_route_unicast_try(source, 'N', dest, wmid, text))
+      sendcmdto_one(source, CMD_NOTICE, dest, "%C :%s", dest, text);
+  }
   else
   {
+    char wmid[64];
     if (cli_user(dest)->away)
       send_reply(source, RPL_AWAY, cli_name(dest), cli_user(dest)->away);
-    sendcmdto_one(source, CMD_PRIVATE, dest, "%C :%s", dest, text);
+    generate_msgid(wmid, sizeof(wmid));
+    if (!crdt_route_unicast_try(source, 'P', dest, wmid, text))
+      sendcmdto_one(source, CMD_PRIVATE, dest, "%C :%s", dest, text);
   }
   return 0;
 }

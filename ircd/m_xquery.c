@@ -89,6 +89,8 @@
 #include "numeric.h"
 #include "numnicks.h"
 #include "send.h"
+#include "ircd_snprintf.h"
+#include "handlers.h"
 
 #include <string.h>
 
@@ -111,10 +113,19 @@ int mo_xquery(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
   if (!(acptr = find_match_server(parv[1])))
     return send_reply(sptr, ERR_NOSUCHSERVER, parv[1]);
 
-  /* If it's to us, do nothing; otherwise, forward the query */
-  if (!IsMe(acptr))
-    sendcmdto_one(sptr, CMD_XQUERY, acptr, "%C %s :%s", acptr, parv[2],
-		  parv[3]);
+  /* If it's to us, do nothing; otherwise, forward the query.  S2S-audit
+   * Cluster A: a mesh-only destination (anchor, no live P10 route) rides
+   * the CR-X carrier via its dormant 'Q' dispatch case — a bare
+   * sendcmdto_one would dead-sink.  services_try self-gates (returns 0
+   * for any live P10 destination). */
+  if (!IsMe(acptr)) {
+    char xbody[BUFSIZE];
+    ircd_snprintf(0, xbody, sizeof(xbody), "%s %s :%s",
+                  cli_yxx(acptr), parv[2], parv[3]);
+    if (!crdt_route_services_try(acptr, 'Q', xbody))
+      sendcmdto_one(sptr, CMD_XQUERY, acptr, "%C %s :%s", acptr, parv[2],
+                    parv[3]);
+  }
 
   return 0;
 }
@@ -139,10 +150,16 @@ int ms_xquery(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
     return send_reply(sptr, SND_EXPLICIT | ERR_NOSUCHSERVER,
 		      "* :Server has disconnected");
 
-  /* Forward the query to its destination */
-  if (!IsMe(acptr))
-    sendcmdto_one(sptr, CMD_XQUERY, acptr, "%C %s :%s", acptr, parv[2],
-		  parv[3]);
+  /* Forward the query to its destination (CR-X for a mesh-only dest —
+   * see mo_xquery above). */
+  if (!IsMe(acptr)) {
+    char xbody[BUFSIZE];
+    ircd_snprintf(0, xbody, sizeof(xbody), "%s %s :%s",
+                  cli_yxx(acptr), parv[2], parv[3]);
+    if (!crdt_route_services_try(acptr, 'Q', xbody))
+      sendcmdto_one(sptr, CMD_XQUERY, acptr, "%C %s :%s", acptr, parv[2],
+                    parv[3]);
+  }
   else /* if it's to us, log it */
     log_write(LS_SYSTEM, L_NOTICE, 0, "Received extension query from "
 	      "%#C to %#C routing %s; message: %s", sptr, acptr,

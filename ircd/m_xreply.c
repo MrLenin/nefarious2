@@ -90,6 +90,8 @@
 #include "numnicks.h"
 #include "s_auth.h"
 #include "send.h"
+#include "ircd_snprintf.h"
+#include "handlers.h"
 
 #include <string.h>
 
@@ -118,10 +120,22 @@ int ms_xreply(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
     return send_reply(sptr, SND_EXPLICIT | ERR_NOSUCHSERVER,
 		      "* :Server has disconnected");
 
-  /* If it's not to us, forward the reply */
+  /* If it's not to us, forward the reply.  S2S-audit Cluster A: a mesh-only
+   * destination (user homed on / server represented by an anchor) rides the
+   * CR-X carrier via its dormant 'Y' dispatch case — a bare sendcmdto_one
+   * would dead-sink.  reply_try self-gates (0 for live P10 routes). */
   if (!IsMe(acptr)) {
-    sendcmdto_one(sptr, CMD_XREPLY, acptr, "%C %s :%s", acptr, routing,
-		  reply);
+    char xbody[BUFSIZE];
+    if (IsServer(acptr) || IsMeshStub(acptr))
+      ircd_snprintf(0, xbody, sizeof(xbody), "%s %s :%s",
+                    cli_yxx(acptr), routing, reply);
+    else
+      ircd_snprintf(0, xbody, sizeof(xbody), "%s%s %s :%s",
+                    cli_yxx(cli_user(acptr)->server), cli_yxx(acptr),
+                    routing, reply);
+    if (!crdt_route_services_reply_try(acptr, 'Y', xbody))
+      sendcmdto_one(sptr, CMD_XREPLY, acptr, "%C %s :%s", acptr, routing,
+                    reply);
     return 0;
   }
 
