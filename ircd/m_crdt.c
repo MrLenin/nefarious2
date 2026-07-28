@@ -926,7 +926,17 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
       log_write(LS_SYSTEM, L_INFO, 0,
                 "CRDT CI: mesh auth-cache invalidation for %s", m_text);
       sasl_cache_invalidate_user(m_text);
-    } else if (target[0] == '#' || target[0] == '&') {    /* channel delivery */
+    } else if ((target[0] == '#' || target[0] == '&')
+               && (m_cmd[0] == 'P' || m_cmd[0] == 'N' || is_tag)) {  /* channel delivery */
+      /* Only the known channel-delivery cmds (PRIVMSG/NOTICE/TAGMSG) enter here.
+       * FORWARD-COMPAT GUARD (WALL* prerequisite): an UNKNOWN channel-target cmd
+       * must NOT fall through to this loop — the cmdstr map above defaults every
+       * unknown letter to "PRIVMSG", so a future targeted-WALL frame (chanops-only)
+       * arriving at a peer that predates its receiver logic would be delivered to
+       * ALL members as a plain PRIVMSG: a privilege leak.  With this guard an
+       * unknown channel cmd matches no delivery branch (drops locally) while the
+       * shared flood relay below still carries it onward.  Extend this set when
+       * the WALL* receiver lands. */
       struct Channel *ch = FindChannel(target);
       struct Membership *memb;
       if (ch)
