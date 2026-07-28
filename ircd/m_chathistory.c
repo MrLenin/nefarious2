@@ -4485,9 +4485,10 @@ static struct Client *ch_fed_reply_target(struct Client *sptr, struct Client *cp
  * toward the origin server encoded in the reqid prefix (reqid = <yy><counter>,
  * minted by start_fed_query). Replies carry no destination field, so
  * multi-hop topologies need this hop-by-hop relay; without it a reply dies at
- * the first intermediate server. Drops (matching prior behavior) when the
- * origin is unknown, local (stale reply after timeout), routed through a mesh
- * anchor (5-5f B3 territory), or would bounce back out the arrival link. */
+ * the first intermediate server and federation only works between directly
+ * linked pairs. Drops (matching prior behavior) when the origin is unknown,
+ * local (stale reply after timeout), routed through a mesh anchor (5-5f B3
+ * territory), or would bounce back out the arrival link. */
 static void forward_fed_reply(struct Client *sptr, struct Client *cptr,
                               int parc, char *parv[])
 {
