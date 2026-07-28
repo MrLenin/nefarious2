@@ -2387,10 +2387,24 @@ void crdt_shadow_topic(struct Channel *chptr, struct Client *from)
  * predicate); +L/+U/+A excluded there — see the note at its definition. */
 
 /** Compact, comparable snapshot of a channel's persistent mode state. */
+/* S2S-audit Cluster C: fields appended AFTER the original {mode,limit,key}
+ * prefix — the wire blob is parsed length-tolerantly (mode_snap_parse), so a
+ * peer that predates these fields still applies the prefix and an old-format
+ * blob still round-trips.  NEVER reorder or resize existing fields.
+ *  - xmode: the persistent exmode word (CRDT_EXMODE_MASK).
+ *  - upass/apass/redir: +U/+A/+L args.  Presence encodes the mode — a founder
+ *    password / redirect target is never empty when set — so no extra mode
+ *    bits are plumbed through the doc's `mode` word (keeps CRDT_MODE_MASK and
+ *    the modebuf-suppression logic untouched; +A/+U/+L still ride P10 for
+ *    legacy rendering pre-MR-6, per modebuf_is_crdt_only). */
 struct ShadowModeSnap {
   uint32_t mode;
   uint32_t limit;
   char     key[KEYLEN + 1];
+  uint32_t xmode;
+  char     upass[KEYLEN + 1];
+  char     apass[KEYLEN + 1];
+  char     redir[CHANNELLEN + 1];
 };
 
 static void build_mode_snap(struct Channel *chptr, struct ShadowModeSnap *s)
@@ -2401,6 +2415,33 @@ static void build_mode_snap(struct Channel *chptr, struct ShadowModeSnap *s)
     s->limit = chptr->mode.limit;
   if (s->mode & MODE_KEY)
     strncpy(s->key, chptr->mode.key, sizeof s->key - 1);
+  s->xmode = chptr->mode.exmode & CRDT_EXMODE_MASK;
+  /* +U/+A/+L store their value ONLY in the string fields — the MODE_UPASS/
+   * APASS/REDIRECT bits are modebuf-transport flags, never set in mode.mode
+   * (verified: channel.c sets chptr->mode.{upass,apass,redir} directly and the
+   * renderer gates on *string).  So capture on STRING presence, not the bit. */
+  if (chptr->mode.upass[0])
+    strncpy(s->upass, chptr->mode.upass, sizeof s->upass - 1);
+  if (chptr->mode.apass[0])
+    strncpy(s->apass, chptr->mode.apass, sizeof s->apass - 1);
+  if (chptr->mode.redir[0])
+    strncpy(s->redir, chptr->mode.redir, sizeof s->redir - 1);
+}
+
+/* Length-tolerant parse of a stored mode-snap blob: memset then copy the bytes
+ * present, so an OLD short blob fills only the prefix (new fields stay zeroed)
+ * and a NEW full blob fills everything.  Append-only field layout makes this
+ * version-safe in both directions.  Returns 1 if at least the original prefix
+ * (mode+limit+key) is present, else 0 (blob too short to trust). */
+static int mode_snap_parse(const void *data, uint32_t len, struct ShadowModeSnap *out)
+{
+  size_t prefix = offsetof(struct ShadowModeSnap, xmode);  /* {mode,limit,key} */
+  size_t n = (len < sizeof *out) ? len : sizeof *out;
+  if (!data || len < prefix)
+    return 0;
+  memset(out, 0, sizeof *out);
+  memcpy(out, data, n);
+  return 1;
 }
 
 /** Inverse of build_mode_snap (Phase 3e): drive the live channel's persistent
@@ -2417,6 +2458,15 @@ static void apply_mode_snap(struct Channel *chptr, const struct ShadowModeSnap *
     ircd_strncpy(chptr->mode.key, s->key, KEYLEN + 1);
   else
     chptr->mode.key[0] = '\0';
+  /* Cluster C: exmode word + arg-mode strings.  +U/+A/+L live ONLY in the
+   * string fields (no mode.mode bit — see build_mode_snap); copy directly so
+   * a materialized channel is byte-identical to a natively-set one.  An empty
+   * snap string clears the live value (the mode was unset). */
+  chptr->mode.exmode = (chptr->mode.exmode & ~CRDT_EXMODE_MASK)
+                       | (s->xmode & CRDT_EXMODE_MASK);
+  ircd_strncpy(chptr->mode.upass, s->upass, KEYLEN + 1);
+  ircd_strncpy(chptr->mode.apass, s->apass, KEYLEN + 1);
+  ircd_strncpy(chptr->mode.redir, s->redir, CHANNELLEN + 1);
 }
 
 void crdt_shadow_modes(struct Channel *chptr, struct Client *from)
@@ -3854,20 +3904,22 @@ void crdt_shadow_verify(struct Client *to)
                   chptr->chname, stopic, chptr->topic);
       }
     }
-    /* field-level: channel modes (bits + limit + key) must match */
+    /* field-level: channel modes (bits + limit + key + exmode + A/U/L) must match */
     {
-      struct ShadowModeSnap cur;
+      struct ShadowModeSnap cur, stored;
       const struct CrdtLWWValue *mv =
         crdt_lwwmap_get(&g_crdt.modes, chptr->chname, strlen(chptr->chname));
+      int have = mv && mode_snap_parse(mv->data, mv->data_len, &stored);
       build_mode_snap(chptr, &cur);
-      /* a channel with no persistent modes matches an absent shadow entry */
-      if ((mv && (mv->data_len != sizeof cur ||
-                  memcmp(mv->data, &cur, sizeof cur) != 0)) ||
-          (!mv && cur.mode != 0)) {
+      /* length-tolerant compare (an old-format stored blob parses with zeroed
+       * new fields); a channel with no persistent modes matches an absent entry */
+      if ((have && memcmp(&stored, &cur, sizeof cur) != 0) ||
+          (!have && (cur.mode != 0 || cur.xmode != 0
+                     || cur.apass[0] || cur.upass[0] || cur.redir[0]))) {
         mismatches++;
         verify_emit(to,
-                  "CRDT shadow mode divergence: %s real_mode=0x%x",
-                  chptr->chname, cur.mode);
+                  "CRDT shadow mode divergence: %s real_mode=0x%x exmode=0x%x",
+                  chptr->chname, cur.mode, cur.xmode);
       }
     }
     /* field-level: every real ban/except must be present in the shadow set */
@@ -4319,17 +4371,21 @@ void crdt_shadow_materialize_check(void)
           log_write(LS_SYSTEM, L_NOTICE, 0,
                     "CRDT mat-check gap: %s topic mismatch", nbuf);
       }
-      /* persistent modes */
+      /* persistent modes (bits + limit + key + exmode + A/U/L) */
       build_mode_snap(live, &cur);
       mv = crdt_lwwmap_get(&g_crdt.modes, nbuf, dc->name_len);
-      if ((mv && (mv->data_len != sizeof cur ||
-                  memcmp(mv->data, &cur, sizeof cur) != 0)) ||
-          (!mv && cur.mode != 0)) {
-        gaps++;
-        if (logged++ < MAT_LOG_CAP)
-          log_write(LS_SYSTEM, L_NOTICE, 0,
-                    "CRDT mat-check gap: %s modes mismatch (mode=0x%x)", nbuf,
-                    cur.mode);
+      {
+        struct ShadowModeSnap stored;
+        int have = mv && mode_snap_parse(mv->data, mv->data_len, &stored);
+        if ((have && memcmp(&stored, &cur, sizeof cur) != 0) ||
+            (!have && (cur.mode != 0 || cur.xmode != 0
+                       || cur.apass[0] || cur.upass[0] || cur.redir[0]))) {
+          gaps++;
+          if (logged++ < MAT_LOG_CAP)
+            log_write(LS_SYSTEM, L_NOTICE, 0,
+                      "CRDT mat-check gap: %s modes mismatch (mode=0x%x exmode=0x%x)",
+                      nbuf, cur.mode, cur.xmode);
+        }
       }
       /* members + per-member status (present doc members only) */
       cc.live = live; cc.chname = nbuf; cc.gaps = &gaps; cc.logged = &logged;
@@ -4639,12 +4695,22 @@ static void rebuild_channel_from_doc(struct Channel *chptr,
       chptr->topic_time = (time_t)tt;
   }
   v = crdt_lwwmap_get(&g_crdt.modes, nbuf, dc->name_len);
-  if (v && v->data_len == sizeof(struct ShadowModeSnap)) {
-    const struct ShadowModeSnap *s = (const struct ShadowModeSnap *)v->data;
-    chptr->mode.mode |= s->mode;
-    if (s->mode & MODE_LIMIT) chptr->mode.limit = s->limit;
-    if (s->mode & MODE_KEY)
-      ircd_strncpy(chptr->mode.key, s->key, sizeof chptr->mode.key);
+  {
+    struct ShadowModeSnap sm;
+    if (v && mode_snap_parse(v->data, v->data_len, &sm)) {
+      chptr->mode.mode |= sm.mode;
+      if (sm.mode & MODE_LIMIT) chptr->mode.limit = sm.limit;
+      if (sm.mode & MODE_KEY)
+        ircd_strncpy(chptr->mode.key, sm.key, sizeof chptr->mode.key);
+      /* Cluster C: exmode + arg-mode strings, else a mesh-only peer rebuilding
+       * this channel from the doc loses +z/+H/+P storage/persistence gates and
+       * the +A/+U founder passwords (security).  +U/+A/+L are string-only (no
+       * mode.mode bit — see build_mode_snap). */
+      chptr->mode.exmode |= (sm.xmode & CRDT_EXMODE_MASK);
+      if (sm.upass[0]) ircd_strncpy(chptr->mode.upass, sm.upass, KEYLEN + 1);
+      if (sm.apass[0]) ircd_strncpy(chptr->mode.apass, sm.apass, KEYLEN + 1);
+      if (sm.redir[0]) ircd_strncpy(chptr->mode.redir, sm.redir, CHANNELLEN + 1);
+    }
   }
   crdt_orset_foreach(&dc->bans, mat_banbuild_cb, &chptr->banlist);
   crdt_orset_foreach(&dc->excepts, mat_banbuild_cb, &chptr->exceptlist);
@@ -5228,15 +5294,16 @@ static void reconcile_mode_cb(const char *key, uint32_t key_len,
   struct ShadowModeSnap doc, before;
   struct ModeBuf mbuf;
   unsigned int added, removed;
-  if (key_len >= sizeof chname || !val->data ||
-      val->data_len != sizeof(struct ShadowModeSnap))
+  if (key_len >= sizeof chname)
     return;
   memcpy(chname, key, key_len); chname[key_len] = '\0';
   chptr = FindChannel(chname);
   if (!chptr)
     return;                              /* channel not live yet */
-  memcpy(&doc, val->data, sizeof doc);
-  doc.mode &= CRDT_MODE_MASK;            /* defensive: ignore any stale +L/U/A bits */
+  if (!mode_snap_parse(val->data, val->data_len, &doc))
+    return;
+  doc.mode &= CRDT_MODE_MASK;            /* mode word carries only simple bits;
+                                          * +A/+U/+L ride the snap's string fields */
   build_mode_snap(chptr, &before);
   if (memcmp(&doc, &before, sizeof doc) == 0)
     return;                              /* in sync — echo guard */

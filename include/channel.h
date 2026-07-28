@@ -167,6 +167,19 @@ struct MetadataEntry;
                         MODE_KEY | MODE_LIMIT | MODE_REGONLY | MODE_DELJOINS | \
                         MODE_REGISTERED)
 
+/** CRDT-mesh (S2S-audit Cluster C): the extended-mode (exmode) bits mirrored
+ *  into / driven from the CRDT doc's mode snapshot.  ALL defined exmode bits are
+ *  persistent channel settings (join/message policy, storage/persistence gates),
+ *  so the whole word converges — a channel materialized on a mesh-only peer would
+ *  otherwise silently lose +z/+H/+P (storage/persistence) and the rest.  Carried
+ *  in ShadowModeSnap.xmode; +A/+U/+L (arg-bearing) ride the snap's pass/redir
+ *  string fields instead (string-presence == mode-set). */
+#define CRDT_EXMODE_MASK (EXMODE_ADMINONLY | EXMODE_OPERONLY | EXMODE_REGMODERATED | \
+                          EXMODE_NONOTICES | EXMODE_PERSIST | EXMODE_SSLONLY |       \
+                          EXMODE_NOQUITPARTS | EXMODE_NOCTCPS | EXMODE_NOMULTITARG | \
+                          EXMODE_NOCOLOR | EXMODE_STRIPCOLOR | EXMODE_PUBLICHISTORY |\
+                          EXMODE_NOSTORAGE)
+
 /** Available Channel modes */
 #define infochanmodes feature_bool(FEAT_OPLEVELS) ? "AabCcDdhHikLlMmNnOopPQRrSsTtUvZz" : "abCcDdhHikLlMmNnOopPQRrSsTtvZz"
 /** Available Channel modes that take parameters */
