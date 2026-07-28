@@ -580,6 +580,10 @@ int crdt_shadow_ch_storage_lookup(const char *srvnum, unsigned int *retention_ou
 typedef void (*crdt_ch_storage_iter_fn)(const char *srvnum,
                                         unsigned int retention, void *ctx);
 void crdt_shadow_ch_storage_foreach(crdt_ch_storage_iter_fn fn, void *ctx);
+/** 5-5f B4: synthesize CH A S to legacy links on behalf of doc-known,
+ *  reachability-gated stores.  @a sptr = one just-linked legacy peer (full
+ *  resend); NULL = all legacy links, change-gated (the verify-tick sweep). */
+void crdt_shadow_ch_storage_synth_to(struct Client *sptr);
 
 /** Decommission standing sweep + auto-dissolve: while an operator's decommission
  *  marker stands, reap the server's user/bconn doc residue; dissolve the marker the

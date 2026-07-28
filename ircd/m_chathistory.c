@@ -4776,6 +4776,27 @@ int ms_chathistory(struct Client *cptr, struct Client *sptr, int parc, char *par
                       dest_numeric);
         return 0;
       }
+      if (!dest) {
+        /* 5-5f B4: a dest numeric with NO local Client is a meshmap peer
+         * (no anchor minted), not an error — legacy dispatches these once
+         * the gateway synthesizes ads on their behalf.  Tunnel on a fresh
+         * beacon, exactly like the collector; otherwise credit the
+         * requester with E 0.  Before this branch the code FELL THROUGH to
+         * local processing and served the gateway's own data under a
+         * foreign dest — wrong data AND a double reply once the real dest
+         * answers. */
+        char qbody[BUFSIZE];
+        if (crdt_ch_tunnel_avail()
+            && crdt_shadow_server_beacon_fresh((uint16_t)base64toint(dest_numeric))) {
+          ircd_snprintf(0, qbody, sizeof(qbody), "Q %s %s %s %d %s %s",
+                        target, query_subcmd_str, ref, limit, reqid,
+                        dest_numeric);
+          if (crdt_ch_tunnel_try(dest_numeric, qbody))
+            return 0;
+        }
+        ch_reply_out(ch_fed_reply_target(sptr, cptr), "E %s 0", reqid);
+        return 0;
+      }
       /* dest_numeric is us — fall through to local processing.
        * Don't propagate (query was targeted at us specifically). */
     }

@@ -220,6 +220,12 @@ int ms_end_of_burst(struct Client* cptr, struct Client* sptr, int parc, char* pa
       send_channel_advertisements(sptr);
     }
 
+    /* 5-5f B4: a legacy CH-capable peer also gets ads synthesized on behalf
+     * of doc-known mesh stores it could never hear from directly (their
+     * CH A S has no P10 link to ride).  CRDT-aware peers read the doc. */
+    if (IsIRCv3Aware(sptr) && !IsCrdtAware(sptr))
+      crdt_shadow_ch_storage_synth_to(sptr);
+
     /* Forward cached SASL mechanism list to newly linked server.
      * The SASL M broadcast from services only fires once when services
      * first links.  Servers that link later miss it, so we re-send

@@ -1208,6 +1208,72 @@ void crdt_shadow_ch_storage_foreach(crdt_ch_storage_iter_fn fn, void *ctx)
   crdt_lwwmap_foreach(&g_crdt.ch_storage, ch_storage_iter_shim, &shim);
 }
 
+/* 5-5f B4: legacy-ward capability synth.  Legacy dispatches CH Q only to
+ * servers it holds CH A S ads for, and a mesh-only store can never deliver
+ * one itself (CH A S rides EOB over a real P10 link).  The gateway therefore
+ * advertises doc-known stores to its legacy CH-capable links ON THEIR BEHALF,
+ * sourced from the store's own numeric so get_server_ad() on the receiver
+ * keys the right slot.
+ *
+ * Reachability-gated (the scope-doc constraint: never advertise a store that
+ * only ever answers empty): a store is synthesized only when it resolves
+ * locally OR its CR H beacon is fresh — the same predicate the B2 collector
+ * uses.  Skips ourselves (m_endburst sends our own ad) and CRDT-aware peers
+ * (they read the doc).  A Client-less store (meshmap peer) is emitted via
+ * sendrawto_one with the raw numeric prefix — the CR-M prefix-reconstruction
+ * pattern; never a %C with a stub source (hard-invariant 2). */
+struct ChStorageSynthCtx {
+  struct Client *to;      /* NULL = all local legacy IRCv3-aware links */
+  int changed_only;       /* 1 = only entries differing from last_synth[] */
+};
+
+static uint32_t ch_synth_last[CRDT_MAX_SERVERS]; /* retention+1; 0 = never */
+
+static void ch_storage_synth_one(const char *srvnum, unsigned int retention,
+                                 void *vctx)
+{
+  struct ChStorageSynthCtx *ctx = (struct ChStorageSynthCtx *)vctx;
+  struct Client *store;
+  struct DLink *lp;
+  int idx = base64toint(srvnum);
+
+  if (idx < 0 || idx >= CRDT_MAX_SERVERS)
+    return;
+  if (srvnum[0] == cli_yxx(&me)[0] && srvnum[1] == cli_yxx(&me)[1])
+    return;                                   /* own ad rides m_endburst */
+  if (ctx->changed_only && ch_synth_last[idx] == retention + 1)
+    return;
+
+  store = FindNServer(srvnum);
+  if (!store && !crdt_shadow_server_beacon_fresh((uint16_t)idx))
+    return;                                   /* unreachable — do not advertise */
+  if (store == &me)
+    return;
+
+  for (lp = cli_serv(&me)->down; lp; lp = lp->next) {
+    struct Client *peer = lp->value.cptr;
+    if (ctx->to && peer != ctx->to)
+      continue;
+    if (IsCrdtAware(peer) || !IsIRCv3Aware(peer))
+      continue;
+    if (store)
+      sendcmdto_one(store, CMD_CHATHISTORY, peer, "A S %u", retention);
+    else
+      sendrawto_one(peer, "%s %s A S %u", srvnum, TOK_CHATHISTORY, retention);
+  }
+  ch_synth_last[idx] = retention + 1;
+}
+
+void crdt_shadow_ch_storage_synth_to(struct Client *sptr)
+{
+  struct ChStorageSynthCtx ctx;
+  if (!shadow_on())
+    return;
+  ctx.to = sptr;              /* new legacy link: full resend, ignore cache */
+  ctx.changed_only = (sptr == NULL);
+  crdt_shadow_ch_storage_foreach(ch_storage_synth_one, &ctx);
+}
+
 void crdt_shadow_own_user_reassert(void)
 {
   struct Client *acptr;
@@ -5873,6 +5939,7 @@ static void crdt_shadow_verify_cb(struct Event *ev)
   crdt_shadow_own_user_sweep();    /* orphan-reap owner sweep: reap MY-origin doc records with no live client (resurrection zombies / restart residue / hookless teardowns) */
   crdt_shadow_own_user_reassert(); /* recovery completion: re-mint records of live local users the doc lost (wrong-decommission heal) */
   crdt_shadow_ch_storage_publish(); /* 5-5f B2: publish our CH storage capability (change-gated, so idle ticks are free) */
+  crdt_shadow_ch_storage_synth_to(NULL); /* 5-5f B4: synth doc-known stores to legacy links (change-gated per leaf — covers stores that appear AFTER the legacy link's EOB) */
   crdt_shadow_decomm_sweep();      /* decommission standing sweep: reap residue of operator-asserted-dead servers; auto-dissolve on return */
   crdt_shadow_reconcile_glines();  /* GLINE step 3: drive global G-lines from doc (+gateway) */
   crdt_shadow_reconcile_shuns();   /* SHUN: drive global Shuns from doc (+gateway) */
