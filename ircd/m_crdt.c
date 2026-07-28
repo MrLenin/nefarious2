@@ -902,7 +902,17 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
                                                      * (%:#C handles server + stub) */
       if (wsrc)
         sendwallto_local(wsrc, WALL_WALLOPS, m_text);    /* deliver to local +w opers */
-    } else if (m_cmd[0] == 'I') {          /* CI: SASL auth-cache invalidation (S2S-audit
+    } else if (m_cmd[0] == 'I' && target[0] == '*') {  /* CI (target "*") — NOT INVITE.
+                                            * INVITE also rides cmd 'I' but always carries a
+                                            * USER numeric target; CI always "*".  Without
+                                            * this target guard the CI branch (added by the
+                                            * gap-B fix `2b1283d`, ordered before the unicast
+                                            * INVITE handler below) swallowed EVERY mesh
+                                            * INVITE into sasl_cache_invalidate_user(channel)
+                                            * — a bogus no-op that also dead-sank the invite
+                                            * (proven live: nef3 INVITE -> nef7 logged "CRDT
+                                            * CI ... for #invchan", target got nothing).
+                                            * SASL auth-cache invalidation (S2S-audit
                                             * gap B, SECURITY — the tree-only CI token
                                             * never reached overlay-only / tree-retired
                                             * nodes, whose POSITIVE cache then served a
