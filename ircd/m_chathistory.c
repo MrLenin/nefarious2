@@ -4487,8 +4487,18 @@ static struct Client *ch_fed_reply_target(struct Client *sptr, struct Client *cp
  * multi-hop topologies need this hop-by-hop relay; without it a reply dies at
  * the first intermediate server and federation only works between directly
  * linked pairs. Drops (matching prior behavior) when the origin is unknown,
- * local (stale reply after timeout), routed through a mesh anchor (5-5f B3
- * territory), or would bounce back out the arrival link. */
+ * local (stale reply after timeout), or would bounce back out the arrival
+ * link.
+ *
+ * ASYMMETRY, deliberate and still open: a reply whose origin resolves to a
+ * mesh anchor is also dropped (the !IsServer test below), even though the
+ * QUERY direction no longer drops its anchored counterpart — the B3 gateway
+ * slice tunnels those over CR-X (crdt_ch_tunnel_try, used at the Q-forward).
+ * The symmetric completion is to tunnel here too instead of dropping. It is
+ * NOT done yet because this whole anchored-counterpart family has no live
+ * trigger until B2: clear_server_ad() (s_misc.c:319) drops a server's storage
+ * ad the moment it exits the tree, so nothing ever queries an anchored server
+ * in the first place. Do it as part of B2, where it can actually be gated. */
 static void forward_fed_reply(struct Client *sptr, struct Client *cptr,
                               int parc, char *parv[])
 {
