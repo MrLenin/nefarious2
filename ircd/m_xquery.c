@@ -122,7 +122,7 @@ int mo_xquery(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
     char xbody[BUFSIZE];
     ircd_snprintf(0, xbody, sizeof(xbody), "%s %s :%s",
                   cli_yxx(acptr), parv[2], parv[3]);
-    if (!crdt_route_services_try(acptr, 'Q', xbody))
+    if (!crdt_route_services_reply_try(acptr, 'Q', xbody))
       sendcmdto_one(sptr, CMD_XQUERY, acptr, "%C %s :%s", acptr, parv[2],
                     parv[3]);
   }
@@ -156,7 +156,7 @@ int ms_xquery(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
     char xbody[BUFSIZE];
     ircd_snprintf(0, xbody, sizeof(xbody), "%s %s :%s",
                   cli_yxx(acptr), parv[2], parv[3]);
-    if (!crdt_route_services_try(acptr, 'Q', xbody))
+    if (!crdt_route_services_reply_try(acptr, 'Q', xbody))
       sendcmdto_one(sptr, CMD_XQUERY, acptr, "%C %s :%s", acptr, parv[2],
                     parv[3]);
   }
