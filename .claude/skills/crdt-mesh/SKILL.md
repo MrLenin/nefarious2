@@ -21,7 +21,12 @@ Numerics nef3=3 nef4=4 nef5=6 nef6=7 nef7=8; client ports 6669/6670/6672/6673/66
 Connect block; the `pgrep` healthcheck greens before the 4496 listener (valgrind boot) so sequence
 targets-before-initiators or autoconnect gets "refused" → backoff; force a stuck P10 uplink with oper
 `CONNECT`; overlays only re-autoconnect on the 10-min `try_connections` cycle (can't force via CONNECT)
-— never restart 3+ nodes at once. (Older 3-node star nef3+nef4/nef5+overlay is the subset still
+— never restart 3+ nodes at once.
+**A just-restarted OVERLAY-ONLY node logs nothing until its overlays reconnect** — that is not a
+stall. nef7 has no P10 links, so until the `try_connections` cycle re-forms its CR overlays (minutes,
+not seconds) there is no traffic and no verify-tick output beyond `Server Ready`. Confirm liveness with
+oper `/CRDT status` (it answers from the live shadow) rather than concluding the log is misrouted.
+ (Older 3-node star nef3+nef4/nef5+overlay is the subset still
 described in many notes below.)
 
 ## Three layers (keep them straight)
