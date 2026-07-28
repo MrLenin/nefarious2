@@ -508,6 +508,7 @@ enum Feature {
   FEAT_CRDT_MESHMAP_PRESENCE,   /* Tier-2: drive presence/keep gates from the beacon set */
   FEAT_CRDT_ROUTE_UNICAST,      /* MR-1: route CRDT-aware user-unicast over CR next-hop (not P10) */
   FEAT_CRDT_ROUTE_BCAST,        /* MR-2: forward channel broadcast over the canonical mesh tree */
+  FEAT_CRDT_ROUTE_WALL,         /* S2S-audit Cluster A: route targeted WALL* (WALLCHOPS/VOICES/HOPS) + WALLUSERS over the mesh. Default OFF — the c/h/v/U receivers must be on EVERY peer before the emit is enabled (they skip CRDT-aware peers on P10), so ship the receiver a bed generation, then flip this flag. */
   FEAT_CRDT_GLINE_CUTOVER,      /* GLINE step 3: doc is the transport for global G-lines among CRDT peers (reconcile-from-doc + §17.7 gateway + suppress P10 GL) */
   FEAT_CRDT_SHUN_CUTOVER,       /* SHUN: doc is the transport for global Shuns among CRDT peers (reconcile-from-doc + §17.7 gateway + suppress P10 SU) */
   FEAT_CRDT_ZLINE_CUTOVER,      /* ZLINE: doc is the transport for global Z-lines among CRDT peers (reconcile-from-doc + §17.7 gateway + suppress P10 ZL) */

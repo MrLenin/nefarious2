@@ -3126,9 +3126,17 @@ void sendwallto_group_butone(struct Client *from, int type, struct Client *one,
   int i;
   /* MR-2b: route a user-sourced WALLOPS to CRDT-aware servers over the mesh instead
    * of the P10 tree (the tree still carries it to legacy peers).  Server-sourced
-   * (cli_user==NULL) stays P10 this phase. */
-  int crdt_route = (type == WALL_WALLOPS && feature_bool(FEAT_CRDT_ROUTE_BCAST) &&
-                    from && cli_user(from));
+   * (cli_user==NULL) stays P10 this phase.  Cluster A extends the same treatment to
+   * WALLUSERS under a SEPARATE flag (FEAT_CRDT_ROUTE_WALL) with a distinct letter
+   * 'U' (the receiver picks WALL_WALLUSERS local delivery). */
+  char crdt_letter = 0;
+  if (from && cli_user(from)) {
+    if (type == WALL_WALLOPS && feature_bool(FEAT_CRDT_ROUTE_BCAST))
+      crdt_letter = 'W';
+    else if (type == WALL_WALLUSERS && feature_bool(FEAT_CRDT_ROUTE_WALL))
+      crdt_letter = 'U';
+  }
+  int crdt_route = (crdt_letter != 0);
   char crdt_txt[512];
 
   if (crdt_route) {
@@ -3193,12 +3201,12 @@ void sendwallto_group_butone(struct Client *from, int type, struct Client *one,
 
   msgq_clean(mb);
 
-  /* MR-2b: emit the mesh copy once (cmd 'W', all-server target '*') -- tree-forwarded
-   * to every CRDT node, each delivers to its local +w opers (ms_crdt cmd 'W'). */
+  /* MR-2b: emit the mesh copy once (target '*') -- tree-forwarded to every CRDT
+   * node, each delivers to its local +w opers ('W') or +w users ('U') via ms_crdt. */
   if (crdt_route) {
     char msgidbuf[64];
     generate_msgid(msgidbuf, sizeof msgidbuf);
-    crdt_gossip_message(from, 'W', "*", msgidbuf, crdt_txt);
+    crdt_gossip_message(from, crdt_letter, "*", msgidbuf, crdt_txt);
   }
 }
 

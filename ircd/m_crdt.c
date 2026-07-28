@@ -902,6 +902,14 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
                                                      * (%:#C handles server + stub) */
       if (wsrc)
         sendwallto_local(wsrc, WALL_WALLOPS, m_text);    /* deliver to local +w opers */
+    } else if (m_cmd[0] == 'U' && target[0] == '*') {    /* Cluster A: WALLUSERS
+                                            * (+w USERS broadcast).  Distinct letter from
+                                            * 'W' — the receiver must pick WALL_WALLUSERS
+                                            * local delivery, not WALL_WALLOPS.  target
+                                            * "*" like every broadcast frame. */
+      struct Client *wsrc = srcu ? srcu : srcsrv;
+      if (wsrc)
+        sendwallto_local(wsrc, WALL_WALLUSERS, m_text);
     } else if (m_cmd[0] == 'I' && target[0] == '*') {  /* CI (target "*") — NOT INVITE.
                                             * INVITE also rides cmd 'I' but always carries a
                                             * USER numeric target; CI always "*".  Without
@@ -1022,6 +1030,40 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
           sendcmdto_serv_butone_v3(srcc, CMD_TAGMSG, NULL, "@%s %s", m_text, ch->chname);
         }
       }
+    } else if ((target[0] == '#' || target[0] == '&')
+               && (m_cmd[0] == 'c' || m_cmd[0] == 'h' || m_cmd[0] == 'v')) {
+      /* Cluster A: targeted channel WALL* — deliver to a member-PRIVILEGE subset.
+       *   c = WALLCHOPS   (chanops)              mirrors SKIP_NONOPS
+       *   h = WALLHOPS    (chanops + halfops)    mirrors SKIP_NONHOPS
+       *   v = WALLVOICES  (chanops+halfops+voice)mirrors SKIP_NONVOICES
+       * The "@ "/"% "/"+ " body prefix is already in m_text (formatted at the
+       * emit, matching each handler's "%H :@ %s" form).  A dedicated branch,
+       * not the P/N/T loop: walls carry no witness-store and no legacy bridge
+       * (ephemeral op-comms; tree parity).  (SKIP_DEAF/SKIP_BURST parity is
+       * omitted — a deaf op missing an op-wall is negligible + non-security;
+       * the privilege filter is the load-bearing part.) */
+      struct Channel *ch = FindChannel(target);
+      struct Membership *memb;
+      const char *wcmd = (m_cmd[0] == 'c') ? "WALLCHOPS"
+                       : (m_cmd[0] == 'h') ? "WALLHOPS" : "WALLVOICES";
+      if (ch)
+        for (memb = ch->members; memb; memb = memb->next_member) {
+          if (!MyConnect(memb->user))
+            continue;
+          if (m_cmd[0] == 'c' && !IsChanOp(memb))
+            continue;
+          if (m_cmd[0] == 'h' && !IsChanOp(memb) && !IsHalfOp(memb))
+            continue;
+          if (m_cmd[0] == 'v' && !IsChanOp(memb) && !IsHalfOp(memb) && !HasVoice(memb))
+            continue;
+          if (src && src->nick[0])
+            sendrawto_one(memb->user, ":%s!%s@%s %s %s :%s", src->nick,
+                          src->ident, src->host[0] ? src->host : "mesh",
+                          wcmd, target, m_text);
+          else
+            sendrawto_one(memb->user, ":%s %s %s :%s",
+                          srcsrv ? cli_name(srcsrv) : srcyxx, wcmd, target, m_text);
+        }
     } else {                                              /* unicast delivery */
       struct Client *tgt = findNUser(target);
       if (tgt && MyConnect(tgt) && m_cmd[0] == 'K') {
