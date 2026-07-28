@@ -91,6 +91,8 @@
 #include "numeric.h"
 #include "numnicks.h"
 #include "send.h"
+#include "handlers.h"   /* Cluster A: crdt_route_services_reply_try */
+#include "ircd_snprintf.h"
 #include "s_user.h"
 
 /* #include <assert.h> -- Now using assert in ircd_log.h */
@@ -120,8 +122,17 @@ int ms_svsmode(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
     param[3] = NULL;
 
     set_user_mode(acptr, acptr, 3, param, ALLOWMODES_ANY | ALLOWMODES_SVSMODE);
-  } else
+  } else {
+    /* Cluster A: mesh-only home -> CR-X 'M' tunnel; mint at the mesh entry
+     * only (see m_svsjoin.c for the full rationale). */
+    if (!cptr || !IsServer(cptr) || !IsCrdtAware(cptr)) {
+      char xbody[BUFSIZE];
+      ircd_snprintf(0, xbody, sizeof(xbody), "%s%s %s",
+                    cli_yxx(cli_user(acptr)->server), cli_yxx(acptr), parv[2]);
+      crdt_route_services_reply_try(acptr, 'M', xbody);
+    }
     sendcmdto_serv_butone(sptr, CMD_SVSMODE, cptr, "%s %s", parv[1], parv[2]);
+  }
 
   return 0;
 }

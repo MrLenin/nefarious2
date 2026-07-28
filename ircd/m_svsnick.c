@@ -92,6 +92,8 @@
 #include "numeric.h"
 #include "numnicks.h"
 #include "send.h"
+#include "handlers.h"   /* Cluster A: crdt_route_services_reply_try */
+#include "ircd_snprintf.h"
 #include "sys.h"
 #include "s_misc.h"
 #include "s_user.h"
@@ -175,6 +177,17 @@ int ms_svsnick(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
   }
 
   set_nick_name(acptr, acptr, nick, parc, parv, 1);
+  /* Cluster A: unlike its siblings SVSNICK applies per-hop, but a MESH-ONLY
+   * home never hears the tree broadcast — its authoritative copy (and the doc
+   * nick op only the home mints) would keep the old nick.  Tunnel to the home
+   * over CR-X 'N'; the home re-injects, applies, and its doc op converges the
+   * rename everywhere.  Mint at the mesh entry only (see m_svsjoin.c). */
+  if ((!cptr || !IsServer(cptr) || !IsCrdtAware(cptr)) && !MyUser(acptr)) {
+    char xbody[BUFSIZE];
+    ircd_snprintf(0, xbody, sizeof(xbody), "%s%s %s",
+                  cli_yxx(cli_user(acptr)->server), cli_yxx(acptr), nick);
+    crdt_route_services_reply_try(acptr, 'N', xbody);
+  }
   sendcmdto_serv_butone(sptr, CMD_SVSNICK, cptr, "%s %s", parv[1], nick);
   return 0;
 }

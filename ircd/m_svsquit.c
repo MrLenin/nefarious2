@@ -32,6 +32,7 @@
 #include "msg.h"
 #include "numnicks.h"
 #include "send.h"
+#include "ircd_snprintf.h"   /* Cluster A tunnel body */
 #include "s_conf.h"
 #include "s_misc.h"
 #include "s_user.h"
@@ -55,6 +56,19 @@ int ms_svsquit(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
     return 0; /* Ignore svsquit for a user that has quit */
 
   if (!MyConnect(acptr)) {
+    /* Cluster A: mesh-only home -> CR-X 'D' tunnel; mint at the mesh entry
+     * only (see m_svsjoin.c for the full rationale). */
+    if (!cptr || !IsServer(cptr) || !IsCrdtAware(cptr)) {
+      char xbody[BUFSIZE];
+      if (parc > 1 && !BadPtr(parv[parc - 1]))
+        ircd_snprintf(0, xbody, sizeof(xbody), "%s%s :%s",
+                      cli_yxx(cli_user(acptr)->server), cli_yxx(acptr),
+                      parv[parc - 1]);
+      else
+        ircd_snprintf(0, xbody, sizeof(xbody), "%s%s",
+                      cli_yxx(cli_user(acptr)->server), cli_yxx(acptr));
+      crdt_route_services_reply_try(acptr, 'D', xbody);
+    }
     if (parc > 1 && !BadPtr(parv[parc - 1]))
       sendcmdto_serv_butone(sptr, CMD_SVSQUIT, cptr, "%C :%s", acptr, parv[parc - 1]);
     else

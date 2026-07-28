@@ -555,6 +555,14 @@ static void crdt_services_reemit(struct Client *srcsrv, struct Client *dsrv, cha
     case 'R': sendcmdto_one(src, CMD_REGREPLY, dsrv, "%s", body); break;
     case 'Q': sendcmdto_one(src, CMD_XQUERY,   dsrv, "%s", body); break;
     case 'Y': sendcmdto_one(src, CMD_XREPLY,   dsrv, "%s", body); break;
+    /* Cluster A: services force-commands toward a user homed on/behind @a dsrv */
+    case 'J': sendcmdto_one(src, CMD_SVSJOIN,  dsrv, "%s", body); break;
+    case 'P': sendcmdto_one(src, CMD_SVSPART,  dsrv, "%s", body); break;
+    case 'M': sendcmdto_one(src, CMD_SVSMODE,  dsrv, "%s", body); break;
+    case 'D': sendcmdto_one(src, CMD_SVSQUIT,  dsrv, "%s", body); break;
+    case 'N': sendcmdto_one(src, CMD_SVSNICK,  dsrv, "%s", body); break;
+    /* Cluster A: bouncer alias echo (BX E / BX M) toward a mesh-only alias home */
+    case 'B': sendcmdto_one(src, CMD_BOUNCER_TRANSFER, dsrv, "%s", body); break;
     /* 5-5f B3: chathistory federation frame (query or reply) leaving the mesh
      * for a legacy server we hold a live P10 link to.  This IS the return leg
      * of the gateway slice: the owner tunnels its replies addressed to the
@@ -627,6 +635,19 @@ static void crdt_services_reinject(char p10cmd, char *body)
     case 'R': ms_regreply(&me, &me, parc, parv); break;
     case 'Q': ms_xquery(&me, &me, parc, parv); break;
     case 'Y': ms_xreply(&me, &me, parc, parv); break;
+    /* Cluster A: services force-commands, re-injected at the target's home.
+     * All five apply via the TARGET (acptr) resolved from the body's numeric;
+     * sptr=&me is cosmetic in these handlers (verified per-handler). */
+    case 'J': ms_svsjoin(&me, &me, parc, parv); break;
+    case 'P': ms_svspart(&me, &me, parc, parv); break;
+    case 'M': ms_svsmode(&me, &me, parc, parv); break;
+    case 'D': ms_svsquit(&me, &me, parc, parv); break;
+    case 'N': ms_svsnick(&me, &me, parc, parv); break;
+    /* Cluster A: BX alias echo re-injected at the alias's home.  The BX
+     * dispatcher (bounce_handle_bt) routes on the subcommand letter in
+     * parv[1] and resolves targets from the body's numerics — no source
+     * gate, so a &me re-inject applies exactly like the P10 arrival. */
+    case 'B': ms_bouncer_transfer(&me, &me, parc, parv); break;
     /* 'G'/'V' (REGISTER/VERIFY) are forward-only to services -> never re-injected at a leaf */
     default: break;
   }

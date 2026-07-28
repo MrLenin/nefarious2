@@ -6919,11 +6919,20 @@ void bounce_echo_pm_to_session(struct Client *sender, struct Client *target,
                              "%s :%s", cli_name(target), text);
     } else {
       char nn[6];
+      char bxbody[BUFSIZE];
       ircd_snprintf(0, nn, sizeof(nn), "%s%s", NumNick(primary));
-      sendcmdto_one(&me, CMD_BOUNCER_TRANSFER, primary,
-          "E %s %s%s %s %s %s :%s",
+      /* S2S-audit Cluster A: a primary homed on a MESH-ONLY server never
+       * receives this tree-only echo — tunnel it over CR-X ('B'; the home
+       * re-injects into ms_bouncer_transfer).  reply_try self-gates, so a
+       * live P10 primary falls through to the unchanged send below. */
+      ircd_snprintf(0, bxbody, sizeof(bxbody), "E %s %s%s %s %s %s :%s",
           nn, NumNick(primary), tok, cli_name(target),
           msgid ? msgid : "*", text);
+      if (!crdt_route_services_reply_try(primary, 'B', bxbody))
+        sendcmdto_one(&me, CMD_BOUNCER_TRANSFER, primary,
+            "E %s %s%s %s %s %s :%s",
+            nn, NumNick(primary), tok, cli_name(target),
+            msgid ? msgid : "*", text);
     }
   }
 
@@ -6937,11 +6946,19 @@ void bounce_echo_pm_to_session(struct Client *sender, struct Client *target,
       sendcmdto_one_tags_ext(primary, cmd, tok, alias, msgid,
                              "%s :%s", cli_name(target), text);
     } else {
-      sendcmdto_one(&me, CMD_BOUNCER_TRANSFER, alias,
-          "E %s %s%s %s %s %s :%s",
+      char bxbody[BUFSIZE];
+      /* Cluster A: mesh-only alias home -> CR-X 'B' tunnel (see the primary
+       * echo above); self-gating, so a live P10 alias takes the P10 send. */
+      ircd_snprintf(0, bxbody, sizeof(bxbody), "E %s %s%s %s %s %s :%s",
           sess->hs_aliases[i].ba_numeric,
           NumNick(primary), tok, cli_name(target),
           msgid ? msgid : "*", text);
+      if (!crdt_route_services_reply_try(alias, 'B', bxbody))
+        sendcmdto_one(&me, CMD_BOUNCER_TRANSFER, alias,
+            "E %s %s%s %s %s %s :%s",
+            sess->hs_aliases[i].ba_numeric,
+            NumNick(primary), tok, cli_name(target),
+            msgid ? msgid : "*", text);
     }
   }
 }
@@ -9604,6 +9621,23 @@ forward_bxm_line(struct Client *sptr, struct Client *next_hop,
    * trailing param so we always pass at least up to whatever parv[]
    * carried.  The exact set of trailing params depends on whether
    * this is start / continuation / concat / end. */
+  /* S2S-audit Cluster A: a next_hop that is mesh-only can't be reached by
+   * the P10 re-emit below — rebuild the line verbatim and tunnel it over
+   * CR-X ('B', re-injected into ms_bouncer_transfer at the home).  Faithful
+   * rebuild: only the trailing param may contain spaces, so joining
+   * parv[1..parc-2] with the last as ':<trail>' round-trips any of the
+   * shapes below (the forward_fed_reply pattern). */
+  if (parc >= 5 && next_hop && IsMeshStub(next_hop)) {
+    char bxbody[BUFSIZE];
+    char *out = bxbody;
+    char *end = bxbody + sizeof(bxbody);
+    int i;
+    for (i = 1; i < parc - 1; i++)
+      out += ircd_snprintf(0, out, end - out, "%s%s", i > 1 ? " " : "", parv[i]);
+    ircd_snprintf(0, out, end - out, " :%s", parv[parc - 1]);
+    if (crdt_route_services_reply_try(next_hop, 'B', bxbody))
+      return;
+  }
   switch (parc) {
   case 5:
     sendcmdto_one(sptr, CMD_BOUNCER_TRANSFER, next_hop,

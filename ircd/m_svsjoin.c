@@ -42,6 +42,8 @@
 #include "s_debug.h"
 #include "s_user.h"
 #include "send.h"
+#include "handlers.h"   /* Cluster A: crdt_route_services_reply_try */
+#include "ircd_snprintf.h"
 #include "sys.h"
 
 /* #include <assert.h> -- Now using assert in ircd_log.h */
@@ -121,6 +123,21 @@ int ms_svsjoin(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
       return 0; /* Ignore SVSNICK for a user that has quit */
 
   if (!MyUser(acptr)) {
+    /* S2S-audit Cluster A: a target homed on a MESH-ONLY server is
+     * unreachable by the tree broadcast below — tunnel the command to its
+     * home over CR-X ('J'; the home re-injects into this handler).  Mint
+     * ONLY at the mesh entry (local origin or arrival from a non-CRDT
+     * link = the §17.7 gateway edge — the ci_broadcast precedent): a relay
+     * arriving from a CRDT-aware peer means the entry node already
+     * tunneled, and per-hop re-mints would deliver N times (each mint gets
+     * its own msgid, so CR-X dedup cannot collapse them).  reply_try
+     * self-gates: a live P10 home returns 0 and the broadcast carries it. */
+    if (!cptr || !IsServer(cptr) || !IsCrdtAware(cptr)) {
+      char xbody[BUFSIZE];
+      ircd_snprintf(0, xbody, sizeof(xbody), "%s%s %s",
+                    cli_yxx(cli_user(acptr)->server), cli_yxx(acptr), parv[2]);
+      crdt_route_services_reply_try(acptr, 'J', xbody);
+    }
     sendcmdto_serv_butone(sptr, CMD_SVSJOIN, cptr, "%C %s", acptr, parv[2]);
     return 0;
   }
