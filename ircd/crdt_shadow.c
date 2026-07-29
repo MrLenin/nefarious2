@@ -4325,15 +4325,19 @@ static void mat_member_cb(const char *key, uint32_t key_len, void *ctx)
   mr = (sv && sv->data_len == sizeof(struct CrdtMemberRecord))
          ? (const struct CrdtMemberRecord *)sv->data : NULL;
   live_status = compact_status(m->status);
-  /* a plain member with no status entry is fine; otherwise must match */
+  /* a plain member with no status entry is fine; otherwise must match.
+   * Oplevel is compared only while OPPED (it is op-grant-scoped data; for a
+   * non-op it is path-dependent junk) — mirrors the reconcile's rule. */
   if ((!mr && live_status != 0) ||
       (mr && (mr->status != live_status ||
-              mr->oplevel != (uint16_t)m->oplevel))) {
+              ((mr->status & CRDT_MEMBER_OP) &&
+               mr->oplevel != (uint16_t)m->oplevel)))) {
     (*c->gaps)++;
     if ((*c->logged)++ < MAT_LOG_CAP)
       log_write(LS_SYSTEM, L_NOTICE, 0,
-                "CRDT mat-check gap: %s member %s status doc=%u live=%u",
-                c->chname, numbuf, mr ? mr->status : 0, live_status);
+                "CRDT mat-check gap: %s member %s status doc=%u/%u live=%u/%u",
+                c->chname, numbuf, mr ? mr->status : 0,
+                mr ? mr->oplevel : 0, live_status, (unsigned)m->oplevel);
   }
 }
 
@@ -5524,8 +5528,19 @@ static void reconcile_mstatus_cb(const char *key, uint32_t key_len,
   mr = (const struct CrdtMemberRecord *)val->data;
   doc_st  = expand_status(mr->status) & CHFL_VOICED_OR_OPPED;
   live_st = m->status & CHFL_VOICED_OR_OPPED;
-  if (doc_st == live_st)
-    return;                              /* in sync — echo guard */
+  if (doc_st == live_st) {
+    /* Status in sync — but the OPLEVEL can still drift (OPLEVELS bed finding
+     * 2026-07-29: P10-CREATE-path nodes held the create-time level while the
+     * owner's member became manager-level at +A; this echo guard hid it while
+     * the mat-check compares oplevel → permanent flagged gap).  Oplevel is
+     * meaningful only while opped; correct the local bookkeeping silently —
+     * no wire emission, oplevel rides op GRANTS, not standalone MODE. */
+    if ((doc_st & CHFL_CHANOP) && m->oplevel != mr->oplevel) {
+      m->oplevel = mr->oplevel;
+      (*c->changed)++;
+    }
+    return;                              /* echo guard */
+  }
   added   = doc_st  & ~live_st;
   removed = live_st & ~doc_st;
   /* drive live DIRECTLY (modebuf_mode_client does not set member->status) */
