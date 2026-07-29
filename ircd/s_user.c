@@ -2410,9 +2410,8 @@ int set_user_mode(struct Client *cptr, struct Client *sptr, int parc,
           if (MyUser(acptr)) {
             struct BouncerSession *session = bounce_get_session(acptr);
             if (session) {
-              session->hs_client = NULL;
               bounce_broadcast(session, 'X', NULL);
-              bounce_destroy(session);
+              bounce_destroy_owned(session);  /* tombstone-then-unanchor */
             }
           }
         }

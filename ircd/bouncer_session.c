@@ -1947,6 +1947,26 @@ int bounce_detach(struct BouncerSession *session)
   return 0;
 }
 
+/** Destroy an OWNED session whose primary the CALLER is about to detach or
+ * has already snapshotted: mints the doc tombstones while hs_client still
+ * proves ownership, THEN unanchors and destroys.  Use this instead of the
+ * "session->hs_client = NULL; bounce_destroy(session);" pattern — that NULL
+ * silently defeated bounce_destroy's MyConnect single-writer gate, so the
+ * bsess/blease doc records never tombstoned and orphaned network-wide (the
+ * M3 election-divergence noise found via ORESET/SET-HOLD-off, 2026-07-29;
+ * five call sites swept). */
+void bounce_destroy_owned(struct BouncerSession *session)
+{
+  assert(0 != session);
+  if (feature_bool(FEAT_CRDT_PRIMARY) && session->hs_client
+      && MyConnect(session->hs_client)) {
+    crdt_shadow_bsess_remove(session->hs_account, session->hs_sessid);
+    crdt_shadow_blease_remove(session->hs_account, session->hs_sessid);  /* M5 */
+  }
+  session->hs_client = NULL;   /* unanchor: later exit passes skip session cleanup */
+  bounce_destroy(session);     /* its own gate no-ops now (hs_client NULL) */
+}
+
 /** Destroy a session entirely. */
 void bounce_destroy(struct BouncerSession *session)
 {
@@ -2021,15 +2041,12 @@ void bounce_kill_session(struct BouncerSession *session, const char *comment)
     }
   }
 
-  /* Clear hs_client so the primary's subsequent exit_one_client pass
-   * (in m_kill's exit_client_msg) sees the session as already
-   * unanchored and skips its own cleanup branch. */
-  session->hs_client = NULL;
-
   /* Broadcast 'X' so IRCv3-aware peers tear down their session view. */
   bounce_broadcast(session, 'X', NULL);
 
-  bounce_destroy(session);
+  /* Tombstone-then-unanchor (hs_client cleared inside so the primary's
+   * subsequent exit_one_client pass skips its own cleanup branch). */
+  bounce_destroy_owned(session);
 }
 
 /** Set a session's user-assigned name. */

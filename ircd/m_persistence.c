@@ -237,9 +237,8 @@ static int persistence_cmd_set(struct Client *sptr, int parc, char *parv[])
     {
       struct BouncerSession *session = bounce_get_session(sptr);
       if (session) {
-        session->hs_client = NULL;
         bounce_broadcast(session, 'X', NULL);
-        bounce_destroy(session);
+        bounce_destroy_owned(session);  /* tombstone-then-unanchor */
       }
     }
     send_persistence_reply(sptr, "SET", "OFF");
@@ -791,12 +790,11 @@ static int persistence_cmd_detach(struct Client *sptr, int parc, char *parv[])
   sendcmdto_serv_butone_v3(&me, CMD_METADATA, NULL, "%s %s P :0",
                            cli_name(sptr), "draft/persistence/hold");
 
-  /* Detach our primary from the session before destroy so
-   * exit_one_client cleanup doesn't try to operate on a destroyed
-   * session later (matches the SET OFF path). */
-  session->hs_client = NULL;
   bounce_broadcast(session, 'X', NULL);
-  bounce_destroy(session);
+  /* Tombstone-then-unanchor (detaches our primary inside so
+   * exit_one_client cleanup doesn't operate on a destroyed session;
+   * matches the SET OFF path). */
+  bounce_destroy_owned(session);
 
   send_persistence_reply(sptr, "DETACH", "OK");
   /* STATUS now resolves to OFF (no session, hold=0). */

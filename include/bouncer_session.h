@@ -754,6 +754,11 @@ extern int bounce_detach(struct BouncerSession *session);
  * @param[in] session Session to destroy.
  */
 extern void bounce_destroy(struct BouncerSession *session);
+/* Tombstone-then-unanchor destroy for an OWNED session (mints the bsess/blease
+ * doc tombstones while hs_client still proves ownership, then NULLs it and
+ * destroys).  Replaces the "hs_client = NULL; bounce_destroy()" pattern, which
+ * silently skipped the tombstones (orphan doc records, 2026-07-29). */
+extern void bounce_destroy_owned(struct BouncerSession *session);
 
 /** Force-destroy a session because its primary was network-KILLed
  * (invariant #12: KILL ends the whole session).  Exits every alias

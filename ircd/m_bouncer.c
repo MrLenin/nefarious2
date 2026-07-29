@@ -767,11 +767,10 @@ static int bouncer_set(struct Client *sptr, int parc, char *parv[])
       {
         struct BouncerSession *session = bounce_get_session(sptr);
         if (session) {
-          /* Detach primary before destroy so exit_one_client doesn't
-           * try to clean up a destroyed session later. */
-          session->hs_client = NULL;
           bounce_broadcast(session, 'X', NULL);
-          bounce_destroy(session);
+          /* Tombstone-then-unanchor (detaches primary inside so
+           * exit_one_client doesn't clean up a destroyed session). */
+          bounce_destroy_owned(session);
         }
       }
 
