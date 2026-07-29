@@ -1067,9 +1067,18 @@ void crdt_shadow_own_user_sweep(void)
   if (!shadow_on() || !feature_bool(FEAT_CRDT_OWNER_SWEEP))
     return;
   for (acptr = GlobalClientList; acptr; acptr = cli_next(acptr))
-    if (IsServer(acptr) && IsBurstOrBurstAck(acptr))
-      return;                              /* resync in flight — defer the pass
-                                            * (pending survives, so no debounce reset) */
+    if (MyConnect(acptr) && IsServer(acptr) && IsBurstOrBurstAck(acptr))
+      return;                              /* resync in flight on a DIRECT link — defer the
+                                            * pass (pending survives, so no debounce reset).
+                                            * MyConnect-scoped, NOT global: x3.services never
+                                            * sends EB and sits perpetually in burst, so the
+                                            * old any-server gate permanently DISABLED this
+                                            * sweep on any node with a legacy path to services
+                                            * (the same lesson reconcile_users' per-user burst
+                                            * guard already encodes).  Found via the immortal
+                                            * "ADAAN in doc, not live" held-ghost residue,
+                                            * 2026-07-29.  Only a direct peer's burst can be
+                                            * an inbound resync of state this sweep reads. */
   c.me = (uint16_t)base64toint(cli_yxx(&me));
   c.n = 0;
   crdt_lwwmap_foreach(&g_crdt.users, own_sweep_collect_cb, &c);
