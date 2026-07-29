@@ -109,8 +109,14 @@ int ms_mark(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
 
   /* Accept a beyond-horizon mesh anchor too: X3 sources every MARK from its
    * server numeric, which resolves to the anchor on a tree-retired leaf
-   * (parse.c only admits it off a trusted CRDT server link). */
-  if (!IsServer(sptr) && !IsMeshStub(sptr))
+   * (parse.c only admits it off a trusted CRDT server link).
+   * Accept IsMe too (mirror of ms_account's exemption): the F1-b user
+   * reconcile re-drives MARK cversion/sslfp/geoip with sptr=&me
+   * (crdt_reconcile_user_update) — &me is STAT_ME, not STAT_SERVER, so
+   * without this every reconcile MARK drive was wallops'd as a protocol
+   * violation AND dropped (the leaf4/leaf5 "MARK from non-server
+   * leafN" wallops spam, and dead cversion/sslfp/geoip convergence). */
+  if (!IsServer(sptr) && !IsMeshStub(sptr) && !IsMe(sptr))
     return protocol_violation(sptr, "MARK from non-server %s", cli_name(sptr));
 
   if (!strcmp(parv[2], MARK_WEBIRC)) {
