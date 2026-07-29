@@ -192,8 +192,13 @@ On a CRDT-server SQUIT, instead of cascade-tombstoning, the departed server is K
    SV dedup) reconciles content. Fix A is the trigger. If you change anti-entropy, preserve this.
 7. **`ctime` (channel creationtime) is a MIN-register incarnation, NOT LWW.** IRC is lower-TS-wins; LWW
    converges to the higher TS → permanent split. Merge = max(del_hlc) + min(value) within the surviving
-   incarnation; `ctime_del` is per-server-local (digest hashes only the live value). Reconcile-create +
-   materialize require a LIVE ctime (`>0`), not just members>0 (the ts=0-zombie guard).
+   incarnation; the DIGEST hashes only the live value, but `ctime_del` IS carried on the CR F wire
+   (crdt_wire.c). Reconcile-create + materialize require a LIVE ctime (`>0`), not just members>0 (the
+   ts=0-zombie guard). **A channel destruct caused by stub/anchor-retirement reap (path loss, members
+   alive elsewhere and never doc-tombstoned) must NOT bump the local incarnation — it would be
+   permanently dead here (the tombstone-clears branch never resolves for members that never leave);
+   the reachability-destruct bracket (`crdt_shadow_reachability_reap_begin/end`, 74cbf1b) suppresses
+   the bump so reconcile-create resurrects post-heal (the #TheOps finding, 2026-07-29).**
 8. **The full-walk reconcile is load-bearing — don't scope it prematurely.** Reconciling the WHOLE doc
    on every delta is what makes out-of-order cross-entity deltas robust (a member-op arriving before the
    user-op it references; whichever lands later re-runs everything). Scoped per-collection reconcile
