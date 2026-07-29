@@ -833,8 +833,20 @@ int mr_crdtmesh(struct Client* cptr, struct Client* sptr, int parc, char* parv[]
   log_write(LS_NETWORK, L_NOTICE, 0, "CRDTMESH: overlay link up with %s [%s]",
             cli_name(cptr), parv[2]);
 
+  /* MR-6-0: link-establishment parity with server_finish_burst — hand the
+   * fresh overlay peer the full current beacon set NOW.  LOAD-BEARING, not
+   * just latency: Case-B anchor materialization requires a FRESH beacon, so
+   * an overlay-only peer without this sits blind (far servers' users
+   * unmaterializable) until the periodic 30s flood reaches it.  Sent BEFORE
+   * the sync pull so the CR S reply's materializations already see fresh
+   * beacons.  Both sides run this handler. */
+  crdt_shadow_beacon_burst(cptr);
+
   /* Pull the peer's state immediately (CR S -> peer replies with delta/snapshot);
-   * the 30s anti-entropy timer also covers this. */
+   * the 30s anti-entropy timer also covers this.  Convergence is bidirectional
+   * within one RTT (both sides pull); an unsolicited eager CR F push is
+   * deliberately NOT sent — the CR S reply already escalates to a snapshot
+   * when the requester is below gc_floor or digest-diverged (Fix A). */
   crdt_sync_request(cptr);
 
   return IsDead(cptr) ? CPTR_KILLED : 0;

@@ -38,6 +38,8 @@
 #include "list.h"
 #include "msg.h"
 #include "numnicks.h"
+#include "s_bsd.h"    /* MR-6-0: connect_overlay (/CRDT link) */
+#include "s_conf.h"   /* MR-6-0: GlobalConfList / CONF_CRDTMESH */
 #include "send.h"
 #include "struct.h"
 
@@ -356,6 +358,55 @@ int mo_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
                       "%C :CRDT decommission: refused — %s is %s", sptr, srvnum,
                       rc == 1 ? "present/linked" : "mesh-reachable (beacon fresh)");
       }
+      break;
+    }
+    case 'l': {   /* link <server> — force an overlay (re)connect NOW (MR-6-0):
+                   * try_connections only retries overlays on the CONNECTFREQUENCY
+                   * cycle (up to ~10 min), and oper CONNECT can't target one (it
+                   * resolves the canonical P10 server of the same name). */
+      const char *arg = (parc > 2 && parv[2][0]) ? parv[2] : NULL;
+      struct ConfItem *aconf;
+      struct Client *ov;
+      if (!arg) {
+        sendcmdto_one(&me, CMD_NOTICE, sptr, "%C :Usage: CRDT link <server>",
+                      sptr);
+        break;
+      }
+      for (aconf = GlobalConfList; aconf; aconf = aconf->next)
+        if ((aconf->status & CONF_SERVER) && (aconf->flags & CONF_CRDTMESH) &&
+            0 == ircd_strcmp(aconf->name, arg))
+          break;
+      if (!aconf) {
+        sendcmdto_one(&me, CMD_NOTICE, sptr,
+                      "%C :CRDT link: no overlay Connect block for '%s'", sptr,
+                      arg);
+        break;
+      }
+      /* Dedupe like try_connections: the canonical P10 server of this name
+       * legitimately exists (the overlay is a redundant, unhashed edge) — scan
+       * for a live/in-progress overlay instead of FindServer. */
+      for (ov = GlobalClientList; ov; ov = cli_next(ov))
+        if (IsCrdtOverlay(ov) && MyConnect(ov) && !IsDead(ov) &&
+            0 == ircd_strcmp(cli_name(ov), aconf->name))
+          break;
+      if (ov) {
+        sendcmdto_one(&me, CMD_NOTICE, sptr,
+                      "%C :CRDT link: overlay to %s already up/connecting",
+                      sptr, arg);
+        break;
+      }
+      aconf->hold = 0;                        /* cancel autoconnect backoff */
+      if (connect_overlay(aconf, 0)) {
+        sendto_opmask_butone(0, SNO_OLDSNO,
+                             "CRDT mesh overlay to %s activated by %s.",
+                             aconf->name, cli_name(sptr));
+        sendcmdto_one(&me, CMD_NOTICE, sptr,
+                      "%C :CRDT link: connecting overlay to %s", sptr, arg);
+      } else
+        sendcmdto_one(&me, CMD_NOTICE, sptr,
+                      "%C :CRDT link: connect to %s did not start "
+                      "(DNS pending or connect failure — see server notices)",
+                      sptr, arg);
       break;
     }
     case 'k': {   /* key <account> <metakey> — raw doc metadata entry + HLC */
