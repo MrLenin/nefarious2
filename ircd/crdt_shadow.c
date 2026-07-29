@@ -617,10 +617,27 @@ void crdt_shadow_kick(struct Channel *chptr, struct Client *who,
   crdt_sync_push();
 }
 
+/* Reachability-destruct bracket: set while crdt_shadow_retire_mesh_stub reaps
+ * a stub/anchor's users.  A channel destruct inside the bracket is MECHANICAL
+ * (this node lost its path to the members), not semantic: the doc members
+ * remain present (alive elsewhere; single-writer forbids us tombstoning them),
+ * so bumping the local ctime incarnation would kill the channel HERE
+ * permanently — invariant 7's "stays dead until the tombstone clears the
+ * member" branch never resolves for members that never actually leave (the
+ * #TheOps/#OperServ/#MrSnoopy service-channel finding from the nick-collision
+ * partition gate, 2026-07-29).  Skipping the bump keeps the doc ctime
+ * incarnation live locally so reconcile-create resurrects the channel from
+ * the doc post-heal. */
+static int g_reachability_destruct;
+void crdt_shadow_reachability_reap_begin(void) { g_reachability_destruct++; }
+void crdt_shadow_reachability_reap_end(void)   { g_reachability_destruct--; }
+
 void crdt_shadow_channel_destroy(struct Channel *chptr)
 {
   if (!shadow_on())
     return;
+  if (g_reachability_destruct)
+    return;   /* mechanical destruct (reachability loss) — see bracket above */
   /* Phase 3j: bump the LOCAL ctime incarnation marker so a later recreate to a
    * HIGHER TS is not resurrected to this incarnation's (lower) creationtime.
    * Local-only (no op recorded); the next create's set-op carries the new

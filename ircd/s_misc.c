@@ -819,6 +819,11 @@ void crdt_shadow_retire_mesh_stub(struct Client *stub, const char *comment)
     sendcmdto_flag_serv_butone(&me, CMD_SQUIT, NULL, FLAG_LAST_FLAG, FLAG_CRDT_AWARE,
                                "%s %Tu :%s", cli_name(stub),
                                cli_serv(stub)->timestamp, comment);
+  /* Reachability-destruct bracket: channel destructs caused by this reap are
+   * mechanical (path loss), not semantic — suppress the local ctime-incarnation
+   * bump so the channels can resurrect from the doc post-heal (see
+   * crdt_shadow_reachability_reap_begin in crdt_shadow.c). */
+  crdt_shadow_reachability_reap_begin();
   acptrp = cli_serv(stub)->client_list;
   for (i = 0; i <= cli_serv(stub)->nn_mask; ++acptrp, ++i)
     if (*acptrp)
@@ -828,6 +833,7 @@ void crdt_shadow_retire_mesh_stub(struct Client *stub, const char *comment)
   /* Case B synthetic anchor (updown == NULL): leave STAT_MESH_SERVER -> exit_one_client
    * skips the remove_dlink branch but still ClearServerYXX's the slot + frees. */
   exit_one_client(stub, comment);
+  crdt_shadow_reachability_reap_end();
 }
 
 /* exit_client, rewritten 25-9-94 by Run */

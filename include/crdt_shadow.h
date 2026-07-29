@@ -289,6 +289,10 @@ void crdt_shadow_convert_to_stub(struct Client *srv);
  *  + its server_list[] slot.  Call BEFORE the relinking peer re-registers its
  *  numeric (SetServerYXX), so the slot is clean. */
 void crdt_shadow_retire_mesh_stub(struct Client *stub, const char *comment);
+/* Reachability-destruct bracket (stub/anchor reap): channel destructs inside it
+ * skip the local ctime-incarnation bump so doc resurrection stays possible. */
+void crdt_shadow_reachability_reap_begin(void);
+void crdt_shadow_reachability_reap_end(void);
 
 /** Tier2 T2-b: doc lookup of a user record by 5-char numeric (CR M source-prefix
  *  reconstruction).  Returns NULL if absent / not initialised. */
