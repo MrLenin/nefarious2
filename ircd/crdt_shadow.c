@@ -5061,6 +5061,28 @@ static void crdt_reconcile_user_update(struct Client *live,
       c->attr++;
     }
   }
+  /* Derived-host convergence: the displayed host and the cloak modes (C/c) are
+   * DERIVED state — the umode delta can't drive param'd modes (their values
+   * aren't in the record) and no clause drives host directly, so a copy
+   * materialized from a half-intro record (flags minted before register_user
+   * derived cloak/hidden-host) could never converge.  Re-run the local
+   * derivation instead: cloaks compute from ip + the shared keys (owner-
+   * identical), and hide_hostmask applies the style host with proper CHGHOST
+   * emission, self-nooping when already converged.  Runs AFTER the umode and
+   * account clauses so +x/account landed this same tick. */
+  if ((strchr(rec->umodes, 'C') && !IsCloakHost(live)) ||
+      (strchr(rec->umodes, 'c') && !IsCloakIP(live))) {
+    user_setcloaked(live);
+    c->attr++;
+  }
+  if (IsHiddenHost(live) &&
+      ircd_strcmp(cli_user(live)->host, rec->host) != 0) {
+    char prevh[HOSTLEN + 1];
+    ircd_strncpy(prevh, cli_user(live)->host, HOSTLEN + 1);
+    hide_hostmask(live);
+    if (ircd_strcmp(prevh, cli_user(live)->host) != 0)
+      c->attr++;
+  }
   /* F1-b: MARK state (CVERSION / SSLCLIFP / GEOIP).  All SERVER-sourced -> sptr=&me.
    * ★ ms_mark resolves its target via FindUser (by NICK), NOT findNUser (numeric) like
    * SVSIDENT/SWHOIS — so parv[1] = cli_name(live), never numbuf.  skip_crdt one-shot =

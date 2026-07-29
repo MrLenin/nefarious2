@@ -2716,8 +2716,14 @@ int set_user_mode(struct Client *cptr, struct Client *sptr, int parc,
 
   /* Phase 3b CRDT shadow: refresh the user record so post-registration umode
    * changes (local /mode, S2S MODE, oper-up) stay reflected in the doc.
-   * Gated + idempotent; single-writer gate skips CRDT-peer-originated changes. */
-  crdt_shadow_user_add(acptr);
+   * Gated + idempotent; single-writer gate skips CRDT-peer-originated changes.
+   * IsRegistered: set_nick_name applies burst-intro umodes through here BEFORE
+   * register_user derives cloak/hidden-host — minting that half-intro snapshot
+   * (flags already +xrCc, host still raw) poisons doc-materialized copies on
+   * mesh peers (host/cloaks aren't delta-driveable); the register_user tail
+   * mints moments later with fully-derived state. */
+  if (IsRegistered(acptr))
+    crdt_shadow_user_add(acptr);
 
   return 0;
 }
