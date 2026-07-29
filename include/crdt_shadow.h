@@ -430,6 +430,11 @@ void crdt_shadow_metadata_set(const char *account, const char *key,
 void crdt_shadow_metadata_remove_key(const void *key, uint32_t klen);
 void crdt_shadow_reconcile_metadata(void);
 void crdt_shadow_metadata_suspend(int on);
+/** Oper diagnostic (/CRDT key): print the raw doc metadata entry for
+ *  (account, key) — value, HLC, writer, and HLC-vs-wallclock delta (a positive
+ *  delta = future-minted entry that beats present-time writes). Read-only. */
+void crdt_shadow_diag_metadata_entry(struct Client *sptr, const char *account,
+                                     const char *key);
 
 /** Global-state track (GLINE step 2 shadow-write): mirror a global G-line into the
  *  GLINES doc collection (keyed by its ban mask). Called from the canonical gline.c

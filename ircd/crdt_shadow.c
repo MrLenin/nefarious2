@@ -3092,6 +3092,49 @@ void crdt_shadow_metadata_remove_key(const void *key, uint32_t klen)
   crdt_sync_push();
 }
 
+/* Oper diagnostic (/CRDT key <account> <metakey>): print the raw doc entry —
+ * value bytes, HLC (physical/logical/node), writer, and the delta between the
+ * entry's HLC physical and this node's wall clock.  Read-only.  Exists to make
+ * LWW losses observable from the outside: a positive delta means the entry was
+ * minted with a FUTURE clock (clockstep residue etc.) and silently beats every
+ * present-time write — the draft/persistence/hold "0" reversion hunt, 2026-07-29. */
+void crdt_shadow_diag_metadata_entry(struct Client *sptr, const char *account,
+                                     const char *key)
+{
+  char dk[CHANNELLEN + METADATA_KEY_LEN + 4];
+  uint32_t klen;
+  const struct CrdtLWWValue *v;
+  if (!shadow_on()) {
+    sendcmdto_one(&me, CMD_NOTICE, sptr, "%C :CRDT key: shadow not active", sptr);
+    return;
+  }
+  klen = metadata_doc_key(account, key, dk, sizeof dk);
+  if (!klen) {
+    sendcmdto_one(&me, CMD_NOTICE, sptr, "%C :CRDT key: bad account/key", sptr);
+    return;
+  }
+  v = crdt_metadata_get(&g_crdt, dk, klen);
+  if (v && v->data) {
+    unsigned long long now_ms = (unsigned long long)CurrentTime * 1000ULL;
+    long long delta = (long long)v->ts.physical_ms - (long long)now_ms;
+    sendcmdto_one(&me, CMD_NOTICE, sptr,
+                  "%C :CRDT key %s/%s = \"%.*s\" hlc=%llu.%u node=%u writer=%u "
+                  "delta_ms=%lld%s",
+                  sptr, account, key,
+                  (int)(v->data_len > 64 ? 64 : v->data_len), (const char *)v->data,
+                  (unsigned long long)v->ts.physical_ms, (unsigned)v->ts.logical,
+                  (unsigned)v->ts.node_id, (unsigned)v->writer, delta,
+                  delta > 0 ? " (FUTURE — wins over present-time writes)" : "");
+  } else if (crdt_metadata_is_explicitly_removed(&g_crdt, dk, klen)) {
+    sendcmdto_one(&me, CMD_NOTICE, sptr,
+                  "%C :CRDT key %s/%s = TOMBSTONE (explicitly removed)",
+                  sptr, account, key);
+  } else {
+    sendcmdto_one(&me, CMD_NOTICE, sptr, "%C :CRDT key %s/%s = absent",
+                  sptr, account, key);
+  }
+}
+
 /* SET heal/backfill: for each PRESENT doc metadata entry, drive it into metadata_cf as a
  * permanent value if the store copy is missing or differs (echo-guarded so a
  * P10-delivered value isn't bounced back + no write churn). Runs under

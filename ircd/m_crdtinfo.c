@@ -358,6 +358,15 @@ int mo_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
       }
       break;
     }
+    case 'k': {   /* key <account> <metakey> — raw doc metadata entry + HLC */
+      if (parc < 4) {
+        sendcmdto_one(&me, CMD_NOTICE, sptr,
+                      "%C :Usage: CRDT key <account> <metakey>", sptr);
+        break;
+      }
+      crdt_shadow_diag_metadata_entry(sptr, parv[2], parv[3]);
+      break;
+    }
 #ifdef DEBUGMODE
     case 'c': {   /* clockstep <±secs> — DEBUG-only relative wall-clock step */
       int step = (parc > 2 && parv[2]) ? atoi(parv[2]) : 0;
