@@ -1395,6 +1395,10 @@ extern void bounce_mark_dirty(struct Client *cptr);
  *  owns into the CRDT BSESSIONS doc collection.  Called from the verify timer; single-
  *  writer (only the primary holder writes its own sessions). Shadow-only (not read). */
 extern void bounce_crdt_bsess_sweep(void);
+/* Eager per-session M2/M4 doc mirror (self-gating single-writer) — call after
+ * any session mutation for sub-second cross-mesh convergence; the 30s sweep
+ * remains the catch-all + carries the M3/M4 diagnostics and M5/M6d lease. */
+extern int bounce_crdt_bsess_mint_one(struct BouncerSession *s, int *conns);
 
 /** 5-5e M6a-3: the REMOVAL half of the doc->live materializer — tears down a
  *  replica session once its owner tombstones the bsessions doc record.  Makes

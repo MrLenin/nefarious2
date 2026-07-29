@@ -1484,6 +1484,26 @@ int bounce_create(struct Client *cptr, struct BouncerSession **out)
   /* Persist to MDBX (session created but no channels yet) */
   bounce_db_put(session);
 
+  bounce_crdt_bsess_mint_one(session, NULL);  /* eager doc mirror (vs 30s tick) */
+
+  /* Eager M5 lease claim for a FRESH session: consumers' replica creation
+   * gates on the lease (reconcile_bsess_cb), and with the claim sweep-only a
+   * new session's replicas materialized only at the next 30s tick (~19s
+   * measured).  A create-time claim is uncontested by construction (no prior
+   * doc lease for a fresh sessid); crdt_blease_decide still arbitrates — if a
+   * FRESH holder somehow has the lease (heal race) it returns <0 and we do
+   * NOT claim here: the conflict path (M6d stand-down) stays timer-paced. */
+  if (feature_bool(FEAT_CRDT_PRIMARY)) {
+    uint16_t myn = (uint16_t)base64toint(cli_yxx(&me));
+    const struct CrdtBouncerLease *cur =
+        crdt_shadow_blease_get(session->hs_account, session->hs_sessid);
+    int cur_fresh = cur ? crdt_shadow_server_beacon_fresh(cur->host) : 0;
+    long gen = crdt_blease_decide(cur, cur_fresh, myn);
+    if (gen >= 0)
+      crdt_shadow_blease_claim(session->hs_account, session->hs_sessid, myn,
+                               (uint32_t)gen, (uint64_t)CurrentTime);
+  }
+
   *out = session;
   return 0;
 }
@@ -1822,6 +1842,8 @@ int bounce_attach(struct BouncerSession *session, struct Client *cptr)
    * effective away so any prior auto-away or stale aggregate clears. */
   bounce_recompute_session_away(session);
 
+  bounce_crdt_bsess_mint_one(session, NULL);  /* eager doc mirror (vs 30s tick) */
+
   return 0;
 }
 
@@ -2133,6 +2155,82 @@ struct BouncerSession *bounce_create_replica_from_doc(
  * is digested, but nothing READS it for behavior yet (M6 cutover flips that).  Called
  * each verify cycle, so it uniformly captures create/promote/hold/count changes without
  * touching the ~10 scattered hs_state assignment sites in the battle-tested core. */
+/* Eager-mint: mirror ONE session's M2 record + M4 me-hosted connection roster
+ * into the doc.  Extracted from bounce_crdt_bsess_sweep so session-MUTATION
+ * sites (create/attach/hold/revive/promote/rebind/oper-grant/SET HOLD) can
+ * mint eagerly — sub-second cross-mesh convergence instead of the 30s verify
+ * tick; the measured 13-31s bsess E2E was almost entirely mint-wait (the
+ * consumer side reconciles per-delta already).  Self-gating (single-writer:
+ * only the MyConnect primary holder writes the record, only the alias host
+ * writes its bconn; DESTROYING skipped) so it is safe to call from any state
+ * and idempotent under LWW.  The M3/M4 de-risk diagnostics and the M5 lease +
+ * M6d stand-down are deliberately NOT here: they encode settled-state heal
+ * semantics and stay timer-only in the sweep.  Returns 1 if the session
+ * record was minted; *conns (when non-NULL) accumulates bconn mints. */
+int bounce_crdt_bsess_mint_one(struct BouncerSession *s, int *conns)
+{
+  int minted = 0;
+  uint16_t myn;
+  const char *me_yxx;
+  int a;
+  if (!feature_bool(FEAT_CRDT_PRIMARY) || !s || s->hs_state == BOUNCE_DESTROYING)
+    return 0;
+
+  /* M2: the session record — single-writer = the PRIMARY holder. */
+  if (s->hs_client && MyConnect(s->hs_client)) {
+    struct CrdtBouncerSession rec;
+    memset(&rec, 0, sizeof rec);
+    ircd_strncpy(rec.token, s->hs_token, sizeof rec.token);
+    ircd_strncpy(rec.name,  s->hs_name,  sizeof rec.name);
+    rec.created       = (uint64_t)s->hs_created;
+    rec.last_active   = (uint64_t)s->hs_last_active;
+    rec.total_active  = (uint64_t)s->hs_total_active;
+    rec.attach_count  = s->hs_attach_count;
+    rec.connect_count = s->hs_connect_count;
+    rec.state         = (uint8_t)s->hs_state;
+    rec.hold_override = (int8_t)s->hs_hold_override;
+    /* M6b-2 BS O: carry the session-anchored oper grant doc-native so a
+     * replica/gateway that materializes (or revives) this session from
+     * the doc retains it — without this, a doc-materialized session loses
+     * the grant and a later promote/revive comes back non-oper.  Empty
+     * hs_oper_name = not opered; the field stays zeroed (memset above). */
+    ircd_strncpy(rec.oper_name, s->hs_oper_name, sizeof rec.oper_name);
+    rec.oper_granted_at = (uint64_t)s->hs_oper_granted_at;
+    crdt_shadow_bsess_set(s->hs_account, s->hs_sessid, &rec);
+    minted = 1;
+  }
+
+  /* M4: connection roster — each node mirrors the connections IT hosts
+   * (single-writer per connection = its host). */
+  myn = (uint16_t)base64toint(cli_yxx(&me));
+  me_yxx = cli_yxx(&me);
+  if (s->hs_client && MyConnect(s->hs_client)) {
+    struct CrdtBouncerConn cr;
+    char pnum[16];
+    ircd_snprintf(0, pnum, sizeof pnum, "%s%s", NumNick(s->hs_client));
+    memset(&cr, 0, sizeof cr);
+    cr.host = myn;
+    cr.is_primary = 1;
+    cr.last_active = (uint64_t)s->hs_last_active;
+    crdt_shadow_bconn_set(s->hs_account, s->hs_sessid, pnum, &cr);
+    if (conns) (*conns)++;
+  }
+  for (a = 0; a < s->hs_alias_count; a++) {
+    struct CrdtBouncerConn cr;
+    if (0 != strcmp(s->hs_aliases[a].ba_server, me_yxx))
+      continue;              /* only the alias's host writes its entry */
+    memset(&cr, 0, sizeof cr);
+    cr.host = myn;
+    cr.is_primary = 0;
+    cr.caps = (uint32_t)s->hs_aliases[a].ba_caps;
+    cr.caps_known = s->hs_aliases[a].ba_caps_known ? 1 : 0;
+    crdt_shadow_bconn_set(s->hs_account, s->hs_sessid,
+                          s->hs_aliases[a].ba_numeric, &cr);
+    if (conns) (*conns)++;
+  }
+  return minted;
+}
+
 void bounce_crdt_bsess_sweep(void)
 {
   int i, n = 0, nc = 0, nl = 0;
@@ -2146,78 +2244,29 @@ void bounce_crdt_bsess_sweep(void)
         if (s->hs_state == BOUNCE_DESTROYING)
           continue;
 
-        /* M2/M3: the session record — single-writer = the PRIMARY holder. */
+        /* M2/M4 mirror (shared with the eager mutation-site mints). */
+        n += bounce_crdt_bsess_mint_one(s, &nc);
+
+        /* M3/M4 de-risk diagnostics — settled-state checks, timer-only (an
+         * eager mint mid-transition would false-positive by design). */
         if (s->hs_client && MyConnect(s->hs_client)) {
-          struct CrdtBouncerSession rec;
           char w[64];
-          memset(&rec, 0, sizeof rec);
-          ircd_strncpy(rec.token, s->hs_token, sizeof rec.token);
-          ircd_strncpy(rec.name,  s->hs_name,  sizeof rec.name);
-          rec.created       = (uint64_t)s->hs_created;
-          rec.last_active   = (uint64_t)s->hs_last_active;
-          rec.total_active  = (uint64_t)s->hs_total_active;
-          rec.attach_count  = s->hs_attach_count;
-          rec.connect_count = s->hs_connect_count;
-          rec.state         = (uint8_t)s->hs_state;
-          rec.hold_override = (int8_t)s->hs_hold_override;
-          /* M6b-2 BS O: carry the session-anchored oper grant doc-native so a
-           * replica/gateway that materializes (or revives) this session from
-           * the doc retains it — without this, a doc-materialized session loses
-           * the grant and a later promote/revive comes back non-oper.  Empty
-           * hs_oper_name = not opered; the field stays zeroed (memset above). */
-          ircd_strncpy(rec.oper_name, s->hs_oper_name, sizeof rec.oper_name);
-          rec.oper_granted_at = (uint64_t)s->hs_oper_granted_at;
-          crdt_shadow_bsess_set(s->hs_account, s->hs_sessid, &rec);
-          n++;
-          /* M3 de-risk: doc-derived election winner must equal this live sessid. */
+          int doc, live;
+          /* M3: doc-derived election winner must equal this live sessid. */
           if (crdt_shadow_bsess_winner(s->hs_account, w, sizeof w)
               && 0 != strcmp(w, s->hs_sessid))
             log_write(LS_SYSTEM, L_NOTICE, 0,
                       "CRDT bsess M3: election divergence acct=%s live=%s doc-winner=%s",
                       s->hs_account, s->hs_sessid, w);
-        }
-
-        /* M4: connection roster — each node mirrors the connections IT hosts
-         * (single-writer per connection = its host). */
-        {
-          uint16_t myn = (uint16_t)base64toint(cli_yxx(&me));
-          const char *me_yxx = cli_yxx(&me);
-          int a;
-          if (s->hs_client && MyConnect(s->hs_client)) {
-            struct CrdtBouncerConn cr;
-            char pnum[16];
-            ircd_snprintf(0, pnum, sizeof pnum, "%s%s", NumNick(s->hs_client));
-            memset(&cr, 0, sizeof cr);
-            cr.host = myn;
-            cr.is_primary = 1;
-            cr.last_active = (uint64_t)s->hs_last_active;
-            crdt_shadow_bconn_set(s->hs_account, s->hs_sessid, pnum, &cr);
-            nc++;
-          }
-          for (a = 0; a < s->hs_alias_count; a++) {
-            struct CrdtBouncerConn cr;
-            if (0 != strcmp(s->hs_aliases[a].ba_server, me_yxx))
-              continue;              /* only the alias's host writes its entry */
-            memset(&cr, 0, sizeof cr);
-            cr.host = myn;
-            cr.is_primary = 0;
-            cr.caps = (uint32_t)s->hs_aliases[a].ba_caps;
-            cr.caps_known = s->hs_aliases[a].ba_caps_known ? 1 : 0;
-            crdt_shadow_bconn_set(s->hs_account, s->hs_sessid,
-                                  s->hs_aliases[a].ba_numeric, &cr);
-            nc++;
-          }
-          /* M4 de-risk: on the primary holder (which knows the full roster), the
+          /* M4: on the primary holder (which knows the full roster), the
            * converged doc roster should equal 1 (primary) + alias_count. A transient
            * mismatch heals as remote alias hosts' entries converge. */
-          if (s->hs_client && MyConnect(s->hs_client)) {
-            int doc  = crdt_shadow_bconn_roster_count(s->hs_account, s->hs_sessid);
-            int live = 1 + s->hs_alias_count;
-            if (doc != live)
-              log_write(LS_SYSTEM, L_NOTICE, 0,
-                        "CRDT bconn M4: roster mismatch acct=%s sid=%s live=%d doc=%d",
-                        s->hs_account, s->hs_sessid, live, doc);
-          }
+          doc  = crdt_shadow_bconn_roster_count(s->hs_account, s->hs_sessid);
+          live = 1 + s->hs_alias_count;
+          if (doc != live)
+            log_write(LS_SYSTEM, L_NOTICE, 0,
+                      "CRDT bconn M4: roster mismatch acct=%s sid=%s live=%d doc=%d",
+                      s->hs_account, s->hs_sessid, live, doc);
         }
 
         /* M5 (liveness lease, SHADOW — THE GATE): beacon-backed host claim.  The PRIMARY
@@ -2631,6 +2680,8 @@ int bounce_session_transition(struct BouncerSession *session,
   }
 
   bounce_session_assert_invariant(session, "transition.exit");
+  if (rc == 0)
+    bounce_crdt_bsess_mint_one(session, NULL);  /* eager doc mirror (vs 30s tick) */
   return rc;
 }
 
@@ -5269,6 +5320,8 @@ int bounce_promote_alias(struct BouncerSession *session, int local_only)
   if (old_primary)
     remove_user_from_all_channels(old_primary);
 
+  bounce_crdt_bsess_mint_one(session, NULL);  /* eager doc mirror (vs 30s tick) */
+
   return 0;
 }
 
@@ -5624,6 +5677,8 @@ int bounce_hold_client(struct Client *cptr, const char *comment)
 
   /* Persist with full ghost identity + channels */
   bounce_db_put(session);
+
+  bounce_crdt_bsess_mint_one(session, NULL);  /* eager doc mirror: HOLDING state */
 
   return 0;
 }
@@ -6065,6 +6120,8 @@ int bounce_revive(struct BouncerSession *session, struct Client *temp)
             was_holding ? "revived" : "promoted to primary",
             session->hs_sessid);
 
+  bounce_crdt_bsess_mint_one(session, NULL);  /* eager doc mirror (vs 30s tick) */
+
   return 0;
 }
 
@@ -6340,6 +6397,8 @@ int bounce_rebind_ghost_to_remote_primary(struct Client *ghost,
             "Bouncer rebind: ghost %s rebound to remote primary %s on %s "
             "(session %s)", cli_name(ghost), new_numeric, cli_name(server),
             session->hs_sessid);
+
+  bounce_crdt_bsess_mint_one(session, NULL);  /* eager doc mirror (vs 30s tick) */
 
   return 0;
 }
@@ -7360,6 +7419,7 @@ static void bounce_apply_remote_oper_grant(struct BouncerSession *sess,
     else
       bounce_clear_oper_locally(alias);
   }
+  bounce_crdt_bsess_mint_one(sess, NULL);  /* eager doc mirror (self-gates if remote) */
 }
 
 /** Sync umode (and oper privileges, handler, snomask) across all
@@ -8014,20 +8074,10 @@ int bounce_setup_local_alias(struct Client *sptr, struct BouncerSession *session
                              primary_full,       /* new: the existing primary */
                              session->hs_sessid,
                              cli_name(primary));
-      /* M6c-1 BX Inc-1: eager bconn doc write so the alias appears in the doc
-       * immediately — the sweep (bounce_crdt_bsess_sweep) is verify-timer-only
-       * (~21s lag, Item 2 measured), which once BX C is suppressed would delay
-       * cross-CRDT alias convergence.  Mirrors the sweep's alias-bconn record;
-       * host==me (this node owns the local alias); caps refined by next sweep. */
-      if (feature_bool(FEAT_CRDT_BOUNCER_DOC) && feature_bool(FEAT_CRDT_PRIMARY)) {
-        struct CrdtBouncerConn cr;
-        memset(&cr, 0, sizeof cr);
-        cr.host = (uint16_t)base64toint(cli_yxx(&me));
-        cr.is_primary = 0;
-        cr.last_active = (uint64_t)session->hs_last_active;
-        crdt_shadow_bconn_set(session->hs_account, session->hs_sessid,
-                              alias_full, &cr);
-      }
+      /* M6c-1 BX Inc-1 (generalized to the eager-mint helper): full session
+       * record + me-hosted roster to the doc immediately, so the alias appears
+       * cross-mesh without waiting for the 30s sweep tick. */
+      bounce_crdt_bsess_mint_one(session, NULL);
     }
   } /* end YYXXX numeric scope */
 

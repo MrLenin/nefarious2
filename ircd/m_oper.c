@@ -296,6 +296,7 @@ void do_oper(struct Client* cptr, struct Client* sptr, struct ConfItem* aconf, i
       sess->hs_oper_granted_at = CurrentTime;
       bounce_mark_dirty(sptr);
       bounce_broadcast(sess, 'O', aconf->name);
+      bounce_crdt_bsess_mint_one(sess, NULL);  /* eager doc mirror of the grant */
     }
   }
 

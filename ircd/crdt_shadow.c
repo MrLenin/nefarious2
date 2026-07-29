@@ -1752,6 +1752,17 @@ static void reconcile_bsess_cb(const char *key, uint32_t key_len,
         if (crdt_gateway_has_legacy_peer())
           crdt_m6c1_synth_bs_o(account, sessid, rec);
       }
+      /* hold_override: minted into the doc but was DROPPED on the consumer —
+       * replica-create hardcoded -1 and nothing applied later drift, so a
+       * per-session `SET SESSION <id> HOLD on|off` (which has NO BS broadcast;
+       * the doc is its only carrier) never converged to replicas.  Doc-apply
+       * it like the oper grant (2026-07-29, found by the eager-mint gate). */
+      if (existing->hs_hold_override != (int)rec->hold_override) {
+        existing->hs_hold_override = (int)rec->hold_override;
+        log_write(LS_SYSTEM, L_NOTICE, 0,
+                  "CRDT bsess: replica acct=%s sid=%s hold_override -> %d (doc-apply)",
+                  account, sessid, (int)rec->hold_override);
+      }
       if ((int)existing->hs_state != (int)rec->state) {
         if (rec->state == BOUNCE_HOLDING) {
           existing->hs_state = BOUNCE_HOLDING;
@@ -1809,6 +1820,9 @@ static void reconcile_bsess_cb(const char *key, uint32_t key_len,
        * promote/revive (bounce_apply_oper_grant) needs to re-oper.  Persist-
        * across-move: NO local-O:line revalidation on the materialize path
        * (that is restart-only, in bounce_create_ghost). */
+      /* hold_override rides the doc only (no BS carrier) — see the doc-apply
+       * clause above; replica-create defaults it to -1. */
+      newsess->hs_hold_override = (int)rec->hold_override;
       ircd_strncpy(newsess->hs_oper_name, rec->oper_name,
                    sizeof newsess->hs_oper_name);
       newsess->hs_oper_granted_at = (time_t)rec->oper_granted_at;

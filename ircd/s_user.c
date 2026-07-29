@@ -2228,6 +2228,7 @@ int set_user_mode(struct Client *cptr, struct Client *sptr, int parc,
              * shutdown — abrupt termination would lose the clear. */
             bounce_mark_dirty(acptr);
             bounce_broadcast(_oper_sess, 'O', NULL);
+            bounce_crdt_bsess_mint_one(_oper_sess, NULL);  /* eager doc mirror */
           }
         }
         break;
@@ -2255,6 +2256,7 @@ int set_user_mode(struct Client *cptr, struct Client *sptr, int parc,
              * branch above). */
             bounce_mark_dirty(acptr);
             bounce_broadcast(_oper_sess, 'O', NULL);
+            bounce_crdt_bsess_mint_one(_oper_sess, NULL);  /* eager doc mirror */
           }
         }
         break;
