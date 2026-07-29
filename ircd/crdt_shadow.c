@@ -5011,6 +5011,47 @@ static void crdt_reconcile_user_update(struct Client *live,
       c->attr++;
     }
   }
+  /* 3l account-prop: ACCOUNT drift -> drive ms_account (R=register / M=change),
+   * SERVER-sourced (sptr=&me) like SVSIDENT/SWHOIS.  Heals a materialized user
+   * whose numeric was recycled onto a different account, or whose login landed
+   * after this node created it — the stale account made the bouncer alias-
+   * target check refuse a CORRECT candidate (promotion scope 2026-07-29).
+   * The LOGOUT direction (doc empty, live set) is deliberately NOT driven:
+   * ms_account 'U' destroys bouncer sessions + clears metadata — far too
+   * destructive to fire off a possibly-lagging doc read; deferred until the
+   * empty-account signal is characterized (noted in the promotion scope doc).
+   * Wire form matches this node's FEAT_EXTENDED_ACCOUNTS parse; the old
+   * syntax has no change form, so a mismatch there heals only via R. */
+  if (rec->account[0] &&
+      ircd_strcmp(cli_user(live)->account, rec->account) != 0) {
+    char nba[CRDT_NUMERICLEN], acct[CRDT_ACCOUNTLEN], ts[24], *pv[6];
+    int pc;
+    ircd_strncpy(nba, numbuf, sizeof nba);
+    ircd_strncpy(acct, rec->account, sizeof acct);
+    pv[0] = cli_name(&me); pv[1] = nba;
+    if (feature_bool(FEAT_EXTENDED_ACCOUNTS)) {
+      pv[2] = IsAccount(live) ? (char *)"M" : (char *)"R";
+      if (rec->acc_create) {
+        ircd_snprintf(0, ts, sizeof ts, "%Tu", (time_t)rec->acc_create);
+        pv[3] = acct; pv[4] = ts; pv[5] = NULL; pc = 5;
+      } else {
+        pv[3] = acct; pv[4] = NULL; pc = 4;
+      }
+    } else if (!IsAccount(live)) {
+      if (rec->acc_create) {
+        ircd_snprintf(0, ts, sizeof ts, "%Tu", (time_t)rec->acc_create);
+        pv[2] = acct; pv[3] = ts; pv[4] = NULL; pc = 4;
+      } else {
+        pv[2] = acct; pv[3] = NULL; pc = 3;
+      }
+    } else
+      pc = 0;  /* old syntax cannot change a set account — leave it */
+    if (pc) {
+      sendcmdto_set_skip_crdt_servers();
+      ms_account(cli_from(live), &me, pc, pv);
+      c->attr++;
+    }
+  }
   /* F1-b: MARK state (CVERSION / SSLCLIFP / GEOIP).  All SERVER-sourced -> sptr=&me.
    * ★ ms_mark resolves its target via FindUser (by NICK), NOT findNUser (numeric) like
    * SVSIDENT/SWHOIS — so parv[1] = cli_name(live), never numbuf.  skip_crdt one-shot =

@@ -99,6 +99,7 @@
 #include "send.h"
 #include "metadata.h"
 #include "channel.h"
+#include "crdt_shadow.h"        /* 3l account-prop: re-mint the doc user record on account change */
 
 /* #include <assert.h> -- Now using assert in ircd_log.h */
 #include <stdlib.h>
@@ -314,6 +315,16 @@ int ms_account(struct Client* cptr, struct Client* sptr, int parc,
            (feature_int(FEAT_HOST_HIDING_STYLE) == 3)) &&
           IsHiddenHost(acptr))
         hide_hostmask(acptr);
+
+      /* 3l account-prop: the doc user record's account only updated at
+       * register/nick/umode refresh, so a post-registration U/R/M never
+       * reached CRDT peers until some unrelated refresh minted — a
+       * materialized copy kept a STALE account (which made the bouncer
+       * alias-target account check refuse a CORRECT candidate; promotion
+       * scope 2026-07-29).  Re-mint the whole record here.  Single-writer
+       * safe: user_add self-skips when this node doesn't own the user
+       * (from_crdt_peer gate), so only the user's home mints. */
+      crdt_shadow_user_add(acptr);
       return 0;
     } else if (type == 'C' || type == 'H' || type == 'S') {
       /* LOC requests, forward them and ignore them */
@@ -499,6 +510,9 @@ int ms_account(struct Client* cptr, struct Client* sptr, int parc,
                           cli_user(acptr)->acc_create ? "%C %s %Tu" : "%C %s",
                           acptr, cli_user(acptr)->account,
                           cli_user(acptr)->acc_create);
+
+    /* 3l account-prop: same re-mint as the extended U/R/M tail above. */
+    crdt_shadow_user_add(acptr);
   }
 
   return 0;
