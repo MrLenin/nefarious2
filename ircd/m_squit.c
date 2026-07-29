@@ -81,7 +81,24 @@ int ms_squit(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
     Debug((DEBUG_NOTICE, "Ignoring SQUIT to an unknown server"));
     return 0;
   }
-  
+
+  /* MR-6-2 CRASH-1: never exit_client() a mesh stub/anchor.  Both lookups above
+   * find one (make_anchor does hAddClient + SetServerYXX -> server_list[]), but
+   * exit_client's whole teardown block is IsServer-EXACT: a STAT_MESH_SERVER
+   * victim skips user reaping, dlink removal and crdt_mesh_stub_dec, then gets
+   * freed with its materialized users still pointing at it (UAF).  Anchor
+   * lifetime is beacon-driven — crdt_shadow_retire_mesh_stub is the ONLY correct
+   * teardown (it reaps users first, then restores STAT_SERVER for Case A).  A
+   * legacy SQUIT naming a mesh-only server is stale routing information: the doc
+   * + beacon are authoritative for that server's presence, so drop it.  Anchors
+   * are steady state at MR-6, so this path is reachable wherever a legacy peer
+   * still SQUITs (the gateway) — not a partition-only edge case. */
+  if (IsMeshStub(acptr)) {
+    Debug((DEBUG_NOTICE, "Ignoring SQUIT for mesh stub/anchor %s "
+           "(beacon-driven lifetime)", cli_name(acptr)));
+    return 0;
+  }
+
   /* If they are squitting me, we reverse it */
   if (IsMe(acptr))
     acptr = cptr; /* Bugfix by Prefect */

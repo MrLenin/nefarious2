@@ -4691,9 +4691,14 @@ mode_process_clients(struct ParseState *state)
       if ((IsChannelService(state->cli_change[i].client) && IsService(cli_user(state->cli_change[i].client)->server))
           || (IsChannelService(state->cli_change[i].client) && !IsXtraOp(state->sptr))) {
 	if (state->flags & MODE_PARSE_FORCE) /* it was forced */
+	  /* IsMeshStub arm: an anchor has cli_user == NULL, so the user branch
+	   * would deref NULL (invariant 2).  Latent today — no caller passes an
+	   * anchor as sptr — but its siblings at :2307 and :5206 already carry
+	   * this arm; MR-6-2 audit found this one missed. */
 	  sendto_opmask_butone(0, SNO_HACK4, "Deop of +k user on %H by %s",
 			       state->chptr,
-			       (IsServer(state->sptr) ? cli_name(state->sptr) :
+			       ((IsServer(state->sptr) || IsMeshStub(state->sptr)) ?
+				cli_name(state->sptr) :
 				cli_name((cli_user(state->sptr))->server)));
 
 	else if (MyUser(state->sptr) && state->flags & MODE_PARSE_SET) {
