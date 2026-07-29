@@ -1710,6 +1710,7 @@ int metadata_set_client(struct Client *cptr, const char *key, const char *value,
     int i;
     for (i = 0; metadata_mode_sync[i].key; i++) {
       if (ircd_strcmp(key, metadata_mode_sync[i].key) == 0) {
+        int had = HasFlag(cptr, metadata_mode_sync[i].flag);
         if (metadata_mode_sync[i].invert) {
           /* Inverted: value "0" or empty = set flag; NULL or truthy = clear flag.
            * For chathistory.pm: "0" = opted out (flag set), deleted = not opted out (flag clear). */
@@ -1724,6 +1725,15 @@ int metadata_set_client(struct Client *cptr, const char *key, const char *value,
           else
             ClrFlag(cptr, metadata_mode_sync[i].flag);
         }
+        /* A flag flipped by metadata changes the user's UMODE LETTERS without
+         * ever passing set_user_mode — the doc user record kept the OLD
+         * letters, and every peer's umode-reconcile then drove the flag back
+         * off (its -b re-write is what minted the stale hold="0"s; promotion
+         * scope 2026-07-29).  Re-mint so the doc stays coherent with the flag.
+         * user_add's internal gates make this a no-op on non-owning nodes
+         * (from_crdt_peer) and mid-registration (unnumbered). */
+        if (HasFlag(cptr, metadata_mode_sync[i].flag) != had)
+          crdt_shadow_user_add(cptr);
         break;
       }
     }

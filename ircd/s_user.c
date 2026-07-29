@@ -2370,18 +2370,30 @@ int set_user_mode(struct Client *cptr, struct Client *sptr, int parc,
           ClrFlag(acptr, FLAG_MULTILINE_EXPAND);
         break;
       case 'Y':
+        /* Flag->metadata writes below are MyUser-gated: metadata_set_client
+         * persists + (crdt) doc-mints as if this node owned the fact.  For a
+         * REMOTE user the umode arrived off the wire (burst, MODE relay, or
+         * the doc umode-reconcile), and firing the write here made every
+         * receiver re-assert the value with a fresh HLC — on the crdt bed a
+         * peer's reconcile-driven "-b" minted hold="0" 4s after the home's
+         * genuine "1" and clobbered it network-wide (writer=6 evidence,
+         * promotion scope 2026-07-29).  One plane per fact: the HOME node
+         * writes metadata; everyone else takes it via MD relay / the doc. */
         if (what == MODE_ADD) {
           SetNoStorage(acptr);
-          metadata_set_client(acptr, "chathistory.nostorage", "1", METADATA_VIS_PUBLIC);
+          if (MyUser(acptr))
+            metadata_set_client(acptr, "chathistory.nostorage", "1", METADATA_VIS_PUBLIC);
         } else {
           ClearNoStorage(acptr);
-          metadata_set_client(acptr, "chathistory.nostorage", NULL, 0);
+          if (MyUser(acptr))
+            metadata_set_client(acptr, "chathistory.nostorage", NULL, 0);
         }
         break;
       case 'b':
         if (what == MODE_ADD) {
           SetBncHoldPref(acptr);
-          metadata_set_client(acptr, "draft/persistence/hold", "1", METADATA_VIS_PRIVATE);
+          if (MyUser(acptr))  /* see the 'Y' comment — home node owns the write */
+            metadata_set_client(acptr, "draft/persistence/hold", "1", METADATA_VIS_PRIVATE);
           /* Auto-create bouncer session if local client doesn't have one */
           if (MyUser(acptr) && IsAccount(acptr) && !bounce_get_session(acptr)) {
             struct BouncerSession *session = NULL;
@@ -2390,7 +2402,8 @@ int set_user_mode(struct Client *cptr, struct Client *sptr, int parc,
           }
         } else {
           ClearBncHoldPref(acptr);
-          metadata_set_client(acptr, "draft/persistence/hold", "0", METADATA_VIS_PRIVATE);
+          if (MyUser(acptr))  /* see the 'Y' comment — home node owns the write */
+            metadata_set_client(acptr, "draft/persistence/hold", "0", METADATA_VIS_PRIVATE);
           /* Destroy bouncer session if local client has one */
           if (MyUser(acptr)) {
             struct BouncerSession *session = bounce_get_session(acptr);
