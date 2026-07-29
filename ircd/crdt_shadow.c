@@ -5243,7 +5243,16 @@ void crdt_shadow_gateway_birth_modes(void)
     struct Channel *chptr = FindChannel(g_birth_modes[i]);
     struct ModeBuf mbuf;
     unsigned int m;
-    if (!chptr || !(chptr->mode.mode & CRDT_MODE_MASK))
+    if (!chptr)
+      continue;
+    /* Cluster C follow-up (gateway_birth_modes legacy-render): the bridge
+     * previously emitted only CRDT_MODE_MASK bits + key/limit — the Cluster C
+     * snapshot extensions (exmode bits and the STRING-ONLY +A/+U/+L, which
+     * have no mode.mode bit; gate on string presence) were applied locally at
+     * birth but never re-emitted to legacy.  The entry gate must consider all
+     * of them, else a channel carrying ONLY extended state is skipped. */
+    if (!(chptr->mode.mode & CRDT_MODE_MASK) && !chptr->mode.exmode &&
+        !chptr->mode.apass[0] && !chptr->mode.upass[0] && !chptr->mode.redir[0])
       continue;
     m = chptr->mode.mode & CRDT_MODE_MASK & ~(MODE_KEY | MODE_LIMIT);
     modebuf_init(&mbuf, &me, NULL, chptr, MODEBUF_DEST_CHANNEL | MODEBUF_DEST_SERVER);
@@ -5253,6 +5262,14 @@ void crdt_shadow_gateway_birth_modes(void)
       modebuf_mode_uint(&mbuf, MODE_ADD | MODE_LIMIT, chptr->mode.limit);
     if (chptr->mode.mode & MODE_KEY)
       modebuf_mode_string(&mbuf, MODE_ADD | MODE_KEY, chptr->mode.key, 0);
+    if (chptr->mode.apass[0])
+      modebuf_mode_string(&mbuf, MODE_ADD | MODE_APASS, chptr->mode.apass, 0);
+    if (chptr->mode.upass[0])
+      modebuf_mode_string(&mbuf, MODE_ADD | MODE_UPASS, chptr->mode.upass, 0);
+    if (chptr->mode.redir[0])
+      modebuf_mode_string(&mbuf, MODE_ADD | MODE_REDIRECT, chptr->mode.redir, 0);
+    if (chptr->mode.exmode)
+      modebuf_exmode(&mbuf, MODE_ADD | chptr->mode.exmode);
     modebuf_flush_nomirror(&mbuf);
   }
   g_birth_modes_n = 0;
