@@ -6143,6 +6143,21 @@ static void crdt_shadow_verify_cb(struct Event *ev)
 {
   if (ev_type(ev) != ET_EXPIRE)
     return;
+  /* MR-6-1 §2.8 redundancy guard (log-only): an overlay-primary node below 2
+   * live overlay edges is one edge loss from a full partition — alarm every
+   * cycle while degraded (the log IS the alarm; /CRDT link is the remedy). */
+  if (feature_bool(FEAT_CRDT_OVERLAY_PRIMARY)) {
+    int live_ov = 0;
+    struct Client *ov;
+    for (ov = GlobalClientList; ov; ov = cli_next(ov))
+      if (IsCrdtOverlay(ov) && MyConnect(ov) && !IsDead(ov))
+        live_ov++;
+    if (live_ov < 2)
+      log_write(LS_SYSTEM, L_WARNING, 0,
+                "CRDT overlay-primary: %d live overlay edge(s) — BELOW "
+                "REDUNDANCY FLOOR (single edge loss partitions this node)",
+                live_ov);
+  }
   /* Phase 4c: no servers-map self-assert — reachability is a local determination
    * (FindNServer at the materialize gate), not replicated doc state. */
   crdt_shadow_verify(NULL);         /* NULL -> the system log (timer path) */

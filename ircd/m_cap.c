@@ -31,6 +31,8 @@
 #include "client.h"
 #include "ircd.h"
 #include "ircd_chattr.h"
+#include "crdt_shadow.h"  /* MR-6-1: crdt_server_is_mesh_only (sasl anchor check) */
+#include "hash.h"         /* FindClient */
 #include "ircd_features.h"
 #include "ircd_log.h"
 #include "ircd_reply.h"
@@ -251,12 +253,27 @@ sasl_server_available(void)
 
   sasl_server = feature_str(FEAT_SASL_SERVER);
 
-  /* If set to "*", SASL is broadcast to all servers - check if any exist */
+  /* If set to "*", SASL is broadcast to all servers - check if any exist
+   * (IsServer-exact; the wildcard form is a 6-2 sweep item for mesh-only). */
   if (!strcmp(sasl_server, "*"))
     return (UserStats.servers > 0);
 
   /* Otherwise, check if the specific SASL server is connected */
-  return (find_match_server((char *)sasl_server) != NULL);
+  if (find_match_server((char *)sasl_server) != NULL)
+    return 1;
+
+  /* MR-6-1 (anchors-as-steady-state): on an overlay-primary / tree-retired
+   * node the services server exists only as a mesh ANCHOR (STAT_MESH_SERVER —
+   * the IsServer-exact lookup above misses it) while the CR-X services bridge
+   * carries AUTHENTICATE.  Without this branch an overlay-only node silently
+   * stopped advertising the sasl cap (found by the MR-6-1 battery: nef7
+   * offered no sasl while its P10-linked peers did). */
+  if (feature_bool(FEAT_CRDT_SERVICES_BRIDGE)) {
+    struct Client *svc = FindClient(sasl_server);
+    if (svc && IsMeshStub(svc) && crdt_server_is_mesh_only(svc))
+      return 1;
+  }
+  return 0;
 }
 
 /**

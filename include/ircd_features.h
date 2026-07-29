@@ -519,6 +519,7 @@ enum Feature {
   FEAT_CRDT_SERVICES_BRIDGE,    /* Tier B: route SASL/ACCOUNT/REGISTER/XQUERY/etc. to/from x3.services over the mesh (CR X carrier) when x3 is reachable only as a dead-sink anchor. Gates the leaf CR-X emit + the gateway reverse-tunnel; the gateway P10 re-emit reuses FEAT_CRDT_GATEWAY_BRIDGE */
   FEAT_CRDT_BOUNCER_DOC,        /* 5-5e M6: the CRDT doc is the AUTHORITATIVE transport for bouncer session/connection/lease state among CRDT peers (reconcile-from-doc drives live state + suppress P10 BS/BX relay toward CRDT peers + §17.7 gateway synthesizes legacy BS/BX). Default off, rolled node-by-node. The M2-M5 shadow mirror stays under FEAT_CRDT_PRIMARY; this flag flips read/authority on. */
   FEAT_CRDT_OWNER_SWEEP,        /* orphan-reap owner sweep: each node reaps its OWN-origin doc user records with no live Client by minting the DELETE itself (resurrection-zombie / restart-residue / hookless-teardown catch-all; single-writer clean). DESTRUCTIVE (mints real tombstones) -> dedicated kill-switch, default off, rolled node-by-node */
+  FEAT_CRDT_OVERLAY_PRIMARY,    /* MR-6-1: this node's PRIMARY transport is the CR overlay mesh — zero P10 tree links by design (cold boot syncs via CR F pull + beacon-burst only; legacy reached via the gateway). Declarative + observability now (status render, §2.8 redundancy guard: warn while <2 live overlay edges); 6-2/6-3 behaviors gate on it. Default off, per-node config */
 
   FEAT_LAST_F
 };

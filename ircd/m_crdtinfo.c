@@ -31,6 +31,7 @@
 #include "crdt_shadow.h"
 #include "handlers.h"
 #include "hash.h"
+#include "ircd_features.h"  /* MR-6-1: FEAT_CRDT_OVERLAY_PRIMARY (status render) */
 #include "ircd_string.h"
 #include "ircd.h"
 #include "ircd_log.h"
@@ -233,6 +234,18 @@ static void render_status(struct Client *to)
                 "mesh reachable=%d; partitioned=%s",
                 to, crdt, legacy, stub, presented, rc,
                 crdt_have_mesh_stub() ? "YES" : "no");
+  /* MR-6-1: overlay-primary mode declaration + live overlay-edge count (the
+   * §2.8 redundancy floor is 2 — a single edge loss must not partition us). */
+  if (feature_bool(FEAT_CRDT_OVERLAY_PRIMARY)) {
+    int live_ov = 0;
+    for (a = GlobalClientList; a; a = cli_next(a))
+      if (IsCrdtOverlay(a) && MyConnect(a) && !IsDead(a))
+        live_ov++;
+    sendcmdto_one(&me, CMD_NOTICE, to,
+                  "%C :CRDT mode: OVERLAY-PRIMARY (no P10 tree links by design); "
+                  "%d live overlay edge(s)%s", to, live_ov,
+                  live_ov < 2 ? " — BELOW REDUNDANCY FLOOR" : "");
+  }
   sendcmdto_one(&me, CMD_NOTICE, to, "%C :End of /CRDT status", to);
 }
 
