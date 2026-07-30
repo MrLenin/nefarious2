@@ -124,6 +124,7 @@ extern struct SLink *get_isupport_lines(void);
 extern int do_nick_name(char* nick);
 
 extern void user_setcloaked(struct Client *cptr);
+extern void user_compute_cloaks(struct Client *cptr);
 
 extern void init_isupport(void);
 extern void del_isupport(const char *name);

@@ -3111,6 +3111,41 @@ int is_silenced(struct Client *sptr, struct Client *acptr, int ischanmsg)
   return 1;
 }
 
+/** Compute a user's cloakip/cloakhost VALUES without touching flags.
+ * Pure w.r.t. registration order: the "host is a bare IP" test compares
+ * against realhost (which never mutates) instead of the current display
+ * host, so a doc-materialized copy derives the same bytes the owner did at
+ * registration time (when host==realhost).  Inputs — ip, realhost, the
+ * shared hidehost keys — all ride the CRDT user record, so no cloak-value
+ * transit is needed (MR-6 C29; exact-byte transit is the group-3 schema
+ * item).  Callers set FLAG_CLOAKHOST/FLAG_CLOAKIP separately to match
+ * their authority (e.g. the doc's umode letters).
+ * @param[in/out] cptr Client to compute cloak values for.
+ */
+void
+user_compute_cloaks(struct Client *cptr)
+{
+  if ((feature_int(FEAT_HOST_HIDING_STYLE) != 2) &&
+      (feature_int(FEAT_HOST_HIDING_STYLE) != 3))
+    return;
+
+  if (irc_in_addr_is_ipv4(&(cli_ip(cptr))))
+    ircd_snprintf(0, cli_user(cptr)->cloakip, HOSTLEN+1,
+                  hidehost_ipv4(&(cli_ip(cptr))));
+  else
+    ircd_snprintf(0, cli_user(cptr)->cloakip, HOSTLEN+1,
+                  hidehost_ipv6(&(cli_ip(cptr))));
+
+  if (!ircd_strncmp(ircd_ntoa(&(cli_ip(cptr))), cli_user(cptr)->realhost,
+                    HOSTLEN+1))
+    ircd_snprintf(0, cli_user(cptr)->cloakhost, HOSTLEN+1,
+                  cli_user(cptr)->cloakip);
+  else
+    ircd_snprintf(0, cli_user(cptr)->cloakhost, HOSTLEN+1,
+                  hidehost_normalhost(cli_user(cptr)->realhost,
+                                      client_get_hidehostcomponents(cptr)));
+}
+
 /** Set a users cloaked host and IP
  * @param[in/out] cptr Client to set cloaked host and IP for.
  */

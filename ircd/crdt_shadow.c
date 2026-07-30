@@ -4682,6 +4682,17 @@ static struct Client *crdt_materialize_one_user(const char *key, uint32_t key_le
      * instead of waiting on the lazy-fill backstop. */
     metadata_load_account(nc, cli_user(nc)->account);
   }
+  /* MR-6 C29: derive cloak VALUES before the flags land.  The record carries
+   * the C/c letters but (deliberately) not the cloak strings; applying the
+   * flags with empty values poisons the §17.7 legacy N-intro — umode_str()
+   * renders "+xCc" with EMPTY params, which collapse on parse so the legacy
+   * side consumes b64ip/numeric as cloakhost/cloakip (field shift; witnessed
+   * live 2026-07-30).  user_compute_cloaks derives from ip + realhost + the
+   * shared hidehost keys — registration-order pure, owner-identical — all of
+   * which the record DOES carry.  Exact-byte transit is the group-3 schema
+   * item; this covers until then. */
+  if (strchr(rec->umodes, 'C') || strchr(rec->umodes, 'c'))
+    user_compute_cloaks(nc);
   user_apply_umode_str(nc, rec->umodes);         /* sets umode FLAGS only */
   SetUser(nc);
   Count_newremoteclient(UserStats, srv);
@@ -4889,6 +4900,7 @@ static void crdt_gateway_user_intro(struct Client *nc)
 {
   char ip_base64[25];
   const char *um;
+  int noval_ch = 0, noval_ci = 0, noval_sh = 0, noval_fh = 0;
   struct Client *srv = cli_user(nc)->server;
   if (!srv)
     return;
@@ -4899,6 +4911,17 @@ static void crdt_gateway_user_intro(struct Client *nc)
                              R6c: a PRESENTED stub IS known to legacy now, so fall
                              through and introduce the user. */
     return;
+  /* C29 wire guard: NEVER render a param-bearing umode whose value string is
+   * empty.  umode_str() appends one param per set flag; an empty param
+   * collapses on the receiving parse, shifting b64ip/numeric into the value
+   * slots (legacy displayed the b64 IP as the hostname).  Values can be empty
+   * when the doc carries the letter but not the value (sethost/fakehost
+   * today; cloaks before the materialize-time derivation).  Suppress the flag
+   * for THIS render only — the local copy keeps it. */
+  if (IsCloakHost(nc) && !cli_user(nc)->cloakhost[0]) { ClearCloakHost(nc); noval_ch = 1; }
+  if (IsCloakIP(nc)   && !cli_user(nc)->cloakip[0])   { ClearCloakIP(nc);   noval_ci = 1; }
+  if (IsSetHost(nc)   && !cli_user(nc)->sethost[0])   { ClearSetHost(nc);   noval_sh = 1; }
+  if (IsFakeHost(nc)  && !cli_user(nc)->fakehost[0])  { ClearFakeHost(nc);  noval_fh = 1; }
   um = umode_str(nc);
   sendcmdto_flag_serv_butone(srv, CMD_NICK, NULL,
                              FLAG_IPV6, FLAG_CRDT_AWARE,
@@ -4916,6 +4939,10 @@ static void crdt_gateway_user_intro(struct Client *nc)
                              *um ? "+" : "", um, *um ? " " : "",
                              iptobase64(ip_base64, &cli_ip(nc), sizeof(ip_base64), 0),
                              NumNick(nc), cli_info(nc));
+  if (noval_ch) SetCloakHost(nc);
+  if (noval_ci) SetCloakIP(nc);
+  if (noval_sh) SetSetHost(nc);
+  if (noval_fh) SetFakeHost(nc);
 }
 
 struct recon_user_ctx { unsigned int created; unsigned int renamed; unsigned int umoded; unsigned int setnamed; unsigned int attr; };
@@ -5105,9 +5132,19 @@ static void crdt_reconcile_user_update(struct Client *live,
    * identical), and hide_hostmask applies the style host with proper CHGHOST
    * emission, self-nooping when already converged.  Runs AFTER the umode and
    * account clauses so +x/account landed this same tick. */
-  if ((strchr(rec->umodes, 'C') && !IsCloakHost(live)) ||
-      (strchr(rec->umodes, 'c') && !IsCloakIP(live))) {
-    user_setcloaked(live);
+  /* C29: also fire on flag-set-but-value-EMPTY (the pre-fix materialize left
+   * exactly that shape, and user_setcloaked self-noops once the flags are set
+   * so it could never heal them).  user_compute_cloaks fills the values
+   * unconditionally; the flags are then set to match the doc's letters. */
+  if ((strchr(rec->umodes, 'C') &&
+       (!IsCloakHost(live) || !cli_user(live)->cloakhost[0])) ||
+      (strchr(rec->umodes, 'c') &&
+       (!IsCloakIP(live) || !cli_user(live)->cloakip[0]))) {
+    user_compute_cloaks(live);
+    if (strchr(rec->umodes, 'C'))
+      SetCloakHost(live);
+    if (strchr(rec->umodes, 'c'))
+      SetCloakIP(live);
     c->attr++;
   }
   if (IsHiddenHost(live) &&
