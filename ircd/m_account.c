@@ -141,6 +141,43 @@ static struct Client *decode_auth_id(const char *id)
  * parv[1] = numeric of client to act on
  * parv[2] = account name (12 characters or less)
  */
+/** MR-6-2 auth carrier: tunnel an applied ACCOUNT change to a target whose HOME
+ * server is mesh-only (an overlay-only node, unreachable by the P10 relay).
+ *
+ * Found live 2026-07-30: x3 sent `AC <numeric> R <acct> <ts>` for a user homed on
+ * the overlay-only node; the gateway applied it locally and relayed over P10, so
+ * every P10 node showed the user authenticated — but the OWNER never learned, so
+ * the user was NOT logged in on their own server (account-gated features silently
+ * dead there) and the doc kept the accountless record (mat-check gap on all four
+ * consumers, permanent: the reconcile's LOGOUT direction is deliberately undriven).
+ *
+ * The gateway CANNOT repair the doc itself — crdt_shadow_user_add self-skips for a
+ * mesh-homed target (single-writer: only the owner mints). So the owner must LEARN
+ * the change: tunnel the same body over CR-X ('C' re-injects as ms_account at the
+ * destination), where the local apply mints the doc record as a normal own-user
+ * write. Additive + self-gating: crdt_route_services_reply_try no-ops unless the
+ * owner is a mesh stub, so P10-homed targets are untouched (no double-apply).
+ *
+ * @a type is the wire subcommand ("U"/"R"/"M"); @a acct / @a ts may be NULL. */
+static void crdt_account_tunnel_owner(struct Client *acptr, const char *type,
+                                      const char *acct, const char *ts)
+{
+  char body[BUFSIZE];
+  if (!acptr || !cli_user(acptr) || !type)
+    return;
+  if (acct && ts)
+    ircd_snprintf(0, body, sizeof body, "%s%s %s %s %s", NumNick(acptr), type,
+                  acct, ts);
+  else if (acct)
+    ircd_snprintf(0, body, sizeof body, "%s%s %s %s", NumNick(acptr), type, acct);
+  else
+    ircd_snprintf(0, body, sizeof body, "%s%s %s", NumNick(acptr), type);
+  if (crdt_route_services_reply_try(acptr, 'C', body))
+    log_write(LS_SYSTEM, L_INFO, 0,
+              "MR-6-2 auth carrier: tunneled AC %s for %s to mesh-only owner",
+              type, cli_name(acptr));
+}
+
 int ms_account(struct Client* cptr, struct Client* sptr, int parc,
 	       char* parv[])
 {
@@ -235,6 +272,7 @@ int ms_account(struct Client* cptr, struct Client* sptr, int parc,
         }
 
         sendcmdto_serv_butone(sptr, CMD_ACCOUNT, cptr, "%C U", acptr);
+        crdt_account_tunnel_owner(acptr, "U", NULL, NULL);
       } else if (type == 'R' || type == 'M') {
         if (parc < 4)
           return need_more_params(sptr, "ACCOUNT");
@@ -308,6 +346,12 @@ int ms_account(struct Client* cptr, struct Client* sptr, int parc,
         } else {
           sendcmdto_serv_butone(sptr, CMD_ACCOUNT, cptr, "%C %c %s",
                                 acptr, type, parv[3]);
+        }
+        {
+          char tbuf[2];
+          tbuf[0] = type; tbuf[1] = '\0';
+          crdt_account_tunnel_owner(acptr, tbuf, parv[3],
+                                    (parc > 4) ? parv[4] : NULL);
         }
       }
 
