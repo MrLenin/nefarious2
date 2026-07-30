@@ -443,6 +443,28 @@ static int do_wilds(struct Client* sptr, char *nick, int count, int parc)
   return found;
 }
 
+/* MR-6: report whether a hunt destination resolves to a MESH-ONLY server
+ * (STAT_MESH_SERVER stub/anchor — no P10 route from here).  hunt_server_cmd
+ * would resolve it fine and then forward into the stub's dead-sink Connection,
+ * where the query silently vanishes (witnessed live 2026-07-30 from legacy,
+ * P10-CRDT and mesh vantages, both directions).  Every user is doc-
+ * materialized locally, so the caller should answer the WHOIS here instead —
+ * the only owner-exact datum lost is idle time.  Resolution mirrors
+ * hunt_server_cmd: name/numnick, then nick -> owning server; '*' masks fall
+ * through to the normal hunt. */
+static int whois_dest_is_mesh_only(struct Client *sptr, const char *to)
+{
+  struct Client *acptr;
+  if (EmptyString(to) || strchr(to, '*'))
+    return 0;
+  acptr = MyUser(sptr) ? FindClient(to) : FindNServer(to);
+  if (!acptr)
+    acptr = FindClient(to);
+  if (acptr && cli_user(acptr))
+    acptr = cli_user(acptr)->server;
+  return acptr && IsMeshStub(acptr);
+}
+
 /*
  * m_whois - generic message handler
  *
@@ -492,7 +514,8 @@ int m_whois(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
       }
     }
 
-    if (hunt_server_cmd(sptr, CMD_WHOIS, cptr, 0, "%C :%s", 1, parc, parv) !=
+    if (!whois_dest_is_mesh_only(sptr, parv[1]) &&
+        hunt_server_cmd(sptr, CMD_WHOIS, cptr, 0, "%C :%s", 1, parc, parv) !=
        HUNTED_ISME)
     return 0;
 
@@ -573,7 +596,8 @@ int ms_whois(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
 
   if (parc > 2)
   {
-    if (hunt_server_cmd(sptr, CMD_WHOIS, cptr, 0, "%C :%s", 1, parc, parv) !=
+    if (!whois_dest_is_mesh_only(sptr, parv[1]) &&
+        hunt_server_cmd(sptr, CMD_WHOIS, cptr, 0, "%C :%s", 1, parc, parv) !=
         HUNTED_ISME)
       return 0;
     parv[1] = parv[2];

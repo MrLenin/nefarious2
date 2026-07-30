@@ -2041,7 +2041,15 @@ int set_user_mode(struct Client *cptr, struct Client *sptr, int parc,
   if (parc < 2)
     return need_more_params(sptr, "MODE");
 
-  if (IsServer(cptr))
+  /* MR-6 invariant-2: a doc-reconcile drives this with cptr = cli_from(live),
+   * which on a consumer is the owner's MESH STUB (dead-sink Connection), not a
+   * STAT_SERVER.  IsServer-exact here skipped the numeric lookup, FindUser
+   * failed on the numeric string, and the whole MODE silently returned 0 —
+   * oper umodes (+owg) of mesh-homed users never converged to consumers
+   * (witnessed live 2026-07-30, AIAAD umode mat-check gaps).  A stub cptr can
+   * only originate internally (dead fd never produces input), so treating it
+   * as a server here is safe. */
+  if (IsServer(cptr) || IsMeshStub(cptr))
     acptr = findNUser(parv[1]);
 
   if (!(parv[1]))
@@ -2049,7 +2057,7 @@ int set_user_mode(struct Client *cptr, struct Client *sptr, int parc,
 
   if (!acptr && !(acptr = FindUser(parv[1])))
   {
-    if (IsServer(cptr) && !MyConnect(sptr)) {
+    if ((IsServer(cptr) || IsMeshStub(cptr)) && !MyConnect(sptr)) {
       acptr = sptr;
     } else {
       if (MyConnect(sptr))
@@ -2486,7 +2494,7 @@ int set_user_mode(struct Client *cptr, struct Client *sptr, int parc,
    * Evaluate rules for new user mode
    * Stop users making themselves operators too easily:
    */
-  if (!IsServer(cptr) && !is_svsmode)
+  if (!IsServer(cptr) && !IsMeshStub(cptr) && !is_svsmode)
   {
     if (!FlagHas(&setflags, FLAG_OPER) && IsOper(acptr))
       ClearOper(acptr);
