@@ -2204,7 +2204,8 @@ int history_query_between(const char *target,
   const char *ref1, *ref2;
   char keybuf[CHANNELLEN + HISTORY_TIMESTAMP_LEN + 8];
   char end_prefix[CHANNELLEN + HISTORY_TIMESTAMP_LEN + 8];
-  int keylen, end_prefix_len;
+  char target_prefix[CHANNELLEN + 2];
+  int keylen, end_prefix_len, target_prefix_len;
   struct db_snapshot *snap = NULL;
   struct db_iter *it = NULL;
   struct HistoryMessage *head = NULL, *tail = NULL, *msg;
@@ -2260,6 +2261,9 @@ int history_query_between(const char *target,
   end_prefix_len = build_key(end_prefix, sizeof(end_prefix), target, ref2, NULL);
   if (end_prefix_len < 0)
     return -1;
+  target_prefix_len = build_key(target_prefix, sizeof(target_prefix), target, NULL, NULL);
+  if (target_prefix_len < 0)
+    return -1;
 
   /* Open a snapshot so the iter and ml_content_resolve see a coherent view. */
   snap = db_snapshot_new(history_db_env);
@@ -2279,9 +2283,21 @@ int history_query_between(const char *target,
     const void *kbase = db_iter_key(it, &klen);
     const void *vbase = db_iter_value(it, &vlen);
 
-    /* Check if past end */
-    if (klen >= (size_t)end_prefix_len &&
-        memcmp(kbase, end_prefix, end_prefix_len) >= 0)
+    /* Still this target's range?  The walk is a plain forward iteration
+     * from <target>\0<from>; without this guard it ran on into whatever
+     * pair sorted next.  The end check below used to be skipped for keys
+     * shorter than the end prefix, so a guest pair (22-char session id)
+     * followed by the account's short account:account pairs returned
+     * those pairs' rows, with no window at all, until the limit -- every
+     * goguma backlog fetch is a BETWEEN (2026-09-05). */
+    if (klen < (size_t)target_prefix_len ||
+        memcmp(kbase, target_prefix, target_prefix_len) != 0)
+      break;
+
+    /* Past the end of the window?  Compare on the shorter length so a
+     * key can never dodge the check by being short. */
+    if (memcmp(kbase, end_prefix,
+               klen < (size_t)end_prefix_len ? klen : (size_t)end_prefix_len) >= 0)
       break;
 
     /* Parse and add message */
