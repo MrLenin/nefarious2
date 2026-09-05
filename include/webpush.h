@@ -205,7 +205,13 @@ struct Client;
  * most, itself clamped to at most 64), ordered by a vendor tag because a
  * batch shares one msgid and time:
  *
- *   @batch=<base msgid>;msgid=<base>;time=..;account=..;evilnet.github.io/line=<i>/<sent>/<total>[;draft/multiline-concat] :nick!user@host PRIVMSG|NOTICE target :line
+ *   @batch=<base msgid>;msgid=<base>;time=..;account=..;evilnet.github.io/line=1/<sent>/<total> :nick!user@host PRIVMSG|NOTICE target :line
+ *   @batch=<base msgid>;time=..;account=..;evilnet.github.io/line=<i>/<sent>/<total>[;draft/multiline-concat] :nick!user@host PRIVMSG|NOTICE target :line
+ *
+ * That is draft/multiline's fallback form (msgid on the first line only,
+ * as the spec requires; batch on every line as a batch's lines carry it);
+ * the evilnet.github.io/line tag is ours, because push delivery keeps no
+ * order.
  *
  * A read-marker relay is the MARKREAD line: ":server MARKREAD target timestamp=<ts>".
  *

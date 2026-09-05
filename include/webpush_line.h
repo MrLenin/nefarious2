@@ -6,9 +6,15 @@
  * drop tags but never msgid.  This module builds those lines:
  *
  *   @msgid=..;time=..;account=.. :nick!user@host PRIVMSG target :text
- *   @batch=<base msgid>;msgid=..;time=..;account=..;evilnet.github.io/line=i/sent/total[;draft/multiline-concat] :nick!user@host PRIVMSG target :line
+ *   @batch=<base msgid>;msgid=..;time=..;account=..;evilnet.github.io/line=1/sent/total :nick!user@host PRIVMSG target :line
+ *   @batch=<base msgid>;time=..;account=..;evilnet.github.io/line=i/sent/total[;draft/multiline-concat] :nick!user@host PRIVMSG target :line
  *   :server MARKREAD target timestamp=<ts>
  *
+ * A multiline message is delivered line by line, in draft/multiline's
+ * fallback form: msgid on the first line only (the spec forbids it on
+ * later ones), batch on every line (what a batch's lines carry; the
+ * receiver's grouping key), time and account repeated.  The
+ * evilnet.github.io/line tag is ours: push delivery is unordered.
  * Tags appear in that order and only when they have a value.  Pure: no
  * ircd dependencies; unit-tested in ircd/test/webpush_line_cmocka.c.
  * Contract: docs/projects/push-payload-multiline.md §3 (Seance repo).

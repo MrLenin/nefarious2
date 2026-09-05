@@ -134,13 +134,23 @@ int webpush_line_message(char *out, size_t outlen,
 
   if (ml)
     wl_tag(&b, &ntags, "batch", ml->batch);
-  if (msgid && msgid[0])
+  /* A multiline message has one msgid, and draft/multiline puts it on the
+   * first line only when the batch is delivered line by line ("Servers
+   * MUST only include a message ID on the first message of a batch when
+   * sending a fallback").  The batch tag on every line is what lines of a
+   * batch carry and is the receiver's grouping key; time and account may
+   * repeat ("MAY also be included on subsequent lines where it makes
+   * sense"), and for a standalone notification they do. */
+  if (msgid && msgid[0] && (!ml || ml->index == 1))
     wl_tag(&b, &ntags, "msgid", msgid);
   if (timestamp && timestamp[0])
     wl_tag(&b, &ntags, "time", timestamp);
   if (src->account && src->account[0])
     wl_tag(&b, &ntags, "account", src->account);
   if (ml) {
+    /* Ours, not part of draft/multiline: a push service promises no
+     * delivery order, so a receiver reassembling a batch from separate
+     * pushes needs each line's position and the count. */
     snprintf(idx, sizeof(idx), "%d/%d/%d", ml->index, ml->sent, ml->total);
     wl_tag(&b, &ntags, "evilnet.github.io/line", idx);
     if (ml->concat)

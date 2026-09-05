@@ -106,12 +106,21 @@ static void test_multiline_lines(void **state)
   assert_string_equal(out, "@batch=base1;msgid=base1;time=" T ";account=alice"
                            ";evilnet.github.io/line=1/3/5"
                            " :alice!u@h.example PRIVMSG #chan :line one");
+  /* Later lines: no msgid (draft/multiline: "MUST only include a message
+   * ID on the first message of a batch" in the fallback form); batch,
+   * time and account stay. */
   ml.index = 2; ml.concat = 1;
   assert_true(webpush_line_message(out, sizeof(out), &s, "PRIVMSG", "#chan", " continued",
                                    "base1", T, &ml) > 0);
-  assert_string_equal(out, "@batch=base1;msgid=base1;time=" T ";account=alice"
+  assert_string_equal(out, "@batch=base1;time=" T ";account=alice"
                            ";evilnet.github.io/line=2/3/5;draft/multiline-concat"
                            " :alice!u@h.example PRIVMSG #chan : continued");
+  ml.index = 3; ml.concat = 0;
+  assert_true(webpush_line_message(out, sizeof(out), &s, "PRIVMSG", "#chan", "last",
+                                   "base1", T, &ml) > 0);
+  assert_string_equal(out, "@batch=base1;time=" T ";account=alice"
+                           ";evilnet.github.io/line=3/3/5"
+                           " :alice!u@h.example PRIVMSG #chan :last");
 }
 
 static void test_multiline_rejects_bad_index(void **state)
