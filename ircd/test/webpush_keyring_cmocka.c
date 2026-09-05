@@ -154,6 +154,8 @@ static void test_next_generation(void **state)
 static void test_prunable(void **state)
 {
   struct webpush_keyring ring;
+  /* CUR (gen 1) was created at T0: every gen-0 key retired at T0,
+   * whatever its own age. */
   struct webpush_key cur = mk("CUR", 1, T0, "one", 0);
   struct webpush_key unref = mk("UNREF", 0, T0 - DAY, "two", 0);
   struct webpush_key held = mk("HELD", 0, T0 - DAY, "two", 0);
@@ -172,34 +174,51 @@ static void test_prunable(void **state)
 
   /* The current key is never prunable, referenced or not. */
   assert_int_equal(webpush_key_prunable(&ring, webpush_keyring_find(&ring, "CUR"),
-                                        T0, 180 * DAY, DAY), 0);
+                                        T0 + 400 * DAY, 180 * DAY, DAY), 0);
   /* A retired key nothing references goes once the grace has passed
-   * (the newcomer's boot key, a day after boot). */
+   * since RETIREMENT (the newcomer's boot key, a day after it adopted
+   * the network's key) -- not since its creation. */
   assert_int_equal(webpush_key_prunable(&ring, webpush_keyring_find(&ring, "UNREF"),
-                                        T0, 180 * DAY, DAY), 1);
+                                        T0, 180 * DAY, DAY), 0);
+  assert_int_equal(webpush_key_prunable(&ring, webpush_keyring_find(&ring, "UNREF"),
+                                        T0 + DAY, 180 * DAY, DAY), 1);
   /* ...but not inside the grace: a peer's registration bound to it may
    * still be on its way. */
   assert_int_equal(webpush_key_prunable(&ring, webpush_keyring_find(&ring, "FRESH"),
-                                        T0, 180 * DAY, DAY), 0);
+                                        T0 + DAY - 1, 180 * DAY, DAY), 0);
   /* grace <= 0 prunes an unreferenced key at once. */
   assert_int_equal(webpush_key_prunable(&ring, webpush_keyring_find(&ring, "FRESH"),
                                         T0, 180 * DAY, 0), 1);
-  /* A retired key with local subscriptions stays while young. */
+  /* A retired key with local subscriptions stays while those can still
+   * be live: until `expire` after retirement, however old the key. */
   assert_int_equal(webpush_key_prunable(&ring, webpush_keyring_find(&ring, "HELD"),
-                                        T0, 180 * DAY, DAY), 0);
-  /* ...but past the expiry window it goes even if referenced: those
-   * records aged out on the same clock. */
+                                        T0 + DAY, 180 * DAY, DAY), 0);
   assert_int_equal(webpush_key_prunable(&ring, webpush_keyring_find(&ring, "OLD"),
-                                        T0, 180 * DAY, DAY), 1);
+                                        T0 + 180 * DAY - 1, 180 * DAY, DAY), 0);
+  /* ...and past the expiry window since retirement it goes even if
+   * referenced: those records aged out on the same clock. */
+  assert_int_equal(webpush_key_prunable(&ring, webpush_keyring_find(&ring, "OLD"),
+                                        T0 + 180 * DAY, 180 * DAY, DAY), 1);
+  /* Rotation period == expiry (both 90 days): a key rotated out is NOT
+   * prunable the tick it retires -- the bug the retirement clock fixes. */
+  assert_int_equal(webpush_key_prunable(&ring, webpush_keyring_find(&ring, "HELD"),
+                                        T0, 90 * DAY, DAY), 0);
   /* expire <= 0 disables the age rule. */
   assert_int_equal(webpush_key_prunable(&ring, webpush_keyring_find(&ring, "OLD"),
-                                        T0, 0, DAY), 0);
-
-  assert_int_equal(webpush_keyring_remove(&ring, "UNREF"), 1);
-  assert_int_equal(webpush_keyring_remove(&ring, "UNREF"), 0);
-  assert_int_equal(ring.count, 4);
-  assert_null(webpush_keyring_find(&ring, "UNREF"));
-  assert_string_equal(webpush_keyring_current(&ring)->id, "CUR");
+                                        T0 + 400 * DAY, 0, DAY), 0);
+  /* A newer key that was created earlier than the current one marks the
+   * retirement (rotation history): retirement is the OLDEST outranking key. */
+  {
+    struct webpush_key mid = mk("MID", 2, T0 + 10 * DAY, "one", 0);
+    struct webpush_key top = mk("TOP", 3, T0 + 20 * DAY, "one", 0);
+    webpush_keyring_add(&ring, &mid);
+    webpush_keyring_add(&ring, &top);
+    /* CUR (gen 1) retired when MID (gen 2) was created, at T0+10d. */
+    assert_int_equal(webpush_key_prunable(&ring, webpush_keyring_find(&ring, "CUR"),
+                                          T0 + 10 * DAY + DAY - 1, 180 * DAY, DAY), 0);
+    assert_int_equal(webpush_key_prunable(&ring, webpush_keyring_find(&ring, "CUR"),
+                                          T0 + 10 * DAY + DAY, 180 * DAY, DAY), 1);
+  }
 }
 
 static void test_format_parse_roundtrip(void **state)

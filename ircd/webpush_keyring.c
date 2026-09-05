@@ -194,10 +194,33 @@ int webpush_key_prunable(const struct webpush_keyring *ring,
     return 0;
   if (cur == key || 0 == strcmp(cur->id, key->id))
     return 0;
-  if (key->refs <= 0 && key->created + (grace > 0 ? grace : 0) <= now)
-    return 1;
-  if (expire > 0 && key->created > 0 && key->created + expire <= now)
-    return 1;
+
+  /* Both clocks run from the key's RETIREMENT, not its creation: a key
+   * is bound to by registrations for as long as it is current, so its
+   * last subscription ages out `expire` after it stopped being current,
+   * and a late registration bound to it can arrive `grace` after that.
+   * Measured from creation, a key rotated out after WEBPUSH_KEY_ROTATE
+   * was prunable the same tick once WEBPUSH_EXPIRE was no larger than
+   * the rotation period (2026-09-05, both 90 days) -- with live
+   * subscriptions still signing with it.  The ring does not record when
+   * a key retired; the creation of the oldest key that outranks it is
+   * that moment (the current key's, when nothing else does). */
+  {
+    long long retired = cur->created;
+    int i;
+    for (i = 0; i < ring->count; i++) {
+      const struct webpush_key *k = &ring->keys[i];
+      if (k->generation > key->generation && k->created > 0
+          && (retired <= 0 || k->created < retired))
+        retired = k->created;
+    }
+    if (retired <= 0)
+      retired = key->created;
+    if (key->refs <= 0 && retired + (grace > 0 ? grace : 0) <= now)
+      return 1;
+    if (expire > 0 && retired > 0 && retired + expire <= now)
+      return 1;
+  }
   return 0;
 }
 

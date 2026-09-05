@@ -86,12 +86,14 @@ int webpush_key_compare(const struct webpush_key *a,
                         const struct webpush_key *b);
 
 /** 1 when `key` (a member of `ring`) may be dropped: it is not current and
- * either nothing local references it (refs == 0) and it is at least
- * `grace` seconds old, or, with `expire` > 0, it is older than `expire`
- * seconds at `now` -- past that, subscriptions bound to it have aged out
- * on the same clock.  The grace covers the window in which a peer's
- * registration bound to the key (a client that saw it in ISUPPORT) can
- * still arrive after the key was retired here. */
+ * either nothing local references it (refs == 0) and it has been retired
+ * for at least `grace` seconds, or, with `expire` > 0, it has been retired
+ * for more than `expire` seconds at `now` -- past that, subscriptions
+ * bound to it have aged out on the same clock (a registration binds to
+ * the key current when it was made).  Retirement is the creation of the
+ * oldest key that outranks it.  The grace covers the window in which a
+ * peer's registration bound to the key (a client that saw it in ISUPPORT)
+ * can still arrive after the key was retired here. */
 int webpush_key_prunable(const struct webpush_keyring *ring,
                          const struct webpush_key *key,
                          long long now, long long expire, long long grace);
