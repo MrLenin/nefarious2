@@ -3097,15 +3097,34 @@ int history_attach_context(const char *target, struct HistoryMessage *messages)
         }
         db_val_free(&main_val);
 
+        /* Context is an ANNOTATION of its parent -- the spec's "reacts,
+         * redacts, edits": a TAGMSG or a REDACT row.  A reply is a
+         * message in its own right, with its own place in the stream; it
+         * is in the index (it carries +reply) but must not ride along as
+         * context: spliced after its parent it arrived out of order,
+         * uncounted, and then again as itself on the page that held it
+         * (2026-09-05). */
+        if (ctx->type != HISTORY_TAGMSG && ctx->type != HISTORY_REDACT) {
+          MyFree(ctx);
+          goto next_child;
+        }
+
         /* Fill in key fields */
         ircd_strncpy(ctx->target, target, sizeof(ctx->target));
         ircd_strncpy(ctx->timestamp, child_ts, sizeof(ctx->timestamp));
         ircd_strncpy(ctx->msgid, child_mid, sizeof(ctx->msgid));
         ctx->is_context = 1;
 
-        /* Splice into list immediately after the parent */
-        ctx->next = msg->next;
-        msg->next = ctx;
+        /* Splice in after the parent AND after the context already hung
+         * on it: the index walks children in time order, and inserting
+         * each at msg->next reversed them. */
+        {
+          struct HistoryMessage *at = msg;
+          while (at->next && at->next->is_context)
+            at = at->next;
+          ctx->next = at->next;
+          at->next = ctx;
+        }
         added++;
       }
 next_child:
