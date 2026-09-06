@@ -2120,6 +2120,31 @@ static void filter_targets_window(struct HistoryTarget **list,
  * @param[in] limit Maximum number of targets.
  * @param[in] label Label string for labeled-response (NULL for auto-replay).
  */
+/** history_query_targets filter: the target is one @a ctx (the requester)
+ * may read, and -- for a channel under strict presence without +H --
+ * one it was present in at the target's last activity.  Same rules as
+ * send_targets_batch's emit loop, applied INSIDE the walk so other
+ * people's targets never count against the requester's limit. */
+static int targets_visible_cb(const char *target, const char *last_ts, void *ctx)
+{
+  struct Client *sptr = (struct Client *)ctx;
+
+  if (check_history_access(sptr, target, NULL, 0) != 0)
+    return 0;
+  if (feature_bool(FEAT_CHATHISTORY_STRICT_PRESENCE) && IsChannelName(target)) {
+    struct Channel *pchan = FindChannel(target);
+    if (!(pchan && (pchan->mode.exmode & EXMODE_PUBLICHISTORY))) {
+      int p_is_session = 0;
+      const char *p_anchor = presence_anchor_for(sptr, &p_is_session);
+      int64_t act = PRESENCE_TIME_FROM_MS_LATE((int64_t)history_parse_ms(last_ts));
+      if (!p_anchor || act == 0
+          || !presence_was_present(p_anchor, p_is_session, target, act))
+        return 0;
+    }
+  }
+  return 1;
+}
+
 static void send_targets_batch(struct Client *sptr, struct HistoryTarget *targets,
                                int limit, const char *label, int query_complete)
 {
@@ -2351,8 +2376,11 @@ static struct FedRequest *start_fed_targets_query(
       if (is_ulined_server(server))
         continue;
 
-      sendcmdto_one(&me, CMD_CHATHISTORY, server, "Q * T %s %d %s %s",
-                    s2s_ref, limit, reqid, dest_yxx);
+      /* Trailing "*" keeps ref2's slot; P<yxx> names the requester so
+       * the responder filters the walk to ITS targets (older responders
+       * ignore both). */
+      sendcmdto_one(&me, CMD_CHATHISTORY, server, "Q * T %s %d %s %s * P%s",
+                    s2s_ref, limit, reqid, dest_yxx, req->client_yxx);
     }
   }
 
@@ -2442,7 +2470,8 @@ static int chathistory_targets(struct Client *sptr, const char *ref1_str,
       fetch_limit = 500;
 
     count = history_query_targets(ts1, ts2, /*include_newer=*/1,
-                                  fetch_limit, &targets);
+                                  fetch_limit, &targets,
+                                  targets_visible_cb, sptr);
     if (count < 0) {
       send_fail(sptr, "CHATHISTORY", "MESSAGE_ERROR", "*",
                 "Failed to retrieve targets");
@@ -5110,8 +5139,17 @@ int ms_chathistory(struct Client *cptr, struct Client *sptr, int parc, char *par
       if (fetch_limit > 500)
         fetch_limit = 500;
 
-      tgt_count = history_query_targets(ts1_buf, ts2_buf, /*include_newer=*/1,
-                                        fetch_limit, &targets);
+      /* Filter for the REQUESTER when the origin named it (its
+       * membership and identity are network-wide); otherwise the
+       * unfiltered walk, and the origin filters what it can. */
+      {
+        struct Client *rq = NULL;
+        if (requester && (requester[0] == 'P' || requester[0] == 'F') && requester[1])
+          rq = findNUser(requester + 1);
+        tgt_count = history_query_targets(ts1_buf, ts2_buf, /*include_newer=*/1,
+                                          fetch_limit, &targets,
+                                          rq ? targets_visible_cb : NULL, rq);
+      }
       if (tgt_count <= 0) {
         sendcmdto_one(&me, CMD_CHATHISTORY, sptr, "E %s 0", reqid);
         return 0;

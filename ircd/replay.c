@@ -337,7 +337,7 @@ int replay_pm_pair_for_nick(struct Client *sptr, const char *nick,
    * those whose other party the TARGETS derivation names @a nick, the
    * most recently active wins: a guest nick is reused by different
    * people over time. */
-  if (history_query_targets("0", "99999999999.999", 1, 1000000, &list) <= 0
+  if (history_query_targets("0", "99999999999.999", 1, 1000000, &list, NULL, NULL) <= 0
       || !list)
     return 0;
   for (t = list; t; t = t->next) {
@@ -824,7 +824,7 @@ void replay_continue(struct Client *sptr)
         /* Auto-replay wants the plain in-window view: no veto rows
          * (this is a local availability sweep, not #565 matching). */
         history_query_targets(rs->since_timestamp, now_timestamp,
-                              /*include_newer=*/0, 50, &rs->pm_targets);
+                              /*include_newer=*/0, 50, &rs->pm_targets, NULL, NULL);
         rs->pm_cursor = rs->pm_targets;
         rs->phase = REPLAY_PHASE_PMS;
       } else {

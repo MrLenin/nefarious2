@@ -2347,7 +2347,8 @@ int history_query_between(const char *target,
 
 int history_query_targets(const char *timestamp1, const char *timestamp2,
                           int include_newer, int limit,
-                          struct HistoryTarget **result)
+                          struct HistoryTarget **result,
+                          history_target_filter_fn filter, void *filter_ctx)
 {
   struct db_iter *it;
   struct HistoryTarget *head = NULL, *tail = NULL, *tgt;
@@ -2422,6 +2423,16 @@ int history_query_targets(const char *timestamp1, const char *timestamp2,
       tgt->target[klen] = '\0';
       ircd_strncpy(tgt->last_timestamp, last_ts, sizeof(tgt->last_timestamp));
       tgt->next = NULL;
+
+      /* The caller's filter runs inside the walk so only ITS targets
+       * count toward the limit (2026-09-05: a 30-day TARGETS on a server
+       * with ~3000 targets listed one, because the first 3x<limit>
+       * window-matching keys in key order were other people's). */
+      if (filter && !filter(tgt->target, tgt->last_timestamp, filter_ctx)) {
+        MyFree(tgt);
+        rc = db_iter_next(it);
+        continue;
+      }
 
       if (tail)
         tail->next = tgt;

@@ -319,9 +319,18 @@ extern int history_query_between(const char *target,
  * @param[out] result Pointer to result list head (caller must free).
  * @return Number of targets returned, or -1 on error.
  */
+/** Per-target keep/skip hook for history_query_targets: 1 keeps the
+ * target (it counts toward the limit), 0 skips it.  The walk is in key
+ * order, not recency, so any filtering the caller would do afterwards
+ * (access, presence) must happen HERE or a server with more active
+ * targets than the limit crowds the caller's own targets out. */
+typedef int (*history_target_filter_fn)(const char *target, const char *last_ts,
+                                        void *ctx);
+
 extern int history_query_targets(const char *timestamp1, const char *timestamp2,
                                  int include_newer,
-                                  int limit, struct HistoryTarget **result);
+                                 int limit, struct HistoryTarget **result,
+                                 history_target_filter_fn filter, void *filter_ctx);
 
 /** Find the most recent JOIN event for a nick in a channel.
  * Scans backward through the channel's history looking for a JOIN
