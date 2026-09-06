@@ -84,6 +84,13 @@ extern void presence_shutdown(void);
  * (~1.7e12) below 1e15, a packed stamp (~1.1e17) above. */
 extern int64_t presence_norm_time(int64_t v);
 
+/** Minute heartbeat for the crash-recovery stamp (see presence_init). */
+extern void presence_alive_tick(void);
+
+/** Newest stored-row time (epoch ms) as a lower bound for boot-close;
+ * call before presence_init. */
+extern void presence_set_boot_alive_hint(uint64_t newest_ms);
+
 /** The presence time of an event: its msgid's HLC stamp when the msgid
  * decodes and its millisecond agrees with @a event_ms (the row's stamp),
  * else (@a event_ms, logical 0). */

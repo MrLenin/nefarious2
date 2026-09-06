@@ -122,6 +122,15 @@ static struct presence_session_entry *session_buckets[PRESENCE_HASH_SIZE];
 
 static struct db_cf *presence_cf = NULL;
 static int           presence_persistence_ready = 0;
+/** Proof-of-life hint for boot-close (epoch ms): the newest row the
+ * history store holds, handed in by ircd.c before presence_init so this
+ * module stays free of history.c (the cmocka harness links it alone). */
+static uint64_t      boot_alive_hint_ms = 0;
+
+void presence_set_boot_alive_hint(uint64_t newest_ms)
+{
+  boot_alive_hint_ms = newest_ms;
+}
 
 /* ---------------------------------------------------------------- */
 /* Helpers                                                            */
@@ -457,7 +466,8 @@ static int record_was_present(const struct presence_record *r, int64_t msg_ms)
 #define PRESENCE_META_LAST_ALIVE "\0\0last_alive"
 
 /** Persist the current time as the last-alive stamp (see boot-close
- * in presence_init).  Called from init and each maintenance sweep. */
+ * in presence_init).  Called from init, each maintenance sweep, and the
+ * minute heartbeat (presence_alive_tick). */
 void presence_touch_last_alive(void)
 {
   struct db_env *env;
@@ -535,6 +545,19 @@ int presence_init(void)
         memcpy(&last_alive, v.base, sizeof(last_alive));
       last_alive = presence_norm_time(last_alive);
       db_val_free(&v);
+    }
+    /* The stamp is a heartbeat (presence_alive_tick, once a minute; the
+     * sweep and boot also write it), but the newest row the history
+     * store holds is proof of life on its own: the server was up when it
+     * stored that.  Bound the close by it so a stalled heartbeat can never
+     * close an interval BEFORE messages the member demonstrably saw --
+     * with the hourly-only stamp of 2026-09-05 a restart hid the hours
+     * before it from every restored session ("history ends a few hours
+     * ago"). */
+    if (boot_alive_hint_ms) {
+      int64_t newest = PRESENCE_TIME_FROM_MS_LATE((int64_t)boot_alive_hint_ms);
+      if (newest > last_alive)
+        last_alive = newest;
     }
 
     if (it && wb && db_iter_seek_first(it) == DB_OK) {
@@ -1453,4 +1476,12 @@ void presence_retention_sweep(void)
              "presence: retention sweep rewrote %u, deleted %u rows",
              rewritten, deleted));
   }
+}
+
+
+/** Minute heartbeat (ircd.c timer): keep the last-alive stamp fresh so
+ * boot-close after a crash loses at most a minute of presence. */
+void presence_alive_tick(void)
+{
+  presence_touch_last_alive();
 }

@@ -319,6 +319,11 @@ extern int history_query_between(const char *target,
  * @param[out] result Pointer to result list head (caller must free).
  * @return Number of targets returned, or -1 on error.
  */
+/** The newest last-activity stamp across every stored target, in epoch
+ * milliseconds; 0 when the store is empty or unavailable.  Proof of life
+ * for crash recovery: the server was alive when it stored that row. */
+extern uint64_t history_newest_activity_ms(void);
+
 /** Per-target keep/skip hook for history_query_targets: 1 keeps the
  * target (it counts toward the limit), 0 skips it.  The walk is in key
  * order, not recency, so any filtering the caller would do afterwards

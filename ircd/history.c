@@ -2345,6 +2345,36 @@ int history_query_between(const char *target,
   return count;
 }
 
+uint64_t history_newest_activity_ms(void)
+{
+  struct db_iter *it;
+  uint64_t newest = 0;
+  int rc;
+
+  if (!history_available)
+    return 0;
+  it = db_iter_open(history_db_env, history_cf_targets, NULL);
+  if (!it)
+    return 0;
+  rc = db_iter_seek_first(it);
+  while (rc == DB_OK && db_iter_valid(it)) {
+    size_t vlen;
+    const void *vbase = db_iter_value(it, &vlen);
+    char ts[HISTORY_TIMESTAMP_LEN];
+    if (vbase && vlen > 0 && vlen < sizeof(ts)) {
+      uint64_t ms;
+      memcpy(ts, vbase, vlen);
+      ts[vlen] = '\0';
+      ms = history_parse_ms(ts);
+      if (ms > newest)
+        newest = ms;
+    }
+    rc = db_iter_next(it);
+  }
+  db_iter_close(it);
+  return newest;
+}
+
 int history_query_targets(const char *timestamp1, const char *timestamp2,
                           int include_newer, int limit,
                           struct HistoryTarget **result,

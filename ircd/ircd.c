@@ -169,6 +169,7 @@ static struct Timer connect_timer; /**< timer structure for try_connections() */
 static struct Timer ping_timer; /**< timer structure for check_pings() */
 static struct Timer destruct_event_timer; /**< timer structure for exec_expired_destruct_events() */
 static struct Timer history_purge_timer; /**< timer structure for history_purge_callback() */
+static struct Timer presence_alive_timer; /**< minute heartbeat for the presence crash-recovery stamp */
 static struct Timer metadata_purge_timer; /**< timer structure for metadata_purge_callback() */
 static struct Timer bouncer_gate_timer;
 static struct Timer fwd_label_timer;
@@ -183,6 +184,7 @@ static void fwd_label_timer_callback(struct Event *ev)
 /* Forward declarations so the *_restart_timer helpers below can refer to
  * the callbacks before their definitions. */
 static void history_purge_callback(struct Event* ev);
+static void presence_alive_callback(struct Event* ev);
 static void metadata_purge_callback(struct Event* ev);
 
 /** Daemon information. */
@@ -844,6 +846,14 @@ static void history_purge_callback(struct Event* ev)
   presence_retention_sweep();
 }
 
+/** Minute heartbeat: the presence store's last-alive stamp (crash
+ * recovery bound; see presence_init's boot-close). */
+static void presence_alive_callback(struct Event* ev)
+{
+  (void)ev;
+  presence_alive_tick();
+}
+
 /** Compute the effective interval for the history_purge_timer.
  * Honours FEAT_CHATHISTORY_MAINTENANCE_INTERVAL with a one-minute floor. */
 static int history_purge_interval(void)
@@ -1354,7 +1364,10 @@ int main(int argc, char **argv) {
      * completes.  Also runs the boot-close sweep for stale open
      * intervals.  Non-fatal: without the env, session-anchored
      * presence remains usable in-memory. */
+    presence_set_boot_alive_hint(history_newest_activity_ms());
     (void)presence_init();
+    timer_add(timer_init(&presence_alive_timer), presence_alive_callback, 0,
+              TT_PERIODIC, 60);
   }
 #endif
 
