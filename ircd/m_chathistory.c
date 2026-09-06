@@ -525,6 +525,39 @@ int should_send_message_type(struct Client *sptr, enum HistoryMessageType type)
   return CapActive(sptr, CAP_DRAFT_EVENTPLAYBACK);
 }
 
+/** Bit mask of the row types should_send_message_type() lets @a sptr
+ * receive, for filtering INSIDE the walk (see HistoryRowFilter.type_mask).
+ * Returns 0 (= no filtering) when every type passes. */
+static unsigned int requester_type_mask(struct Client *sptr)
+{
+  unsigned int mask = 0, all = 0;
+  int type;
+
+  for (type = 0; type < HISTORY_TYPE_COUNT; type++) {
+    all |= 1u << type;
+    if (should_send_message_type(sptr, (enum HistoryMessageType)type))
+      mask |= 1u << type;
+  }
+  return mask == all ? 0 : mask;
+}
+
+/** The row filter for a local requester's walk: the presence hook when
+ * strict presence opened one (@a pf), else the caller's @a bare filter,
+ * either way carrying the requester's type mask.  Never NULL. */
+static struct HistoryRowFilter *query_row_filter(struct Client *sptr,
+                                                 struct PresenceQueryFilter *pf,
+                                                 struct HistoryRowFilter *bare)
+{
+  struct HistoryRowFilter *hook = presence_query_filter_hook(pf);
+
+  if (!hook) {
+    memset(bare, 0, sizeof(*bare));
+    hook = bare;
+  }
+  hook->type_mask = requester_type_mask(sptr);
+  return hook;
+}
+
 /** Copy @a in to @a out without the server's own PM-history markers
  * (`+evilnet.github.io/sid=` and the legacy `+afternet.org/sid=`).  They
  * exist for the ephemeral participant check in check_history_access and
@@ -1030,7 +1063,7 @@ static int presence_filter_and_replay(struct Client *sptr,
 static int open_query_presence(struct Client *sptr, const char *lookup_target,
                                int ops_override,
                                struct PresenceQueryFilter **pf_out);
-static int query_page_complete(struct PresenceQueryFilter *pf, int count,
+static int query_page_complete(struct HistoryRowFilter *hook, int count,
                                int limit);
 
 /** Replay chathistory to a client since a given timestamp.
@@ -1058,11 +1091,13 @@ int chathistory_auto_replay(struct Client *sptr, const char *target,
    * messages than the limit, we get the newest ones (not the oldest). */
   {
     struct PresenceQueryFilter *pf = NULL;
+    struct HistoryRowFilter bare, *hook;
     if (open_query_presence(sptr, target, 0, &pf) < 0)
       return 0;   /* fail closed: nothing visible to replay */
+    hook = query_row_filter(sptr, pf, &bare);
     count = history_query_latest_after(target, limit, since_timestamp, &messages,
-                                       presence_query_filter_hook(pf));
-    complete = query_page_complete(pf, count, limit);
+                                       hook);
+    complete = query_page_complete(hook, count, limit);
     presence_query_filter_close(pf);
   }
   if (count < 0)
@@ -1468,10 +1503,9 @@ static int open_query_presence(struct Client *sptr, const char *lookup_target,
 /** Completeness of a page produced by a (possibly filtered) walk: fewer
  * visible rows than the limit means the walk was exhausted -- unless
  * the raw-scan cap cut it short. */
-static int query_page_complete(struct PresenceQueryFilter *pf, int count,
+static int query_page_complete(struct HistoryRowFilter *hook, int count,
                                int limit)
 {
-  struct HistoryRowFilter *hook = presence_query_filter_hook(pf);
   if (hook && hook->truncated)
     return 0;
   return count < limit;
@@ -1495,6 +1529,7 @@ static int chathistory_latest(struct Client *sptr, const char *target,
   int limit, count, max_limit;
   int complete = 1;
   struct PresenceQueryFilter *pf = NULL;
+  struct HistoryRowFilter bare, *hook;
   char lookup_target[CHANNELLEN + 1];  /* must fit a channel name (CHANNELLEN) or a
                                        * PM identity pair-key (PM_PAIRKEY_BUFSIZE); CHANNELLEN+1 dominates */
 
@@ -1528,9 +1563,10 @@ static int chathistory_latest(struct Client *sptr, const char *target,
                                ops_override, cli_label(sptr), 1, target);
     return 0;
   }
+  hook = query_row_filter(sptr, pf, &bare);
   count = history_query_latest(lookup_target, ref_type, ref_value, limit,
-                               &messages, presence_query_filter_hook(pf));
-  complete = query_page_complete(pf, count, limit);
+                               &messages, hook);
+  complete = query_page_complete(hook, count, limit);
   presence_query_filter_close(pf);
   if (count < 0) {
     send_fail(sptr, "CHATHISTORY", "MESSAGE_ERROR", target,
@@ -1600,6 +1636,7 @@ static int chathistory_before(struct Client *sptr, const char *target,
   int limit, count, max_limit;
   int complete = 1;
   struct PresenceQueryFilter *pf = NULL;
+  struct HistoryRowFilter bare, *hook;
   char lookup_target[CHANNELLEN + 1];  /* must fit a channel name (CHANNELLEN) or a
                                        * PM identity pair-key (PM_PAIRKEY_BUFSIZE); CHANNELLEN+1 dominates */
 
@@ -1628,9 +1665,10 @@ static int chathistory_before(struct Client *sptr, const char *target,
                                ops_override, cli_label(sptr), 1, target);
     return 0;
   }
+  hook = query_row_filter(sptr, pf, &bare);
   count = history_query_before(lookup_target, ref_type, ref_value, limit,
-                               &messages, presence_query_filter_hook(pf));
-  complete = query_page_complete(pf, count, limit);
+                               &messages, hook);
+  complete = query_page_complete(hook, count, limit);
   presence_query_filter_close(pf);
   if (count < 0) {
     send_fail(sptr, "CHATHISTORY", "MESSAGE_ERROR", target,
@@ -1680,6 +1718,7 @@ static int chathistory_after(struct Client *sptr, const char *target,
   int limit, count, max_limit;
   int complete = 1;
   struct PresenceQueryFilter *pf = NULL;
+  struct HistoryRowFilter bare, *hook;
   char lookup_target[CHANNELLEN + 1];  /* must fit a channel name (CHANNELLEN) or a
                                        * PM identity pair-key (PM_PAIRKEY_BUFSIZE); CHANNELLEN+1 dominates */
 
@@ -1708,9 +1747,10 @@ static int chathistory_after(struct Client *sptr, const char *target,
                                ops_override, cli_label(sptr), 1, target);
     return 0;
   }
+  hook = query_row_filter(sptr, pf, &bare);
   count = history_query_after(lookup_target, ref_type, ref_value, limit,
-                              &messages, presence_query_filter_hook(pf));
-  complete = query_page_complete(pf, count, limit);
+                              &messages, hook);
+  complete = query_page_complete(hook, count, limit);
   presence_query_filter_close(pf);
   if (count < 0) {
     send_fail(sptr, "CHATHISTORY", "MESSAGE_ERROR", target,
@@ -1760,6 +1800,7 @@ static int chathistory_around(struct Client *sptr, const char *target,
   int limit, count, max_limit;
   int complete = 1;
   struct PresenceQueryFilter *pf = NULL;
+  struct HistoryRowFilter bare, *hook;
   char lookup_target[CHANNELLEN + 1];  /* must fit a channel name (CHANNELLEN) or a
                                        * PM identity pair-key (PM_PAIRKEY_BUFSIZE); CHANNELLEN+1 dominates */
 
@@ -1788,9 +1829,10 @@ static int chathistory_around(struct Client *sptr, const char *target,
                                ops_override, cli_label(sptr), 1, target);
     return 0;
   }
+  hook = query_row_filter(sptr, pf, &bare);
   count = history_query_around(lookup_target, ref_type, ref_value, limit,
-                               &messages, presence_query_filter_hook(pf));
-  complete = query_page_complete(pf, count, limit);
+                               &messages, hook);
+  complete = query_page_complete(hook, count, limit);
   presence_query_filter_close(pf);
   if (count < 0) {
     send_fail(sptr, "CHATHISTORY", "MESSAGE_ERROR", target,
@@ -1841,6 +1883,7 @@ static int chathistory_between(struct Client *sptr, const char *target,
   int limit, count, max_limit;
   int complete = 1;
   struct PresenceQueryFilter *pf = NULL;
+  struct HistoryRowFilter bare, *hook;
   char lookup_target[CHANNELLEN + 1];  /* must fit a channel name (CHANNELLEN) or a
                                        * PM identity pair-key (PM_PAIRKEY_BUFSIZE); CHANNELLEN+1 dominates */
 
@@ -1876,10 +1919,11 @@ static int chathistory_between(struct Client *sptr, const char *target,
                                ops_override, cli_label(sptr), 1, target);
     return 0;
   }
+  hook = query_row_filter(sptr, pf, &bare);
   count = history_query_between(lookup_target, ref_type1, ref_value1,
                                  ref_type2, ref_value2, limit, &messages,
-                                 presence_query_filter_hook(pf));
-  complete = query_page_complete(pf, count, limit);
+                                 hook);
+  complete = query_page_complete(hook, count, limit);
   presence_query_filter_close(pf);
   if (count < 0) {
     send_fail(sptr, "CHATHISTORY", "MESSAGE_ERROR", target,
@@ -4727,6 +4771,7 @@ static void autoreplay_next_channel(struct AutoReplayContext *ctx)
       struct HistoryMessage *messages = NULL;
       int complete = 1;
       struct PresenceQueryFilter *pf = NULL;
+      struct HistoryRowFilter bare;
       int count = 0;
       /* Presence-aware paging: the walk itself skips rows outside the
        * session's presence, so a long absence no longer empties the
@@ -4734,7 +4779,7 @@ static void autoreplay_next_channel(struct AutoReplayContext *ctx)
       if (open_query_presence(sptr, channame, 0, &pf) == 0)
         count = history_query_latest(channame, HISTORY_REF_NONE, "*",
                                      ctx->limit + 1, &messages,
-                                     presence_query_filter_hook(pf));
+                                     query_row_filter(sptr, pf, &bare));
       presence_query_filter_close(pf);
       if (count > ctx->limit && messages) {
         struct HistoryMessage *extra = messages;

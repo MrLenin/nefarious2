@@ -51,6 +51,13 @@ struct HistoryRowFilter {
   int (*fn)(const struct HistoryMessage *msg, int reverse, void *ctx,
             int64_t *skip_to);
   void *ctx;
+  /** Bit per HistoryMessageType the requester can receive; 0 = every
+   * type.  Rows of other types are skipped INSIDE the walk (like hook
+   * rejects, uncounted) instead of at send time, so a run of JOIN/PART
+   * rows longer than the limit can no longer hand a client without
+   * draft/event-playback an empty page while messages sit behind it
+   * (2026-09-06). */
+  unsigned int type_mask;
   int scan_max;    /**< raw rows examined before giving up; 0 = default */
   int scanned;     /**< out: raw rows examined (kept + skipped) */
   int truncated;   /**< out: scan_max hit -- page may be incomplete */
@@ -104,6 +111,7 @@ enum HistoryMessageType {
                           *   record type (not in-band content bytes) is
                           *   what marks a record as multiline, so client
                           *   message bytes can never forge one. */
+  ,HISTORY_TYPE_COUNT       /**< one past the last type (for masks) */
 };
 
 /** Stored message for chathistory retrieval.
