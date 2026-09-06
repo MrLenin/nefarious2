@@ -3295,6 +3295,14 @@ void chathistory_reflood_ads(struct Client *newpeer)
     owner = FindNServer(yxx);
     if (!owner || owner == &me || owner == newpeer)
       continue;
+    /* Only a REAL P10 server may be a message source here.  On the
+     * crdt-mesh branch a tree-departed server is kept as a
+     * STAT_MESH_SERVER stub (cli_user == NULL, dead-sink link); its ad
+     * can linger, and a stub as a %C source SIGSEGVs (crdt-mesh skill
+     * invariant #2).  Pure-CRDT nodes never advertise over P10 and are
+     * outside the CH wire entirely.  IsServer is exact STAT_SERVER. */
+    if (!IsServer(owner))
+      continue;
     if (cli_from(owner) == newpeer)
       continue;   /* reached via the new peer -- it already has this ad */
     sendcmdto_one(owner, CMD_CHATHISTORY, newpeer, "A S %d", ad->retention_days);
