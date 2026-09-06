@@ -519,10 +519,44 @@ int should_send_message_type(struct Client *sptr, enum HistoryMessageType type)
    * Per spec: "draft/event-playback is not required in order to include
    * REDACT messages in chathistory responses." */
   if (type == HISTORY_REDACT)
-    return CapActive(sptr, CAP_DRAFT_REDACT);
+    return CapRecipientHas(sptr, CAP_DRAFT_REDACT);
 
-  /* Other events (JOIN, PART, QUIT, KICK, MODE, NICK) require event-playback */
-  return CapActive(sptr, CAP_DRAFT_EVENTPLAYBACK);
+  /* Other events (JOIN, PART, QUIT, KICK, MODE, NICK) require event-playback.
+   * The CONNECTION's own caps decide (CapRecipientHas), like every tag
+   * emission does -- CapActive is the bouncer session's UNION, which let a
+   * sibling's event-playback deliver JOIN/PART rows to a connection that
+   * never negotiated it (audit 2026-09-06). */
+  return CapRecipientHas(sptr, CAP_DRAFT_EVENTPLAYBACK);
+}
+
+/** A stored TAGMSG whose client tags are ALL +typing (legacy rows from
+ * before typing-only TAGMSGs stopped being stored).  Such a row is never
+ * emitted, so it must not consume a page slot either. */
+static int history_row_is_typing_only(const struct HistoryMessage *msg)
+{
+  const char *tags, *tp;
+
+  if (msg->type != HISTORY_TAGMSG)
+    return 0;
+  tags = msg->client_tags[0] ? msg->client_tags
+       : (msg->dyn_content ? msg->dyn_content : msg->content);
+  if (!tags[0])
+    return 1;
+  for (tp = tags; tp && *tp; ) {
+    const char *sep = strchr(tp, ';');
+    size_t tlen = sep ? (size_t)(sep - tp) : strlen(tp);
+    if (tlen < 7 || strncmp(tp, "+typing", 7) != 0 ||
+        (tlen > 7 && tp[7] != '='))
+      return 0;
+    tp = sep ? sep + 1 : NULL;
+  }
+  return 1;
+}
+
+static int typing_only_veto(const struct HistoryMessage *msg, void *ctx)
+{
+  (void)ctx;
+  return history_row_is_typing_only(msg);
 }
 
 /** Bit mask of the row types should_send_message_type() lets @a sptr
@@ -555,6 +589,8 @@ static struct HistoryRowFilter *query_row_filter(struct Client *sptr,
     hook = bare;
   }
   hook->type_mask = requester_type_mask(sptr);
+  hook->veto = typing_only_veto;
+  hook->veto_ctx = NULL;
   return hook;
 }
 
@@ -1053,7 +1089,7 @@ static void send_history_batch(struct Client *sptr, const char *target,
 }
 
 /* Forward declaration — definition further down, after the per-subcommand
- * helpers it co-locates with.  Used here by chathistory_auto_replay. */
+ * helpers it co-locates with.  Used here by chathistory_page_since. */
 static int presence_filter_and_replay(struct Client *sptr,
                                        const char *target,
                                        struct HistoryMessage **head,
@@ -1065,52 +1101,51 @@ static int open_query_presence(struct Client *sptr, const char *lookup_target,
                                struct PresenceQueryFilter **pf_out);
 static int query_page_complete(struct HistoryRowFilter *hook, int count,
                                int limit);
+static int redact_filter_messages(struct HistoryMessage **head, int count);
 
-/** Replay chathistory to a client since a given timestamp.
- * Used by bouncer auto-replay for legacy clients without draft/chathistory.
- * Queries history_query_after and sends messages using send_history_batch.
- *
- * @param[in] sptr Client to send history to.
- * @param[in] target Channel or nick to replay.
- * @param[in] since_timestamp Unix timestamp (seconds.milliseconds) to replay from.
- * @param[in] limit Maximum messages to replay.
- * @return Number of messages replayed, or -1 on error.
- */
-int chathistory_auto_replay(struct Client *sptr, const char *target,
-                            const char *since_timestamp, int limit)
+/** Build one page of history since @a since_timestamp for @a sptr on
+ * @a target the way the on-demand handlers do.  See history.h.  This is
+ * the ONLY page builder the bouncer reattach replay may use (wave 1). */
+int chathistory_page_since(struct Client *sptr, const char *target, int limit,
+                           const char *since_timestamp,
+                           struct HistoryMessage **out, int *complete)
 {
   struct HistoryMessage *messages = NULL;
+  struct PresenceQueryFilter *pf = NULL;
+  struct HistoryRowFilter bare, *hook;
   int count;
-  int complete = 1;
 
+  *out = NULL;
+  *complete = 1;
   if (!history_is_available())
     return -1;
 
-  /* Query the most recent messages, but no older than the since-timestamp.
-   * Uses LATEST with a floor rather than AFTER so that when there are more
-   * messages than the limit, we get the newest ones (not the oldest). */
-  {
-    struct PresenceQueryFilter *pf = NULL;
-    struct HistoryRowFilter bare, *hook;
-    if (open_query_presence(sptr, target, 0, &pf) < 0)
-      return 0;   /* fail closed: nothing visible to replay */
-    hook = query_row_filter(sptr, pf, &bare);
-    count = history_query_latest_after(target, limit, since_timestamp, &messages,
-                                       hook);
-    complete = query_page_complete(hook, count, limit);
-    presence_query_filter_close(pf);
-  }
+  /* LATEST with a floor rather than AFTER: when more rows than the limit
+   * exist, the page is the NEWEST ones.  Presence hook, type mask and
+   * typing veto all run inside the walk, so `count < limit` means the
+   * walk was exhausted. */
+  if (open_query_presence(sptr, target, 0, &pf) < 0)
+    return 0;   /* fail closed: nothing visible to replay */
+  hook = query_row_filter(sptr, pf, &bare);
+  count = history_query_latest_after(target, limit, since_timestamp, &messages,
+                                     hook);
+  *complete = query_page_complete(hook, count, limit);
+  presence_query_filter_close(pf);
   if (count < 0)
     return -1;
 
   if (count > 0 && messages) {
-    /* Attach context messages (reactions, redacts) to their parents */
+    /* Same reply-side sequence as presence_filter_and_replay. */
     history_attach_context(target, messages);
-    /* Ownership of messages transfers to replay_start_batch */
-    count = presence_filter_and_replay(sptr, target, &messages, count, 0, NULL,
-                                       complete, NULL);
+    count = redact_filter_messages(&messages, count);
+    count = presence_filter_messages(sptr, target, &messages, count, 0);
   }
-
+  if (count <= 0 || !messages) {
+    if (messages)
+      history_free_messages(messages);
+    return 0;
+  }
+  *out = messages;
   return count;
 }
 

@@ -77,6 +77,18 @@ static int is_pm_target_for_client(const char *target, struct Client *cptr)
   return 0;
 }
 
+/** history_query_targets filter for the bouncer PM leg: a pair key that
+ * involves the reattaching client. */
+static int replay_pm_target_cb(const char *target, const char *last_ts, void *ctx)
+{
+  (void)last_ts;
+  return strchr(target, ':') != NULL
+      && is_pm_target_for_client(target, (struct Client *)ctx);
+}
+
+/** Cap on the session's own PM conversations listed for one replay. */
+#define REPLAY_PM_TARGETS_MAX 200
+
 /* Recover the counterparty DISPLAY nick from the batch's messages.
  * `me` tiebreak uses current nick — display-only (access already
  * authorized), so a mutable nick is acceptable here.  Returns 1+fills
@@ -578,44 +590,17 @@ static int replay_next_channel(struct Client *sptr, struct ReplayState *rs)
      * completeness).  The list is chronological (oldest first) of the
      * LATEST results, so the overflow extra is the head -- drop it to
      * keep exactly the limit-sized set the old query returned. */
+    /* The on-demand page builder: presence hook + type mask + typing
+     * veto inside the walk, context attached, redacted originals
+     * dropped.  A bare walk here replayed redacted content and let a
+     * JOIN/PART run empty the page (audit 2026-09-06, wave 1). */
     {
-      /* Presence-aware paging: skip rows outside the session's presence
-       * inside the walk (and seek past invisible runs) instead of
-       * filtering a page that was already full of them. */
-      int pf_rc = 0;
-      struct PresenceQueryFilter *pf =
-          presence_query_filter_open(sptr, channame, 0, &pf_rc);
-      count = (pf_rc < 0) ? 0
-          : history_query_latest_after(channame, rs->replay_limit + 1,
-                                       chan_since, &messages,
-                                       presence_query_filter_hook(pf));
-      presence_query_filter_close(pf);
-    }
-    if (count <= 0 || !messages) {
-      if (messages)
-        history_free_messages(messages);
-      continue;
-    }
-    rs->is_last_page = 1;
-    if (count > rs->replay_limit) {
-      struct HistoryMessage *extra = messages;
-      messages = messages->next;
-      extra->next = NULL;
-      history_free_messages(extra);
-      count = rs->replay_limit;
-      rs->is_last_page = 0;
-    }
-
-    /* Strict-presence: the bouncer auto-replay bypassed the presence
-     * filter entirely -- a session that joined a channel yesterday
-     * replayed it from its detach point days back.  Filter exactly
-     * like the CHATHISTORY query paths do (no-op unless the feature
-     * is on). */
-    count = presence_filter_messages(sptr, channame, &messages, count, 0);
-    if (count <= 0 || !messages) {
-      if (messages)
-        history_free_messages(messages);
-      continue;
+      int complete = 1;
+      count = chathistory_page_since(sptr, channame, rs->replay_limit,
+                                     chan_since, &messages, &complete);
+      if (count <= 0 || !messages)
+        continue;
+      rs->is_last_page = complete;
     }
 
     /* Set up new batch */
@@ -649,24 +634,15 @@ static int replay_next_pm(struct Client *sptr, struct ReplayState *rs)
     if (!strchr(tgt->target, ':') || !is_pm_target_for_client(tgt->target, sptr))
       continue;
 
-    /* Query history -- limit+1 truncation probe, same as the channel
-     * leg: complete => @draft/chathistory-end on the opener, truncated
-     * => tag withheld (drop the overflow head to keep the latest
-     * limit-sized set). */
-    count = history_query_latest_after(tgt->target, rs->replay_limit + 1,
-                                        rs->since_timestamp, &messages, NULL);
-    if (count <= 0 || !messages) {
-      if (messages)
-        history_free_messages(messages);
-      continue;
-    }
-    rs->is_last_page = 1;
-    if (count > rs->replay_limit) {
-      struct HistoryMessage *extra = messages;
-      messages = messages->next;
-      extra->next = NULL;
-      history_free_messages(extra);
-      rs->is_last_page = 0;
+    /* Same page builder as the channel leg: complete => the opener
+     * carries @draft/chathistory-end, else the tag is withheld. */
+    {
+      int complete = 1;
+      count = chathistory_page_since(sptr, tgt->target, rs->replay_limit,
+                                     rs->since_timestamp, &messages, &complete);
+      if (count <= 0 || !messages)
+        continue;
+      rs->is_last_page = complete;
     }
 
     /* Set up new batch.  Storage key is "lowerNick:higherNick" — the
@@ -822,9 +798,14 @@ void replay_continue(struct Client *sptr)
         ircd_snprintf(0, now_timestamp, sizeof(now_timestamp), "%lu.000",
                       (unsigned long)CurrentTime);
         /* Auto-replay wants the plain in-window view: no veto rows
-         * (this is a local availability sweep, not #565 matching). */
+         * (this is a local availability sweep, not #565 matching).
+         * The filter keeps only THIS session's pair keys inside the
+         * walk: the targets CF is in key order with channels first, so
+         * an unfiltered 50-row window never reached the PMs on a busy
+         * server (audit 2026-09-06, wave 1). */
         history_query_targets(rs->since_timestamp, now_timestamp,
-                              /*include_newer=*/0, 50, &rs->pm_targets, NULL, NULL);
+                              /*include_newer=*/0, REPLAY_PM_TARGETS_MAX,
+                              &rs->pm_targets, replay_pm_target_cb, sptr);
         rs->pm_cursor = rs->pm_targets;
         rs->phase = REPLAY_PHASE_PMS;
       } else {

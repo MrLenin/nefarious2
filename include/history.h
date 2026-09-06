@@ -58,6 +58,11 @@ struct HistoryRowFilter {
    * draft/event-playback an empty page while messages sit behind it
    * (2026-09-06). */
   unsigned int type_mask;
+  /** Optional per-row veto applied after the type mask: return 1 to skip
+   * the row (uncounted, no seek).  For content-level rejects such as
+   * typing-only TAGMSG rows that should never consume a page slot. */
+  int (*veto)(const struct HistoryMessage *msg, void *veto_ctx);
+  void *veto_ctx;
   int scan_max;    /**< raw rows examined before giving up; 0 = default */
   int scanned;     /**< out: raw rows examined (kept + skipped) */
   int truncated;   /**< out: scan_max hit -- page may be incomplete */
@@ -665,14 +670,23 @@ extern int history_quota_check(const char *channel, const char *account, int cha
 
 /** Replay chathistory to a client since a given timestamp.
  * Used by bouncer auto-replay for legacy clients without draft/chathistory.
- * @param[in] sptr Client to send history to.
- * @param[in] target Channel or nick to replay.
- * @param[in] since_timestamp Unix timestamp (seconds.milliseconds) to replay from.
- * @param[in] limit Maximum messages to replay.
- * @return Number of messages replayed, or -1 on error.
+ * Build ONE page of history since a timestamp for a client exactly the way
+ * the on-demand CHATHISTORY handlers do (presence hook + requester type
+ * mask + typing veto inside the walk; context attached; redacted originals
+ * dropped; presence post-filter).  The single page builder shared with the
+ * bouncer reattach replay -- audit 2026-09-06 wave 1: the replay path had
+ * its own bare walk and drifted (replayed redacted content, no type mask).
+ * @param[in] sptr Requesting client.
+ * @param[in] target Storage target (channel, or a:b pair key).
+ * @param[in] limit Page size.
+ * @param[in] since_timestamp Floor ("sec.mmm"); rows at/after it.
+ * @param[out] out Page rows (oldest first), NULL when empty; caller owns.
+ * @param[out] complete 1 when the walk was exhausted (no more pages).
+ * @return Row count (0 = empty page), or -1 on error.
  */
-extern int chathistory_auto_replay(struct Client *sptr, const char *target,
-                                   const char *since_timestamp, int limit);
+extern int chathistory_page_since(struct Client *sptr, const char *target,
+                                  int limit, const char *since_timestamp,
+                                  struct HistoryMessage **out, int *complete);
 
 /** Free partial federation chunk reassembly buffers (CH B read responses and
  *  CH WB writes) that arrived from a server link that is now exiting, so they

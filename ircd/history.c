@@ -1594,12 +1594,14 @@ static int history_filter_row(struct HistoryRowFilter *filter,
   int verdict;
   int scan_max;
 
-  if (!filter || (!filter->fn && !filter->type_mask))
+  if (!filter || (!filter->fn && !filter->type_mask && !filter->veto))
     return 1;
 
   filter->scanned++;
   if (filter->type_mask && !(filter->type_mask & (1u << msg->type)))
     verdict = 0;   /* type the requester cannot receive: skip, uncounted */
+  else if (filter->veto && filter->veto(msg, filter->veto_ctx))
+    verdict = 0;   /* content the requester never sees: skip, uncounted */
   else if (filter->fn)
     verdict = filter->fn(msg, reverse, filter->ctx, &skip_to);
   else
