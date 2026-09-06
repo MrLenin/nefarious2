@@ -133,21 +133,31 @@ static void send_ch_response(struct Client *sptr, const char *reqid,
 {
   const char *account = msg->account[0] ? msg->account : "*";
   const char *content = msg->dyn_content ? msg->dyn_content : msg->content;
-  /* A resolved-multiline record ships its dyn_content INLINE, so the
-   * receiving requester has no local ml blob and no dyn_content -- the
-   * wire TYPE is the only way its \x1F-split gate can open.  Rewrite
-   * legacy (pre-type-12) records to HISTORY_MULTILINE on the wire; for
-   * everything else wire_type == msg->type. */
   int wire_type = msg->dyn_content ? HISTORY_MULTILINE : msg->type;
+  char tbuf[8];
+  size_t full, cont;
 
-  /* If we have raw compressed data, send with Z flag for bandwidth savings.
-   * Only use Z if the base64-encoded result fits in a single P10 message.
-   * Otherwise fall through to normal B chunking with decompressed content.
-   * Never for a resolved-multiline record: raw_content is the stored
-   * PLACEHOLDER record, not the body the requester needs. */
+  ircd_snprintf(0, tbuf, sizeof(tbuf), "%d", wire_type);
+  /* Content budget for one P10 line = 510 (BUFSIZE-2) minus this row's
+   * header.  Measured per row so a long prod hostmask (sender) or
+   * account no longer overflows the line and gets silently truncated
+   * by msgq (audit 2026-09-06 #11).  The first/R/Z line carries the
+   * full metadata; continuation B lines carry only reqid+msgid. */
+  {
+    size_t base = strlen(reqid) + strlen(msg->msgid) + strlen(msg->timestamp)
+                + strlen(tbuf) + strlen(msg->sender) + strlen(account);
+    size_t over = 3 /*:XX*/ + 4 /* CH B */ + 7 /* single spaces */ + 2 /* " :" */ + base;
+    size_t cover = 3 + 4 + strlen(reqid) + 1 + strlen(msg->msgid) + 2 /* " +" */ + 2 /* " :" */;
+    full = (over + 4 < 510) ? (size_t)(510 - over - 4) : 8;    /* -4 safety */
+    full &= ~((size_t)3);                                      /* mult of 4 for b64 */
+    cont = (cover + 4 < 510) ? (size_t)(510 - cover - 4) : 8;
+    cont &= ~((size_t)3);
+  }
+
+  /* Compressed passthrough (Z) only when the whole b64 fits one line. */
   if (!msg->dyn_content && msg->raw_content && msg->raw_content_len > 0) {
     size_t b64_len = ((msg->raw_content_len + 2) / 3) * 4 + 1;
-    if (b64_len <= CH_CHUNK_B64_SIZE) {
+    if (b64_len - 1 <= full) {
       char *b64 = MyMalloc(b64_len);
       if (b64) {
         ch_base64_encode((const char *)msg->raw_content, msg->raw_content_len, b64);
@@ -158,84 +168,65 @@ static void send_ch_response(struct Client *sptr, const char *reqid,
         return;
       }
     }
-    /* Fall through to uncompressed if too large or malloc failed */
   }
 
-  /* Check if content needs base64 encoding */
-  if (!ch_needs_encoding(content)) {
-    /* Simple case: send as-is */
+  /* Plain R only when the raw content has no newline AND fits one line. */
+  if (!ch_needs_encoding(content) && strlen(content) <= full) {
     sendcmdto_one(&me, CMD_CHATHISTORY, sptr, "R %s %s %s %d %s %s :%s",
                   reqid, msg->msgid, msg->timestamp, wire_type,
                   msg->sender, account, content);
     return;
   }
 
-  /* Base64 encode the content */
-  size_t content_len = strlen(content);
-  size_t b64_len = ((content_len + 2) / 3) * 4 + 1;
-  char *b64 = MyMalloc(b64_len);
-  if (!b64) {
-    /* Fallback: send truncated without encoding */
-    sendcmdto_one(&me, CMD_CHATHISTORY, sptr, "R %s %s %s %d %s %s :%s",
-                  reqid, msg->msgid, msg->timestamp, wire_type,
-                  msg->sender, account, "[content too large]");
-    return;
-  }
+  /* Base64 + chunk to fit each line. */
+  {
+    size_t content_len = strlen(content);
+    size_t b64_len = ((content_len + 2) / 3) * 4 + 1;
+    char *b64 = MyMalloc(b64_len);
+    size_t b64_total, offset = 0;
+    int first = 1;
+    if (!b64) {
+      sendcmdto_one(&me, CMD_CHATHISTORY, sptr, "R %s %s %s %d %s %s :%s",
+                    reqid, msg->msgid, msg->timestamp, wire_type,
+                    msg->sender, account, "[content too large]");
+      return;
+    }
+    ch_base64_encode(content, content_len, b64);
+    b64_total = strlen(b64);
 
-  ch_base64_encode(content, content_len, b64);
-  size_t b64_total = strlen(b64);
-
-  /* If it fits in one message, send complete B message (no + marker) */
-  if (b64_total <= CH_CHUNK_B64_SIZE) {
-    sendcmdto_one(&me, CMD_CHATHISTORY, sptr, "B %s %s %s %d %s %s :%s",
-                  reqid, msg->msgid, msg->timestamp, wire_type,
-                  msg->sender, account, b64);
-    MyFree(b64);
-    return;
-  }
-
-  /* Multi-chunk: send with chunking */
-  size_t offset = 0;
-  int first = 1;
-
-  while (offset < b64_total) {
-    size_t remaining = b64_total - offset;
-    size_t chunk_size = (remaining > CH_CHUNK_B64_SIZE) ? CH_CHUNK_B64_SIZE : remaining;
-    int more = (offset + chunk_size < b64_total);
-    char chunk[CH_CHUNK_B64_SIZE + 1];
-
-    memcpy(chunk, b64 + offset, chunk_size);
-    chunk[chunk_size] = '\0';
-
-    if (first) {
-      /* First chunk: include all metadata, + marker if more coming */
-      if (more) {
-        sendcmdto_one(&me, CMD_CHATHISTORY, sptr, "B %s %s %s %d %s %s + :%s",
-                      reqid, msg->msgid, msg->timestamp, wire_type,
-                      msg->sender, account, chunk);
-      } else {
-        /* Single chunk that just barely needed encoding */
-        sendcmdto_one(&me, CMD_CHATHISTORY, sptr, "B %s %s %s %d %s %s :%s",
-                      reqid, msg->msgid, msg->timestamp, wire_type,
-                      msg->sender, account, chunk);
-      }
-      first = 0;
-    } else {
-      /* Continuation chunk: just reqid, msgid, and marker */
-      if (more) {
-        sendcmdto_one(&me, CMD_CHATHISTORY, sptr, "B %s %s + :%s",
-                      reqid, msg->msgid, chunk);
-      } else {
-        /* Final chunk: no + marker */
-        sendcmdto_one(&me, CMD_CHATHISTORY, sptr, "B %s %s :%s",
-                      reqid, msg->msgid, chunk);
-      }
+    if (b64_total <= full) {
+      sendcmdto_one(&me, CMD_CHATHISTORY, sptr, "B %s %s %s %d %s %s :%s",
+                    reqid, msg->msgid, msg->timestamp, wire_type,
+                    msg->sender, account, b64);
+      MyFree(b64);
+      return;
     }
 
-    offset += chunk_size;
+    while (offset < b64_total) {
+      size_t budget = first ? full : cont;
+      size_t remaining = b64_total - offset;
+      size_t chunk_size = remaining > budget ? budget : remaining;
+      int more = (offset + chunk_size < b64_total);
+      char chunk[520];
+      if (chunk_size > sizeof(chunk) - 1)
+        chunk_size = sizeof(chunk) - 1;
+      memcpy(chunk, b64 + offset, chunk_size);
+      chunk[chunk_size] = '\0';
+      if (first) {
+        sendcmdto_one(&me, CMD_CHATHISTORY, sptr,
+                      more ? "B %s %s %s %d %s %s + :%s" : "B %s %s %s %d %s %s :%s",
+                      reqid, msg->msgid, msg->timestamp, wire_type,
+                      msg->sender, account, chunk);
+        first = 0;
+      } else {
+        sendcmdto_one(&me, CMD_CHATHISTORY, sptr,
+                      more ? "B %s %s + :%s" : "B %s %s :%s",
+                      reqid, msg->msgid, chunk);
+      }
+      offset += chunk_size;
+    }
+    MyFree(b64);
   }
-
-  MyFree(b64);
 }
 
 /** Message type names for formatting.
@@ -1333,7 +1324,7 @@ static struct FedRequest *start_fed_query(struct Client *sptr, const char *targe
                                            int limit,
                                            struct HistoryMessage *local_msgs,
                                            int local_count, int ops_override,
-                                           const char *ref2);
+                                           const char *ref2, int local_complete);
 static int count_storage_servers(const char *target, time_t query_time);
 static int is_ulined_server(struct Client *server);
 static void fed_timeout_callback(struct Event *ev);
@@ -1628,7 +1619,7 @@ static int chathistory_latest(struct Client *sptr, const char *target,
   if (should_federate(lookup_target, count, limit)) {
     struct FedRequest *req = start_fed_query(sptr, lookup_target, target, "LATEST",
                                               ref_str, limit, messages, count,
-                                              ops_override, NULL);
+                                              ops_override, NULL, complete);
     if (req) {
       /* Federation started - response will be sent when complete */
       /* Note: messages ownership transferred to req */
@@ -1715,7 +1706,7 @@ static int chathistory_before(struct Client *sptr, const char *target,
   if (should_federate(lookup_target, count, limit)) {
     struct FedRequest *req = start_fed_query(sptr, lookup_target, target, "BEFORE",
                                               ref_str, limit, messages, count,
-                                              ops_override, NULL);
+                                              ops_override, NULL, complete);
     if (req)
       return 0;
   }
@@ -1797,7 +1788,7 @@ static int chathistory_after(struct Client *sptr, const char *target,
   if (should_federate(lookup_target, count, limit)) {
     struct FedRequest *req = start_fed_query(sptr, lookup_target, target, "AFTER",
                                               ref_str, limit, messages, count,
-                                              ops_override, NULL);
+                                              ops_override, NULL, complete);
     if (req)
       return 0;
   }
@@ -1879,7 +1870,7 @@ static int chathistory_around(struct Client *sptr, const char *target,
   if (should_federate(lookup_target, count, limit)) {
     struct FedRequest *req = start_fed_query(sptr, lookup_target, target, "AROUND",
                                               ref_str, limit, messages, count,
-                                              ops_override, NULL);
+                                              ops_override, NULL, complete);
     if (req)
       return 0;
   }
@@ -1972,7 +1963,7 @@ static int chathistory_between(struct Client *sptr, const char *target,
   if (should_federate(lookup_target, count, limit)) {
     struct FedRequest *req = start_fed_query(sptr, lookup_target, target, "BETWEEN",
                                               ref1_str, limit, messages, count,
-                                              ops_override, ref2_str);
+                                              ops_override, ref2_str, complete);
     if (req)
       return 0;  /* messages ownership transferred to req */
   }
@@ -2029,6 +2020,8 @@ struct FedRequest {
   int timer_active;                   /**< Whether timer is active */
   int response_sent;                  /**< Whether response was already sent */
   int fed_truncated;                  /**< Any storage server flagged its result truncated (CH E ... T) */
+  int local_incomplete;               /**< The origin's own walk did not exhaust (scan cap / short) */
+  int keep_oldest;                    /**< Merge trim direction: 1 keep oldest (AFTER/asc BETWEEN), 0 keep newest */
   struct FedCtxPair ctx_pairs[MAX_FED_CTX]; /**< Declared context children (CH C) */
   int ctx_pair_count;
   void (*completion_cb)(struct FedRequest *); /**< Custom completion (NULL = send_fed_response) */
@@ -3280,6 +3273,34 @@ void clear_server_ad(struct Client *server)
   }
 }
 
+/** Re-flood every known storage advertisement to a newly linked peer,
+ * on behalf of each ad's owner.  Only the owner self-advertises (CH A S
+ * at END_OF_BURST_ACK), so a server already behind a hub was never made
+ * known to a peer that links later -- its ad stays NULL there and it is
+ * never federated to, an asymmetric look-alike of the SOLO condition
+ * (audit 2026-09-06 #21).  Skips servers reached VIA the new peer (they
+ * are on its side and it already knows them). */
+void chathistory_reflood_ads(struct Client *newpeer)
+{
+  int si;
+  if (!newpeer || !IsServer(newpeer))
+    return;
+  for (si = 0; si < MAX_AD_SERVERS; si++) {
+    struct ChathistoryAd *ad = server_ads[si];
+    struct Client *owner;
+    char yxx[4];
+    if (!ad || !ad->has_advertisement || !ad->is_storage_server)
+      continue;
+    inttobase64(yxx, si, 2);
+    owner = FindNServer(yxx);
+    if (!owner || owner == &me || owner == newpeer)
+      continue;
+    if (cli_from(owner) == newpeer)
+      continue;   /* reached via the new peer -- it already has this ad */
+    sendcmdto_one(owner, CMD_CHATHISTORY, newpeer, "A S %d", ad->retention_days);
+  }
+}
+
 /** Check if a server has channel-level advertisements (Layer 1).
  * @param[in] server Server client.
  * @return 1 if server has channel ads, 0 otherwise.
@@ -4054,7 +4075,7 @@ static int message_exists(struct HistoryMessage *list, struct HistoryMessage *ch
 /** Merge and deduplicate two message lists, sort by timestamp */
 static struct HistoryMessage *merge_messages(struct HistoryMessage *list1,
                                               struct HistoryMessage *list2,
-                                              int limit)
+                                              int limit, int keep_oldest)
 {
   struct HistoryMessage *result = NULL, *tail = NULL;
   int count = 0;
@@ -4105,15 +4126,32 @@ static struct HistoryMessage *merge_messages(struct HistoryMessage *list1,
     count++;
   }
 
-  /* Step 2: If over limit, drop the oldest (front of list) to keep
-   * the N most recent messages. Result is chronological (ascending).
-   * The dropped copies own their heap content now (see above). */
-  while (count > limit && result) {
-    struct HistoryMessage *old = result;
-    result = result->next;
-    old->next = NULL;
-    history_free_messages(old);
-    count--;
+  /* Step 2: trim to `limit`.  Direction matters: LATEST/BEFORE and a
+   * descending BETWEEN keep the NEWEST `limit` (drop from the front);
+   * AFTER and an ascending BETWEEN keep the OLDEST `limit` (drop from
+   * the tail) -- keeping the newest for a forward query dropped the
+   * rows right after the anchor, so the client's next AFTER started
+   * past them (audit 2026-09-06 #9).  AROUND keeps newest (rare over
+   * federation; centring would need the ref position). */
+  if (count > limit && result) {
+    if (keep_oldest) {
+      struct HistoryMessage *m = result;
+      int i = 1;
+      while (m && i < limit) { m = m->next; i++; }
+      if (m && m->next) {
+        struct HistoryMessage *drop = m->next;
+        m->next = NULL;
+        history_free_messages(drop);
+      }
+    } else {
+      while (count > limit && result) {
+        struct HistoryMessage *old = result;
+        result = result->next;
+        old->next = NULL;
+        history_free_messages(old);
+        count--;
+      }
+    }
   }
 
   return result;
@@ -4146,7 +4184,7 @@ static void send_fed_response(struct FedRequest *req)
   {
     struct HistoryMessage *fed_ctx = extract_fed_context(req);
 
-    merged = merge_messages(req->local_msgs, req->fed_msgs, req->limit);
+    merged = merge_messages(req->local_msgs, req->fed_msgs, req->limit, req->keep_oldest);
 
     /* Count total */
     total = 0;
@@ -4164,7 +4202,8 @@ static void send_fed_response(struct FedRequest *req)
    * query_count note in the subcommand handlers). */
   total = presence_filter_and_replay(client, req->target, &merged, total,
                                      req->ops_override, req->label,
-                                     total < req->limit && !req->fed_truncated,
+                                     total < req->limit && !req->fed_truncated
+                                       && !req->local_incomplete,
                                      req->requested);
 }
 
@@ -4209,10 +4248,15 @@ static void fed_timeout_callback(struct Event *ev)
 
   switch (ev_type(ev)) {
   case ET_EXPIRE:
-    /* Timer expired - complete with whatever we have.
-     * Don't free here - timer_run will send ET_DESTROY after we return.
-     */
+    /* Timer expired - complete with whatever we have.  Any responder
+     * that never answered means the page is INCOMPLETE: mark it so the
+     * merged completeness withholds @draft/chathistory-end instead of
+     * telling an end-tag client there is no more history (audit
+     * 2026-09-06 #10; also covers a peer that SQUIT mid-query).
+     * Don't free here - timer_run will send ET_DESTROY after we return. */
     req->timer_active = 0;
+    if (req->servers_pending > 0)
+      req->fed_truncated = 1;
     complete_fed_request(req);
     break;
 
@@ -4324,13 +4368,32 @@ static int count_storage_servers(const char *target, time_t query_time)
  * Only queries servers that have advertised chathistory storage (CH A S)
  * and whose retention window covers the query timeframe.
  */
+/** Resolve a client reference (ISO timestamp, msgid, or *) to a Unix
+ * "sec.mmm" string for BETWEEN direction comparison; empty on failure. */
+static void fed_ref_to_unix(const char *ref, char *out, size_t n)
+{
+  enum HistoryRefType t;
+  const char *v;
+  out[0] = '\0';
+  if (!ref || parse_reference(ref, &t, &v) != 0)
+    return;
+  if (t == HISTORY_REF_TIMESTAMP) {
+    if (history_iso_to_unix(v, out, n) != 0)
+      ircd_strncpy(out, v, n - 1), out[n-1] = '\0';
+  } else if (t == HISTORY_REF_MSGID) {
+    if (history_msgid_to_timestamp(v, out) != 0)
+      out[0] = '\0';
+  }
+  /* HISTORY_REF_NONE ("*"): leave empty -> no direction preference. */
+}
+
 static struct FedRequest *start_fed_query(struct Client *sptr, const char *target,
                                            const char *requested,
                                            const char *subcmd, const char *ref,
                                            int limit,
                                            struct HistoryMessage *local_msgs,
                                            int local_count, int ops_override,
-                                           const char *ref2)
+                                           const char *ref2, int local_complete)
 {
   struct FedRequest *req;
   char reqid[32];
@@ -4418,6 +4481,19 @@ static struct FedRequest *start_fed_query(struct Client *sptr, const char *targe
   req->start_time = CurrentTime;
   req->limit = limit;
   req->ops_override = ops_override;
+  req->local_incomplete = !local_complete;
+  /* Merge trim direction: AFTER and an ascending BETWEEN keep the
+   * OLDEST limit; everything else keeps the newest (audit #9). */
+  if (s2s_subcmd == 'A') {
+    req->keep_oldest = 1;
+  } else if (s2s_subcmd == 'W' && ref2 && ref2[0]) {
+    char u1[HISTORY_TIMESTAMP_LEN], u2[HISTORY_TIMESTAMP_LEN];
+    fed_ref_to_unix(ref, u1, sizeof(u1));
+    fed_ref_to_unix(ref2, u2, sizeof(u2));
+    req->keep_oldest = (u1[0] && u2[0] && strcmp(u1, u2) <= 0) ? 1 : 0;
+  } else {
+    req->keep_oldest = 0;
+  }
 
   /* Save label for async response delivery */
   req->label[0] = '\0';
@@ -4473,10 +4549,15 @@ static struct FedRequest *start_fed_query(struct Client *sptr, const char *targe
        * F<yxx> = the requester asked for ":full" (the responder applies
        * has_ops_override itself).  ref2 is "*" when absent so the token
        * keeps its slot; older responders ignore both. */
-      sendcmdto_one(&me, CMD_CHATHISTORY, server, "Q %s %c %s %d %s %s %s %c%s",
+      /* Trailing type mask (hex): the row types the requester can
+       * receive, so the responder skips the rest INSIDE its walk and
+       * its limit+1 probe counts VISIBLE rows.  0 = all types.  Older
+       * responders ignore the extra param (audit #8). */
+      sendcmdto_one(&me, CMD_CHATHISTORY, server, "Q %s %c %s %d %s %s %s %c%s %x",
                     target, s2s_subcmd, s2s_ref, limit, reqid, dest_yxx,
                     s2s_ref2[0] ? s2s_ref2 : "*",
-                    ops_override ? 'F' : 'P', req->client_yxx);
+                    ops_override ? 'F' : 'P', req->client_yxx,
+                    requester_type_mask(sptr));
     }
   }
 
@@ -4963,7 +5044,7 @@ static void complete_autoreplay_channel(struct FedRequest *req)
     int total;
 
     fed_ctx = extract_fed_context(req);
-    merged = merge_messages(req->local_msgs, req->fed_msgs, req->limit);
+    merged = merge_messages(req->local_msgs, req->fed_msgs, req->limit, req->keep_oldest);
     total = 0;
     for (struct HistoryMessage *m = merged; m; m = m->next)
       total++;
@@ -5106,6 +5187,7 @@ int ms_chathistory(struct Client *cptr, struct Client *sptr, int parc, char *par
     char *dest_numeric = NULL;
     char *ref2 = NULL;
     const char *requester = NULL;   /* P<yxx> / F<yxx>, see start_fed_query */
+    unsigned int req_type_mask = 0; /* row types the requester can receive; 0 = all */
     struct PresenceQueryFilter *fed_pf = NULL;
     char query_subcmd_char;
     const char *query_subcmd_full;
@@ -5136,6 +5218,12 @@ int ms_chathistory(struct Client *cptr, struct Client *sptr, int parc, char *par
     /* Optional requester token (presence-aware paging on the responder) */
     if (parc >= 10 && parv[9][0] != '\0')
       requester = parv[9];
+    /* Optional trailing requester type mask (hex): the row types the
+     * requester can receive.  0 / absent = all types (audit #8). */
+    {
+      if (parc >= 11 && parv[10][0] != '\0')
+        req_type_mask = (unsigned int)strtoul(parv[10], NULL, 16);
+    }
 
     /* Destination-addressed query: if not for us, forward and skip */
     if (dest_numeric) {
@@ -5143,9 +5231,11 @@ int ms_chathistory(struct Client *cptr, struct Client *sptr, int parc, char *par
       if (dest && dest != &me) {
         /* Forward to destination via P10 routing — don't process locally */
         if (requester)
-          sendcmdto_one(sptr, CMD_CHATHISTORY, dest, "Q %s %s %s %d %s %s %s %s",
+          sendcmdto_one(sptr, CMD_CHATHISTORY, dest, "Q %s %s %s %d %s %s %s %s%s%s",
                         target, query_subcmd_str, ref, limit, reqid,
-                        dest_numeric, ref2 ? ref2 : "*", requester);
+                        dest_numeric, ref2 ? ref2 : "*", requester,
+                        (parc >= 11 && parv[10][0]) ? " " : "",
+                        (parc >= 11 && parv[10][0]) ? parv[10] : "");
         else if (ref2)
           sendcmdto_one(sptr, CMD_CHATHISTORY, dest, "Q %s %s %s %d %s %s %s",
                         target, query_subcmd_str, ref, limit, reqid,
@@ -5300,6 +5390,20 @@ int ms_chathistory(struct Client *cptr, struct Client *sptr, int parc, char *par
       }
     }
 
+    /* Filter for the responder walk: the presence hook when one was
+     * opened (account requester), else a bare filter -- either way it
+     * carries the requester's type mask and typing veto so the limit+1
+     * probe counts VISIBLE rows (audit #8). */
+    struct HistoryRowFilter fed_bare;
+    struct HistoryRowFilter *fed_hook = presence_query_filter_hook(fed_pf);
+    if (!fed_hook) {
+      memset(&fed_bare, 0, sizeof(fed_bare));
+      fed_hook = &fed_bare;
+    }
+    fed_hook->type_mask = req_type_mask;
+    fed_hook->veto = typing_only_veto;
+    fed_hook->veto_ctx = NULL;
+
     /* Query local LMDB based on subcommand.  For the linear shapes
      * (L/B/A) probe limit+1: an over-limit result marks this response
      * TRUNCATED, signaled to the requester on the CH E terminator so
@@ -5312,16 +5416,16 @@ int ms_chathistory(struct Client *cptr, struct Client *sptr, int parc, char *par
      * no probe, never flagged. */
     if (query_subcmd_char == 'L') {
       count = history_query_latest(target, ref_type, ref_value, limit + 1,
-                                   &messages, presence_query_filter_hook(fed_pf));
+                                   &messages, fed_hook);
     } else if (query_subcmd_char == 'B') {
       count = history_query_before(target, ref_type, ref_value, limit + 1,
-                                   &messages, presence_query_filter_hook(fed_pf));
+                                   &messages, fed_hook);
     } else if (query_subcmd_char == 'A') {
       count = history_query_after(target, ref_type, ref_value, limit + 1,
-                                  &messages, presence_query_filter_hook(fed_pf));
+                                  &messages, fed_hook);
     } else if (query_subcmd_char == 'R') {
       count = history_query_around(target, ref_type, ref_value, limit,
-                                   &messages, presence_query_filter_hook(fed_pf));
+                                   &messages, fed_hook);
     } else if (query_subcmd_char == 'W') {
       /* BETWEEN: second reference arrives as the optional trailing
        * param (after dest_numeric). */
@@ -5334,7 +5438,7 @@ int ms_chathistory(struct Client *cptr, struct Client *sptr, int parc, char *par
       }
       count = history_query_between(target, ref_type, ref_value,
                                     ref_type2, ref_value2, limit, &messages,
-                                    presence_query_filter_hook(fed_pf));
+                                    fed_hook);
     } else if (query_subcmd_char == 'X') {
       presence_query_filter_close(fed_pf);
       fed_pf = NULL;
