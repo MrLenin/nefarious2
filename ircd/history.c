@@ -922,10 +922,20 @@ int history_iso_to_unix(const char *iso_ts, char *unix_buf, size_t unix_buflen)
 
   tm.tm_sec = strtol(p, &end, 10);
 
-  /* Parse optional milliseconds */
+  /* Parse the optional fraction as a DECIMAL fraction: ".5" is 500 ms,
+   * ".12" is 120 ms, ".123456" is 123 ms.  strtoul on the digits read
+   * ".5" as 5 ms and clamped ".123456" to 999 (audit 2026-09-06). */
   if (end && *end == '.') {
-    millis = strtoul(end + 1, &end, 10);
-    if (millis > 999) millis = 999;
+    const char *d = end + 1;
+    unsigned int scale = 100;
+    millis = 0;
+    while (*d >= '0' && *d <= '9') {
+      if (scale)
+        millis += (unsigned int)(*d - '0') * scale;
+      scale /= 10;
+      d++;
+    }
+    end = (char *)d;
   }
 
   /* Convert to Unix time */
@@ -1859,12 +1869,17 @@ int history_query_before(const char *target, enum HistoryRefType ref_type,
 {
   char keybuf[CHANNELLEN + HISTORY_TIMESTAMP_LEN + HISTORY_MSGID_LEN + 8];
   char timestamp[HISTORY_TIMESTAMP_LEN];
+  const char *msgid = NULL;
   int keylen;
 
   *result = NULL;
 
-  /* Convert reference to Unix timestamp format */
+  /* Convert reference to Unix timestamp format.  A msgid reference
+   * keeps the msgid: the cursor is the ROW, not its millisecond, so
+   * same-millisecond siblings on the far side of it stay reachable
+   * (audit 2026-09-06). */
   if (ref_type == HISTORY_REF_MSGID) {
+    msgid = reference;
     if (history_msgid_to_timestamp(reference, timestamp) != 0)
       return 0; /* msgid not found, return empty */
     reference = timestamp;
@@ -1876,7 +1891,7 @@ int history_query_before(const char *target, enum HistoryRefType ref_type,
   }
 
   /* Build starting key */
-  keylen = build_key(keybuf, sizeof(keybuf), target, reference, NULL);
+  keylen = build_key(keybuf, sizeof(keybuf), target, reference, msgid);
   if (keylen < 0)
     return -1;
 
@@ -1895,12 +1910,17 @@ int history_query_after(const char *target, enum HistoryRefType ref_type,
 {
   char keybuf[CHANNELLEN + HISTORY_TIMESTAMP_LEN + HISTORY_MSGID_LEN + 8];
   char timestamp[HISTORY_TIMESTAMP_LEN];
+  const char *msgid = NULL;
   int keylen;
 
   *result = NULL;
 
-  /* Convert reference to Unix timestamp format */
+  /* Convert reference to Unix timestamp format.  A msgid reference
+   * keeps the msgid: the cursor is the ROW, not its millisecond, so
+   * same-millisecond siblings on the far side of it stay reachable
+   * (audit 2026-09-06). */
   if (ref_type == HISTORY_REF_MSGID) {
+    msgid = reference;
     if (history_msgid_to_timestamp(reference, timestamp) != 0)
       return 0;
     reference = timestamp;
@@ -1911,7 +1931,7 @@ int history_query_after(const char *target, enum HistoryRefType ref_type,
     /* If conversion fails, assume it's already Unix format */
   }
 
-  keylen = build_key(keybuf, sizeof(keybuf), target, reference, NULL);
+  keylen = build_key(keybuf, sizeof(keybuf), target, reference, msgid);
   if (keylen < 0)
     return -1;
 
@@ -1926,8 +1946,9 @@ int history_query_latest(const char *target, enum HistoryRefType ref_type,
                          struct HistoryRowFilter *filter)
 {
   char keybuf[CHANNELLEN + HISTORY_TIMESTAMP_LEN + 8];
-  char floorbuf[CHANNELLEN + HISTORY_TIMESTAMP_LEN + 8];
+  char floorbuf[CHANNELLEN + HISTORY_TIMESTAMP_LEN + HISTORY_MSGID_LEN + 8];
   char timestamp[HISTORY_TIMESTAMP_LEN];
+  const char *msgid = NULL;
   int keylen, floorlen;
 
   *result = NULL;
@@ -1944,6 +1965,7 @@ int history_query_latest(const char *target, enum HistoryRefType ref_type,
 
   /* Convert reference to Unix timestamp format */
   if (ref_type == HISTORY_REF_MSGID) {
+    msgid = reference;   /* floor is the ROW: same-ms rows after it stay */
     if (history_msgid_to_timestamp(reference, timestamp) != 0)
       return 0;
     reference = timestamp;
@@ -1958,7 +1980,7 @@ int history_query_latest(const char *target, enum HistoryRefType ref_type,
    * Per IRCv3 spec, LATEST <target> <msgid> <limit> returns the most
    * recent messages AFTER the anchor, up to limit. */
   keylen = build_key(keybuf, sizeof(keybuf), target, "32503680000.000", NULL);
-  floorlen = build_key(floorbuf, sizeof(floorbuf), target, reference, NULL);
+  floorlen = build_key(floorbuf, sizeof(floorbuf), target, reference, msgid);
   if (keylen < 0 || floorlen < 0)
     return -1;
 
@@ -2140,12 +2162,19 @@ int history_query_around(const char *target, enum HistoryRefType ref_type,
   if (ref_type == HISTORY_REF_MSGID) {
     int rc = history_lookup_message(target, reference, &ref_msg);
     if (rc == 0 && ref_msg) {
-      /* The reference row is subject to the same visibility rule as
-       * the rows around it. */
-      if (filter && filter->fn) {
+      /* The reference row is subject to the same visibility rules as
+       * the rows around it: type mask, veto, then the presence hook. */
+      if (filter) {
         int64_t skip_to = 0;
+        int keep = 1;
         filter->scanned++;
-        if (filter->fn(ref_msg, 0, filter->ctx, &skip_to) != 1) {
+        if (filter->type_mask && !(filter->type_mask & (1u << ref_msg->type)))
+          keep = 0;
+        else if (filter->veto && filter->veto(ref_msg, filter->veto_ctx))
+          keep = 0;
+        else if (filter->fn && filter->fn(ref_msg, 0, filter->ctx, &skip_to) != 1)
+          keep = 0;
+        if (!keep) {
           history_free_messages(ref_msg);
           ref_msg = NULL;
         }
@@ -2167,7 +2196,22 @@ int history_query_around(const char *target, enum HistoryRefType ref_type,
     return -1;
   }
 
-  /* Get messages after reference (reduce limit by ref_msg if found) */
+  /* Get messages after reference (reduce limit by ref_msg if found).
+   * AFTER excludes the reference millisecond; for a TIMESTAMP reference
+   * the rows AT that millisecond belong to this page (the client asked
+   * for the neighbourhood of that instant), so anchor the after-walk one
+   * millisecond earlier (keys are millisecond-granular). */
+  if (ref_type == HISTORY_REF_TIMESTAMP) {
+    char unix_ts[HISTORY_TIMESTAMP_LEN], prev_ts[HISTORY_TIMESTAMP_LEN];
+    uint64_t ms;
+    if (history_iso_to_unix(reference, unix_ts, sizeof(unix_ts)) != 0)
+      ircd_strncpy(unix_ts, reference, sizeof(unix_ts));
+    ms = history_parse_ms(unix_ts);
+    history_format_ms(prev_ts, sizeof(prev_ts), ms > 0 ? ms - 1 : 0);
+    count_after = history_query_after(target, HISTORY_REF_TIMESTAMP, prev_ts,
+                                      limit - count_before - count_ref, &after,
+                                      filter);
+  } else
   count_after = history_query_after(target, ref_type, reference,
                                     limit - count_before - count_ref, &after,
                                     filter);
@@ -2209,10 +2253,12 @@ int history_query_between(const char *target,
   char timestamp1[HISTORY_TIMESTAMP_LEN];
   char timestamp2[HISTORY_TIMESTAMP_LEN];
   const char *ref1, *ref2;
-  char keybuf[CHANNELLEN + HISTORY_TIMESTAMP_LEN + 8];
-  char end_prefix[CHANNELLEN + HISTORY_TIMESTAMP_LEN + 8];
+  const char *msgid1 = NULL, *msgid2 = NULL;
+  char keybuf[CHANNELLEN + HISTORY_TIMESTAMP_LEN + HISTORY_MSGID_LEN + 8];
+  char end_prefix[CHANNELLEN + HISTORY_TIMESTAMP_LEN + HISTORY_MSGID_LEN + 8];
   char target_prefix[CHANNELLEN + 2];
   int keylen, end_prefix_len, target_prefix_len;
+  int descending;
   struct db_snapshot *snap = NULL;
   struct db_iter *it = NULL;
   struct HistoryMessage *head = NULL, *tail = NULL, *msg;
@@ -2226,6 +2272,7 @@ int history_query_between(const char *target,
 
   /* Convert references to Unix timestamps */
   if (ref_type1 == HISTORY_REF_MSGID) {
+    msgid1 = reference1;
     if (history_msgid_to_timestamp(reference1, timestamp1) != 0)
       return 0;
     ref1 = timestamp1;
@@ -2240,6 +2287,7 @@ int history_query_between(const char *target,
   }
 
   if (ref_type2 == HISTORY_REF_MSGID) {
+    msgid2 = reference2;
     if (history_msgid_to_timestamp(reference2, timestamp2) != 0)
       return 0;
     ref2 = timestamp2;
@@ -2253,24 +2301,38 @@ int history_query_between(const char *target,
     ref2 = reference2;
   }
 
-  /* Ensure ref1 < ref2 */
-  if (strcmp(ref1, ref2) > 0) {
-    const char *tmp = ref1;
-    ref1 = ref2;
-    ref2 = tmp;
-  }
-
-  /* Build start and end keys */
-  keylen = build_key(keybuf, sizeof(keybuf), target, ref1, NULL);
+  /* Bounds are ROWS when given as msgids (full key), milliseconds when
+   * given as timestamps (prefix).  Both selectors are EXCLUSIVE, and the
+   * page is counted from the FIRST selector: a newer-first request pages
+   * backwards from it (spec: "counted starting from and excluding the
+   * first message selector ... may be forwards or backwards in time").
+   * The old walk swapped the selectors and always returned the OLDEST
+   * rows of the window, with the start row included (2026-09-06). */
+  keylen = build_key(keybuf, sizeof(keybuf), target, ref1, msgid1);
   if (keylen < 0)
     return -1;
-
-  end_prefix_len = build_key(end_prefix, sizeof(end_prefix), target, ref2, NULL);
+  end_prefix_len = build_key(end_prefix, sizeof(end_prefix), target, ref2, msgid2);
   if (end_prefix_len < 0)
     return -1;
   target_prefix_len = build_key(target_prefix, sizeof(target_prefix), target, NULL, NULL);
   if (target_prefix_len < 0)
     return -1;
+  {
+    int minlen = keylen < end_prefix_len ? keylen : end_prefix_len;
+    int cmp = memcmp(keybuf, end_prefix, minlen);
+    if (cmp == 0)
+      cmp = keylen - end_prefix_len;
+    descending = cmp > 0;
+  }
+  if (descending) {
+    /* Walk backwards from just before the first selector down to (and
+     * excluding) the second: the reverse walk's floor is the exclusive
+     * lower bound, in row or millisecond terms as given.  Result stays
+     * chronological (the reverse walk prepends). */
+    return history_query_internal(target, keybuf, keylen, HISTORY_DIR_BEFORE,
+                                  limit, result, end_prefix, end_prefix_len,
+                                  filter);
+  }
 
   /* Open a snapshot so the iter and ml_content_resolve see a coherent view. */
   snap = db_snapshot_new(history_db_env);
@@ -2284,6 +2346,15 @@ int history_query_between(const char *target,
   }
 
   rc = db_iter_seek(it, keybuf, keylen);
+  /* Exclusive start: skip the first selector itself -- the whole
+   * millisecond for a timestamp, just the row for a msgid. */
+  while (rc == DB_OK && db_iter_valid(it)) {
+    size_t klen;
+    const void *kbase = db_iter_key(it, &klen);
+    if (klen < (size_t)keylen || memcmp(kbase, keybuf, keylen) != 0)
+      break;
+    rc = db_iter_next(it);
+  }
 
   while (rc == DB_OK && db_iter_valid(it) && count < limit) {
     size_t klen, vlen;
