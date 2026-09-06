@@ -122,6 +122,12 @@ static struct presence_session_entry *session_buckets[PRESENCE_HASH_SIZE];
 
 static struct db_cf *presence_cf = NULL;
 static int           presence_persistence_ready = 0;
+
+/** 1 when account-anchored presence has a store to live in. */
+int presence_account_store_ready(void)
+{
+  return presence_persistence_ready && presence_cf != NULL;
+}
 /** Proof-of-life hint for boot-close (epoch ms): the newest row the
  * history store holds, handed in by ircd.c before presence_init so this
  * module stays free of history.c (the cmocka harness links it alone). */
@@ -500,10 +506,18 @@ int presence_init(void)
 
   env = metadata_get_env();
   if (!env) {
-    /* History storage isn't up yet (or is disabled).  Session-anchored
-     * presence still works; account-anchored is silently unavailable. */
+    /* The metadata env is not up (CAP_draft_metadata_2 off, or its DB
+     * failed).  Session-anchored presence still works in memory;
+     * account-anchored presence has nowhere to live, and under strict
+     * presence that means every authenticated user's history is hidden
+     * -- so never fail quietly (2026-09-06). */
     presence_cf = NULL;
     presence_persistence_ready = 0;
+    if (feature_bool(FEAT_CHATHISTORY_STRICT_PRESENCE))
+      log_write(LS_CONFIG, L_ERROR, 0,
+                "CHATHISTORY_STRICT_PRESENCE is on but the metadata database "
+                "is not available (CAP_draft_metadata_2 off or failed): "
+                "account presence cannot be recorded");
     return -1;
   }
 
@@ -653,13 +667,18 @@ static void record_union_close(struct presence_record *r,
     if (r->count >= cap) {
       if (pos == 0)
         return;   /* older than everything retained -- drop it */
+      /* Drop the oldest: slots 1..pos-1 move down one, which frees slot
+       * pos-1 for the new window; slots pos.. (the later windows) are
+       * already where they belong and MUST NOT be shifted (doing so
+       * overwrote the newest window with its predecessor, 2026-09-06). */
       memmove(&r->intervals[0], &r->intervals[1],
               sizeof(r->intervals[0]) * (pos - 1u));
       pos--;
       r->count--;
+    } else {
+      memmove(&r->intervals[pos + 1], &r->intervals[pos],
+              sizeof(r->intervals[0]) * (r->count - pos));
     }
-    memmove(&r->intervals[pos + 1], &r->intervals[pos],
-            sizeof(r->intervals[0]) * (r->count - pos));
     r->intervals[pos].start = start;
     r->intervals[pos].end = end;
     r->count++;

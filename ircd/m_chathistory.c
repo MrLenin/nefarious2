@@ -4051,6 +4051,16 @@ static struct HistoryMessage *merge_messages(struct HistoryMessage *list1,
     struct HistoryMessage *copy = (struct HistoryMessage *)MyCalloc(1, sizeof(*copy));
     memcpy(copy, pick, sizeof(*copy));
     copy->next = NULL;
+    /* Ownership of the heap content moves to the copy: the merged list
+     * is handed to the replay engine, which frees it with
+     * history_free_messages, and the source lists are freed by
+     * free_fed_request afterwards.  Leaving both pointing at the same
+     * raw_content/dyn_content was a double free on every federated page
+     * with a compressed (>256 B) or multiline local row (2026-09-06). */
+    pick->raw_content = NULL;
+    pick->raw_content_len = 0;
+    pick->dyn_content = NULL;
+    pick->dyn_content_len = 0;
     if (!result) {
       result = tail = copy;
     } else {
@@ -4062,12 +4072,12 @@ static struct HistoryMessage *merge_messages(struct HistoryMessage *list1,
 
   /* Step 2: If over limit, drop the oldest (front of list) to keep
    * the N most recent messages. Result is chronological (ascending).
-   * Don't free raw_content/dyn_content — those are shallow copies of
-   * pointers owned by the original lists (freed by the caller). */
+   * The dropped copies own their heap content now (see above). */
   while (count > limit && result) {
     struct HistoryMessage *old = result;
     result = result->next;
-    MyFree(old);
+    old->next = NULL;
+    history_free_messages(old);
     count--;
   }
 

@@ -49,6 +49,10 @@ struct HistoryRowFilter;
  */
 extern int presence_init(void);
 
+/** Whether account-anchored presence has a persistent store (the
+ * metadata env).  Strict presence is unusable without it. */
+int presence_account_store_ready(void);
+
 /** Drop persistent handles and free in-memory state.  Called from
  * history_shutdown().  Safe to call without a prior init. */
 extern void presence_shutdown(void);

@@ -86,10 +86,12 @@
  * this via feature_int(FEAT_CHATHISTORY_PRESENCE_MAX_INTERVALS).
  * Fixed at 0 for this suite -- the "misconfigured/max" case that used
  * to let count overflow. */
+static int test_max_intervals = 0;   /* 0 = the clamp (255); tests may lower it */
+
 int feature_int(enum Feature feat)
 {
   (void)feat;
-  return 0;
+  return test_max_intervals;
 }
 
 int feature_bool(enum Feature feat)
@@ -457,6 +459,47 @@ static void test_presence_clock_skew_clamp(void **state)
  * must union into the record without disturbing correctness of the
  * membership test.  Exercised via the session flavor (the account
  * flavor shares the merge code; its load/store is stubbed here). */
+/** Audit 2026-09-06 P1: a union-close landing in the MIDDLE of a record
+ * that is already at its interval cap must drop the OLDEST window and
+ * keep every later one.  The cap branch shifted only pos-1 slots and
+ * then ran the ordinary insert memmove on top, overwriting the newest
+ * window with its predecessor -- so the most recent closed window
+ * vanished whenever an older PN arrived (burst sync sends a peer's
+ * records oldest-first, so any at-cap account lost its newest window on
+ * every relink). */
+static void test_presence_union_close_at_cap(void **state)
+{
+  const char *anchor = "test-session-anchor-cap";
+  int64_t t = BASE_MS + SEC(3000000);
+  int i;
+
+  (void)state;
+  presence_purge_session(anchor);
+  test_max_intervals = 4;
+
+  /* Four disjoint closed windows: W1..W4 at 100s spacing. */
+  for (i = 1; i <= 4; i++)
+    presence_apply_close(anchor, 1, TEST_CHANNEL,
+                         t + SEC(i * 100), t + SEC(i * 100 + 10));
+  for (i = 1; i <= 4; i++)
+    assert_true(presence_was_present(anchor, 1, TEST_CHANNEL, t + SEC(i * 100 + 5)));
+
+  /* A fifth window that sorts between W2 and W3 (older than the newest). */
+  presence_apply_close(anchor, 1, TEST_CHANNEL, t + SEC(250), t + SEC(260));
+
+  /* Oldest dropped; the new window and EVERY later window survive. */
+  assert_false(presence_was_present(anchor, 1, TEST_CHANNEL, t + SEC(105)));
+  assert_true(presence_was_present(anchor, 1, TEST_CHANNEL, t + SEC(205)));
+  assert_true(presence_was_present(anchor, 1, TEST_CHANNEL, t + SEC(255)));
+  assert_true(presence_was_present(anchor, 1, TEST_CHANNEL, t + SEC(305)));
+  assert_true(presence_was_present(anchor, 1, TEST_CHANNEL, t + SEC(405)));
+  /* Nothing leaked into the gaps. */
+  assert_false(presence_was_present(anchor, 1, TEST_CHANNEL, t + SEC(350)));
+
+  test_max_intervals = 0;
+  presence_purge_session(anchor);
+}
+
 static void test_presence_remote_close_union(void **state)
 {
   const char *anchor = "test-session-anchor-union";
@@ -666,6 +709,7 @@ int main(void)
     cmocka_unit_test(test_presence_reconnect_coalescing),
     cmocka_unit_test(test_presence_clock_skew_clamp),
     cmocka_unit_test(test_presence_remote_close_union),
+    cmocka_unit_test(test_presence_union_close_at_cap),
     cmocka_unit_test(test_presence_next_visible_boundaries),
     cmocka_unit_test(test_presence_millisecond_edges),
     cmocka_unit_test(test_presence_event_time_from_msgid),

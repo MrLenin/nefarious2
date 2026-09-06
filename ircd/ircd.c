@@ -1365,7 +1365,15 @@ int main(int argc, char **argv) {
      * intervals.  Non-fatal: without the env, session-anchored
      * presence remains usable in-memory. */
     presence_set_boot_alive_hint(history_newest_activity_ms());
-    (void)presence_init();
+    if (presence_init() != 0 && feature_bool(FEAT_CHATHISTORY_STRICT_PRESENCE)) {
+      /* Strict presence with no account store hides every authenticated
+       * user's history behind a zero record.  Fail loud and fail open. */
+      static const char *const off[] = { "CHATHISTORY_STRICT_PRESENCE", "FALSE" };
+      log_write(LS_CONFIG, L_ERROR, 0,
+                "CHATHISTORY_STRICT_PRESENCE disabled: it needs the metadata "
+                "database (CAP_draft_metadata_2) for account presence records");
+      feature_set(NULL, off, 2);
+    }
     timer_add(timer_init(&presence_alive_timer), presence_alive_callback, 0,
               TT_PERIODIC, 60);
   }

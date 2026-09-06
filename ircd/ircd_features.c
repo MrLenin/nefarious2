@@ -699,6 +699,19 @@ feature_notify_strict_presence(void)
     return;
   if (!cli_serv(&me))
     return;
+  if (!presence_account_store_ready()) {
+    /* SET at runtime without the metadata env: every authenticated
+     * user would see empty history.  Refuse, loudly (2026-09-06). */
+    static const char *const off[] = { "CHATHISTORY_STRICT_PRESENCE", "FALSE" };
+    log_write(LS_CONFIG, L_ERROR, 0,
+              "CHATHISTORY_STRICT_PRESENCE refused: the metadata database "
+              "(CAP_draft_metadata_2) is not available for account presence");
+    sendto_opmask_butone(0, SNO_OLDSNO,
+                         "CHATHISTORY_STRICT_PRESENCE refused: metadata database "
+                         "not available for account presence records");
+    feature_set(NULL, off, 2);
+    return;
+  }
   presence_backfill_now();
 }
 
