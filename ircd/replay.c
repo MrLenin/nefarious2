@@ -406,26 +406,35 @@ static void replay_open_batch(struct Client *sptr, struct ReplayState *rs)
   replay_emit_outer_batch_if_needed(sptr, rs);
 
   if (rs->outer_batch_open) {
-    ircd_snprintf(0, outer_buf, sizeof(outer_buf), "batch=%s;", rs->outer_batch_id);
+    ircd_snprintf(0, outer_buf, sizeof(outer_buf), "batch=%s", rs->outer_batch_id);
     outer_tag = outer_buf;
   }
 
   if (CapRecipientHas(sptr, CAP_BATCH)) {
-    const char *end_tag = rs->is_last_page ? "draft/chathistory-end;" : "";
-
-    if (!rs->label_used && rs->label[0] &&
+    /* Assemble the tag list so it never ends in ';' -- a truncated inner
+     * page used to open as "@batch=<outer>; :srv BATCH ..." (an empty
+     * trailing tag, illegal per message-tags; audit 2026-09-06 #13). */
+    char tagbuf[256];
+    int tl = 0;
+    int want_label = !rs->label_used && rs->label[0] &&
         feature_bool(FEAT_CAP_labeled_response) &&
-        CapRecipientHas(sptr, CAP_LABELEDRESP)) {
-      sendrawto_one(sptr, "@%s%slabel=%s :%s " MSG_BATCH_CMD " +%s chathistory %s",
-                    outer_tag, end_tag, rs->label, cli_name(&me),
-                    rs->batch_id, rs->target);
+        CapRecipientHas(sptr, CAP_LABELEDRESP);
+    tagbuf[0] = '\0';
+    if (outer_tag[0])
+      tl += ircd_snprintf(0, tagbuf + tl, sizeof(tagbuf) - tl, "%s%s", tl ? ";" : "", outer_tag);
+    if (rs->is_last_page)
+      tl += ircd_snprintf(0, tagbuf + tl, sizeof(tagbuf) - tl, "%sdraft/chathistory-end", tl ? ";" : "");
+    if (want_label)
+      tl += ircd_snprintf(0, tagbuf + tl, sizeof(tagbuf) - tl, "%slabel=%s", tl ? ";" : "", rs->label);
+
+    if (want_label) {
+      sendrawto_one(sptr, "@%s :%s " MSG_BATCH_CMD " +%s chathistory %s",
+                    tagbuf, cli_name(&me), rs->batch_id, rs->target);
       cli_label_responded(sptr) = 1;
       rs->label_used = 1;
-    } else if (rs->is_last_page || outer_tag[0]) {
-      sendrawto_one(sptr, "@%s%s :%s " MSG_BATCH_CMD " +%s chathistory %s",
-                    outer_tag,
-                    rs->is_last_page ? "draft/chathistory-end" : "",
-                    cli_name(&me), rs->batch_id, rs->target);
+    } else if (tagbuf[0]) {
+      sendrawto_one(sptr, "@%s :%s " MSG_BATCH_CMD " +%s chathistory %s",
+                    tagbuf, cli_name(&me), rs->batch_id, rs->target);
     } else {
       sendcmdto_one(&me, CMD_BATCH_CMD, sptr, "+%s chathistory %s",
                     rs->batch_id, rs->target);

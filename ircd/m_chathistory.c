@@ -486,7 +486,12 @@ static int parse_s2s_reference(const char *ref, enum HistoryRefType *ref_type, c
 void generate_batch_id(char *buf, size_t buflen, struct Client *sptr)
 {
   static unsigned long batch_counter = 0;
-  ircd_snprintf(0, buf, buflen, "hist%lu%s", ++batch_counter, cli_yxx(sptr));
+  /* batch spec: a reference is ASCII letters, digits and/or hyphen.  The
+   * process-unique counter alone satisfies uniqueness; the client numeric
+   * it used to carry is base64 over [A-Za-z0-9[]] and put an illegal '['
+   * or ']' in every batch id of ~3%% of clients (audit 2026-09-06 #27). */
+  (void)sptr;
+  ircd_snprintf(0, buf, buflen, "hist%lu", ++batch_counter);
 }
 
 /** Check if message type should be sent to client.
@@ -776,7 +781,7 @@ void send_history_message(struct Client *sptr, struct HistoryMessage *msg,
     char *line_end;
 
     /* Generate unique multiline batch ID */
-    ircd_snprintf(0, ml_batchid, sizeof(ml_batchid), "ml%lu%s", ++ml_counter, cli_yxx(sptr));
+    ircd_snprintf(0, ml_batchid, sizeof(ml_batchid), "ml%lu", ++ml_counter);   /* see generate_batch_id */
 
     /* Start nested multiline batch (inside outer chathistory batch).
      * Per multiline spec, server tags (time, msgid, account) and client tags
