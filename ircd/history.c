@@ -1356,15 +1356,37 @@ store_retry:
     if (rc != DB_OK) goto store_wb_fail;
   }
 
-  /* target → last-timestamp (folded key, like the message rows) */
-  {
+  /* target → last-timestamp (folded key, like the message rows).  Only
+   * MESSAGE rows bump it: TARGETS is "ordered by the time of the latest
+   * message" (spec), and bumping on JOIN/PART/MODE/... floated churning
+   * channels to the top and listed event-only channels as conversations
+   * (audit 2026-09-06 #23/#28). */
+  if (type == HISTORY_PRIVMSG || type == HISTORY_NOTICE
+      || type == HISTORY_TAGMSG || type == HISTORY_MULTILINE
+      || type == HISTORY_GAP) {
     char tkey[CHANNELLEN + 2];
+    struct db_val cur = { NULL, 0 };
+    int newer = 1;
     int tlen = build_target_key(tkey, sizeof(tkey), target);
     if (tlen < 0) { rc = -1; goto store_wb_fail; }
-    rc = db_writebatch_put(wb, history_cf_targets, tkey, (size_t)tlen,
-                           timestamp, strlen(timestamp));
+    /* max(), not a blind overwrite: a row arriving late with an OLDER
+     * stamp (S2S lag, CH W, a relayed QUIT) must not move the target's
+     * "latest" backwards.  Stamps are fixed-width "sec.mmm", so a byte
+     * compare orders them. */
+    if (db_get(history_db_env, history_cf_targets, tkey, (size_t)tlen,
+               NULL, &cur) == DB_OK && cur.base && cur.len > 0) {
+      size_t nl = strlen(timestamp);
+      size_t cl = cur.len;
+      int c = memcmp(timestamp, cur.base, nl < cl ? nl : cl);
+      newer = (c > 0) || (c == 0 && nl > cl);
+      db_val_free(&cur);
+    }
+    if (newer) {
+      rc = db_writebatch_put(wb, history_cf_targets, tkey, (size_t)tlen,
+                             timestamp, strlen(timestamp));
+      if (rc != DB_OK) goto store_wb_fail;
+    }
   }
-  if (rc != DB_OK) goto store_wb_fail;
 
   /* Index reply references for draft/chathistory-context lookups.
    * Flat-key encoding (target\0parent\0timestamp\0child) makes this
@@ -2812,8 +2834,10 @@ static int history_cleanup_empty_targets(void)
     memcpy(target, kbase, klen);
     target[klen] = '\0';
 
-    /* Only process channels (start with # or &) */
-    if (target[0] != '#' && target[0] != '&')
+    /* Channels (# or &) and PM pair keys (a:b); anything else is skipped.
+     * Pair keys were never cleaned, so TARGETS listed conversations with
+     * zero rows after a purge (audit 2026-09-06 #23). */
+    if (target[0] != '#' && target[0] != '&' && !strchr(target, ':'))
       continue;
 
     if (history_channel_has_messages(target) == 0) {

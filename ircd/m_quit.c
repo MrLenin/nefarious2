@@ -219,5 +219,14 @@ int ms_quit(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
   /*
    * ignore quit from servers
    */
-  return exit_client(cptr, sptr, sptr, parv[parc - 1]);
+  {
+    int rc;
+    /* This QUIT line's own tags (the link stash holds exactly this line
+     * now) -- so exit_client stamps the quitter's rows with them and not
+     * with whatever the link carried last on a KILL/collision/SQUIT. */
+    exit_arm_s2s_event(cli_s2s_msgid(cptr), cli_s2s_time_ms(cptr));
+    rc = exit_client(cptr, sptr, sptr, parv[parc - 1]);
+    exit_arm_s2s_event(NULL, 0);
+    return rc;
+  }
 }

@@ -855,11 +855,36 @@ void send_history_message(struct Client *sptr, struct HistoryMessage *msg,
                         msg->sender, cmd, target, first_line);
         first = 0;
       } else {
-        /* Subsequent lines — same tags (time+msgid for standalone PRIVMSGs) */
-        if (tpos)
-          sendrawto_one(sptr, "@%s :%s %s %s :%s",
-                        tags, msg->sender, cmd, target, first_line);
-        else
+        /* Subsequent lines: the batch/time tags but NOT the msgid.  The
+         * live fallback (send_multiline_fallback) puts the msgid on the
+         * first line only; repeating it here made msgid-deduping clients
+         * keep one line of every multiline in history and broke the
+         * one-msgid-per-event rule (audit 2026-09-06 #14). */
+        if (tpos) {
+          char rest[sizeof(tags)];
+          const char *m = strstr(tags, "msgid=");
+          if (m) {
+            const char *e = strchr(m, ';');
+            size_t pre = (size_t)(m - tags);
+            /* drop "msgid=...;" or a trailing ";msgid=..." */
+            if (e) {
+              memcpy(rest, tags, pre);
+              ircd_strncpy(rest + pre, e + 1, sizeof(rest) - pre - 1);
+            } else {
+              if (pre > 0 && tags[pre - 1] == ';')
+                pre--;
+              memcpy(rest, tags, pre);
+              rest[pre] = '\0';
+            }
+          } else
+            ircd_strncpy(rest, tags, sizeof(rest) - 1);
+          if (rest[0])
+            sendrawto_one(sptr, "@%s :%s %s %s :%s",
+                          rest, msg->sender, cmd, target, first_line);
+          else
+            sendrawto_one(sptr, ":%s %s %s :%s",
+                          msg->sender, cmd, target, first_line);
+        } else
           sendrawto_one(sptr, ":%s %s %s :%s",
                         msg->sender, cmd, target, first_line);
       }
@@ -4677,21 +4702,17 @@ static void complete_redact_fed(struct FedRequest *req)
     struct Membership *member;
     const char *reason = ctx->reason[0] ? ctx->reason : NULL;
     char redact_msgid[HISTORY_MSGID_LEN];
-    struct timeval tv;
     uint64_t time_ms;
 
     generate_msgid(redact_msgid, sizeof(redact_msgid));
-    gettimeofday(&tv, NULL);
-    time_ms = (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+    time_ms = history_event_time_ms(NULL);   /* the msgid's own mint time (audit #16) */
 
     /* Write-forward the REDACT event to STORE servers */
     {
       char timestamp[32];
       char redact_content[512];
 
-      ircd_snprintf(0, timestamp, sizeof(timestamp), "%lu.%03lu",
-                    (unsigned long)tv.tv_sec,
-                    (unsigned long)(tv.tv_usec / 1000));
+      history_format_ms(timestamp, sizeof(timestamp), time_ms);
 
       if (reason)
         ircd_snprintf(0, redact_content, sizeof(redact_content),

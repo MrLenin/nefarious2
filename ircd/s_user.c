@@ -1339,11 +1339,10 @@ int set_nick_name(struct Client* cptr, struct Client* sptr,
       /* Set S2S msgid override so NICK relay carries same msgid as local storage.
        * Static globals survive past the nick_msgid scope closure. */
       if (nick_msgid[0]) {
-        struct timeval nick_tv;
-        gettimeofday(&nick_tv, NULL);
-        sendcmdto_set_s2s_tags(
-          (uint64_t)nick_tv.tv_sec * 1000 + nick_tv.tv_usec / 1000,
-          nick_msgid);
+        /* The same event time the rows were stored with (above), so every
+         * server stores this msgid at ONE time (audit 2026-09-06 #16). */
+        sendcmdto_set_s2s_tags(history_event_time_ms(MyUser(sptr) ? NULL : cptr),
+                               nick_msgid);
         sendcmdto_want_s2s_tags(1);
       }
       }

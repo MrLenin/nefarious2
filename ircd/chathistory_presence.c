@@ -1144,6 +1144,12 @@ void presence_burst_sync(struct Client *cptr)
     }
   }
   db_iter_close(it);
+  if (sent >= line_ceiling)
+    log_write(LS_SYSTEM, L_WARNING, 0,
+              "presence: burst sync to %s hit the %u-line ceiling; accounts "
+              "sorting after it were NOT synced (their split windows stay "
+              "hidden on that peer until they part and rejoin)",
+              cli_name(cptr), line_ceiling);
   if (sent)
     log_write(LS_SYSTEM, L_INFO, 0,
               "presence: burst-synced %u interval(s) to %s",

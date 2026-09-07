@@ -71,6 +71,18 @@
 #include <string.h>
 #include <sys/time.h>
 
+static void format_time_tag(char *buf, size_t buflen);   /* defined below */
+
+/** Format an epoch-millisecond time as a server-time tag value
+ * (YYYY-MM-DDThh:mm:ss.sssZ) -- the batch's one event time, not "now". */
+static void ms_to_time_tag(char *buf, size_t buflen, uint64_t ms)
+{
+  char unix_ts[32];
+  history_format_ms(unix_ts, sizeof(unix_ts), ms);
+  if (history_unix_to_iso(unix_ts, buf, buflen) != 0)
+    format_time_tag(buf, buflen);   /* unreachable in practice: keep a valid tag */
+}
+
 /*
  * generate_paste_url - Generate a paste secret and URL for multiline fallback.
  *
@@ -950,15 +962,13 @@ process_multiline_batch(struct Client *sptr)
    */
   generate_msgid(batch_base_msgid, sizeof(batch_base_msgid));
 
-  /* Capture time ONCE for consistent timestamps across all recipients */
+  /* ONE time for the whole batch: the msgid's own mint time, read right
+   * after the mint (the truncation notices mint again later).  Row, live
+   * @time, S2S @time and ml_content all use it -- this used to be four
+   * different times under one msgid (audit 2026-09-06 #12). */
   char batch_timebuf[32];
-  uint64_t batch_time_ms;
-  {
-    struct timeval btv;
-    gettimeofday(&btv, NULL);
-    batch_time_ms = (uint64_t)btv.tv_sec * 1000 + btv.tv_usec / 1000;
-  }
-  format_time_tag(batch_timebuf, sizeof(batch_timebuf));
+  uint64_t batch_time_ms = history_event_time_ms(NULL);
+  ms_to_time_tag(batch_timebuf, sizeof(batch_timebuf), batch_time_ms);
 
   /* Set global time override so all send.c tag formatters use the same
    * timestamp as the batch opener. Cleared at the end of this function. */
@@ -1674,8 +1684,8 @@ process_multiline_batch(struct Client *sptr)
     }
     history_content[content_len] = '\0';
 
-    /* Get timestamp for storage */
-    history_format_timestamp(timestamp, sizeof(timestamp));
+    /* Row time = the batch's one event time (see batch_time_ms). */
+    history_format_ms(timestamp, sizeof(timestamp), batch_time_ms);
 
     /* Storage keying + consent.  Channels: store under the channel
      * name gated on +P / +Y.  DMs: store under the IDENTITY PAIR-KEY --
@@ -1691,6 +1701,13 @@ process_multiline_batch(struct Client *sptr)
       if (is_channel) {
         if (!(chptr->mode.exmode & EXMODE_NOSTORAGE) && !IsNoStorage(sptr))
           store_target = chptr->chname;
+      } else if (IsServer(sptr) || IsServer(acptr)
+                 || IsServiceClient(sptr) || IsServiceClient(acptr)) {
+        /* Service traffic is not a conversation -- the same gate as the
+         * single-line PM store in ircd_relay.c.  Storing it keyed rows on
+         * the bot's session id and put that id in every user's TARGETS
+         * (audit 2026-09-06 #15). */
+        store_target = NULL;
       } else {
         char id_s[S2S_SESSID_BUFSIZE], id_a[S2S_SESSID_BUFSIZE];
         history_pm_identity(sptr, id_s, sizeof(id_s));
@@ -2352,7 +2369,9 @@ deliver_s2s_multiline_batch(struct S2SMultilineBatch *batch, struct Client *cptr
          * client-only tags go on the BATCH + opener. */
         {
           char tagbuf[512];
-          format_time_tag(timebuf, sizeof(timebuf));
+          ms_to_time_tag(timebuf, sizeof(timebuf),
+                         batch->time_ms ? batch->time_ms
+                                        : msgid_decode_time_ms(batch_base_msgid));
           int taglen = format_batch_open_tags(tagbuf, sizeof(tagbuf), to, sptr,
                          timebuf, batch_base_msgid, NULL,
                          batch->client_tags[0] ? batch->client_tags : NULL);
@@ -2404,7 +2423,9 @@ deliver_s2s_multiline_batch(struct S2SMultilineBatch *batch, struct Client *cptr
        * client-only tags go on the BATCH + opener. */
       {
         char tagbuf[512];
-        format_time_tag(timebuf, sizeof(timebuf));
+        ms_to_time_tag(timebuf, sizeof(timebuf),
+                       batch->time_ms ? batch->time_ms
+                                      : msgid_decode_time_ms(batch_base_msgid));
         int taglen = format_batch_open_tags(tagbuf, sizeof(tagbuf), acptr, sptr,
                        timebuf, batch_base_msgid, NULL,
                        batch->client_tags[0] ? batch->client_tags : NULL);
@@ -2546,8 +2567,12 @@ deliver_s2s_multiline_batch(struct S2SMultilineBatch *batch, struct Client *cptr
     }
     history_content[content_len] = '\0';
 
-    /* Get timestamp for storage */
-    history_format_timestamp(timestamp, sizeof(timestamp));
+    /* Row time = the ORIGIN's batch time carried on the S2S open, so
+     * every server stores this msgid at one time; the msgid's intrinsic
+     * mint time is the fallback for a legacy sender. */
+    history_format_ms(timestamp, sizeof(timestamp),
+                      batch->time_ms ? batch->time_ms
+                                     : msgid_decode_time_ms(batch_base_msgid));
 
     /* Storage keying + consent.  Channels: store under the channel
      * name gated on +P / +Y.  DMs: store under the IDENTITY PAIR-KEY --
@@ -2563,6 +2588,13 @@ deliver_s2s_multiline_batch(struct S2SMultilineBatch *batch, struct Client *cptr
       if (is_channel) {
         if (!(chptr->mode.exmode & EXMODE_NOSTORAGE) && !IsNoStorage(sptr))
           store_target = chptr->chname;
+      } else if (IsServer(sptr) || IsServer(acptr)
+                 || IsServiceClient(sptr) || IsServiceClient(acptr)) {
+        /* Service traffic is not a conversation -- the same gate as the
+         * single-line PM store in ircd_relay.c.  Storing it keyed rows on
+         * the bot's session id and put that id in every user's TARGETS
+         * (audit 2026-09-06 #15). */
+        store_target = NULL;
       } else {
         char id_s[S2S_SESSID_BUFSIZE], id_a[S2S_SESSID_BUFSIZE];
         history_pm_identity(sptr, id_s, sizeof(id_s));

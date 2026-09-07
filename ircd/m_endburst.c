@@ -182,7 +182,10 @@ int ms_end_of_burst(struct Client* cptr, struct Client* sptr, int parc, char* pa
      * were lost while the link was down.  Self-gated on the feature
      * and storage availability; union application on the receiver
      * makes repeat syncs across relinks harmless. */
-    presence_burst_sync(sptr);
+    /* Legacy peers (X3, vanilla ircu) do not speak PN and logged every
+     * line as a parse error -- up to 20000 of them per relink (audit P4). */
+    if (IsIRCv3Aware(sptr))
+      presence_burst_sync(sptr);
 
     /* Advertise chathistory storage capability (CH A S) to newly linked server.
      * Only advertise if we have CHATHISTORY_STORE enabled - this indicates we

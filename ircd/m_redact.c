@@ -287,12 +287,10 @@ int m_redact(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
    * live channel broadcast, and S2S relay. */
   {
     char redact_msgid[HISTORY_MSGID_LEN];
-    struct timeval tv;
     uint64_t time_ms;
 
     generate_msgid(redact_msgid, sizeof(redact_msgid));
-    gettimeofday(&tv, NULL);
-    time_ms = (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+    time_ms = history_event_time_ms(NULL);   /* the msgid's own mint time (audit #16) */
 
     /* Store REDACT event in history */
     if (history_is_available()) {
@@ -300,9 +298,7 @@ int m_redact(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
       char sender[HISTORY_SENDER_LEN];
       char redact_content[512];
 
-      ircd_snprintf(0, timestamp, sizeof(timestamp), "%lu.%03lu",
-                    (unsigned long)tv.tv_sec,
-                    (unsigned long)(tv.tv_usec / 1000));
+      history_format_ms(timestamp, sizeof(timestamp), time_ms);
       ircd_snprintf(0, sender, sizeof(sender), "%s!%s@%s",
                     cli_name(sptr), cli_user(sptr)->username,
                     cli_user(sptr)->host);
@@ -331,7 +327,7 @@ int m_redact(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
 
     /* Set msgid for live channel broadcast */
     if (feature_bool(FEAT_MSGID))
-      sendcmdto_set_client_msgid(redact_msgid);
+      sendcmdto_set_client_event(redact_msgid, time_ms);
 
     /* Propagate to channel members with capability */
     propagate_redact_to_channel(sptr, chptr, target, msgid, reason);
@@ -394,7 +390,6 @@ int ms_redact(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
       /* Use incoming S2S msgid for the REDACT event, or generate new */
       {
         char redact_msgid[HISTORY_MSGID_LEN];
-        struct timeval tv;
         uint64_t time_ms;
 
         if (cli_s2s_msgid(cptr)[0])
@@ -402,12 +397,7 @@ int ms_redact(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
         else
           generate_msgid(redact_msgid, sizeof(redact_msgid));
 
-        if (cli_s2s_time_ms(cptr))
-          time_ms = cli_s2s_time_ms(cptr);
-        else {
-          gettimeofday(&tv, NULL);
-          time_ms = (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
-        }
+        time_ms = history_event_time_ms(cptr);   /* origin tag time, else HLC */
 
         /* Store REDACT event in history -- once.  A repeat arriving over
          * the network (two servers or two users redacting the same message)
@@ -445,7 +435,7 @@ int ms_redact(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
 
         /* Set msgid for live channel broadcast */
         if (feature_bool(FEAT_MSGID))
-          sendcmdto_set_client_msgid(redact_msgid);
+          sendcmdto_set_client_event(redact_msgid, time_ms);
 
         /* Propagate to channel members with capability */
         propagate_redact_to_channel(sptr, chptr, target, msgid, reason);

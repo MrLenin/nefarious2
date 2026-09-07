@@ -197,8 +197,25 @@ const char* get_client_name(const struct Client* sptr, int showip)
  * @param[in] comment The quit message.
  * @param[in] msgid The msgid used in the live broadcast.
  */
+/* A remote user's own QUIT line: ms_quit arms the line's msgid/time here
+ * before calling exit_client, which is the only way exit_client can tell
+ * that exit apart from a KILL, collision or SQUIT of the same user. */
+static char exit_armed_msgid[S2S_MSGID_BUFSIZE];
+static uint64_t exit_armed_ms;
+
+void exit_arm_s2s_event(const char *msgid, uint64_t ms)
+{
+  if (msgid && *msgid) {
+    ircd_strncpy(exit_armed_msgid, msgid, sizeof(exit_armed_msgid) - 1);
+    exit_armed_ms = ms;
+  } else {
+    exit_armed_msgid[0] = '\0';
+    exit_armed_ms = 0;
+  }
+}
+
 static void store_quit_events(struct Client *sptr, const char *comment,
-                              const char *broadcast_msgid)
+                              const char *broadcast_msgid, uint64_t event_ms)
 {
   struct Membership *member;
   char timestamp[32];
@@ -245,8 +262,12 @@ static void store_quit_events(struct Client *sptr, const char *comment,
    * several contexts (SQUIT, ping-out, KILL) where the link's tag stash
    * may belong to an unrelated earlier message, so it is NOT consulted:
    * remote QUIT rows keep a local mint time (documented residue). */
+  /* The exit's ONE event time (exit_client computed it alongside the
+   * msgid: own stash for a local quitter, the armed QUIT line's tags for a
+   * remote one) -- remote QUIT rows used to keep a local mint time. */
   history_format_ms(timestamp, sizeof(timestamp),
-                    history_event_time_ms(MyConnect(sptr) ? sptr : NULL));
+                    event_ms ? event_ms
+                             : history_event_time_ms(MyConnect(sptr) ? sptr : NULL));
 
   /* Build sender string: nick!user@host */
   if (cli_user(sptr))
@@ -479,17 +500,30 @@ static void exit_one_client(struct Client* bcptr, const char* comment)
      * the common-channel broadcast at this point, the QUIT routed via
      * channel members reaches legacy peers anyway. */
     int64_t quit_time = 0;   /* presence stamp for the removals below */
+    uint64_t quit_ms_for_rows = 0;
     if (!IsBouncerInternalDestroy(bcptr)) {
       char quit_msgid[64] = "";
       if (feature_bool(FEAT_MSGID)) {
         uint64_t quit_ms;
-        if (cli_s2s_msgid(bcptr)[0])
+        if (MyConnect(bcptr) && cli_s2s_msgid(bcptr)[0]) {
+          /* Local user: its own connection's stash -- its own QUIT line,
+           * or the KILL pre-stamp. */
           ircd_strncpy(quit_msgid, cli_s2s_msgid(bcptr), sizeof(quit_msgid));
-        else
+          quit_ms = history_event_time_ms(bcptr);
+        } else if (!MyConnect(bcptr) && exit_armed_msgid[0]) {
+          /* Remote user leaving on its OWN QUIT line: ms_quit armed that
+           * line's tags.  cli_s2s_msgid() of a remote user is the server
+           * LINK's stash -- the last line parsed on that link -- so reading
+           * it for a KILL / collision / SQUIT exit stamped some unrelated
+           * message's id on N QUIT rows and overwrote that message's index
+           * entry (audit 2026-09-06 #13). */
+          ircd_strncpy(quit_msgid, exit_armed_msgid, sizeof(quit_msgid));
+          quit_ms = exit_armed_ms ? exit_armed_ms : history_event_time_ms(NULL);
+        } else {
           generate_msgid(quit_msgid, sizeof(quit_msgid));
-        /* Same time the QUIT rows are stored with (store_quit_events);
-         * the presence hooks close at the same HLC stamp (below). */
-        quit_ms = history_event_time_ms(MyConnect(bcptr) ? bcptr : NULL);
+          quit_ms = history_event_time_ms(NULL);
+        }
+        quit_ms_for_rows = quit_ms;
         sendcmdto_set_client_event(quit_msgid, quit_ms);
         quit_time = presence_event_time(quit_msgid, quit_ms);
       }
@@ -498,7 +532,8 @@ static void exit_one_client(struct Client* bcptr, const char* comment)
 
 #ifdef USE_ROCKSDB
       /* Store QUIT events in history before removing from channels */
-      store_quit_events(bcptr, comment, quit_msgid[0] ? quit_msgid : NULL);
+      store_quit_events(bcptr, comment, quit_msgid[0] ? quit_msgid : NULL,
+                        quit_ms_for_rows);
 #endif
     }
 

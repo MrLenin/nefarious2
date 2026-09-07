@@ -268,21 +268,22 @@ int m_kick(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
    * one id instead of a per-hop re-mint. */
   {
     char kick_msgid[64] = "";
+    uint64_t kick_ms = 0;
     if (feature_bool(FEAT_MSGID)) {
       if (cptr && !MyUser(sptr) && cli_s2s_msgid(cptr)[0])
         ircd_strncpy(kick_msgid, cli_s2s_msgid(cptr), sizeof(kick_msgid));
       else
         generate_msgid(kick_msgid, sizeof(kick_msgid));
-      sendcmdto_set_client_msgid(kick_msgid);
+      /* The event's ONE time: the origin's tag time for a relayed kick,
+       * else the mint time.  Row, live @time, S2S @time and the presence
+       * close all use it (audit 2026-09-06 #16). */
+      kick_ms = history_event_time_ms(cptr && !MyUser(sptr) ? cptr : NULL);
+      sendcmdto_set_client_event(kick_msgid, kick_ms);
     }
 
   if (!IsLocalChannel(name)) {
-    if (kick_msgid[0]) {
-      struct timeval tv;
-      gettimeofday(&tv, NULL);
-      sendcmdto_set_s2s_tags(
-        (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000, kick_msgid);
-    }
+    if (kick_msgid[0])
+      sendcmdto_set_s2s_tags(kick_ms, kick_msgid);
     sendcmdto_want_s2s_tags(1);
     sendcmdto_serv_butone(sptr, CMD_KICK, cptr, "%H %C :%s", chptr, who,
 			  comment);
@@ -308,11 +309,15 @@ int m_kick(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
 #ifdef USE_ROCKSDB
     /* Store KICK event in history — same msgid as broadcast */
     store_kick_event(sptr, chptr, who, comment,
-                     kick_msgid[0] ? kick_msgid : NULL, 0);
+                     kick_msgid[0] ? kick_msgid : NULL, kick_ms);
 #endif
+    /* The victim's presence interval closes at the kick's time, not at
+     * whenever make_zombie's removal happens to run (P2). */
+    presence_set_event_time(kick_msgid[0] ? presence_event_time(kick_msgid, kick_ms) : 0);
   }
 
   make_zombie(member, who, cptr, sptr, chptr);
+  presence_set_event_time(0);
 
   return 0;
 }
@@ -433,7 +438,7 @@ int ms_kick(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
 
     if (member) { /* and tell the channel about it */
       if (kick_msgid[0])
-        sendcmdto_set_client_msgid(kick_msgid);
+        sendcmdto_set_client_event(kick_msgid, kick_time_ms);
 
       if (IsDelayedJoin(member)) {
         if (MyUser(who))
@@ -447,7 +452,9 @@ int ms_kick(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
 
       sendcmdto_set_client_msgid(NULL);
 
+      presence_set_event_time(kick_msgid[0] ? presence_event_time(kick_msgid, kick_time_ms) : 0);
       make_zombie(member, who, cptr, sptr, chptr);
+      presence_set_event_time(0);
     }
   }
 

@@ -197,7 +197,7 @@ static void do_settopic(struct Client *sptr, struct Client *cptr,
      /* Use the same msgid for broadcast and chathistory storage */
      {
        if (topic_msgid[0])
-         sendcmdto_set_client_msgid(topic_msgid);
+         sendcmdto_set_client_event(topic_msgid, topic_time_ms);
 
        sendcmdto_channel_butserv_butone(from, CMD_TOPIC, chptr, NULL, 0,
                                         (setter ? "%H :%s (%s)" : "%H :%s%s"),

@@ -2775,7 +2775,7 @@ modebuf_flush_int(struct ModeBuf *mbuf, int all)
         }
         if (!mode_time_ms)
           mode_time_ms = history_event_time_ms(NULL);  /* mint time */
-        sendcmdto_set_client_msgid(mode_msgid);
+        sendcmdto_set_client_event(mode_msgid, mode_time_ms);
       }
 
       sendcmdto_channel_butserv_butone(app_source, CMD_MODE, mbuf->mb_channel, NULL, 0,
@@ -5723,9 +5723,16 @@ joinbuf_flush(struct JoinBuf *jbuf)
     build_string(chanlist, &chanlist_i,
 		 jbuf->jb_channels[i] ? jbuf->jb_channels[i]->chname : "0", 0,
 		 i == 0 ? '\0' : ',');
-    if (JOINBUF_TYPE_PART == jbuf->jb_type)
-      /* Remove user from channel */
+    if (JOINBUF_TYPE_PART == jbuf->jb_type) {
+      /* Remove user from channel.  The presence hook closes at the
+       * PART's own event time (this slot's msgid, the batch time):
+       * closing at receipt time here let every observing server stamp
+       * a different, later interval end (audit 2026-09-06 P2). */
+      presence_set_event_time(presence_event_time(jbuf->jb_msgids[i],
+                                                  jbuf->jb_msgid_time_ms));
       remove_user_from_channel(jbuf->jb_source, jbuf->jb_channels[i]);
+      presence_set_event_time(0);
+    }
 
     jbuf->jb_channels[i] = 0; /* mark slot empty */
   }
