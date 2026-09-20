@@ -211,7 +211,7 @@ int server_estab(struct Client *cptr, struct ConfItem *aconf)
     if (crdt_server_intro_suppress(acptr, cptr))
       continue;
     sendcmdto_one(&me, CMD_SERVER, acptr,
-		  "%s 2 0 %Tu J%02u %s%s +%s%s%s%s%s%s%s :%s", cli_name(cptr),
+		  "%s 2 0 %Tu J%02u %s%s +%s%s%s%s%s%s%s%s :%s", cli_name(cptr),
 		  cli_serv(cptr)->timestamp, Protocol(cptr), NumServCap(cptr),
 		  IsHub(cptr) ? "h" : "", IsService(cptr) ? "s" : "",
 		  IsIPv6(cptr) ? "6" : "", IsOpLevels(cptr) ? "o" : "",
