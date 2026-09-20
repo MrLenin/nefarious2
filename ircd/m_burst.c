@@ -240,6 +240,15 @@ int ms_burst(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
   char modestr[BUFSIZE], modestro[BUFSIZE], nickstr[BUFSIZE];
   char nickstro[BUFSIZE], banstr[BUFSIZE], exstr[BUFSIZE];
 
+  /* A beyond-horizon mesh anchor's channels are doc-owned (materialized by
+   * the CRDT reconcile: members, modes, bans, topic), so its tree BURST is
+   * redundant here -- and mode_parse would grant it only what a non-server
+   * source may, dropping server-only letters.  Drop the stub edition, the
+   * NICK precedent (m_nick.c); parse.c's beyond-horizon exemption admits
+   * stub-sourced commands wholesale. */
+  if (IsMeshStub(sptr))
+    return 0;
+
   if (parc < 3)
     return protocol_violation(sptr,"Too few parameters for BURST");
 
