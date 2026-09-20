@@ -92,6 +92,8 @@
 #include "numnicks.h"
 #include "s_bsd.h"
 #include "send.h"
+#include "ircd_snprintf.h"
+#include "handlers.h"   /* crdt_gossip_message */
 
 /* #include <assert.h> -- Now using assert in ircd_log.h */
 
@@ -106,9 +108,18 @@
  */
 int ms_desynch(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
 {
-  if (parc >= 2)
+  if (parc >= 2) {
     sendwallto_group_butone(sptr, WALL_DESYNCH, cptr, "%s", parv[parc - 1]);
-  else
+    /* Gateway edge (CI precedent): a DESYNCH that arrived over a LEGACY
+     * link is minted into the mesh once here (letter 'D'); relays from a
+     * CRDT peer already rode the mesh (sendwallto_group_butone mints only
+     * where it is called at the origin). */
+    if (IsServer(cptr) && !IsCrdtAware(cptr)) {
+      char msgidbuf[64];
+      generate_msgid(msgidbuf, sizeof msgidbuf);
+      crdt_gossip_message(&me, 'D', "*", msgidbuf, parv[parc - 1]);
+    }
+  } else
     need_more_params(sptr,"DESYNCH");			
 
   return 0;

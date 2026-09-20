@@ -3332,6 +3332,11 @@ void sendwallto_group_butone(struct Client *from, int type, struct Client *one,
     else if (type == WALL_WALLUSERS && feature_bool(FEAT_CRDT_ROUTE_WALL))
       crdt_letter = 'U';
   }
+  /* Tier C F5: DESYNCH is server-sourced by nature (protocol violations,
+   * bad SETTIME); it gets its own letter 'D' whoever sourced it, so an
+   * overlay-only node's +g opers see it too. */
+  if (type == WALL_DESYNCH && feature_bool(FEAT_CRDT_ROUTE_BCAST))
+    crdt_letter = 'D';
   int crdt_route = (crdt_letter != 0);
   char crdt_txt[512];
 
@@ -3485,6 +3490,23 @@ void sendto_opmask_butone_global(struct Client *one, unsigned int mask,
     }
 
     msgq_clean(mb);
+  }
+
+  /* Tier C F5: the mesh copy (letter 'O', target "*"; the WALLOPS 'W'
+   * precedent).  The tree copy above never reaches an overlay-only CRDT
+   * node and is retired among CRDT peers.  crdt_gossip_message self-gates
+   * (shadow active + FEAT_CRDT_ROUTE_BCAST + bcast-stable). */
+  if (cli_serv(&me)) {
+    char body[BUFSIZE], msgidbuf[64];
+    size_t l;
+    vd.vd_format = pattern;
+    va_copy(vd.vd_args, vl);
+    ircd_snprintf(0, body, sizeof body, "%u ", mask);
+    l = strlen(body);
+    ircd_snprintf(0, body + l, sizeof body - l, "%v", &vd);
+    va_end(vd.vd_args);
+    generate_msgid(msgidbuf, sizeof msgidbuf);
+    crdt_gossip_message(&me, 'O', "*", msgidbuf, body);
   }
 
   vsendto_opmask_butone(&me, one, mask, pattern, vl);

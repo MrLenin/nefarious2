@@ -995,6 +995,48 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
       struct Client *wsrc = srcu ? srcu : srcsrv;
       if (wsrc)
         sendwallto_local(wsrc, WALL_WALLUSERS, m_text);
+    } else if ((m_cmd[0] == 'O' || m_cmd[0] == 'M' || m_cmd[0] == 'D')
+               && target[0] == '*') {          /* Tier C F5 ephemeral notices over the
+                                            * mesh: 'O' = SNO "<mask> <text>", 'M' = SMO
+                                            * "<umodes> <text>", 'D' = DESYNCH "<text>".
+                                            * Local delivery from the source server; a
+                                            * real P10 re-emit to LEGACY links only when
+                                            * the origin has no tree presence here (an
+                                            * overlay-only node's notices would otherwise
+                                            * never reach legacy opers), never otherwise
+                                            * (the origin's own tree copy serves them and
+                                            * a re-emit would echo across planes). */
+      struct Client *nsrc = srcu ? srcu : (srcsrv ? srcsrv : &me);
+      int legacy_reemit = (!srcsrv || IsMeshStub(srcsrv)) && !srcu;
+      char nb[BUFSIZE];
+      char *ntext = nb, *sp;
+      ircd_strncpy(nb, m_text, sizeof nb);
+      if (m_cmd[0] == 'O') {
+        unsigned int omask;
+        sp = strchr(nb, ' ');
+        if (sp) { *sp = '\0'; ntext = sp + 1; }
+        omask = (unsigned int)strtoul(nb, NULL, 10);
+        if (omask && ntext[0]) {
+          sendto_opmask_butone_from(nsrc, NULL, omask, "%s", ntext);
+          if (legacy_reemit)
+            sendcmdto_flag_serv_butone(&me, CMD_SNO, NULL, FLAG_LAST_FLAG, FLAG_CRDT_AWARE,
+                                       "%u :%s", omask, ntext);
+        }
+      } else if (m_cmd[0] == 'M') {
+        sp = strchr(nb, ' ');
+        if (sp) { *sp = '\0'; ntext = sp + 1; }
+        if (nb[0] && ntext[0]) {
+          sendto_mode_butone(NULL, nsrc, nb, "%s", ntext);
+          if (legacy_reemit)
+            sendcmdto_flag_serv_butone(&me, CMD_SMO, NULL, FLAG_LAST_FLAG, FLAG_CRDT_AWARE,
+                                       "%s :%s", nb, ntext);
+        }
+      } else {
+        sendwallto_local(nsrc, WALL_DESYNCH, ntext);
+        if (legacy_reemit)
+          sendcmdto_flag_serv_butone(&me, CMD_DESYNCH, NULL, FLAG_LAST_FLAG, FLAG_CRDT_AWARE,
+                                     ":%s", ntext);
+      }
     } else if (m_cmd[0] == 'A' && target[0] == '*') {  /* TK over the mesh: the P10
                                             * body verbatim ("G <token> <service> <yxx>
                                             * <expires> <scope>" / "U <token>").  Learn or

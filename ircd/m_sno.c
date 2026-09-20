@@ -33,6 +33,9 @@
 #include "msg.h"
 #include "numeric.h"
 #include "send.h"
+#include "ircd_snprintf.h"
+#include "ircd.h"          /* me */
+#include "handlers.h"   /* crdt_gossip_message */
 
 #include <stdlib.h>
 
@@ -52,6 +55,15 @@ int ms_sno(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
 
   sendto_opmask_butone_from(sptr, sptr, mask, "%s", message);
   sendcmdto_serv_butone(sptr, CMD_SNO, cptr, "%d :%s", mask, message);
+  /* Gateway edge (CI precedent): a notice that arrived over a LEGACY link
+   * is minted into the mesh once here (letter 'O'); one from a CRDT peer
+   * already rode the mesh. */
+  if (IsServer(cptr) && !IsCrdtAware(cptr)) {
+    char body[BUFSIZE], msgidbuf[64];
+    ircd_snprintf(0, body, sizeof body, "%d %s", mask, message);
+    generate_msgid(msgidbuf, sizeof msgidbuf);
+    crdt_gossip_message(&me, 'O', "*", msgidbuf, body);
+  }
   return 0;
 }
 

@@ -33,6 +33,9 @@
 #include "msg.h"
 #include "numeric.h"
 #include "send.h"
+#include "ircd_snprintf.h"
+#include "ircd.h"          /* me */
+#include "handlers.h"   /* crdt_gossip_message */
 
 #include <stdlib.h>
 
@@ -52,5 +55,13 @@ int ms_smo(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
 
   sendto_mode_butone(cptr, sptr, mask, "%s", message);
   sendcmdto_serv_butone(sptr, CMD_SMO, cptr, "%s :%s", mask, message);
+  /* Gateway edge (CI precedent): minted into the mesh once, where the
+   * notice entered from a LEGACY link (letter 'M'). */
+  if (IsServer(cptr) && !IsCrdtAware(cptr)) {
+    char body[BUFSIZE], msgidbuf[64];
+    ircd_snprintf(0, body, sizeof body, "%s %s", mask, message);
+    generate_msgid(msgidbuf, sizeof msgidbuf);
+    crdt_gossip_message(&me, 'M', "*", msgidbuf, body);
+  }
   return 0;
 }
