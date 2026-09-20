@@ -2778,8 +2778,11 @@ int ms_multiline(struct Client* cptr, struct Client* sptr, int parc, char* parv[
   /* ML from server = capability advertisement during BURST.
    * Format: AB ML [max-bytes max-lines]
    * Legacy servers send bare ML with no params (ml_max_bytes=0).
-   */
-  if (IsServer(sptr)) {
+   * A CRDT peer beyond our tree is a synthetic anchor here
+   * (STAT_MESH_SERVER, not IsServer; it carries a cli_serv) -- hard
+   * invariant 2, handler side: its announce relayed over the tree
+   * was a "Non-user sending MULTILINE" violation on every relink. */
+  if (IsServer(sptr) || IsMeshStub(sptr)) {
     SetMultiline(sptr);
     if (parc >= 2 && !EmptyString(parv[1]))
       cli_serv(sptr)->ml_max_bytes = atoi(parv[1]);
