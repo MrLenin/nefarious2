@@ -41,6 +41,7 @@
 #include "ircd_reply.h"
 #include "ircd_snprintf.h"
 #include "ircd_string.h"
+#include "handlers.h"      /* crdt_gossip_message: TK over the mesh */
 #include "msg.h"
 #include "numeric.h"
 #include "s_user.h"
@@ -224,10 +225,25 @@ int ms_token(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
     authtoken_learn(parv[2], parv[3], parv[4], (time_t)strtoll(parv[5], NULL, 10), parv[6]);
     sendcmdto_serv_butone_v3(sptr, CMD_TOKEN, cptr, "G %s %s %s %s %s",
                              parv[2], parv[3], parv[4], parv[5], parv[6]);
+    /* Gateway edge (CI precedent): a TK that arrived over a LEGACY link
+     * is minted into the mesh once here; one from a CRDT peer already
+     * rode the mesh (re-minting per tree hop would storm fresh msgids). */
+    if (!IsCrdtAware(cptr)) {
+      char b[BUFSIZE], msgidbuf[64];
+      ircd_snprintf(0, b, sizeof b, "G %s %s %s %s %s", parv[2], parv[3], parv[4], parv[5], parv[6]);
+      generate_msgid(msgidbuf, sizeof msgidbuf);
+      crdt_gossip_message(&me, 'A', "*", msgidbuf, b);
+    }
     return 0;
   case 'U':
     authtoken_forget(parv[2]);
     sendcmdto_serv_butone_v3(sptr, CMD_TOKEN, cptr, "U %s", parv[2]);
+    if (!IsCrdtAware(cptr)) {
+      char b[BUFSIZE], msgidbuf[64];
+      ircd_snprintf(0, b, sizeof b, "U %s", parv[2]);
+      generate_msgid(msgidbuf, sizeof msgidbuf);
+      crdt_gossip_message(&me, 'A', "*", msgidbuf, b);
+    }
     return 0;
   default:
     return 0;

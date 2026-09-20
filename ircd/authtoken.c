@@ -48,6 +48,7 @@
 #include "numnicks.h"
 #include "numeric.h"
 #include "s_debug.h"
+#include "handlers.h"      /* crdt_gossip_message: TK over the mesh */
 #include "s_user.h"
 #include "send.h"
 #include "struct.h"
@@ -248,6 +249,20 @@ int authtoken_conf_end(void)
   return 1;
 }
 
+
+/* TK over the mesh (2026-09-20): the tree copy above never reaches an
+ * overlay-only CRDT node and is retired among CRDT peers, so a token
+ * generated or revoked here was unknown there until it expired.  Flood the
+ * same P10 body over CR M (letter 'A', target "*", the CI precedent);
+ * receivers learn/forget locally and re-emit to legacy links only when the
+ * origin has no tree presence there.  crdt_gossip_message self-gates
+ * (shadow active + FEAT_CRDT_ROUTE_BCAST + bcast-stable). */
+static void tk_mesh(const char *body)
+{
+  char msgidbuf[64];
+  generate_msgid(msgidbuf, sizeof msgidbuf);
+  crdt_gossip_message(&me, 'A', "*", msgidbuf, body);
+}
 /** Tell every local client that negotiated batch + authtoken. */
 static void notify_users(const char *fmt, const char *key, const char *url)
 {
@@ -607,6 +622,7 @@ static void make_room(const char *yxx)
     if (!oldest)
       break;
     sendcmdto_serv_butone_v3(&me, CMD_TOKEN, NULL, "U %s", oldest->token);
+    { char b[AUTHTOKEN_LEN + 8]; ircd_snprintf(0, b, sizeof b, "U %s", oldest->token); tk_mesh(b); }
     unlink_token(oldest);
     --mine;
   }
@@ -848,9 +864,16 @@ const char *authtoken_generate(struct Client *user, int svc, const char *scope)
   sendcmdto_serv_butone_v3(&me, CMD_TOKEN, NULL, "G %s %s %s %Tu %s",
                            t->token, t->key, t->yxx, t->expires,
                            t->scope[0] ? t->scope : "*");
+  {
+    char b[BUFSIZE];
+    ircd_snprintf(0, b, sizeof b, "G %s %s %s %Tu %s", t->token, t->key, t->yxx,
+                  t->expires, t->scope[0] ? t->scope : "*");
+    tk_mesh(b);
+  }
   if (services[svc].jwt) {
     if (!jwt_mint(&services[svc], t, user, jwt, sizeof(jwt))) {
       sendcmdto_serv_butone_v3(&me, CMD_TOKEN, NULL, "U %s", t->token);
+      { char b[AUTHTOKEN_LEN + 8]; ircd_snprintf(0, b, sizeof b, "U %s", t->token); tk_mesh(b); }
       unlink_token(t);
       return NULL;
     }
@@ -1001,6 +1024,7 @@ int authtoken_consume(struct Client *to, int svc, const char *token)
   user = findNUser(t->yxx);
   if (!user || !IsUser(user)) {
     sendcmdto_serv_butone_v3(&me, CMD_TOKEN, NULL, "U %s", t->token);
+    { char b[AUTHTOKEN_LEN + 8]; ircd_snprintf(0, b, sizeof b, "U %s", t->token); tk_mesh(b); }
     unlink_token(t);
     return -1;                                  /* requester is gone */
   }

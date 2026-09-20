@@ -37,7 +37,8 @@
 #include "ircd_relay.h"   /* 5-5f B1: store_channel_history (CR-M witness store) */
 #include "history.h"      /* 5-5f B1: HISTORY_PRIVMSG/NOTICE type enum */
 
-#include "chathistory_presence.h"   /* PN over the mesh: presence_apply_close */
+#include "chathistory_presence.h"
+#include "authtoken.h"      /* TK over the mesh */   /* PN over the mesh: presence_apply_close */
 #include "crdt_shadow.h"
 #include "s_debug.h"        /* Debug() */
 #include "crdt_meshmap.h"  /* MR-1: crdt_meshmap_nexthop + crdt_route_action */
@@ -994,6 +995,39 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
       struct Client *wsrc = srcu ? srcu : srcsrv;
       if (wsrc)
         sendwallto_local(wsrc, WALL_WALLUSERS, m_text);
+    } else if (m_cmd[0] == 'A' && target[0] == '*') {  /* TK over the mesh: the P10
+                                            * body verbatim ("G <token> <service> <yxx>
+                                            * <expires> <scope>" / "U <token>").  Learn or
+                                            * forget locally (idempotent); re-emit as real
+                                            * P10 to our LEGACY links only when the origin
+                                            * server has no tree presence here (an
+                                            * overlay-only node's tokens would otherwise
+                                            * never reach legacy at all) -- a tree-present
+                                            * origin's own P10 copy serves them and a
+                                            * re-emit would echo across planes. */
+      char tb[BUFSIZE];
+      char *tv[8];
+      int tc = 0;
+      char *q;
+      ircd_strncpy(tb, m_text, sizeof tb);
+      for (q = tb; *q && tc < 7; ) {
+        while (*q == ' ') *q++ = '\0';
+        if (!*q) break;
+        tv[tc++] = q;
+        while (*q && *q != ' ') q++;
+      }
+      if (tc >= 6 && tv[0][0] == 'G' && !tv[0][1])
+        authtoken_learn(tv[1], tv[2], tv[3], (time_t)strtoll(tv[4], NULL, 10), tv[5]);
+      else if (tc >= 2 && tv[0][0] == 'U' && !tv[0][1])
+        authtoken_forget(tv[1]);
+      else
+        tc = 0;
+      if (tc) {
+        Debug((DEBUG_DEBUG, "CRDT TK: mesh %s from %s", m_text, srcyxx));
+        if (!srcsrv || IsMeshStub(srcsrv))
+          sendcmdto_flag_serv_butone(&me, CMD_TOKEN, NULL, FLAG_LAST_FLAG, FLAG_CRDT_AWARE,
+                                     "%s", m_text);
+      }
     } else if (m_cmd[0] == 'S' && target[0] == '*') {  /* PN (strict-presence closed
                                             * interval) over the mesh: "<account>
                                             * <channel> <start> <end>", the P10 PN
