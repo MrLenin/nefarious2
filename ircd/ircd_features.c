@@ -1535,6 +1535,13 @@ static struct FeatureDesc {
   { FEAT_LAST_F, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }
 };
 
+/* One row per enum Feature plus the FEAT_LAST_F sentinel.  Order is checked
+ * at run time (features[feat].feat == feat, first lookup at boot); this
+ * catches a row added on one side of a merge without its enum entry, or the
+ * reverse, before a container has to die to tell us. */
+_Static_assert(sizeof(features) / sizeof(features[0]) == FEAT_LAST_F + 1,
+               "features[] must have exactly one row per enum Feature");
+
 /** Given a feature's identifier, look up the feature descriptor.
  * @param[in] from Client looking up feature, or NULL.
  * @param[in] feature Feature name to find.
