@@ -291,3 +291,6 @@ Keep this skill and the submodule copy (`nefarious-crdt/.claude/skills/crdt-mesh
 - Suites that SQUIT `leaf.fractalrealities.net` by name are tree-bed specific;
   on the mesh a tree split is not a store absence (see the catch-up plan's
   open list).
+- Mesh-only suite: `CRDT_BED=1 IRC_HOST=localhost npm test -- src/ircv3/crdt-mesh-absence.test.ts`
+  (stops/starts nefarious6 with docker; ~8 min).  A tree split is NOT a store absence on
+  the mesh (the peer stays a reachable stub); a stopped node is.
