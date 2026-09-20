@@ -857,6 +857,10 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
           crdt_shadow_reconcile_metadata(); /* Tier C F2-b: drive account metadata from doc -> metadata_cf */
           crdt_shadow_reconcile_tempshuns(); /* Tier C F3: apply tempshun flips on the delta, not the 30s tick */
           crdt_shadow_reconcile_webpush(); /* Tier C F2-c: converge webpush subs on the delta */
+          /* The delta may carry a peer's storage capability / retention
+           * (CRDT_COLL_CH_STORAGE): re-derive evilnet/CHATHISTORYRETENTION
+           * now, not on the 30s tick.  Cached compare -> no-op when unchanged. */
+          chathistory_update_retention_isupport(1);
           /* M6c-1 Increment 2: reconcile bouncer sessions EAGERLY on the delta that
            * carries the change, not on the 30s verify timer.  Without this the
            * gateway's HOLDING<->ACTIVE state-apply (and its BS A/D synth toward

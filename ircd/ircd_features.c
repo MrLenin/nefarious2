@@ -24,6 +24,7 @@
 
 #include "ircd_features.h"
 #include "handlers.h"
+#include "crdt_shadow.h"   /* crdt_shadow_ch_storage_publish */
 #include "chathistory_presence.h"
 #include "capab.h"	/* send_cap_notify */
 #include "channel.h"	/* list_set_default */
@@ -797,6 +798,12 @@ feature_notify_chathistory_caps(void)
   int retention_days;
 
   /* Only notify if chathistory capability is enabled */
+  /* 5-5f B2: CRDT peers learn this server's storage capability and
+   * retention from the doc, not from CH A S/R (which the tree-retirement
+   * suppresses toward them).  Publish eagerly on every STORE/RETENTION
+   * change instead of waiting for the verify tick; change-gated, so this
+   * is free when nothing moved and safe before the shadow is up. */
+  crdt_shadow_ch_storage_publish();
   if (!feature_bool(FEAT_CAP_draft_chathistory))
     return;
 
