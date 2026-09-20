@@ -269,3 +269,25 @@ On a CRDT-server SQUIT, instead of cascade-tombstoning, the departed server is K
 | `ircd/test/crdt_cmocka.c` | the engine test suite (the image gate) |
 
 Keep this skill and the submodule copy (`nefarious-crdt/.claude/skills/crdt-mesh/`) in sync when editing.
+
+Keep this skill and the submodule copy (`nefarious-crdt/.claude/skills/crdt-mesh/`) in sync when editing.
+
+## Bed testing of the fork suites on the mesh (2026-09-20)
+
+- Point BOTH ends at CRDT nodes: `IRC_HOST=localhost IRC_PORT=6669 IRC_PORT2=6670`
+  (hub2 + leaf2).  `PRIMARY_SERVER` honours `IRC_PORT` since the catch-up merge;
+  before that every "primary" client silently sat on the legacy fork primary.
+- Slot confs (`data/ircd3..7.conf`) are bind-mounted PER FILE: edit in place or
+  restart the container after an atomic rename, else REHASH reloads the old inode.
+  Slot opers need `set = yes` (the suites SET feature flags).
+- Hand-merged format strings get an arg-count audit before images build: the
+  2026-09-20 catch-up shipped a burst SERVER line with 7 flag slots for 8 flag
+  args; the info field became the `C` flag, the legacy primary answered
+  `SQ :No server info specified` and hub2 lost services for the session.
+- Enum/table pairs that must agree in order (`enum Feature` vs `features[]`)
+  cannot be checked by the build beyond the row-count `_Static_assert`; diff the
+  two orders after any union-style merge (15 lines of python), or the first
+  feature lookup at boot asserts on every slot.
+- Suites that SQUIT `leaf.fractalrealities.net` by name are tree-bed specific;
+  on the mesh a tree split is not a store absence (see the catch-up plan's
+  open list).
