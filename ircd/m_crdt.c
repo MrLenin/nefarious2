@@ -591,6 +591,20 @@ int crdt_ch_tunnel_try(const char *dstyxx, const char *body)
   return 1;
 }
 
+/* Forward a chathistory reply we RELAY (not one we answered) toward the
+ * request origin over the mesh, keeping the real responder as the frame's
+ * source: the origin's per-responder guard keys on it, and a CRDT-aware next
+ * hop may hold no Client for a legacy responder at all (a P10 line with an
+ * unknown prefix is dropped there without a trace). */
+int crdt_ch_tunnel_from(const char *srcyxx, const char *dstyxx, const char *body)
+{
+  if (!crdt_ch_tunnel_avail() || !srcyxx || !srcyxx[0] || !dstyxx || !dstyxx[0]
+      || !body || !body[0])
+    return 0;
+  crdt_services_emit(srcyxx, dstyxx, 'H', body);
+  return 1;
+}
+
 /* 5-5f B2 part 2: is the CR-X carrier usable at all?  Deterministic within a
  * tick, so the federation dispatcher can decide at COUNT time whether a
  * mesh-stub storage server is reachable — count and dispatch then agree by

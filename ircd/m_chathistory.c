@@ -74,6 +74,7 @@ void broadcast_channel_advertisement(const char *channel);
  * enum HistoryMessageType (ABI-identical, but C sees conflicting types). */
 extern void crdt_ch_tunnel_reply(const char *dstyxx, const char *body);
 extern int  crdt_ch_tunnel_try(const char *dstyxx, const char *body);
+extern int  crdt_ch_tunnel_from(const char *srcyxx, const char *dstyxx, const char *body);
 extern int  crdt_ch_tunnel_avail(void);
 extern int  ms_chathistory(struct Client *cptr, struct Client *sptr,
                            int parc, char *parv[]);
@@ -6045,6 +6046,15 @@ static void forward_fed_reply(struct Client *sptr, struct Client *cptr,
     return;
   }
   if (!IsServer(origin) || cli_from(origin) == cptr)
+    return;
+  /* The next hop toward the origin is a CRDT peer: the tree is retired
+   * between CRDT servers, so it may not know this reply's source at all (a
+   * legacy responder behind us reaches it only as a beacon, or nothing).
+   * Tunnel the reply with the responder as the frame's source instead of
+   * sending a P10 line whose prefix the peer would silently drop. */
+  if (cli_from(origin) && IsCrdtAware(cli_from(origin))
+      && (IsServer(sptr) || IsMeshStub(sptr))
+      && crdt_ch_tunnel_from(cli_yxx(sptr), yy, buf))
     return;
   sendcmdto_one(sptr, CMD_CHATHISTORY, origin, "%s", buf);
 }
