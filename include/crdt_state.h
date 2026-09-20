@@ -266,11 +266,16 @@ struct CrdtBouncerSession {
  *  (single-writer per connection) suffices — no OR-Set needed: only the host adds/removes
  *  its own connection, so there is no concurrent add/remove to merge.  M4 = SHADOW only. */
 struct CrdtBouncerConn {
-  uint64_t last_active;                  /**< per-connection activity TS */
+  uint64_t last_active;                  /**< per-connection activity TS (BX U la= on the tree) */
   uint32_t caps;                        /**< BX_CAP_* bitmask (0 if unknown) */
   uint16_t host;                        /**< owning server numeric (single-writer) */
   uint8_t  is_primary;                  /**< 1 = primary connection, 0 = alias */
   uint8_t  caps_known;                  /**< 0 if caps not yet learned */
+  uint8_t  away;                        /**< the connection's OWN away state: 0 present,
+                                             1 away, 2 AWAY * (BX U aw= on the tree);
+                                             2026-09-20, sizeof 16 -> 24 (fleet-wide rebuild) */
+  uint8_t  away_known;                  /**< 1 once the host reported it */
+  uint8_t  pad_[6];                     /**< explicit, zeroed by every writer's memset */
 };
 
 /** Per-session liveness lease (5-5e M5 doc-native bouncer — THE GATE).  Keyed by

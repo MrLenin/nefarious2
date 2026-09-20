@@ -593,6 +593,13 @@ extern void bounce_dematerialize_replica_alias(struct Client *alias);
  * @return AccountSessions pointer, or NULL if no sessions.
  */
 extern struct AccountSessions *bounce_find_by_account(const char *account);
+/* Bouncer-connection doc record (5-5e M4) carrying away + activity (2026-09-20). */
+struct CrdtBouncerConn;
+extern void bounce_crdt_bconn_fill(struct CrdtBouncerConn *cr, struct BouncerSession *s,
+                                   struct Client *who, int idx);
+extern void bounce_crdt_bconn_touch(struct Client *who);
+extern void bounce_crdt_bconn_apply(const char *account, const char *sessid,
+                                    const char *connnum, const struct CrdtBouncerConn *rec);
 
 /** M4b reconciler: test whether any profile across the account
  * (active or HOLD-sticky inactive) effectively wants `channel`.

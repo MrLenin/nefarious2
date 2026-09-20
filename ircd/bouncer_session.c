@@ -2268,10 +2268,7 @@ int bounce_crdt_bsess_mint_one(struct BouncerSession *s, int *conns)
     struct CrdtBouncerConn cr;
     char pnum[16];
     ircd_snprintf(0, pnum, sizeof pnum, "%s%s", NumNick(s->hs_client));
-    memset(&cr, 0, sizeof cr);
-    cr.host = myn;
-    cr.is_primary = 1;
-    cr.last_active = (uint64_t)s->hs_last_active;
+    bounce_crdt_bconn_fill(&cr, s, s->hs_client, -1);
     crdt_shadow_bconn_set(s->hs_account, s->hs_sessid, pnum, &cr);
     if (conns) (*conns)++;
   }
@@ -2279,16 +2276,130 @@ int bounce_crdt_bsess_mint_one(struct BouncerSession *s, int *conns)
     struct CrdtBouncerConn cr;
     if (0 != strcmp(s->hs_aliases[a].ba_server, me_yxx))
       continue;              /* only the alias's host writes its entry */
-    memset(&cr, 0, sizeof cr);
-    cr.host = myn;
-    cr.is_primary = 0;
-    cr.caps = (uint32_t)s->hs_aliases[a].ba_caps;
-    cr.caps_known = s->hs_aliases[a].ba_caps_known ? 1 : 0;
+    bounce_crdt_bconn_fill(&cr, s, findNUser(s->hs_aliases[a].ba_numeric), a);
     crdt_shadow_bconn_set(s->hs_account, s->hs_sessid,
                           s->hs_aliases[a].ba_numeric, &cr);
     if (conns) (*conns)++;
   }
   return minted;
+}
+
+/** Build the doc record for one connection we host: identity fields, its
+ * activity, and its OWN away state (the tree carries the same two as BX U
+ * la= / aw=; on the mesh the record is how a peer learns them).  @a idx is
+ * the roster index of an alias, -1 for the primary.  A local client's away
+ * comes from its Connection; a roster entry is the fallback. */
+void bounce_crdt_bconn_fill(struct CrdtBouncerConn *cr, struct BouncerSession *s,
+                            struct Client *who, int idx)
+{
+  memset(cr, 0, sizeof *cr);
+  cr->host = (uint16_t)base64toint(cli_yxx(&me));
+  if (idx < 0) {
+    cr->is_primary = 1;
+    cr->last_active = (uint64_t)s->hs_last_active;
+  } else {
+    cr->is_primary = 0;
+    cr->caps = (uint32_t)s->hs_aliases[idx].ba_caps;
+    cr->caps_known = s->hs_aliases[idx].ba_caps_known ? 1 : 0;
+    cr->last_active = (uint64_t)s->hs_aliases[idx].ba_last_active;
+  }
+  if (who && MyConnect(who) && cli_connect(who)) {
+    cr->away = (uint8_t)con_pre_away(cli_connect(who));
+    cr->away_known = 1;
+  } else if (idx >= 0 && s->hs_aliases[idx].ba_away_known) {
+    cr->away = (uint8_t)s->hs_aliases[idx].ba_away;
+    cr->away_known = 1;
+  }
+}
+
+/** Re-mint the doc record of one connection we host after its away state
+ * or activity changed (the mesh counterpart of a BX U aw= / la= emit).
+ * Change-gated by the callers (aw= fires on change, la= on its interval). */
+void bounce_crdt_bconn_touch(struct Client *who)
+{
+  struct AccountSessions *as;
+  struct BouncerSession *sess;
+  char num[16];
+  int a;
+
+  if (!feature_bool(FEAT_CRDT_BOUNCER_DOC) || !feature_bool(FEAT_CRDT_PRIMARY))
+    return;
+  if (!who || !MyConnect(who) || !IsUser(who) || !IsAccount(who)
+      || !cli_user(who) || !cli_user(who)->server)
+    return;
+  as = bounce_find_by_account(cli_user(who)->account);
+  if (!as)
+    return;
+  ircd_snprintf(0, num, sizeof num, "%s%s", cli_yxx(cli_user(who)->server), cli_yxx(who));
+  for (sess = as->as_sessions; sess; sess = sess->hs_anext) {
+    if (sess->hs_state == BOUNCE_DESTROYING)
+      continue;
+    if (!IsBouncerAlias(who)) {
+      if (sess->hs_client == who) {
+        struct CrdtBouncerConn cr;
+        bounce_crdt_bconn_fill(&cr, sess, who, -1);
+        crdt_shadow_bconn_set(sess->hs_account, sess->hs_sessid, num, &cr);
+        return;
+      }
+      continue;
+    }
+    for (a = 0; a < sess->hs_alias_count; a++)
+      if (0 == strcmp(sess->hs_aliases[a].ba_numeric, num)) {
+        struct CrdtBouncerConn cr;
+        bounce_crdt_bconn_fill(&cr, sess, who, a);
+        crdt_shadow_bconn_set(sess->hs_account, sess->hs_sessid, num, &cr);
+        return;
+      }
+  }
+}
+
+/** Apply the per-connection fields of a doc record another host wrote
+ * (last_active, caps, away) into our view of that session: the primary's
+ * hs_last_active / hs_primary_away, an alias's roster entry.  Called from
+ * the bconn reconcile on every delta; activity only moves forward. */
+void bounce_crdt_bconn_apply(const char *account, const char *sessid,
+                             const char *connnum, const struct CrdtBouncerConn *rec)
+{
+  struct AccountSessions *as = bounce_find_by_account(account);
+  struct BouncerSession *sess;
+  int a;
+
+  if (!as || !rec || !connnum || !connnum[0])
+    return;
+  for (sess = as->as_sessions; sess; sess = sess->hs_anext) {
+    if (0 != strcmp(sess->hs_sessid, sessid))
+      continue;
+    if (rec->is_primary) {
+      if ((time_t)rec->last_active > sess->hs_last_active)
+        sess->hs_last_active = (time_t)rec->last_active;
+      if (rec->away_known) {
+        sess->hs_primary_away = rec->away;
+        sess->hs_primary_away_known = 1;
+      }
+      Debug((DEBUG_DEBUG, "CRDT bconn: %s/%s primary %s la=%lu away=%d",
+             account, sessid, connnum, (unsigned long)rec->last_active,
+             rec->away_known ? rec->away : -1));
+      return;
+    }
+    for (a = 0; a < sess->hs_alias_count; a++) {
+      if (0 != strcmp(sess->hs_aliases[a].ba_numeric, connnum))
+        continue;
+      if ((time_t)rec->last_active > sess->hs_aliases[a].ba_last_active)
+        sess->hs_aliases[a].ba_last_active = (time_t)rec->last_active;
+      if (rec->caps_known) {
+        sess->hs_aliases[a].ba_caps = rec->caps;
+        sess->hs_aliases[a].ba_caps_known = 1;
+      }
+      if (rec->away_known) {
+        sess->hs_aliases[a].ba_away = rec->away;
+        sess->hs_aliases[a].ba_away_known = 1;
+      }
+      Debug((DEBUG_DEBUG, "CRDT bconn: %s/%s alias %s la=%lu away=%d",
+             account, sessid, connnum, (unsigned long)rec->last_active,
+             rec->away_known ? rec->away : -1));
+      return;
+    }
+  }
 }
 
 void bounce_crdt_bsess_sweep(void)
@@ -10760,6 +10871,7 @@ void bounce_note_away_state(struct Client *who, int state)
                 cli_yxx(cli_user(who)->server), cli_yxx(who));
   sendcmdto_serv_butone(&me, CMD_BOUNCER_TRANSFER, NULL,
                         "U %s aw=%d", full_numeric, state);
+  bounce_crdt_bconn_touch(who);   /* mesh peers read it off the doc record */
 }
 
 int bounce_activity_quiet(const char *account)
@@ -10807,6 +10919,7 @@ void bounce_record_activity(struct Client *from)
             sendcmdto_serv_butone(&me, CMD_BOUNCER_TRANSFER, NULL,
                                   "U %s la=%lu", full_numeric,
                                   (unsigned long)CurrentTime);
+            bounce_crdt_bconn_touch(from);
           }
           return;
         }
@@ -10829,6 +10942,7 @@ void bounce_record_activity(struct Client *from)
                                 "U %s%s la=%lu",
                                 cli_yxx(cli_user(from)->server), cli_yxx(from),
                                 (unsigned long)CurrentTime);
+          bounce_crdt_bconn_touch(from);
         }
         return;
       }

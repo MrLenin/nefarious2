@@ -1984,14 +1984,18 @@ static void reconcile_bconn_cb(const char *key, uint32_t key_len,
                                                * (a live-walk + crdt_shadow_bconn_present check,
                                                * mirror of the replica-session reap), NOT here. */
   rec = (const struct CrdtBouncerConn *)val->data;
-  if (rec->is_primary)
-    return;                                   /* primary = a real user (reconcile_users), not an alias */
   myn = (uint16_t)base64toint(cli_yxx(&me));
   if (rec->host == myn)
-    return;                                   /* real local fd alias — never materialize our own */
+    return;                                   /* real local fd connection — never materialize our own */
   if (!crdt_parse_bconn_key(key, key_len, account, sizeof account,
                             sessid, sizeof sessid, aliasn, sizeof aliasn))
     return;
+  /* The record's per-connection fields (activity, caps, the connection's
+   * own away state) are the mesh's BX U la= / aw=: apply them into our
+   * view of the session on every delta, primary and alias alike. */
+  bounce_crdt_bconn_apply(account, sessid, aliasn, rec);
+  if (rec->is_primary)
+    return;                                   /* primary = a real user (reconcile_users), not an alias */
   if (!crdt_bconn_primary(&g_crdt, account, sessid, primary, sizeof primary))
     return;                                   /* no primary in doc yet — retry next cycle */
   if (bounce_materialize_alias_from_doc(account, sessid, primary, aliasn)) {
