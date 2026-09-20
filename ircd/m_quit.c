@@ -212,7 +212,7 @@ int ms_quit(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
 {
   assert(0 != sptr);
   assert(parc > 0);
-  if (IsServer(sptr)) {
+  if (!IsUser(sptr)) {
   	protocol_violation(sptr,"Server QUIT, not SQUIT?");
   	return 0;
   }

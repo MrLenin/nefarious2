@@ -565,7 +565,7 @@ int ms_join(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
     sptr = cli_alias_primary(sptr);
   }
 
-  if (IsServer(sptr))
+  if (!IsUser(sptr))   /* servers, and mesh anchors, cannot: only a user may (inv. 2) */
   {
     return protocol_violation(cptr,
                               "%s tried to JOIN %s, duh!",

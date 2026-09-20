@@ -398,7 +398,7 @@ int ms_kick(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
 
   /* Send HACK notice, but not for servers in BURST */
   /* 2002-10-17: Don't send HACK if the users local server is kicking them */
-  if (IsServer(sptr) &&
+  if ((IsServer(sptr) || IsMeshStub(sptr)) &&
       !IsBurstOrBurstAck(sptr) &&
       sptr!=cli_user(who)->server)
     sendto_opmask_butone(0, SNO_HACK4, "HACK: %C KICK %H %C %s", sptr, chptr,
@@ -408,7 +408,7 @@ int ms_kick(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
    * here), if kicker is not on channel, or if kicker is not a channel
    * operator, bounce the kick
    */
-  if (!IsServer(sptr) && !IsChannelService(sptr) && member && cli_from(who) != cptr &&
+  if (!IsServer(sptr) && !IsMeshStub(sptr) && !IsChannelService(sptr) && member && cli_from(who) != cptr &&
       (!(sptr_link = find_member_link(chptr, sptr)) ||
         (!IsChanOp(sptr_link) && !IsHalfOp(sptr_link)))) {
     sendto_opmask_butone(0, SNO_HACK2, "HACK: %C KICK %H %C %s", sptr, chptr,
@@ -469,10 +469,10 @@ int ms_kick(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
 
       if (IsDelayedJoin(member)) {
         if (MyUser(who))
-          sendcmdto_one(IsServer(sptr) ? &his : sptr, CMD_KICK,
+          sendcmdto_one((IsServer(sptr) || IsMeshStub(sptr)) ? &his : sptr, CMD_KICK,
                         who, "%H %C :%s", chptr, who, comment);
       } else {
-        sendcmdto_channel_butserv_butone(IsServer(sptr) ? &his : sptr, CMD_KICK,
+        sendcmdto_channel_butserv_butone((IsServer(sptr) || IsMeshStub(sptr)) ? &his : sptr, CMD_KICK,
                                          chptr, NULL, 0, "%H %C :%s", chptr, who,
                                          comment);
       }

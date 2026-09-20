@@ -219,7 +219,7 @@ int ms_setname(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
   assert(0 != sptr);
 
   /* Servers can't set realname */
-  if (IsServer(sptr))
+  if (!IsUser(sptr))   /* servers, and mesh anchors, cannot: only a user may (inv. 2) */
     return protocol_violation(sptr, "Server trying to set realname");
 
   if (parc < 2 || EmptyString(parv[1]))

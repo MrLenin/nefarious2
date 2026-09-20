@@ -308,7 +308,7 @@ int ms_invite(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
   struct Channel *chptr;
   time_t invite_ts;
   
-  if (IsServer(sptr)) {
+  if (!IsUser(sptr)) {
     /*
      * this will blow up if we get an invite from a server
      * we look for channel membership in sptr below. 

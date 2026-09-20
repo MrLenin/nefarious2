@@ -127,8 +127,8 @@ static void do_settopic(struct Client *sptr, struct Client *cptr,
    char nick[NICKLEN + 1];
    int newtopic;
 
-   if (feature_bool(FEAT_HIS_BANWHO) && IsServer(sptr))
-       from = &his;
+   if ((feature_bool(FEAT_HIS_BANWHO) && IsServer(sptr)) || IsMeshStub(sptr))
+       from = &his;   /* a mesh anchor has no cli_user to name (inv. 2) */
    else
        from = sptr;
    /* Note if this is just a refresh of an old topic, and don't

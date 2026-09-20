@@ -137,7 +137,7 @@ ms_gline(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
   if (parc < 3)
     return need_more_params(sptr, "GLINE");
 
-  if (IsServer(sptr))
+  if (IsServer(sptr) || IsMeshStub(sptr))   /* a mesh anchor's line carries a server's FORCE (inv. 2) */
     flags |= GLINE_FORCE;
 
   if (*mask == '!') {

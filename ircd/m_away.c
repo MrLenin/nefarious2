@@ -480,7 +480,7 @@ int ms_away(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
   /*
    * servers can't set away
    */
-  if (IsServer(sptr))
+  if (!IsUser(sptr))   /* servers, and mesh anchors, cannot: only a user may (inv. 2) */
     return protocol_violation(sptr,"Server trying to set itself away");
 
   /* Check for AWAY * (hidden connection) from P10 */

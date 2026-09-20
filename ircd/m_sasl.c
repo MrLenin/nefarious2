@@ -236,7 +236,10 @@ int ms_sasl(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
    * bridge: a CR-X reverse re-inject arrives with sptr==&me (the reply was already mesh-
    * validated and re-injected locally from the carrier) — accept IsMe too.  A client cannot
    * forge sptr==&me (ms_sasl is a server-only handler), so this opens no injection hole. */
-  if ((!IsServer(sptr) && !IsMe(sptr)) || IsDead(sptr)) {
+  if ((!IsServer(sptr) && !IsMe(sptr) && !IsMeshStub(sptr))
+      || (IsDead(sptr) && !IsMeshStub(sptr))) {   /* a mesh anchor is a server here and a
+                                                   * case-A stub carries the dead flag by
+                                                   * construction (inv. 2) */
     log_write(LS_DEBUG, L_DEBUG, 0,
               "SASL: Response from invalid/dead server %C, ignoring", sptr);
     return 0;
@@ -248,7 +251,8 @@ int ms_sasl(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
     cli_saslagentref(sptr)++;
   } else if (cli_saslagent(acptr) != sptr) {
     /* Check if existing agent is dead - if so, accept new agent */
-    if (IsDead(cli_saslagent(acptr)) || !IsServer(cli_saslagent(acptr))) {
+    if ((IsDead(cli_saslagent(acptr)) && !IsMeshStub(cli_saslagent(acptr)))
+        || (!IsServer(cli_saslagent(acptr)) && !IsMeshStub(cli_saslagent(acptr)))) {
       log_write(LS_DEBUG, L_DEBUG, 0,
                 "SASL: Previous agent %C is dead, accepting new agent %C",
                 cli_saslagent(acptr), sptr);
@@ -318,7 +322,7 @@ int abort_sasl(struct Client* cptr, int timeout) {
   }
 
   /* Validate agent is still a valid, connected server */
-  if (acptr && (IsDead(acptr) || !IsServer(acptr))) {
+  if (acptr && ((IsDead(acptr) && !IsMeshStub(acptr)) || (!IsServer(acptr) && !IsMeshStub(acptr)))) {
     log_write(LS_DEBUG, L_DEBUG, 0,
               "SASL abort: Agent %C is dead/invalid, broadcasting instead", acptr);
     acptr = NULL;

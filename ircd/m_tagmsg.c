@@ -433,7 +433,7 @@ int ms_tagmsg(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
   assert(0 != sptr);
 
   /* Servers can't send TAGMSG */
-  if (IsServer(sptr))
+  if (!IsUser(sptr))   /* servers, and mesh anchors, cannot: only a user may (inv. 2) */
     return protocol_violation(sptr, "Server trying to send TAGMSG");
 
   if (parc < 2 || EmptyString(parv[1]))

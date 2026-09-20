@@ -265,7 +265,7 @@ ms_mode(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
                            ALLOWMODES_ANY | ALLOWMODES_ALIAS_SYNC);
     }
 
-    if ((sptr != acptr) && !IsServer(sptr))
+    if ((sptr != acptr) && !IsServer(sptr) && !IsMeshStub(sptr))   /* a mesh anchor is a server here (inv. 2) */
     {
       sendwallto_group_butone(&me, WALL_WALLOPS, 0,
                               "MODE for User %s from %s!%s", parv[1],

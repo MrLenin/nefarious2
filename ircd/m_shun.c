@@ -137,7 +137,7 @@ ms_shun(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
   if (parc < 3)
     return need_more_params(sptr, "SHUN");
 
-  if (IsServer(sptr))
+  if (IsServer(sptr) || IsMeshStub(sptr))   /* a mesh anchor's line carries a server's FORCE (inv. 2) */
     flags |= SHUN_FORCE;
 
   if (*mask == '!') {

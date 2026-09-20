@@ -194,7 +194,10 @@ int ms_end_of_burst(struct Client* cptr, struct Client* sptr, int parc, char* pa
   crdt_shadow_decomm_sweep();       /* dissolve markers for returned servers / reap freshly-learned decommissions at the settle point */
   crdt_shadow_ch_storage_publish(); /* 5-5f B2: publish our CH storage capability at the settle point so a fresh peer learns it now, not on the next 30s tick (F3 lesson); change-gated, so it is a no-op once published */
 
-  if (MyConnect(sptr)) {
+  /* A mesh anchor's cli_from is itself, so MyConnect() is true for it;
+   * only a REAL directly-linked server gets the ack + sync kickoff (a
+   * relayed EB from beyond the horizon carries the origin as an anchor). */
+  if (MyConnect(sptr) && IsServer(sptr)) {
     sendcmdto_one(&me, CMD_END_OF_BURST_ACK, sptr, "");
 
     /* Phase 2 CRDT: kick off delta sync with this directly-connected
@@ -316,7 +319,8 @@ int ms_end_of_burst(struct Client* cptr, struct Client* sptr, int parc, char* pa
  */
 int ms_end_of_burst_ack(struct Client *cptr, struct Client *sptr, int parc, char **parv)
 {
-  if (!IsServer(sptr))
+  if (!IsServer(sptr) && !IsMeshStub(sptr))   /* the ack of an anchored origin must still
+                                              * clear its BurstAck (inv. 2) */
     return 0;
 
   sendto_opmask_butone(0, SNO_NETWORK, "%C acknowledged end of net.burst.",

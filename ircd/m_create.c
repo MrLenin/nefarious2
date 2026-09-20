@@ -116,7 +116,7 @@ int ms_create(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
   int badop; /* a flag */
   struct Client *alias_source = NULL;
 
-  if (IsServer(sptr))
+  if (!IsUser(sptr))   /* servers, and mesh anchors, cannot: only a user may (inv. 2) */
     return protocol_violation(sptr,"%s tried to CREATE a channel", cli_name(sptr));
 
   /* Alias CREATE — rewrite to primary unconditionally, mirroring ms_join.
