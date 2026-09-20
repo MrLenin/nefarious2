@@ -3875,6 +3875,29 @@ void chathistory_update_retention_isupport(int announce)
 /** Clear advertisement entry for a server (on SQUIT).
  * @param[in] server Server client.
  */
+/** Walk the storage advertisements of LEGACY servers (real P10 servers that
+ * are not CRDT-aware).  The gateway publishes these into the CRDT doc so
+ * inner mesh nodes, which never see a legacy CH A S, learn that store
+ * exists (the mirror of the legacy-ward synth, 2026-09-20). */
+void chathistory_legacy_ads_foreach(void (*fn)(const char *srvnum, unsigned int retention, void *ctx),
+                                    void *ctx)
+{
+  int i;
+  char num[4];
+  for (i = 0; i < MAX_AD_SERVERS; i++) {
+    struct ChathistoryAd *ad = server_ads[i];
+    struct Client *server;
+    if (!ad || !ad->has_advertisement || !ad->is_storage_server)
+      continue;
+    server = FindNServer(inttobase64(num, i, 2));
+    if (!server || server == &me || !IsServer(server) || IsCrdtAware(server))
+      continue;
+    if (is_ulined_server(server))
+      continue;
+    fn(num, (unsigned int)(ad->retention_days < 0 ? 0 : ad->retention_days), ctx);
+  }
+}
+
 void clear_server_ad(struct Client *server)
 {
   int idx = server_ad_index(server);
@@ -3882,8 +3905,17 @@ void clear_server_ad(struct Client *server)
   if (idx < 0)
     return;
   if (server_ads[idx] && server_ads[idx]->has_advertisement
-      && server_ads[idx]->is_storage_server)
+      && server_ads[idx]->is_storage_server) {
     absence_open(idx);   /* a known store is going away: remember it */
+    /* We were this legacy store's gateway (it hung off a non-CRDT link of
+     * ours): withdraw the doc record we published for it.  Inner nodes see
+     * it only as an anchor and must not tombstone what the gateway owns. */
+    if (!IsCrdtAware(server) && cli_from(server) && cli_from(server) != server
+        && IsServer(cli_from(server)) && !IsCrdtAware(cli_from(server)))
+      crdt_shadow_ch_storage_withdraw_for(cli_yxx(server));
+    else if (!IsCrdtAware(server) && MyConnect(server))
+      crdt_shadow_ch_storage_withdraw_for(cli_yxx(server));
+  }
   if (server_ads[idx]) {
     /* Free channel array if present */
     if (server_ads[idx]->channels) {
@@ -6830,6 +6862,8 @@ int ms_chathistory(struct Client *cptr, struct Client *sptr, int parc, char *par
 
       /* Propagate to other servers (except source) */
       sendcmdto_serv_butone_v3(sptr, CMD_CHATHISTORY, cptr, "A S %d", retention);
+      if (IsServer(sptr) && !IsCrdtAware(sptr))
+        crdt_shadow_ch_storage_publish_for(cli_yxx(sptr), retention < 0 ? 0 : (unsigned int)retention);
       chathistory_update_retention_isupport(1);
     }
     else if (subtype[0] == 'R') {
@@ -6848,6 +6882,8 @@ int ms_chathistory(struct Client *cptr, struct Client *sptr, int parc, char *par
 
       /* Propagate to other servers (except source) */
       sendcmdto_serv_butone_v3(sptr, CMD_CHATHISTORY, cptr, "A R %d", retention);
+      if (IsServer(sptr) && !IsCrdtAware(sptr) && ad->is_storage_server)
+        crdt_shadow_ch_storage_publish_for(cli_yxx(sptr), retention < 0 ? 0 : (unsigned int)retention);
       chathistory_update_retention_isupport(1);
     }
     else if (subtype[0] == 'F') {

@@ -580,6 +580,10 @@ void crdt_shadow_own_user_reassert(void);
 /** 5-5f B2: publish/withdraw THIS server's chathistory storage capability in
  *  the doc (change-gated; safe to call on both the verify tick and eagerly). */
 void crdt_shadow_ch_storage_publish(void);
+/* Gateway: publish / withdraw a LEGACY server's storage capability on its behalf
+ * (legacy CH A S never crosses into the mesh; the doc is how inner nodes learn it). */
+void crdt_shadow_ch_storage_publish_for(const char *srvnum, unsigned int retention);
+void crdt_shadow_ch_storage_withdraw_for(const char *srvnum);
 /** 5-5f B2 read side: 1 if the doc says @a srvnum stores history (fills
  *  @a retention_out), else 0.  Fallback behind the legacy CH A S table. */
 int crdt_shadow_ch_storage_lookup(const char *srvnum, unsigned int *retention_out);

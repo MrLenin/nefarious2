@@ -1186,6 +1186,47 @@ void crdt_shadow_ch_storage_publish(void)
   crdt_sync_push();
 }
 
+/* Gateway-side publish of a LEGACY store (2026-09-20, catch-up follow-up).
+ * The legacy CH A S reaches only nodes with a real P10 view of that server;
+ * the gateway mints the doc record on its behalf, change-gated like its own
+ * (an identical value is a no-op, so two gateways minting is benign LWW),
+ * and withdraws it when the server leaves its legacy link. */
+void crdt_shadow_ch_storage_publish_for(const char *srvnum, unsigned int retention)
+{
+  const struct CrdtChStorage *cur;
+  if (!shadow_on() || !srvnum || !srvnum[0])
+    return;
+  cur = crdt_chstore_get(&g_crdt, srvnum);
+  if (cur && cur->stores && cur->retention_days == retention)
+    return;
+  log_write(LS_SYSTEM, L_NOTICE, 0,
+            "CRDT CH-storage: publishing legacy store %s (retention %u) on its behalf",
+            srvnum, retention);
+  crdt_chstore_set(&g_crdt, srvnum, 1u, retention);
+  crdt_sync_push();
+}
+
+void crdt_shadow_ch_storage_withdraw_for(const char *srvnum)
+{
+  if (!shadow_on() || !srvnum || !srvnum[0])
+    return;
+  if (!crdt_chstore_get(&g_crdt, srvnum))
+    return;
+  log_write(LS_SYSTEM, L_NOTICE, 0,
+            "CRDT CH-storage: withdrawing legacy store %s (left our legacy link)", srvnum);
+  crdt_chstore_remove(&g_crdt, srvnum);
+  crdt_sync_push();
+}
+
+/* Verify-tick re-mint: a legacy store the gateway still holds an ad for must
+ * be in the doc (covers a tombstone minted by an inner node that retired the
+ * store's anchor while the gateway kept seeing it). */
+static void legacy_store_remint_one(const char *srvnum, unsigned int retention, void *ctx)
+{
+  (void)ctx;
+  crdt_shadow_ch_storage_publish_for(srvnum, retention);
+}
+
 /* 5-5f B2 read side: does the DOC say server @a srvnum stores channel history?
  * Returns 1 and fills @a retention_out when so, else 0.  m_chathistory.c uses
  * this as a fallback behind the legacy CH A S table (which stays authoritative
@@ -6271,6 +6312,7 @@ static void crdt_shadow_verify_cb(struct Event *ev)
   crdt_shadow_own_user_reassert(); /* recovery completion: re-mint records of live local users the doc lost (wrong-decommission heal) */
   crdt_shadow_ch_storage_publish(); /* 5-5f B2: publish our CH storage capability (change-gated, so idle ticks are free) */
   crdt_shadow_ch_storage_foreach(ch_storage_reach_sweep_one, NULL); /* absence table: doc-known stores go absent on a stale beacon, back on a fresh one */
+  chathistory_legacy_ads_foreach(legacy_store_remint_one, NULL);    /* gateway: legacy stores we still see stay published (change-gated) */
   crdt_shadow_ch_storage_synth_to(NULL); /* 5-5f B4: synth doc-known stores to legacy links (change-gated per leaf — covers stores that appear AFTER the legacy link's EOB) */
   chathistory_update_retention_isupport(1); /* the doc may have taught us a store P10 never advertised: re-derive the widest retention (cached compare, no-op when unchanged) */
   crdt_shadow_decomm_sweep();      /* decommission standing sweep: reap residue of operator-asserted-dead servers; auto-dissolve on return */
