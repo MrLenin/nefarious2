@@ -177,11 +177,20 @@ static int account_name_matches(const char *have, const char *wire)
  * owner is a mesh stub, so P10-homed targets are untouched (no double-apply).
  *
  * @a type is the wire subcommand ("U"/"R"/"M"); @a acct / @a ts may be NULL. */
-static void crdt_account_tunnel_owner(struct Client *acptr, const char *type,
-                                      const char *acct, const char *ts)
+static void crdt_account_tunnel_owner(struct Client *cptr, struct Client *acptr,
+                                      const char *type, const char *acct,
+                                      const char *ts)
 {
   char body[BUFSIZE];
   if (!acptr || !cli_user(acptr) || !type)
+    return;
+  /* Only where the change ENTERS the mesh: an AC that arrived over a
+   * legacy (non-CRDT) server link, i.e. we are the gateway edge.  An AC
+   * that reached us over a CRDT-aware link or a CR-X re-inject already
+   * came from the owner's side; tunnelling it back made every inner
+   * peer echo each services stamp to the legacy owner (four "ACCOUNT for
+   * already registered user" violations per login, 2026-09-20). */
+  if (!cptr || !IsServer(cptr) || IsCrdtAware(cptr))
     return;
   if (acct && ts)
     ircd_snprintf(0, body, sizeof body, "%s%s %s %s %s", NumNick(acptr), type,
@@ -298,7 +307,7 @@ int ms_account(struct Client* cptr, struct Client* sptr, int parc,
         }
 
         sendcmdto_serv_butone(sptr, CMD_ACCOUNT, cptr, "%C U", acptr);
-        crdt_account_tunnel_owner(acptr, "U", NULL, NULL);
+        crdt_account_tunnel_owner(cptr, acptr, "U", NULL, NULL);
       } else if (type == 'R' || type == 'M') {
         if (parc < 4)
           return need_more_params(sptr, "ACCOUNT");
@@ -400,7 +409,7 @@ int ms_account(struct Client* cptr, struct Client* sptr, int parc,
         {
           char tbuf[2];
           tbuf[0] = type; tbuf[1] = '\0';
-          crdt_account_tunnel_owner(acptr, tbuf, parv[3],
+          crdt_account_tunnel_owner(cptr, acptr, tbuf, parv[3],
                                     (parc > 4) ? parv[4] : NULL);
         }
       }
