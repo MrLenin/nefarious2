@@ -64,6 +64,7 @@
 #include "db_txn.h"
 #include "history.h"
 #include "chathistory_presence.h"
+#include "crdt_hlc.h"
 
 /* ------------------------------------------------------------------ */
 /* Link-time stubs for chathistory_presence.c's other dependencies.   */
@@ -85,10 +86,12 @@
  * this via feature_int(FEAT_CHATHISTORY_PRESENCE_MAX_INTERVALS).
  * Fixed at 0 for this suite -- the "misconfigured/max" case that used
  * to let count overflow. */
+static int test_max_intervals = 0;   /* 0 = the clamp (255); tests may lower it */
+
 int feature_int(enum Feature feat)
 {
   (void)feat;
-  return 0;
+  return test_max_intervals;
 }
 
 int feature_bool(enum Feature feat)
@@ -228,6 +231,28 @@ int history_msgid_to_timestamp(const char *msgid, char *timestamp)
   return -1;
 }
 
+/* history.c is not linked here; the presence filter paths that parse a
+ * row stamp are never exercised by this suite, but the symbol must
+ * resolve.  Kept faithful anyway ("sec[.mmm]" -> epoch ms). */
+uint64_t history_parse_ms(const char *ts)
+{
+  char *end = NULL;
+  unsigned long long sec;
+  unsigned long ms = 0;
+  int digits = 0;
+  if (!ts || !*ts)
+    return 0;
+  sec = strtoull(ts, &end, 10);
+  if (end == ts)
+    return 0;
+  if (end && *end == '.') {
+    const char *p = end + 1;
+    while (*p >= '0' && *p <= '9' && digits < 3) { ms = ms * 10 + (unsigned long)(*p - '0'); p++; digits++; }
+    while (digits < 3) { ms *= 10; digits++; }
+  }
+  return sec * 1000ULL + ms;
+}
+
 struct Channel *hSeekChannel(const char *name)
 {
   (void)name;
@@ -240,6 +265,36 @@ struct Channel *hSeekChannel(const char *name)
  * called here), but the symbol must exist to link. */
 time_t CurrentTime;
 
+/** presence_backfill_now walks the real channel list; this suite never
+ * calls it (feature-gated, no channels exist here) but the standalone
+ * link of ../chathistory_presence.o needs the symbol. */
+struct Channel *GlobalChannelList;
+
+/* PN replication emit path (presence_broadcast_close): never fires in
+ * this suite (feature stubbed off / no server init) but the standalone
+ * link needs the symbols. */
+/* 'me' comes from test_stub.o. */
+void sendcmdto_serv_butone_v3(struct Client *from, const char *cmd,
+                              const char *tok, struct Client *one,
+                              const char *pattern, ...)
+{
+  (void)from; (void)cmd; (void)tok; (void)one; (void)pattern;
+}
+struct db_env *metadata_get_env(void) { return NULL; }
+/* presence's fallback clock when no caller supplied an event time
+ * (SQUIT teardown, backfill); this suite always passes explicit times. */
+static struct HLC test_hlc;
+const struct HLC *hlc_global(void)
+{
+  test_hlc.physical_ms = (uint64_t)time(NULL) * 1000;
+  return &test_hlc;
+}
+void sendcmdto_one(struct Client *from, const char *cmd, const char *tok,
+                   struct Client *to, const char *pattern, ...)
+{
+  (void)from; (void)cmd; (void)tok; (void)to; (void)pattern;
+}
+
 /* ------------------------------------------------------------------ */
 /* Tests                                                               */
 /* ------------------------------------------------------------------ */
@@ -247,14 +302,23 @@ time_t CurrentTime;
 #define TEST_ANCHOR  "test-session-anchor-0001"
 #define TEST_CHANNEL "#f-ch3-test"
 
-/* Base epoch far enough from 0 to make failures easy to eyeball. */
-#define BASE_TS ((time_t)1700000000)
+/* Base epoch far enough from 0 to make failures easy to eyeball.
+ * Presence stamps are epoch MILLISECONDS (2026-09-02); SEC() scales the
+ * seconds-era offsets these tests were written with. */
+#define BASE_MS PRESENCE_TIME_FROM_MS((int64_t)1700000000 * 1000)
+/* Presence time is the HLC packed as ms<<16|logical; SEC() scales the
+ * seconds-era offsets these tests were written with, MS() millisecond
+ * ones, and a bare +1/-1 is one logical tick inside a millisecond. */
+#define SEC(n) PRESENCE_TIME_FROM_MS((int64_t)(n) * 1000)
+#define MS(n)  PRESENCE_TIME_FROM_MS((int64_t)(n))
 
-/* Interval i occupies [BASE_TS + i*10, BASE_TS + i*10 + 1]; consecutive
- * intervals are strictly increasing and never overlap (gap of 10 vs a
- * 1-second span). */
-static time_t join_ts(int i) { return BASE_TS + (time_t)i * 10; }
-static time_t part_ts(int i) { return join_ts(i) + 1; }
+/* Interval i occupies [BASE_MS + i*100 s, +1 s]; consecutive intervals
+ * are strictly increasing and never overlap.  The 99-second gap
+ * deliberately exceeds the 30 s reconnect-coalescing window in
+ * record_apply_part, so each join/part pair stays a distinct interval
+ * and the FIFO-eviction assertions below keep their meaning. */
+static int64_t join_ts(int i) { return BASE_MS + SEC((int64_t)i * 100); }
+static int64_t part_ts(int i) { return join_ts(i) + SEC(1); }
 
 static void test_presence_basic_join_part_present(void **state)
 {
@@ -334,11 +398,367 @@ static void test_presence_no_wraparound_at_misconfigured_cap(void **state)
   presence_purge_session(anchor);
 }
 
+/* Reconnect-churn coalescing: a part/rejoin gap of <=30s must merge
+ * into the previous interval (one FIFO slot, and the blip itself is
+ * covered), while a larger gap must stay a distinct interval with the
+ * gap NOT covered. */
+static void test_presence_reconnect_coalescing(void **state)
+{
+  const char *anchor = "test-session-anchor-coal";
+  int64_t t = BASE_MS;
+
+  (void)state;
+  presence_purge_session(anchor);
+
+  presence_record_join(anchor, 1, TEST_CHANNEL, t);
+  presence_record_part(anchor, 1, TEST_CHANNEL, t + SEC(5));
+  /* Reconnect 10s later: inside the 30s window -> coalesce. */
+  presence_record_join(anchor, 1, TEST_CHANNEL, t + SEC(15));
+  presence_record_part(anchor, 1, TEST_CHANNEL, t + SEC(20));
+  /* The blip gap is covered by the merged interval. */
+  assert_true(presence_was_present(anchor, 1, TEST_CHANNEL, t + SEC(10)));
+  assert_true(presence_was_present(anchor, 1, TEST_CHANNEL, t + SEC(20)));
+
+  /* Reconnect 100s later: outside the window -> distinct interval,
+   * gap NOT covered. */
+  presence_record_join(anchor, 1, TEST_CHANNEL, t + SEC(120));
+  presence_record_part(anchor, 1, TEST_CHANNEL, t + SEC(125));
+  assert_false(presence_was_present(anchor, 1, TEST_CHANNEL, t + SEC(70)));
+  assert_true(presence_was_present(anchor, 1, TEST_CHANNEL, t + SEC(122)));
+
+  presence_purge_session(anchor);
+}
+
+/* Backward clock step: a part BEFORE the open's start must clamp to a
+ * zero-length visit at the join instant, not discard the window
+ * entirely (the old behavior erased the member's whole real window). */
+static void test_presence_clock_skew_clamp(void **state)
+{
+  const char *anchor = "test-session-anchor-skew";
+  int64_t t = BASE_MS + SEC(1000000);
+
+  (void)state;
+  presence_purge_session(anchor);
+
+  presence_record_join(anchor, 1, TEST_CHANNEL, t);
+  presence_record_part(anchor, 1, TEST_CHANNEL, t - SEC(50));  /* skewed */
+  /* The join instant survives as a zero-length interval. */
+  assert_true(presence_was_present(anchor, 1, TEST_CHANNEL, t));
+  assert_false(presence_was_present(anchor, 1, TEST_CHANNEL, t - SEC(50)));
+  assert_false(presence_was_present(anchor, 1, TEST_CHANNEL, t + SEC(1)));
+
+  /* Record remains usable afterwards. */
+  presence_record_join(anchor, 1, TEST_CHANNEL, t + SEC(100));
+  assert_true(presence_was_present(anchor, 1, TEST_CHANNEL, t + SEC(150)));
+
+  presence_purge_session(anchor);
+}
+
+/* Remote-close union merge (#6 metadata replication): closed intervals
+ * arriving from peers -- out of order, overlapping, or duplicated --
+ * must union into the record without disturbing correctness of the
+ * membership test.  Exercised via the session flavor (the account
+ * flavor shares the merge code; its load/store is stubbed here). */
+/** Audit 2026-09-06 P1: a union-close landing in the MIDDLE of a record
+ * that is already at its interval cap must drop the OLDEST window and
+ * keep every later one.  The cap branch shifted only pos-1 slots and
+ * then ran the ordinary insert memmove on top, overwriting the newest
+ * window with its predecessor -- so the most recent closed window
+ * vanished whenever an older PN arrived (burst sync sends a peer's
+ * records oldest-first, so any at-cap account lost its newest window on
+ * every relink). */
+/* Re-review 2026-09-07 R5: a remote window (PN from another connection of
+ * the same anchor) that STARTS AFTER the local open must not erase the
+ * local connection's earlier presence when the local part coalesces with
+ * it.  record_apply_part merged into the last closed window without
+ * lowering its start: union [900,1000]; join@400; part@1100 gave
+ * [900,1100] and t=500 flipped from visible to hidden. */
+static void test_presence_part_coalesce_keeps_earlier_open(void **state)
+{
+  const char *anchor = "test-session-anchor-partcoal";
+  int64_t t = BASE_MS + SEC(4000000);
+
+  (void)state;
+  presence_purge_session(anchor);
+
+  /* Local connection joins at 400s (interval opens). */
+  presence_record_join(anchor, 1, TEST_CHANNEL, t + SEC(400));
+  /* The other connection's closed window [900s,1000s] arrives by PN. */
+  presence_apply_close(anchor, 1, TEST_CHANNEL, t + SEC(900), t + SEC(1000));
+  /* Still visible while open. */
+  assert_true(presence_was_present(anchor, 1, TEST_CHANNEL, t + SEC(500)));
+  /* Local part at 1100s: within the coalesce window of [900,1000]. */
+  presence_record_part(anchor, 1, TEST_CHANNEL, t + SEC(1100));
+  /* The whole span [400,1100] stays visible ... */
+  assert_true(presence_was_present(anchor, 1, TEST_CHANNEL, t + SEC(500)));
+  assert_true(presence_was_present(anchor, 1, TEST_CHANNEL, t + SEC(950)));
+  assert_true(presence_was_present(anchor, 1, TEST_CHANNEL, t + SEC(1050)));
+  /* ... and nothing outside it. */
+  assert_false(presence_was_present(anchor, 1, TEST_CHANNEL, t + SEC(399)));
+  assert_false(presence_was_present(anchor, 1, TEST_CHANNEL, t + SEC(1101)));
+
+  /* Mirror: a remote window that ends INSIDE the open interval and a part
+   * far outside the coalesce window: the open window must still be the
+   * one that lands, not be dropped as "already covered". */
+  presence_record_join(anchor, 1, TEST_CHANNEL, t + SEC(2000));
+  presence_apply_close(anchor, 1, TEST_CHANNEL, t + SEC(2100), t + SEC(2200));
+  presence_record_part(anchor, 1, TEST_CHANNEL, t + SEC(2500));
+  assert_true(presence_was_present(anchor, 1, TEST_CHANNEL, t + SEC(2050)));
+  assert_true(presence_was_present(anchor, 1, TEST_CHANNEL, t + SEC(2400)));
+  assert_false(presence_was_present(anchor, 1, TEST_CHANNEL, t + SEC(1500)));
+
+  presence_purge_session(anchor);
+}
+
+static void test_presence_union_close_at_cap(void **state)
+{
+  const char *anchor = "test-session-anchor-cap";
+  int64_t t = BASE_MS + SEC(3000000);
+  int i;
+
+  (void)state;
+  presence_purge_session(anchor);
+  test_max_intervals = 4;
+
+  /* Four disjoint closed windows: W1..W4 at 100s spacing. */
+  for (i = 1; i <= 4; i++)
+    presence_apply_close(anchor, 1, TEST_CHANNEL,
+                         t + SEC(i * 100), t + SEC(i * 100 + 10));
+  for (i = 1; i <= 4; i++)
+    assert_true(presence_was_present(anchor, 1, TEST_CHANNEL, t + SEC(i * 100 + 5)));
+
+  /* A fifth window that sorts between W2 and W3 (older than the newest). */
+  presence_apply_close(anchor, 1, TEST_CHANNEL, t + SEC(250), t + SEC(260));
+
+  /* Oldest dropped; the new window and EVERY later window survive. */
+  assert_false(presence_was_present(anchor, 1, TEST_CHANNEL, t + SEC(105)));
+  assert_true(presence_was_present(anchor, 1, TEST_CHANNEL, t + SEC(205)));
+  assert_true(presence_was_present(anchor, 1, TEST_CHANNEL, t + SEC(255)));
+  assert_true(presence_was_present(anchor, 1, TEST_CHANNEL, t + SEC(305)));
+  assert_true(presence_was_present(anchor, 1, TEST_CHANNEL, t + SEC(405)));
+  /* Nothing leaked into the gaps. */
+  assert_false(presence_was_present(anchor, 1, TEST_CHANNEL, t + SEC(350)));
+
+  test_max_intervals = 0;
+  presence_purge_session(anchor);
+}
+
+static void test_presence_remote_close_union(void **state)
+{
+  const char *anchor = "test-session-anchor-union";
+  int64_t t = BASE_MS + SEC(2000000);
+
+  (void)state;
+  presence_purge_session(anchor);
+
+  /* Base closed interval. */
+  presence_apply_close(anchor, 1, TEST_CHANNEL, t + SEC(100), t + SEC(200));
+  assert_true(presence_was_present(anchor, 1, TEST_CHANNEL, t + SEC(150)));
+  assert_false(presence_was_present(anchor, 1, TEST_CHANNEL, t + SEC(250)));
+
+  /* Overlapping close extends the same window (union, not append). */
+  presence_apply_close(anchor, 1, TEST_CHANNEL, t + SEC(150), t + SEC(300));
+  assert_true(presence_was_present(anchor, 1, TEST_CHANNEL, t + SEC(250)));
+  assert_false(presence_was_present(anchor, 1, TEST_CHANNEL, t + SEC(350)));
+
+  /* Disjoint later window. */
+  presence_apply_close(anchor, 1, TEST_CHANNEL, t + SEC(500), t + SEC(600));
+  assert_true(presence_was_present(anchor, 1, TEST_CHANNEL, t + SEC(550)));
+  assert_false(presence_was_present(anchor, 1, TEST_CHANNEL, t + SEC(400)));
+
+  /* Out-of-order EARLIER window still lands. */
+  presence_apply_close(anchor, 1, TEST_CHANNEL, t + SEC(10), t + SEC(40));
+  assert_true(presence_was_present(anchor, 1, TEST_CHANNEL, t + SEC(20)));
+  assert_false(presence_was_present(anchor, 1, TEST_CHANNEL, t + SEC(60)));
+
+  /* Duplicate apply is idempotent (no visibility change). */
+  presence_apply_close(anchor, 1, TEST_CHANNEL, t + SEC(10), t + SEC(40));
+  assert_true(presence_was_present(anchor, 1, TEST_CHANNEL, t + SEC(20)));
+
+  /* Degenerate input (end < start) is clamped, not corrupting. */
+  presence_apply_close(anchor, 1, TEST_CHANNEL, t + SEC(900), t + SEC(800));
+  assert_true(presence_was_present(anchor, 1, TEST_CHANNEL, t + SEC(900)));
+  assert_false(presence_was_present(anchor, 1, TEST_CHANNEL, t + SEC(850)));
+
+  /* An open interval must survive a union merge underneath it. */
+  presence_record_join(anchor, 1, TEST_CHANNEL, t + SEC(1000));
+  presence_apply_close(anchor, 1, TEST_CHANNEL, t + SEC(700), t + SEC(750));
+  assert_true(presence_was_present(anchor, 1, TEST_CHANNEL, t + SEC(1100)));
+  assert_true(presence_was_present(anchor, 1, TEST_CHANNEL, t + SEC(720)));
+
+  presence_purge_session(anchor);
+}
+
+/* Presence-aware paging (2026-09-02): the store walk asks, for a row
+ * OUTSIDE the anchor's presence, where the next presence boundary lies
+ * in the walk direction so it can seek there instead of stepping (or
+ * stop when nothing further is visible).  Pure interval logic over the
+ * same record the membership test uses.
+ *
+ *   forward  (reverse=0): smallest interval start > t, or open_since
+ *                         if that is > t; -1 when none
+ *   backward (reverse=1): largest interval end < t; -1 when none
+ *   t inside an interval (or >= open_since): the query never asks, but
+ *   the answer is t itself (identity) so a caller can't be misled. */
+static void test_presence_next_visible_boundaries(void **state)
+{
+  const char *anchor = "test-session-anchor-page";
+  int64_t t = BASE_MS + SEC(3000000);
+
+  (void)state;
+  presence_purge_session(anchor);
+
+  /* No record at all: nothing visible in either direction. */
+  assert_int_equal(presence_next_visible(anchor, 1, TEST_CHANNEL, t, 0), -1);
+  assert_int_equal(presence_next_visible(anchor, 1, TEST_CHANNEL, t, 1), -1);
+
+  /* Two closed windows [100,200] and [500,600], gaps around them. */
+  presence_apply_close(anchor, 1, TEST_CHANNEL, t + SEC(100), t + SEC(200));
+  presence_apply_close(anchor, 1, TEST_CHANNEL, t + SEC(500), t + SEC(600));
+
+  /* Before everything, walking forward: first window's start. */
+  assert_int_equal(presence_next_visible(anchor, 1, TEST_CHANNEL, t, 0), t + SEC(100));
+  /* Before everything, walking backward: nothing. */
+  assert_int_equal(presence_next_visible(anchor, 1, TEST_CHANNEL, t, 1), -1);
+
+  /* In the gap between the windows. */
+  assert_int_equal(presence_next_visible(anchor, 1, TEST_CHANNEL, t + SEC(300), 0), t + SEC(500));
+  assert_int_equal(presence_next_visible(anchor, 1, TEST_CHANNEL, t + SEC(300), 1), t + SEC(200));
+
+  /* After everything (no open interval): forward nothing, backward last end. */
+  assert_int_equal(presence_next_visible(anchor, 1, TEST_CHANNEL, t + SEC(900), 0), -1);
+  assert_int_equal(presence_next_visible(anchor, 1, TEST_CHANNEL, t + SEC(900), 1), t + SEC(600));
+
+  /* Inside a window: identity in both directions. */
+  assert_int_equal(presence_next_visible(anchor, 1, TEST_CHANNEL, t + SEC(150), 0), t + SEC(150));
+  assert_int_equal(presence_next_visible(anchor, 1, TEST_CHANNEL, t + SEC(150), 1), t + SEC(150));
+
+  /* Boundary seconds are inclusive: end+1 is outside, end is inside. */
+  assert_int_equal(presence_next_visible(anchor, 1, TEST_CHANNEL, t + SEC(201), 1), t + SEC(200));
+  assert_int_equal(presence_next_visible(anchor, 1, TEST_CHANNEL, t + SEC(200), 1), t + SEC(200));
+  assert_int_equal(presence_next_visible(anchor, 1, TEST_CHANNEL, t + SEC(499), 0), t + SEC(500));
+
+  /* Open interval from t+1000: forward from the trailing gap lands on
+   * open_since; backward from inside the open run is identity; forward
+   * from inside is identity. */
+  presence_record_join(anchor, 1, TEST_CHANNEL, t + SEC(1000));
+  assert_int_equal(presence_next_visible(anchor, 1, TEST_CHANNEL, t + SEC(900), 0), t + SEC(1000));
+  assert_int_equal(presence_next_visible(anchor, 1, TEST_CHANNEL, t + SEC(900), 1), t + SEC(600));
+  assert_int_equal(presence_next_visible(anchor, 1, TEST_CHANNEL, t + SEC(5000), 0), t + SEC(5000));
+  assert_int_equal(presence_next_visible(anchor, 1, TEST_CHANNEL, t + SEC(5000), 1), t + SEC(5000));
+
+  presence_purge_session(anchor);
+}
+
+/* Sub-second precision (2026-09-02): presence stamps are milliseconds,
+ * inclusive at both edges, so a row 1 ms before the join is hidden and
+ * a row 1 ms after the part is hidden -- and a row in the SAME
+ * wall-clock second as the join but before it is hidden too, which the
+ * old whole-second records could not express. */
+static void test_presence_millisecond_edges(void **state)
+{
+  const char *anchor = "test-session-anchor-ms";
+  /* join at .500 with logical counter 7; part 10 s later at .750, logical 3 */
+  int64_t j = BASE_MS + SEC(4000000) + PRESENCE_TIME_PACK(500, 7);
+  int64_t p = PRESENCE_TIME_PACK(PRESENCE_TIME_MS(j) + 10250, 3);
+
+  (void)state;
+  presence_purge_session(anchor);
+
+  presence_record_join(anchor, 1, TEST_CHANNEL, j);
+  /* One logical tick before the join, SAME millisecond: hidden. */
+  assert_false(presence_was_present(anchor, 1, TEST_CHANNEL, j - 1));
+  assert_true(presence_was_present(anchor, 1, TEST_CHANNEL, j));
+  assert_true(presence_was_present(anchor, 1, TEST_CHANNEL, j + 1));
+  /* Same second as the join, 400 ms earlier: hidden. */
+  assert_false(presence_was_present(anchor, 1, TEST_CHANNEL, j - MS(400)));
+  /* One millisecond earlier, any logical: hidden. */
+  assert_false(presence_was_present(anchor, 1, TEST_CHANNEL,
+                                    PRESENCE_TIME_PACK(PRESENCE_TIME_MS(j) - 1, 60000)));
+
+  presence_record_part(anchor, 1, TEST_CHANNEL, p);
+  assert_true(presence_was_present(anchor, 1, TEST_CHANNEL, p));
+  assert_false(presence_was_present(anchor, 1, TEST_CHANNEL, p + 1));   /* same ms, later tick */
+
+  /* Boundary seeks are exact too. */
+  assert_int_equal(presence_next_visible(anchor, 1, TEST_CHANNEL, j - 1, 0), j);
+  assert_int_equal(presence_next_visible(anchor, 1, TEST_CHANNEL, p + 1, 1), p);
+
+  presence_purge_session(anchor);
+}
+
+/* The msgid's embedded HLC is the row's presence time when it agrees
+ * with the row's millisecond stamp; a foreign/legacy msgid, or one that
+ * disagrees, falls back to (row ms, logical 0). */
+static void test_presence_event_time_from_msgid(void **state)
+{
+  (void)state;
+  /* No msgid: (ms, 0). */
+  assert_int_equal(presence_event_time(NULL, 1700000000123ULL),
+                   PRESENCE_TIME_FROM_MS(1700000000123LL));
+  assert_int_equal(presence_event_time("", 1700000000123ULL),
+                   PRESENCE_TIME_FROM_MS(1700000000123LL));
+  /* Legacy-shaped msgid that cannot decode: (ms, 0). */
+  assert_int_equal(presence_event_time("AB-1703334400-123", 1700000000123ULL),
+                   PRESENCE_TIME_FROM_MS(1700000000123LL));
+}
+
+/* The reconnect-coalescing window is 30 000 ms exactly: a gap of that
+ * size merges, one millisecond more stays a distinct interval. */
+static void test_presence_coalesce_window_ms(void **state)
+{
+  const char *anchor = "test-session-anchor-coalms";
+  int64_t t = BASE_MS + SEC(5000000);
+
+  (void)state;
+  presence_purge_session(anchor);
+
+  presence_record_join(anchor, 1, TEST_CHANNEL, t);
+  presence_record_part(anchor, 1, TEST_CHANNEL, t + SEC(5));
+  presence_record_join(anchor, 1, TEST_CHANNEL, t + SEC(5) + MS(30000));  /* gap == window: merge */
+  presence_record_part(anchor, 1, TEST_CHANNEL, t + SEC(40));
+  assert_true(presence_was_present(anchor, 1, TEST_CHANNEL, t + SEC(20)));
+
+  presence_record_join(anchor, 1, TEST_CHANNEL, t + SEC(40) + MS(30001)); /* one ms past: distinct */
+  presence_record_part(anchor, 1, TEST_CHANNEL, t + SEC(80));
+  assert_false(presence_was_present(anchor, 1, TEST_CHANNEL, t + SEC(55)));
+  assert_true(presence_was_present(anchor, 1, TEST_CHANNEL, t + SEC(75)));
+
+  presence_purge_session(anchor);
+}
+
+/* Older stamps (stored rows, PN values from older peers) migrate on
+ * read by magnitude: seconds (~1.7e9) below 1e11, milliseconds
+ * (~1.7e12) below 1e15, packed HLC (~1.1e17) above. */
+static void test_presence_norm_ms(void **state)
+{
+  (void)state;
+  assert_int_equal(presence_norm_time(0), 0);
+  assert_int_equal(presence_norm_time(1700000000LL),
+                   PRESENCE_TIME_FROM_MS(1700000000000LL));
+  assert_int_equal(presence_norm_time(1700000000000LL),
+                   PRESENCE_TIME_FROM_MS(1700000000000LL));
+  assert_int_equal(presence_norm_time(PRESENCE_TIME_PACK(1700000000000LL, 9)),
+                   PRESENCE_TIME_PACK(1700000000000LL, 9));
+  assert_int_equal(presence_norm_time(99999999999LL),
+                   PRESENCE_TIME_FROM_MS(99999999999000LL));
+}
+
 int main(void)
 {
   const struct CMUnitTest tests[] = {
     cmocka_unit_test(test_presence_basic_join_part_present),
     cmocka_unit_test(test_presence_no_wraparound_at_misconfigured_cap),
+    cmocka_unit_test(test_presence_reconnect_coalescing),
+    cmocka_unit_test(test_presence_clock_skew_clamp),
+    cmocka_unit_test(test_presence_remote_close_union),
+    cmocka_unit_test(test_presence_union_close_at_cap),
+    cmocka_unit_test(test_presence_part_coalesce_keeps_earlier_open),
+    cmocka_unit_test(test_presence_next_visible_boundaries),
+    cmocka_unit_test(test_presence_millisecond_edges),
+    cmocka_unit_test(test_presence_event_time_from_msgid),
+    cmocka_unit_test(test_presence_coalesce_window_ms),
+    cmocka_unit_test(test_presence_norm_ms),
   };
 
   return cmocka_run_group_tests(tests, NULL, NULL);

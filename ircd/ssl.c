@@ -55,6 +55,8 @@
 #include <openssl/rand.h>
 #include <openssl/ssl.h>
 
+void ssl_doerror_anon(void);
+
 #ifndef IOV_MAX
 #define IOV_MAX 1024
 #endif /* IOV_MAX */
@@ -72,6 +74,13 @@ struct sni_cert {
 /** Linked list of SNI certificates (from SSL config block) */
 static struct sni_cert *sni_cert_list = NULL;
 
+/** SSL ex_data slot tracking the browser / client-cert decision for a
+ * connection (see ssl_client_hello_cb).  Values stored in the slot: */
+#define SSL_WS_EXDATA_NONE     ((void *)0) /**< not a websocket-capable port */
+#define SSL_WS_EXDATA_CAPABLE  ((void *)1) /**< websocket port, undecided */
+#define SSL_WS_EXDATA_BROWSER  ((void *)2) /**< ALPN seen: skip cert request */
+static int ssl_ws_ex_idx = -1;
+
 SSL_CTX *ssl_init_server_ctx(void);
 SSL_CTX *ssl_init_client_ctx(void);
 SSL_CTX *ssl_create_ctx_for_cert(const char *certfile, const char *keyfile);
@@ -83,6 +92,9 @@ void binary_to_hex(unsigned char *bin, char *hex, int length);
 static int sni_callback(SSL *ssl, int *al, void *arg);
 static void sni_init_certs(void);
 static void sni_free_certs(void);
+#if OPENSSL_VERSION_NUMBER >= 0x10101000L
+static int ssl_client_hello_cb(SSL *ssl, int *al, void *arg);
+#endif
 
 int ssl_init(void)
 {
@@ -91,6 +103,8 @@ int ssl_init(void)
   ERR_load_crypto_strings();
 
   Debug((DEBUG_NOTICE, "SSL: read %d bytes of randomness", RAND_load_file("/dev/urandom", 4096)));
+
+  ssl_ws_ex_idx = SSL_get_ex_new_index(0, "websocket listener", NULL, NULL, NULL);
 
   ssl_server_ctx = ssl_init_server_ctx();
   if (!ssl_server_ctx)
@@ -165,6 +179,17 @@ SSL_CTX *ssl_init_server_ctx(void)
     SSL_CTX_set_options(server_ctx, SSL_OP_NO_TLSv1);
   SSL_CTX_set_verify(server_ctx, vrfyopts, ssl_verify_callback);
   SSL_CTX_set_session_cache_mode(server_ctx, SSL_SESS_CACHE_OFF);
+  /* Required for TLS session resumption under SSL_VERIFY_PEER: without a
+   * session id context OpenSSL refuses to resume ("session id context
+   * uninitialized" -- older versions fail the handshake, newer ones
+   * silently fall back to a full one), so every reconnect paid a full
+   * handshake.  TLS 1.3 tickets are stateless, so SSL_SESS_CACHE_OFF
+   * above does not conflict.  The SNI per-cert contexts must use the
+   * SAME value (see ssl_create_ctx_for_cert) or resumption breaks
+   * across a servername-driven context switch.  certfp survives
+   * resumption: the peer cert is restored from the original session. */
+  SSL_CTX_set_session_id_context(server_ctx,
+                                 (const unsigned char *)"nefarious", 9);
 
   if (SSL_CTX_use_certificate_chain_file(server_ctx, feature_str(FEAT_SSL_CERTFILE)) <= 0)
   {
@@ -216,6 +241,12 @@ SSL_CTX *ssl_init_server_ctx(void)
 
   /* Register SNI callback for multi-certificate support */
   SSL_CTX_set_tlsext_servername_callback(server_ctx, sni_callback);
+
+#if OPENSSL_VERSION_NUMBER >= 0x10101000L
+  /* Spot browsers on websocket-capable listeners before the
+   * CertificateRequest is written (see ssl_client_hello_cb). */
+  SSL_CTX_set_client_hello_cb(server_ctx, ssl_client_hello_cb, NULL);
+#endif
 
   return server_ctx;
 }
@@ -292,6 +323,44 @@ int ssl_verify_callback(int preverify_ok, X509_STORE_CTX *cert)
  * @param arg User data (unused)
  * @return SSL_TLSEXT_ERR_OK if context switched, SSL_TLSEXT_ERR_NOACK otherwise
  */
+#if OPENSSL_VERSION_NUMBER >= 0x10101000L
+/** ClientHello callback: runs after the ClientHello is parsed but before
+ * the server constructs its CertificateRequest — the last moment the
+ * client-cert decision can still be made per connection.
+ *
+ * Chromium (Chrome, Edge) cancels JS-initiated WebSocket handshakes
+ * outright when the TLS server requests a client certificate: there is
+ * no certificate picker for WebSockets ("WebSocket opening handshake
+ * was canceled").  Browsers always advertise ALPN (http/1.1) in their
+ * ClientHello, while native IRC clients essentially never send ALPN —
+ * so on websocket-capable listeners an ALPN-bearing ClientHello marks a
+ * browser and turns the certificate request off for just that
+ * connection.  Handshakes without ALPN keep SSL_VERIFY_PEER, so certfp
+ * on a `websocket = auto` port still works for IRC clients sharing it. */
+static int ssl_client_hello_cb(SSL *ssl, int *al, void *arg)
+{
+  const unsigned char *ext;
+  size_t extlen;
+
+  (void)al;   /* Unused */
+  (void)arg;  /* Unused */
+
+  if (ssl_ws_ex_idx < 0
+      || SSL_get_ex_data(ssl, ssl_ws_ex_idx) == SSL_WS_EXDATA_NONE)
+    return SSL_CLIENT_HELLO_SUCCESS;
+
+  if (SSL_client_hello_get0_ext(ssl, TLSEXT_TYPE_application_layer_protocol_negotiation,
+                                &ext, &extlen) && extlen > 0) {
+    Debug((DEBUG_DEBUG, "SSL: ALPN in ClientHello on websocket listener, "
+           "skipping client certificate request"));
+    SSL_set_ex_data(ssl, ssl_ws_ex_idx, SSL_WS_EXDATA_BROWSER);
+    SSL_set_verify(ssl, SSL_VERIFY_NONE, NULL);
+  }
+
+  return SSL_CLIENT_HELLO_SUCCESS;
+}
+#endif /* OPENSSL_VERSION_NUMBER >= 0x10101000L */
+
 static int sni_callback(SSL *ssl, int *al, void *arg)
 {
   const char *hostname;
@@ -312,6 +381,12 @@ static int sni_callback(SSL *ssl, int *al, void *arg)
       if (!strcasecmp(cert->hostname, hostname)) {
         Debug((DEBUG_DEBUG, "SNI: switching to certificate for '%s'", hostname));
         SSL_set_SSL_CTX(ssl, cert->ctx);
+        /* SSL_set_SSL_CTX can adopt the new context's verify mode;
+         * re-apply the per-connection browser decision made in
+         * ssl_client_hello_cb (which runs before this callback). */
+        if (ssl_ws_ex_idx >= 0
+            && SSL_get_ex_data(ssl, ssl_ws_ex_idx) == SSL_WS_EXDATA_BROWSER)
+          SSL_set_verify(ssl, SSL_VERIFY_NONE, NULL);
         return SSL_TLSEXT_ERR_OK;
       }
     }
@@ -349,6 +424,9 @@ SSL_CTX *ssl_create_ctx_for_cert(const char *certfile, const char *keyfile)
     SSL_CTX_set_options(ctx, SSL_OP_NO_TLSv1);
 
   SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_OFF);
+  /* Same session id context as the main server ctx -- required for
+   * resumption to survive the SNI context switch (see ssl_init_server_ctx). */
+  SSL_CTX_set_session_id_context(ctx, (const unsigned char *)"nefarious", 9);
 
   if (SSL_CTX_use_certificate_chain_file(ctx, certfile) <= 0) {
     Debug((DEBUG_ERROR, "SNI: Error loading certificate '%s'", certfile));
@@ -497,6 +575,7 @@ int ssl_accept(struct Client *cptr)
             return 1;
         default:
           cli_sslerror(cptr) = ssl_error_str(err, errno);
+          ssl_doerror_anon();
 
           Debug((DEBUG_ERROR, "SSL_accept: %s", cli_sslerror(cptr)));
 
@@ -539,6 +618,13 @@ int ssl_accept(struct Client *cptr)
   return -1;
 }
 
+/** Is the pending handshake waiting to WRITE (as opposed to read)?
+ *  Used to decide whether to keep writable interest during SSL_accept. */
+int ssl_want_write(struct Client *cptr)
+{
+  return cli_socket(cptr).ssl && SSL_want_write(cli_socket(cptr).ssl);
+}
+
 int ssl_starttls(struct Client *cptr)
 {
   if (!cli_socket(cptr).ssl) {
@@ -563,6 +649,25 @@ void ssl_add_connection(struct Listener *listener, int fd)
     return;
   }
   SSL_set_fd(ssl, fd);
+
+  /* Dedicated WebSocket listeners serve browsers, and Chromium cancels a
+   * JS-initiated WebSocket handshake outright when the server requests a
+   * client certificate (there is no certificate picker for WebSockets;
+   * Firefox just continues without one).  So don't ask on these ports —
+   * same workaround the paste listener uses. */
+  if (listener_websocket(listener))
+    SSL_set_verify(ssl, SSL_VERIFY_NONE, NULL);
+
+  /* On `websocket = auto` ports the peer may be a browser or an IRC
+   * client wanting certfp, and nothing distinguishes them until the
+   * ClientHello arrives.  Mark the connection so ssl_client_hello_cb can
+   * decide per handshake (ALPN present == browser).  Dedicated websocket
+   * ports are marked too so the same path covers a browser whose cert
+   * request was already disabled above. */
+  if (ssl_ws_ex_idx >= 0
+      && (listener_websocket(listener) || listener_websocket_auto(listener)))
+    SSL_set_ex_data(ssl, ssl_ws_ex_idx, SSL_WS_EXDATA_CAPABLE);
+
   ssl_set_nonblocking(ssl);
 
   add_connection(listener, fd, ssl);
@@ -575,7 +680,11 @@ void ssl_doerror(struct Client *cptr)
 
   memset(&ebuf, 0, 120);
   err = ERR_get_error();
-  ERR_error_string(err, (char *)&ebuf);
+  if (err)
+    ERR_error_string(err, (char *)&ebuf);
+  else
+    snprintf(ebuf, sizeof(ebuf), "no OpenSSL error queued (errno: %s)",
+             strerror(errno));
 
   sendto_opmask_butone(0, SNO_TCPCOMMON, "SSL Error for client %s: %s", cli_name(cptr), ebuf);
 }
@@ -616,7 +725,8 @@ IOResult ssl_recv(struct Socket *socketh, struct Client *cptr, char* buf,
 
   ERR_clear_error();
   res = SSL_read(socketh->ssl, buf, length);
-  switch (SSL_get_error(socketh->ssl, res)) {
+  err = SSL_get_error(socketh->ssl, res);
+  switch (err) {
   case SSL_ERROR_NONE:
     *count_out = (unsigned) res;
     return IO_SUCCESS;
@@ -634,8 +744,9 @@ IOResult ssl_recv(struct Socket *socketh, struct Client *cptr, char* buf,
     break;
   }
 
-  /* Use the socket's own SSL context for error lookup, not the client's. */
-  err = SSL_get_error(socketh->ssl, res);
+  /* err was captured BEFORE the ZERO_RETURN branch's SSL_shutdown above:
+   * re-calling SSL_get_error here would reflect the shutdown's close_notify
+   * write (e.g. WANT_WRITE) and mislabel a clean peer EOF as an SSL error. */
   cli_sslerror(cptr) = ssl_error_str(err, errno);
   cli_error(cptr) = errno;
 
@@ -984,7 +1095,11 @@ char *ssl_error_str(int err, int my_errno)
       break;
     case SSL_ERROR_SSL:
       ssl_errstr = "Internal OpenSSL error or protocol error";
-      ssl_doerror_anon();
+      /* Do NOT drain the OpenSSL error queue here: callers that follow
+       * up with ssl_doerror(cptr) need the queued reason.  (This used
+       * to call ssl_doerror_anon(), which popped the queue -- every
+       * real error printed as "unknown client" and the subsequent named
+       * notice printed an empty 00000000 reason.) */
       break;
     case SSL_ERROR_WANT_READ:
       ssl_errstr = "OpenSSL functions requested a read()";

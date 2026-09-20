@@ -34,9 +34,11 @@
  * converted to ISO 8601 only for client-facing protocol.
  */
 #include "config.h"
+#include "webpush.h"
 
 #include "capab.h"
 #include "channel.h"
+#include "chathistory_presence.h"
 #include "client.h"
 #include "crdt_shadow.h" /* Tier C F2-a: mirror read-markers into the CRDT doc */
 #include "hash.h"
@@ -44,6 +46,7 @@
 #include "metadata.h"
 #include "ircd.h"
 #include "ircd_alloc.h"
+#include "ircd_chattr.h"
 #include "ircd_features.h"
 #include "ircd_log.h"
 #include "ircd_reply.h"
@@ -99,10 +102,11 @@ static unsigned int sm_hash(const char *session_id, const char *target)
   }
   h ^= 0;
   h *= 16777619u;
+  /* Fold with the ircd casemapping: sm_find compares with ircd_strcmp,
+   * under which rfc1459's []\~ equal {}|^ -- an ASCII-only fold hashed
+   * such spellings to different buckets (case-fold audit 2026-09-02). */
   for (p = target; *p; p++) {
-    unsigned char c = (unsigned char)*p;
-    if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
-    h ^= c;
+    h ^= (unsigned char)ToLower((unsigned char)*p);
     h *= 16777619u;
   }
   return h & SESSION_MR_HASH_MASK;
@@ -213,6 +217,19 @@ static int parse_timestamp_param(const char *arg, char *unix_ts, size_t tslen)
   if (history_iso_to_unix(iso_ts, unix_ts, tslen) != 0)
     return 0;
 
+  /* Clamp to the server clock.  Markers are only-update-if-newer
+   * (metadata_readmarker_set), so a client with a skewed-ahead clock
+   * would otherwise plant a FUTURE marker that can never be lowered --
+   * and both replay paths skip messages at or before the marker, so
+   * that channel's replay is silently suppressed until wall-time
+   * catches up.  A clamped marker is still "everything read as of
+   * now", which is the most the client can truthfully claim. */
+  {
+    unsigned long secs = strtoul(unix_ts, NULL, 10);
+    if (secs > (unsigned long)CurrentTime)
+      ircd_snprintf(0, unix_ts, tslen, "%Tu.000", CurrentTime);
+  }
+
   return 1;
 }
 
@@ -251,12 +268,22 @@ static void notify_local_clients(const char *account, const char *target, const 
   if (!account || !*account)
     return;
 
-  /* Find all local clients with the same account */
+  /* Find all local clients with the same anchor: the account, or -- for
+   * an ephemeral (session-anchored) marker -- the session_id itself.
+   * The session branch used to be unreachable (an unauthed client has an
+   * empty account and was skipped), so an ephemeral MARKREAD SET was
+   * stored but never echoed; the spec requires every connection of the
+   * setter, the setter included, to receive the new marker. */
   for (acptr = GlobalClientList; acptr; acptr = cli_next(acptr)) {
     if (!IsUser(acptr) || !MyUser(acptr))
       continue;
     if (!CapActive(acptr, CAP_DRAFT_READMARKER))
       continue;
+    if (cli_session_id(acptr)[0]
+        && 0 == strcmp(cli_session_id(acptr), account)) {
+      send_markread(acptr, target, timestamp);
+      continue;
+    }
     if (!cli_user(acptr) || !cli_user(acptr)->account[0])
       continue;
     if (ircd_strcmp(cli_user(acptr)->account, account) != 0)
@@ -365,6 +392,10 @@ int m_markread(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
         /* Successfully updated - notify local clients and broadcast */
         notify_local_clients(account, target, timestamp);
 
+        /* Relay to the account's webpush subscriptions so other devices
+         * can close their notifications (draft/webpush). */
+        webpush_notify_read(account, target, timestamp);
+
         /* Broadcast to other servers: MR <account> <target> <timestamp> */
         sendcmdto_serv_butone_v3(&me, CMD_MARKREAD, cptr, "%s %s %s",
                               account, target, timestamp);
@@ -417,6 +448,41 @@ int m_markread(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
   return 0;
 }
 
+/** ms_presencesync - Handle the S2S-only PN token: a peer replicated a
+ * closed strict-presence interval for an account (#6 metadata-layer
+ * replication).  Union-merge it into the local record and relay
+ * butone (readmarker MR pattern).  Applied regardless of the local
+ * FEAT_CHATHISTORY_STRICT_PRESENCE setting -- like readmarkers, the
+ * data stays warm for a later enable; storage no-ops if the metadata
+ * LMDB is unavailable.
+ *
+ * Format: PN <account> <channel> <start> <end>   (presence time since
+ * 2026-09-02: HLC packed as ms<<16|logical; seconds-era values from
+ * older peers are recognized by magnitude and scaled)
+ */
+int ms_presencesync(struct Client *cptr, struct Client *sptr, int parc,
+                    char *parv[])
+{
+  int64_t start, end;
+
+  if (parc < 5)
+    return 0;
+  if (!IsServer(sptr))
+    return protocol_violation(cptr, "PRESENCE from non-server %s",
+                              cli_name(sptr));
+
+  start = presence_norm_time((int64_t)strtoull(parv[3], NULL, 10));
+  end = presence_norm_time((int64_t)strtoull(parv[4], NULL, 10));
+  if (start == 0 || end == 0)
+    return 0;
+
+  presence_apply_close(parv[1], /*is_session=*/0, parv[2], start, end);
+
+  sendcmdto_serv_butone_v3(sptr, CMD_PRESENCE, cptr, "%s %s %s %s",
+                           parv[1], parv[2], parv[3], parv[4]);
+  return 0;
+}
+
 /** ms_markread - Handle MARKREAD command from server.
  *
  * P10 format: MR <account> <target> <timestamp>
@@ -447,6 +513,10 @@ int ms_markread(struct Client *cptr, struct Client *sptr, int parc, char *parv[]
 
   /* Notify local clients with this account */
   notify_local_clients(account, target, timestamp);
+
+  /* And this server's push subscriptions for the account: a read on
+   * another server must close notifications here too. */
+  webpush_notify_read(account, target, timestamp);
 
   /* Propagate to other servers */
   sendcmdto_serv_butone_v3(sptr, CMD_MARKREAD, cptr, "%s %s %s",

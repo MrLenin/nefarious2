@@ -53,6 +53,7 @@
 #include "dnsbl.h"
 #include "s_misc.h"
 #include "sasl_conf.h"
+#include "authtoken.h"
 #include "send.h"
 #include "struct.h"
 #include "sys.h"
@@ -259,6 +260,7 @@ static void free_slist(struct SLink **link) {
 %token REQUIRE_SASL
 %token BOUNCER
 %token WEBHOOK
+%token AUTHTOKEN
 %token KEYCLOAK
 %token SECRET
 %token URL
@@ -308,7 +310,7 @@ block: adminblock | generalblock | classblock | connectblock |
        killblock | cruleblock | motdblock | featuresblock | quarantineblock |
        pseudoblock | iauthblock | forwardsblock | webircblock | spoofhostblock |
        exceptblock | sslblock | dnsblblock |
-       webhookblock | keycloakblock |
+       webhookblock | keycloakblock | authtokenblock |
        include | error ';';
 
 /* The timespec, sizespec and expr was ripped straight from
@@ -1010,9 +1012,9 @@ portblock: PORT '{' portitems '}' ';' {
       parse_error("Port block has paste enabled but ssl is not set; paste requires ssl = yes.");
       paste_invalid = 1;
     }
-    if (FlagHas(&listen_flags, LISTEN_WEBSOCKET) ||
-        FlagHas(&listen_flags, LISTEN_WEBSOCKET_AUTO)) {
-      parse_error("Port block cannot combine paste with websocket.");
+    if (FlagHas(&listen_flags, LISTEN_WEBSOCKET_AUTO)) {
+      parse_error("Port block cannot combine paste with websocket = autodetect; "
+                  "use websocket = yes (upgrade detection is HTTP-header based).");
       paste_invalid = 1;
     }
     if (FlagHas(&listen_flags, LISTEN_SERVER)) {
@@ -1815,6 +1817,8 @@ spoofhostblock : SPOOFHOST QSTRING
     parse_error("Missing host(s) in spoofhost block");
   else if (spoofhost == NULL)
     parse_error("Missing spoofhost in spoofhost block");
+  else if (!valid_spoofhost(spoofhost, (flags & SHFLAG_ISMASK)))
+    parse_error("Invalid spoofhost '%s' in spoofhost block", spoofhost);
   else for (link = hosts; link != NULL; link = link->next) {
     sconf = (struct SHostConf*) MyCalloc(1, sizeof(*sconf));
     if (!(flags & SHFLAG_NOPASS))
@@ -2167,6 +2171,48 @@ webhookqueuemax: QUEUEMAX '=' NUMBER ';'
 webhookbatchsize: BATCHSIZE '=' NUMBER ';'
 {
   sasl_conf_webhook_set_batch_size($3);
+};
+
+/* ---------------------------------------------------------------- */
+/* Authtoken "<service key>" { } — IRCv3 draft/authtoken external    */
+/* service: url, description, and the validator credential (pass     */
+/* and/or host masks).  One block per service; see ircd/authtoken.c. */
+/* ---------------------------------------------------------------- */
+authtokenblock: AUTHTOKEN QSTRING
+{
+  authtoken_conf_service($2);
+  MyFree($2);
+} '{' authtokenitems '}' ';'
+{
+  if (!authtoken_conf_end())
+    parse_error("Invalid Authtoken block (see the config log)");
+};
+authtokenitems: authtokenitem authtokenitems | authtokenitem;
+authtokenitem: authtokenurl | authtokendesc | authtokenpass | authtokenhost | authtokenkey;
+authtokenurl: URL '=' QSTRING ';'
+{
+  authtoken_conf_url($3);
+  MyFree($3);
+};
+authtokendesc: DESCRIPTION '=' QSTRING ';'
+{
+  authtoken_conf_description($3);
+  MyFree($3);
+};
+authtokenpass: PASS '=' QSTRING ';'
+{
+  authtoken_conf_pass($3);
+  MyFree($3);
+};
+authtokenhost: HOST '=' QSTRING ';'
+{
+  authtoken_conf_host($3);
+  MyFree($3);
+};
+authtokenkey: KEY '=' QSTRING ';'
+{
+  authtoken_conf_key($3);
+  MyFree($3);
 };
 
 /* ---------------------------------------------------------------- */

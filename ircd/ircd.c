@@ -39,6 +39,7 @@
 #include "ircd_alloc.h"
 #include "ircd_compress.h"
 #include "ircd_events.h"
+#include "forwarded_label.h"
 #include "ircd_features.h"
 #include "ircd_geoip.h"
 #include "ircd_log.h"
@@ -169,12 +170,22 @@ static struct Timer connect_timer; /**< timer structure for try_connections() */
 static struct Timer ping_timer; /**< timer structure for check_pings() */
 static struct Timer destruct_event_timer; /**< timer structure for exec_expired_destruct_events() */
 static struct Timer history_purge_timer; /**< timer structure for history_purge_callback() */
+static struct Timer presence_alive_timer; /**< minute heartbeat for the presence crash-recovery stamp */
 static struct Timer metadata_purge_timer; /**< timer structure for metadata_purge_callback() */
-static struct Timer bouncer_gate_timer; /**< timer structure for bounce_legacy_burst_gate_tick() */
+static struct Timer bouncer_gate_timer;
+static struct Timer fwd_label_timer;
+
+/** Periodic forwarded-label expiry (see forwarded_label.c). */
+static void fwd_label_timer_callback(struct Event *ev)
+{
+  (void)ev;
+  fwd_label_expire_all();
+} /**< timer structure for bounce_legacy_burst_gate_tick() */
 
 /* Forward declarations so the *_restart_timer helpers below can refer to
  * the callbacks before their definitions. */
 static void history_purge_callback(struct Event* ev);
+static void presence_alive_callback(struct Event* ev);
 static void metadata_purge_callback(struct Event* ev);
 
 /** Daemon information. */
@@ -234,6 +245,11 @@ const char* get_sasl_mechanisms(void)
 /** VAPID public key received from services. Empty means webpush unavailable. */
 char VapidPublicKey[VAPID_KEY_LEN] = "";
 
+/** 1 once libkc's HTTP transport initialised (webpush delivery, local
+ * SASL, webhooks).  Stays 0 on a build without libkc or when kc_init()
+ * failed at boot; STATS webpush reports it. */
+int kc_transport_ready = 0;
+
 /** Set the VAPID public key (called when services announces it).
  * Sends CAP NEW when webpush becomes available, CAP DEL when removed.
  * @param[in] key Base64url-encoded VAPID public key.
@@ -279,6 +295,38 @@ const char* get_vapid_pubkey(void)
  * @param[in] tag_len Length of the tag name (up to = or end).
  * @return 1 if tag is denied, 0 if allowed.
  */
+/** Check whether a client-only tag squats a server-reserved vendor
+ * namespace.  The server authors tags there and trusts them: the
+ * `+evilnet.github.io/sid=<sessid>` marker injected into PM history
+ * (ircd_relay.c) is what chathistory's ephemeral-participant auth check
+ * (history_pm_target_has_sessid) matches against.  `+afternet.org/` is
+ * ALSO reserved, permanently and independent of any single use: it is
+ * the network's own domain (cf. the afternet.org/account WEBIRC
+ * option), so client tags have no claim to it -- and concretely,
+ * records stored before 2026-08-29 carry the sid marker under it and
+ * the auth check still honors those.  Do NOT drop this entry when the
+ * legacy records age out.  A client-supplied
+ * tag in either namespace is dropped at capture (parse.c).  The vendor
+ * part is a DNS name -> case-insensitive match (ircd_strncmp folds
+ * ASCII letters; the '.' '/' '+' are compared exactly).
+ * @param[in] tag The tag name to check (including + prefix).
+ * @param[in] tag_len Length of the tag (name, optionally =value).
+ * @return 1 if the tag is in a reserved namespace, 0 otherwise. */
+int is_reserved_vendor_tag(const char *tag, size_t tag_len)
+{
+  static const char *prefixes[] = { "+evilnet.github.io/", "+afternet.org/" };
+  size_t i;
+
+  if (!tag)
+    return 0;
+  for (i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+    size_t plen = strlen(prefixes[i]);
+    if (tag_len >= plen && 0 == ircd_strncmp(tag, prefixes[i], plen))
+      return 1;
+  }
+  return 0;
+}
+
 int is_client_tag_denied(const char *tag, size_t tag_len)
 {
   const char *deny_list;
@@ -386,6 +434,7 @@ void server_die(const char *message)
 {
   /* log_write will send out message to both log file and as server notice */
   log_write(LS_SYSTEM, L_CRIT, 0, "Server terminating: %s", message);
+  stop_listeners();      /* refuse new connections before the slow part */
   bounce_db_shutdown();  /* Persist bouncer sessions before closing connections */
   metadata_shutdown();   /* close the metadata/readmarkers RocksDB env */
   flush_connections(0);
@@ -427,6 +476,7 @@ void server_restart(const char *message)
 
   sendto_opmask_butone(0, SNO_OLDSNO, "Restarting server: %s", message);
   Debug((DEBUG_NOTICE, "Restarting server..."));
+  stop_listeners();      /* refuse new connections before the slow part */
   bounce_db_shutdown();  /* Persist bouncer sessions before closing connections */
   metadata_shutdown();   /* close the metadata/readmarkers RocksDB env */
   flush_connections(0);
@@ -853,6 +903,14 @@ static void history_purge_callback(struct Event* ev)
   presence_retention_sweep();
 }
 
+/** Minute heartbeat: the presence store's last-alive stamp (crash
+ * recovery bound; see presence_init's boot-close). */
+static void presence_alive_callback(struct Event* ev)
+{
+  (void)ev;
+  presence_alive_tick();
+}
+
 /** Compute the effective interval for the history_purge_timer.
  * Honours FEAT_CHATHISTORY_MAINTENANCE_INTERVAL with a one-minute floor. */
 static int history_purge_interval(void)
@@ -1231,6 +1289,7 @@ int main(int argc, char **argv) {
   IPcheck_init();
   timer_add(timer_init(&connect_timer), try_connections, 0, TT_RELATIVE, 1);
   timer_add(timer_init(&ping_timer), check_pings, 0, TT_RELATIVE, 1);
+  websocket_ping_timer_init();
   timer_add(timer_init(&destruct_event_timer), exec_expired_destruct_events, 0, TT_PERIODIC, 60);
   timer_add(timer_init(&history_purge_timer), history_purge_callback, 0,
             TT_PERIODIC, history_purge_interval());
@@ -1240,6 +1299,11 @@ int main(int argc, char **argv) {
    * design intent #135 + #254 (one face per session toward legacy). */
   timer_add(timer_init(&bouncer_gate_timer),
             bounce_legacy_burst_gate_callback, 0, TT_PERIODIC, 1);
+  /* Forwarded-label expiry: closes DRAINING batches and reaps stranded
+   * PENDING/ACTIVE entries for idle clients (the lazy checks only run
+   * on client activity). */
+  timer_add(timer_init(&fwd_label_timer), fwd_label_timer_callback, 0,
+            TT_PERIODIC, 2);
 
 #ifdef DEBUGMODE
   /* Timing-race test harness (DEBUG builds only): read a static per-node
@@ -1298,6 +1362,15 @@ int main(int argc, char **argv) {
    * accordingly. Legacy peers ignore the unknown flag char. */
   SetIRCv3Aware(&me);
   SetCrdtAware(&me);   /* this binary speaks the CR (CRDT sync) token */
+  /* Deliberately do NOT SetRenameCapable(&me): 'r' (FLAG_RENAME_CAPABLE)
+   * exists so this fork can recognize and propagate rename-capable
+   * non-v3 peers (X3, which advertises 'r'), not to advertise it on our
+   * own SERVER line. Fork servers apply/relay RENAME via the 'v'
+   * (IsIRCv3Aware) path, so &me stays r-less; the emit sites in
+   * s_serv.c/m_server.c only carry 'r' for the *described* server, and
+   * IsServer(&me) is false (cli_status(&me) == STAT_ME, not
+   * STAT_SERVER) so rename_legacy_blocker()'s GlobalClientList walk
+   * never even considers &me. */
 
   write_pidfile();
   init_counters();
@@ -1373,6 +1446,24 @@ int main(int argc, char **argv) {
     if (feature_bool(FEAT_CAP_draft_webpush) && web_arg.rc != 0)
       log_write(LS_SYSTEM, L_WARNING, 0,
                 "Failed to initialize webpush database");
+
+    /* Strict-presence: account records live on the METADATA env (#6
+     * metadata-layer replication) -- init after metadata_lmdb_init
+     * completes.  Also runs the boot-close sweep for stale open
+     * intervals.  Non-fatal: without the env, session-anchored
+     * presence remains usable in-memory. */
+    presence_set_boot_alive_hint(history_newest_activity_ms());
+    if (presence_init() != 0 && feature_bool(FEAT_CHATHISTORY_STRICT_PRESENCE)) {
+      /* Strict presence with no account store hides every authenticated
+       * user's history behind a zero record.  Fail loud and fail open. */
+      static const char *const off[] = { "CHATHISTORY_STRICT_PRESENCE", "FALSE" };
+      log_write(LS_CONFIG, L_ERROR, 0,
+                "CHATHISTORY_STRICT_PRESENCE disabled: it needs the metadata "
+                "database (CAP_draft_metadata_2) for account presence records");
+      feature_set(NULL, off, 2);
+    }
+    timer_add(timer_init(&presence_alive_timer), presence_alive_callback, 0,
+              TT_PERIODIC, 60);
   }
 #endif
 
@@ -1385,6 +1476,11 @@ int main(int argc, char **argv) {
    * with CRFLAG_BOUNCER can create sessions independently of the global flag.
    * The init is cheap (zeroes hash tables). */
   bounce_init();
+
+  /* draft/persistence CAP 302 value: static feature-token inventory
+   * (spec: clients MUST tolerate unknown tokens).  attach-cursor =
+   * ATTACH accepts the optional last-seen-msgid catch-up anchor. */
+  cap_set_value(CAP_DRAFT_PERSISTENCE, "attach,detach,list,attach-cursor");
 
   /* Restore persisted bouncer sessions (ghosts + channels) from MDBX.
    * Must run after bounce_init() and metadata_lmdb_init(), before event_loop().
@@ -1409,21 +1505,47 @@ int main(int argc, char **argv) {
     if (kc_needed) {
       ircd_kc_adapter_init();
       if (kc_init(ircd_kc_get_event_ops(), ircd_kc_get_log_ops()) != 0) {
-        log_write(LS_SYSTEM, L_WARNING, 0,
-                  "Failed to initialize libkc HTTP transport");
+        log_write(LS_SYSTEM, L_ERROR, 0,
+                  "Failed to initialize libkc HTTP transport "
+                  "(webpush delivery, local SASL and webhooks are down)");
       } else {
+        kc_transport_ready = 1;
         /* Apply parsed Keycloak{} + Webhook{} blocks (or fall back to features).
          * Re-initialises libkc's Keycloak REST API + arms local SASL on first
          * arrival, and starts the webhook listener if configured. */
         sasl_conf_boot_apply();
-
-        /* Initialize webpush if enabled */
-        if (feature_bool(FEAT_CAP_draft_webpush))
-          webpush_setup();
       }
     }
   }
 #endif
+
+  /* draft/webpush promises delivery.  Without the libkc HTTP transport --
+   * a build without --enable-keycloak (the configure default is OFF), or
+   * kc_init() failing -- no push can ever be sent, so advertising the cap
+   * only collects registrations nobody can serve.  Refuse loudly, at a
+   * log level every deployment keeps.  (Prod 2026-09-03: the whole block
+   * above was compiled out, nothing logged, and the cap stayed on with no
+   * VAPID key for months.) */
+  if (feature_bool(FEAT_CAP_draft_webpush) && !kc_transport_ready) {
+    static const char *const off[] = { "CAP_draft_webpush", "FALSE" };
+#ifdef USE_LIBKC
+    log_write(LS_CONFIG, L_ERROR, 0,
+              "CAP_draft_webpush is on but the libkc HTTP transport failed to "
+              "initialise: draft/webpush disabled (pushes could never be sent)");
+#else
+    log_write(LS_CONFIG, L_ERROR, 0,
+              "CAP_draft_webpush is on but this build has no libkc: rebuild with "
+              "./configure --enable-keycloak (needs libcurl and libjansson); "
+              "draft/webpush disabled");
+#endif
+    feature_set(NULL, off, 2);
+  }
+
+  /* Webpush key setup is independent of the transport's health once it
+   * exists: the VAPID key and its ISUPPORT token are what clients register
+   * against.  STATS webpush reports both. */
+  if (feature_bool(FEAT_CAP_draft_webpush))
+    webpush_setup();
 
 #ifdef USE_LIBGIT2
   /* Start gitsync timer after config is loaded */

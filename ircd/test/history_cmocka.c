@@ -41,7 +41,11 @@ enum HistoryMessageType {
     HISTORY_KICK    = 5,
     HISTORY_MODE    = 6,
     HISTORY_TOPIC   = 7,
-    HISTORY_TAGMSG  = 8
+    HISTORY_TAGMSG  = 8,
+    HISTORY_GAP     = 9,
+    HISTORY_NICK    = 10,
+    HISTORY_REDACT  = 11,
+    HISTORY_MULTILINE = 12
 };
 
 /* Reference types from history.h */
@@ -176,7 +180,7 @@ static int deserialize_message(const char *data, int datalen,
     field = strchr(p, '|');
     if (!field || field >= end) return -1;
     type = atoi(p);
-    if (type < 0 || type > HISTORY_TAGMSG) return -1;
+    if (type < 0 || type > HISTORY_MULTILINE) return -1;
     msg->type = (enum HistoryMessageType)type;
     p = field + 1;
 
@@ -371,6 +375,252 @@ static void test_parse_key_roundtrip(void **state)
     }
 }
 
+/* ========== #103 sentinel-escape helpers (copied verbatim from
+ * ircd/history.c -- pure logic, no deps, gated here) ========== */
+#define HIST_ESC 0x04
+static int history_field_needs_escape(unsigned char c)
+{
+  return c == HIST_ESC || c == 0x05 || c == 0x06;
+}
+static char *history_escape_field(char *dst, size_t dstsize, const char *src)
+{
+  size_t o = 0;
+  const unsigned char *p;
+  if (dstsize == 0)
+    return dst;
+  for (p = (const unsigned char *)(src ? src : ""); *p; ++p) {
+    if (history_field_needs_escape(*p)) {
+      if (o + 2 >= dstsize) break;
+      dst[o++] = HIST_ESC;
+      dst[o++] = (char)(*p ^ 0x40);
+    } else {
+      if (o + 1 >= dstsize) break;
+      dst[o++] = (char)*p;
+    }
+  }
+  dst[o] = '\0';
+  return dst;
+}
+static void history_unescape_field(char *str)
+{
+  char *r = str, *w = str;
+  while (*r) {
+    if (*r == HIST_ESC && r[1]) { *w++ = (char)((unsigned char)r[1] ^ 0x40); r += 2; }
+    else { *w++ = *r++; }
+  }
+  *w = '\0';
+}
+static char *history_forward_encode(char *dst, size_t dstsize,
+                                    const char *client_tags, const char *text)
+{
+  size_t used = 0;
+  if (dstsize == 0)
+    return dst;
+  dst[0] = '\0';
+  if (client_tags && client_tags[0]) {
+    if (dstsize < 3)
+      return dst;
+    dst[used++] = '\x06';
+    history_escape_field(dst + used, dstsize - used - 1, client_tags);
+    used += strlen(dst + used);
+    dst[used++] = '\x06';
+    dst[used] = '\0';
+  }
+  history_escape_field(dst + used, dstsize - used, text ? text : "");
+  return dst;
+}
+static char *history_forward_split(char *content, char **tags_out)
+{
+  char *text = content;
+  *tags_out = NULL;
+  if (content[0] == '\x06') {
+    char *close = strchr(content + 1, '\x06');
+    if (close) {
+      *close = '\0';
+      *tags_out = content + 1;
+      history_unescape_field(*tags_out);
+      text = close + 1;
+    }
+  }
+  history_unescape_field(text);
+  return text;
+}
+
+static void test_sentinel_escape_roundtrip(void **state)
+{
+  char esc[128];
+  (void)state;
+  /* Plain text is untouched. */
+  history_escape_field(esc, sizeof(esc), "hello world");
+  assert_string_equal(esc, "hello world");
+  history_unescape_field(esc);
+  assert_string_equal(esc, "hello world");
+  /* Formatting/CTCP bytes (0x02, 0x03, 0x01) are NOT escaped -- only
+   * the record sentinels are -- so mIRC codes survive verbatim. */
+  history_escape_field(esc, sizeof(esc), "\002bold\003 \001ACTION\001");
+  assert_string_equal(esc, "\002bold\003 \001ACTION\001");
+}
+
+static void test_sentinel_escape_neutralizes_injection(void **state)
+{
+  char esc[128];
+  (void)state;
+  /* The reproduced attack: body starting with a forged \x06 tag span. */
+  history_escape_field(esc, sizeof(esc), "\x06+evil/injected=owned\x06text");
+  /* No raw sentinel remains, so the deserializer's leading-\x06 check
+   * can never lift it into client_tags. */
+  assert_null(strchr(esc, '\x06'));
+  assert_null(strchr(esc, '\x05'));
+  assert_true(esc[0] == HIST_ESC);
+  /* Round-trip restores the exact body as literal content. */
+  history_unescape_field(esc);
+  assert_string_equal(esc, "\x06+evil/injected=owned\x06text");
+}
+
+static void test_sentinel_escape_of_escape_byte(void **state)
+{
+  char esc[64];
+  (void)state;
+  /* A literal 0x04 in the body must itself be escaped, else unescape
+   * would misread the following byte.  "a\x04b" -> "a" ESC (0x04^0x40='D')
+   * "b" = "a\x04Db"; the escaped form differs from the input, and the
+   * round-trip restores it exactly. */
+  history_escape_field(esc, sizeof(esc), "a\004b");
+  assert_string_equal(esc, "a\004Db");
+  history_unescape_field(esc);
+  assert_string_equal(esc, "a\004b");
+}
+
+/* Mirror of ml_content_resolve's multiline-identification predicate
+ * (ircd/ml_content.c): TYPE-keyed, with an EXACT-3-byte legacy fallback.
+ * Copied here as pure logic to lock the #103-residue semantics: client
+ * message bytes must never forge a multiline resolve. */
+static int ml_is_multiline_ref(int type, const char *content)
+{
+  if (type == HISTORY_MULTILINE)
+    return 1;
+  if (type == HISTORY_PRIVMSG &&
+      content[0] == '\x1E' && content[1] == 'm' &&
+      content[2] == 'l' && content[3] == '\0')
+    return 1;  /* legacy pre-type-12 placeholder */
+  return 0;
+}
+
+/* Mirror of ircd.c is_reserved_vendor_tag -- pure prefix test; the real
+ * one uses ircd_strncmp (case-insensitive IRC casemap), available here
+ * because the suite links ../ircd_string.o. */
+extern int ircd_strncmp(const char *a, const char *b, size_t n);
+static int is_reserved_vendor_tag(const char *tag, size_t tag_len)
+{
+  static const char *prefixes[] = { "+evilnet.github.io/", "+afternet.org/" };
+  size_t i;
+  if (!tag)
+    return 0;
+  for (i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+    size_t plen = strlen(prefixes[i]);
+    if (tag_len >= plen && 0 == ircd_strncmp(tag, prefixes[i], plen))
+      return 1;
+  }
+  return 0;
+}
+
+static void test_reserved_vendor_tag(void **state)
+{
+  (void)state;
+  /* The org vendor namespace is reserved (case-insensitive vendor). */
+  assert_true(is_reserved_vendor_tag("+evilnet.github.io/sid=abc",
+                                     strlen("+evilnet.github.io/sid=abc")));
+  assert_true(is_reserved_vendor_tag("+EvilNet.GitHub.IO/sid=abc",
+                                     strlen("+EvilNet.GitHub.IO/sid=abc")));
+  assert_true(is_reserved_vendor_tag("+evilnet.github.io/anything",
+                                     strlen("+evilnet.github.io/anything")));
+  /* The legacy namespace stays reserved (pre-2026-08-29 records carry
+   * the sid marker there and the auth check still honors it). */
+  assert_true(is_reserved_vendor_tag("+afternet.org/sid=abc",
+                                     strlen("+afternet.org/sid=abc")));
+  assert_true(is_reserved_vendor_tag("+AfterNet.ORG/sid=abc",
+                                     strlen("+AfterNet.ORG/sid=abc")));
+  /* Other client tags pass through untouched. */
+  assert_false(is_reserved_vendor_tag("+reply=abc", strlen("+reply=abc")));
+  assert_false(is_reserved_vendor_tag("+draft/react=x", strlen("+draft/react=x")));
+  assert_false(is_reserved_vendor_tag("+example.com/afternet.org",
+                                      strlen("+example.com/afternet.org")));
+  /* A lookalike shorter than the prefix cannot match. */
+  assert_false(is_reserved_vendor_tag("+afternet.org", strlen("+afternet.org")));
+  assert_false(is_reserved_vendor_tag("+evilnet.github.io",
+                                      strlen("+evilnet.github.io")));
+  assert_false(is_reserved_vendor_tag(NULL, 0));
+}
+
+static void test_multiline_ref_is_type_keyed(void **state)
+{
+  (void)state;
+  /* Genuine placeholder: type-12, resolves regardless of content. */
+  assert_true(ml_is_multiline_ref(HISTORY_MULTILINE, "\x1Eml"));
+  assert_true(ml_is_multiline_ref(HISTORY_MULTILINE, "anything"));
+  /* Legacy placeholder: PRIVMSG whose entire body is the 3-byte sentinel. */
+  assert_true(ml_is_multiline_ref(HISTORY_PRIVMSG, "\x1Eml"));
+  /* #103 residue closed: a client PRIVMSG that merely STARTS with the
+   * sentinel (or embeds \x1F) is NOT multiline -- renders as literal. */
+  assert_false(ml_is_multiline_ref(HISTORY_PRIVMSG, "\x1Emlctrl-injected"));
+  assert_false(ml_is_multiline_ref(HISTORY_PRIVMSG, "line1\x1Fline2"));
+  assert_false(ml_is_multiline_ref(HISTORY_PRIVMSG, "\x1E"));
+  assert_false(ml_is_multiline_ref(HISTORY_NOTICE, "\x1Eml"));
+}
+
+static void test_forward_encode_split_roundtrip(void **state)
+{
+  char wire[512];
+  char *tags = (char *)1;
+  char *text;
+  (void)state;
+  /* Benign tags+text: escape is identity, wire format unchanged from
+   * the pre-escape encoding, split recovers both halves exactly. */
+  history_forward_encode(wire, sizeof(wire), "+draft/react=x;+reply=abc", "hello");
+  assert_string_equal(wire, "\006+draft/react=x;+reply=abc\006hello");
+  text = history_forward_split(wire, &tags);
+  assert_non_null(tags);
+  assert_string_equal(tags, "+draft/react=x;+reply=abc");
+  assert_string_equal(text, "hello");
+  /* Tags-only (TAGMSG) form. */
+  history_forward_encode(wire, sizeof(wire), "+typing=active", "");
+  text = history_forward_split(wire, &tags);
+  assert_non_null(tags);
+  assert_string_equal(tags, "+typing=active");
+  assert_string_equal(text, "");
+  /* No tags: no bracket. */
+  history_forward_encode(wire, sizeof(wire), NULL, "plain");
+  assert_string_equal(wire, "plain");
+  text = history_forward_split(wire, &tags);
+  assert_null(tags);
+  assert_string_equal(text, "plain");
+}
+
+static void test_forward_encode_blocks_injection(void **state)
+{
+  char wire[512];
+  char *tags = (char *)1;
+  char *text;
+  (void)state;
+  /* The federation-side #103 variant: no real tags, client text opens
+   * with a forged \x06 span.  Pre-escape this went raw onto the wire
+   * and the storage server lifted it as tags; now the composer escapes
+   * it, so split finds no bracket and the text survives as literals. */
+  history_forward_encode(wire, sizeof(wire), NULL,
+                         "\006+evil/injected=owned\006hi");
+  assert_true(wire[0] != '\006');
+  text = history_forward_split(wire, &tags);
+  assert_null(tags);
+  assert_string_equal(text, "\006+evil/injected=owned\006hi");
+  /* Sentinel bytes inside genuinely-tagged text round-trip too. */
+  history_forward_encode(wire, sizeof(wire), "+reply=abc",
+                         "body\005with\006bytes\004too");
+  text = history_forward_split(wire, &tags);
+  assert_non_null(tags);
+  assert_string_equal(tags, "+reply=abc");
+  assert_string_equal(text, "body\005with\006bytes\004too");
+}
+
 /* ========== serialize_message Tests ========== */
 
 static void test_serialize_privmsg(void **state)
@@ -533,10 +783,11 @@ static void test_deserialize_all_message_types(void **state)
 
     const char *type_names[] = {
         "PRIVMSG", "NOTICE", "JOIN", "PART", "QUIT",
-        "KICK", "MODE", "TOPIC", "TAGMSG"
+        "KICK", "MODE", "TOPIC", "TAGMSG", "GAP",
+        "NICK", "REDACT", "MULTILINE"
     };
 
-    for (int i = 0; i <= HISTORY_TAGMSG; i++) {
+    for (int i = 0; i <= HISTORY_MULTILINE; i++) {
         len = serialize_message(buf, sizeof(buf), (enum HistoryMessageType)i,
                                 "nick!user@host", "acc", type_names[i]);
         assert_true(len > 0);
@@ -666,6 +917,13 @@ int main(void)
         cmocka_unit_test(test_deserialize_invalid_type),
         cmocka_unit_test(test_deserialize_missing_field),
         cmocka_unit_test(test_serialize_deserialize_roundtrip),
+        cmocka_unit_test(test_sentinel_escape_roundtrip),
+        cmocka_unit_test(test_sentinel_escape_neutralizes_injection),
+        cmocka_unit_test(test_sentinel_escape_of_escape_byte),
+        cmocka_unit_test(test_forward_encode_split_roundtrip),
+        cmocka_unit_test(test_forward_encode_blocks_injection),
+        cmocka_unit_test(test_multiline_ref_is_type_keyed),
+        cmocka_unit_test(test_reserved_vendor_tag),
         cmocka_unit_test(test_deserialize_all_message_types),
 
         /* parse_reference tests */

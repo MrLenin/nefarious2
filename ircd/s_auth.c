@@ -39,6 +39,7 @@
 #include "bouncer_session.h"
 #include "class.h"
 #include "dnsbl.h"
+#include "authtoken.h"
 #include "client.h"
 #include "handlers.h"          /* B0/MR-3d (LOC forward): crdt_route_services_try */
 #include "hash.h"
@@ -127,25 +128,20 @@ struct AuthRequest {
   char deferred_nick[NICKLEN + 1]; /**< nick deferred due to bouncer ghost collision */
 };
 
-/** Array of message text (with length) pairs for AUTH status
- * messages.  Indexed using #ReportType.
+/** Array of AUTH status message texts (CRLF is added by msgq).
+ * Indexed using #ReportType.
  */
-static struct {
-  const char*  message;
-  unsigned int length;
-} HeaderMessages [] = {
-#define MSG(STR) { STR, sizeof(STR) - 1 }
-  MSG("NOTICE * :*** Looking up your hostname\r\n"),
-  MSG("NOTICE * :*** Found your hostname\r\n"),
-  MSG("NOTICE * :*** Couldn't look up your hostname\r\n"),
-  MSG("NOTICE * :*** Checking Ident\r\n"),
-  MSG("NOTICE * :*** Got ident response\r\n"),
-  MSG("NOTICE * :*** No ident response\r\n"),
-  MSG("NOTICE * :*** \r\n"),
-  MSG("NOTICE * :*** Your forward and reverse DNS do not match, "
-    "ignoring hostname.\r\n"),
-  MSG("NOTICE * :*** Invalid hostname\r\n")
-#undef MSG
+static const char* HeaderMessages [] = {
+  "NOTICE * :*** Looking up your hostname",
+  "NOTICE * :*** Found your hostname",
+  "NOTICE * :*** Couldn't look up your hostname",
+  "NOTICE * :*** Checking Ident",
+  "NOTICE * :*** Got ident response",
+  "NOTICE * :*** No ident response",
+  "NOTICE * :*** ",
+  "NOTICE * :*** Your forward and reverse DNS do not match, "
+    "ignoring hostname.",
+  "NOTICE * :*** Invalid hostname"
 };
 
 /** Enum used to index messages in the HeaderMessages[] array. */
@@ -161,14 +157,20 @@ typedef enum {
   REPORT_INVAL_DNS
 } ReportType;
 
-/** Sends response \a r (from #ReportType) to client \a c. */
-#ifdef USE_SSL
+/** Sends response \a r (from #ReportType) to client \a c.
+ *
+ * Always goes through the client's sendQ (msgq appends the CRLF).
+ * This used to be a raw write() on plain sockets, which bypassed the
+ * IsWSNeedHandshake()/IsWSSniff() hold in deliver_it() and put bare
+ * IRC lines on the wire ahead of the HTTP 101 on plain-text WebSocket
+ * ports.  Queuing it means the hold applies, and once the handshake
+ * completes the notices are delivered as proper WebSocket frames.  For
+ * ordinary plain IRC ports the sendQ is flushed immediately, so the
+ * behaviour there is unchanged.
+ */
 #define sendheader(c, r) \
-   ssl_send(c, HeaderMessages[(r)].message, HeaderMessages[(r)].length)
-#else
-#define sendheader(c, r) \
-   send(cli_fd(c), HeaderMessages[(r)].message, HeaderMessages[(r)].length, 0)
-#endif /* USE_SSL */
+   do { sendrawto_one((c), "%s", HeaderMessages[(r)]); \
+        send_queued(c); } while (0)
 
 /** Enumeration of IAuth connection flags. */
 enum IAuthFlag
@@ -766,6 +768,7 @@ static int check_auth_finished(struct AuthRequest *auth)
   {
     Debug((DEBUG_INFO, "check_auth_finished: completing auth for %p (fd %d), cli_name='%s'",
            (void*)auth->client, cli_fd(auth->client), cli_name(auth->client)));
+    authtoken_note_pass(auth->client);   /* validator PASS survives registration */
     memset(cli_passwd(auth->client), 0, sizeof(cli_passwd(auth->client)));
     res = auth_set_username(auth);
     if (res == 0) {
@@ -798,7 +801,16 @@ static int check_auth_finished(struct AuthRequest *auth)
          * cli_fd() is con_fd(cli_connect(cli)), so touching cptr after the
          * call reads through NULL: that is the SIGSEGV at 0x23e0
          * (offsetof(Connection,con_socket) 9128 + offsetof(Socket,s_fd) 56).
-         * Capture the fd up front; never deref cptr after register_user. */
+         * Capture the fd up front; never deref cptr after register_user.
+         *
+         * The `if (res == 0) destroy_auth_request(auth)` tail below is safe
+         * only because THIS call passes the same client as both cptr and
+         * sptr: exit_client() returns CPTR_KILLED when cptr == victim and 0
+         * otherwise (s_misc.c:244), so every exiting path above returns
+         * non-zero here and the tail is skipped — which matters because the
+         * client's own teardown already freed this auth request
+         * (list.c:336-337).  If this call is ever changed to pass distinct
+         * cptr/sptr, an exiting path would return 0 and double-free it. */
         int diag_fd = cli_fd(cptr);
 
         log_write(LS_USER, L_INFO, 0,
@@ -1490,13 +1502,15 @@ void start_auth(struct Client* client)
   assert(0 != client);
   Debug((DEBUG_INFO, "Beginning auth request on client %p", client));
 
-  /* Register with event handlers. */
+  /* Register with event handlers.  The socket's event interest is
+   * add_connection's: readable from registration, and while a TLS
+   * handshake is pending whatever OpenSSL asks for (writable interest
+   * armed there must survive this call). */
   cli_lasttime(client) = CurrentTime;
   cli_since(client) = CurrentTime;
   if (cli_fd(client) > HighestFd)
     HighestFd = cli_fd(client);
   LocalClientArray[cli_fd(client)] = client;
-  socket_events(&(cli_socket(client)), SOCK_ACTION_SET | SOCK_EVENT_READABLE);
 
   /* Allocate the AuthRequest. */
 #define AUTH_FREELIST_MARKER ((struct AuthRequest*)0xDEADBEEF)

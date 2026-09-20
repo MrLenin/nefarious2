@@ -50,6 +50,9 @@
 #include "ssl.h"
 #endif
 #endif /* USE_SSL */
+#ifndef INCLUDED_websocket_h
+#include "websocket.h"          /* WS_MAX_FRAME */
+#endif
 
 struct ConfItem;
 struct Listener;
@@ -192,6 +195,13 @@ enum Flag
     FLAG_OPLEVELS,                  /**< server has oplevels support */
     FLAG_MULTILINE,                 /**< server supports P10 multiline batches */
     FLAG_IRCV3AWARE,                /**< server speaks IRCv3 message-tag wire extensions */
+    FLAG_RENAME_CAPABLE,            /**< server applies and relays RENAME
+                                         (P10 RN) without being IRCv3-aware —
+                                         set on peers like X3 that advertise
+                                         'r' in their SERVER flags. Advertised
+                                         via 'r' in SERVER flags. Fork servers
+                                         are IRCv3-aware and use 'v' instead;
+                                         we never set this on &me. */
     FLAG_BXF_AWARE,                 /**< server speaks BX F (reconcile-end)
                                          marker — gates the burst N tail on
                                          peer's BX F arrival.  Strictly a
@@ -269,6 +279,7 @@ enum Flag
     FLAG_SSL,                       /**< User is connected via SSL (+z) */
     FLAG_STARTTLS,                  /**< User is connecting with StartTLS */
     FLAG_SSLNEEDACCEPT,             /**< Client needs SSL_accept() to be called again */
+    FLAG_SSLNEEDCONNECT,            /**< Outbound TLS handshake pending: SSL_connect() again */
     FLAG_WEBSOCKET,                 /**< Client is connected via WebSocket */
     FLAG_WSNEEDHANDSHAKE,           /**< WebSocket client needs handshake */
     FLAG_WSTEXT,                    /**< WebSocket uses text frames (not binary) */
@@ -346,6 +357,7 @@ DECLARE_FLAGSET(Privs, PRIV_LAST_PRIV);
 DECLARE_FLAGSET(Flags, FLAG_LAST_FLAG);
 
 #include "capab.h" /* client capabilities */
+#include "webpush_keyring.h" /* WEBPUSH_KEY_ID_LEN */
 
 /** Maximum number of concurrent forwarded label entries per connection. */
 #define MAX_FORWARDED_LABELS 4
@@ -404,6 +416,9 @@ struct Connection
                                         for parsing. */
   struct ListingArgs* con_listing;   /**< Current LIST status. */
   struct ReplayState* con_replay;    /**< Current chathistory replay status. */
+  char con_vapid_seen[WEBPUSH_KEY_ID_LEN + 1]; /**< VAPID key id in the last
+                                        ISUPPORT this connection was sent
+                                        (draft/webpush REGISTER binds to it) */
   unsigned int        con_max_sendq; /**< cached max send queue for client */
   unsigned int        con_max_recvq; /**< cached max recv queue for client */
   unsigned int        con_ping_freq; /**< cached ping freq */
@@ -444,6 +459,7 @@ struct Connection
   unsigned char       con_label_responded; /**< Whether a response was sent for current label */
   char                con_batch_id[16]; /**< Current batch reference ID */
   unsigned int        con_batch_seq;  /**< Batch sequence number for generating IDs */
+  unsigned int        con_token_auth; /**< draft/authtoken: service slots this connection's PASS may validate */
   char                con_client_tags[4096]; /**< Client-only tags (+tag=value) for TAGMSG relay (IRCv3: 4094 max) */
   uint64_t            con_s2s_time_ms;   /**< S2S @time as epoch milliseconds (0 = not set) */
 #define S2S_MSGID_BUFSIZE 64  /**< Msgid buffer: fits both verbose (~34 chars) and compact (14 chars) */
@@ -466,8 +482,15 @@ struct Connection
    * "default" at registration if not specified.  Per-connection
    * (aliases each have their own value). */
   char                con_active_profile[33]; /* PERSISTENCE_PROFILE_NAME_MAX + 1 */
+  char                con_attach_cursor[64];  /* HISTORY_MSGID_LEN: client's last-seen
+                                                 msgid from PERSISTENCE ATTACH (catch-up
+                                                 anchor); empty = none supplied */
   /* Multiline batch state (draft/multiline) */
   char                con_ml_batch_id[65]; /**< Active multiline batch ID (IRCv3 allows up to 64 chars) */
+  char                con_ml_dead_batch_id[65]; /**< Last FAILed/cleared batch ref: spec says all past and
+                                                 *   future messages in that batch are ignored, so tagged
+                                                 *   lines arriving after the FAIL are swallowed, not
+                                                 *   delivered (reset when a new batch opens) */
   char                con_ml_target[CHANNELLEN + 1]; /**< Multiline batch target (channel or nick) */
   struct SLink*       con_ml_messages; /**< List of multiline messages */
   int                 con_ml_msg_count; /**< Number of messages in batch */
@@ -486,11 +509,17 @@ struct Connection
   unsigned char       con_labeled_batch; /**< 1 if labeled_batch_start opened a batch */
   struct ForwardedLabel con_fwd_labels[MAX_FORWARDED_LABELS]; /**< Forwarded label FIFO */
   /* WebSocket state for RFC 6455 compliance */
-  unsigned char       con_ws_frame_buf[FULL_MSG_SIZE]; /**< Partial WebSocket frame buffer */
+  unsigned char       con_ws_frame_buf[WS_MAX_FRAME]; /**< Partial WebSocket frame buffer (holds one max-size frame) */
   int                 con_ws_frame_len;   /**< Length of data in frame buffer */
   char                con_ws_frag_buf[16384]; /**< Fragment reassembly buffer */
   int                 con_ws_frag_len;    /**< Length of data in fragment buffer */
   int                 con_ws_frag_opcode; /**< Opcode of first fragment */
+  time_t              con_ws_ctl_since;   /**< Control-frame meter: debt clock (same shape as con_since, own budget) */
+  char*               con_ws_hs_buf;      /**< HTTP upgrade request being accumulated (heap, WS_HANDSHAKE_MAX + 1; freed once the handshake is decided) */
+  int                 con_ws_hs_len;      /**< Bytes in con_ws_hs_buf */
+  char*               con_ws_txrem;       /**< Unsent tail of a partially-written outbound WS frame (heap, on demand; plaintext sockets) */
+  int                 con_ws_txrem_len;   /**< Total bytes in con_ws_txrem */
+  int                 con_ws_txrem_pos;   /**< Bytes of con_ws_txrem already written */
   time_t              con_burst_gate_deadline; /**< Deadline at which to force-release a
                                                   burst gate held on a non-BXF-aware (legacy)
                                                   peer.  Only meaningful while IsBurstGated().
@@ -561,6 +590,7 @@ struct Client {
   char cli_sslclifp[BUFSIZE + 1];   /**< SSL client certificate fingerprint if available */
   time_t cli_sslcliexp;             /**< SSL client certificate expiration timestamp */
   char cli_killmark[BUFSIZE + 1];   /**< Kill block mark */
+  char cli_wsorigin[256];           /**< WebSocket Origin header (oper WHOIS mark); empty = not WS */
 
   /* SASL */
   int            cli_saslagentref; /**< Number of clients that reference this client as an SASL agent */
@@ -571,6 +601,9 @@ struct Client {
   time_t cli_saslstart;             /**< When SASL authentication started (for stale response detection) */
   struct Timer cli_sasltimeout;     /**< timeout timer for SASL */
   struct SASLSession* cli_saslsession; /**< Local SASL session state (NULL if not using local path) */
+
+  /* IRCv3 draft/account-registration */
+  unsigned int cli_regcookie;       /**< Nonzero exactly while a REGISTER async chain is outstanding on this connection; doubles as that chain's client-refind key and as the one-in-flight guard. Deliberately NOT cli_saslcookie, which SASL zeroes on its own failure paths. See m_register.c */
 
   /* IRCv3 Metadata */
   struct MetadataEntry* cli_metadata;    /**< Client metadata key-value pairs */
@@ -658,6 +691,7 @@ struct Client {
 #define cli_batch_id(cli)	con_batch_id(cli_connect(cli))
 /** Get batch sequence number */
 #define cli_batch_seq(cli)	con_batch_seq(cli_connect(cli))
+#define cli_token_auth(cli)	con_token_auth(cli_connect(cli))
 /** Get client-only tags buffer for TAGMSG relay */
 #define cli_client_tags(cli)	con_client_tags(cli_connect(cli))
 /** Get S2S @time as epoch milliseconds from incoming message */
@@ -678,6 +712,7 @@ struct Client {
 #define cli_s2s_batch_type(cli)	con_s2s_batch_type(cli_connect(cli))
 /** Get active multiline batch ID. */
 #define cli_ml_batch_id(cli)	con_ml_batch_id(cli_connect(cli))
+#define cli_ml_dead_batch_id(cli)	con_ml_dead_batch_id(cli_connect(cli))
 /** Get multiline batch target. */
 #define cli_ml_target(cli)	con_ml_target(cli_connect(cli))
 /** Get multiline message list. */
@@ -718,6 +753,11 @@ struct Client {
 #define cli_ws_frag_len(cli)	con_ws_frag_len(cli_connect(cli))
 /** Get WebSocket first fragment opcode. */
 #define cli_ws_frag_opcode(cli)	con_ws_frag_opcode(cli_connect(cli))
+#define cli_ws_ctl_since(cli)	con_ws_ctl_since(cli_connect(cli))
+/** Get WebSocket handshake accumulation buffer. */
+#define cli_ws_hs_buf(cli)	con_ws_hs_buf(cli_connect(cli))
+/** Get WebSocket handshake accumulation buffer length. */
+#define cli_ws_hs_len(cli)	con_ws_hs_len(cli_connect(cli))
 /** Get per-class recv classifier state. */
 #define cli_recv_state(cli)     con_recv_state(cli_connect(cli))
 /** Get tag-region byte count for the in-flight wire line. */
@@ -744,6 +784,7 @@ struct Client {
 #define cli_version(cli)        ((cli)->cli_version)
 /** Get a clients SSL fingerprint string. */
 #define cli_sslclifp(cli)       ((cli)->cli_sslclifp)
+#define cli_wsorigin(cli)       ((cli)->cli_wsorigin)
 /** Get a clients SSL certificate expiration timestamp. */
 #define cli_sslcliexp(cli)      ((cli)->cli_sslcliexp)
 /** Get a clients Kill block exemption mark. */
@@ -774,6 +815,8 @@ struct Client {
 #define cli_sasltimeout(cli)     ((cli)->cli_sasltimeout)
 /** Get local SASL session (may be NULL). */
 #define cli_saslsession(cli)     ((cli)->cli_saslsession)
+/** Get the REGISTER in-flight cookie (nonzero => a chain is outstanding). */
+#define cli_regcookie(cli)       ((cli)->cli_regcookie)
 /** Get client metadata list. */
 #define cli_metadata(cli)        ((cli)->cli_metadata)
 /** Get client metadata subscriptions. */
@@ -845,6 +888,8 @@ struct Client {
 #define cli_sock_ip(cli)	con_sock_ip(cli_connect(cli))
 /** Get the resolved hostname for the client. */
 #define cli_sockhost(cli)	con_sockhost(cli_connect(cli))
+/** Get the VAPID key id the client last saw in ISUPPORT. */
+#define cli_vapid_seen(cli)	con_vapid_seen(cli_connect(cli))
 /** Get the client's password. */
 #define cli_passwd(cli)		con_passwd(cli_connect(cli))
 /** Get the unprocessed input buffer for a client's connection.  */
@@ -942,6 +987,8 @@ struct Client {
 #define con_sock_ip(con)	((con)->con_sock_ip)
 /** Get the resolved hostname for the connection. */
 #define con_sockhost(con)	((con)->con_sockhost)
+/** Get the VAPID key id the connection last saw in ISUPPORT. */
+#define con_vapid_seen(con)	((con)->con_vapid_seen)
 /** Get the password sent by the remote end of the connection.  */
 #define con_passwd(con)		((con)->con_passwd)
 /** Get the buffer of unprocessed incoming data from the connection. */
@@ -968,6 +1015,7 @@ struct Client {
 #define con_batch_id(con)	((con)->con_batch_id)
 /** Get the batch sequence number. */
 #define con_batch_seq(con)	((con)->con_batch_seq)
+#define con_token_auth(con)	((con)->con_token_auth)
 /** Get the client-only tags buffer for TAGMSG relay. */
 #define con_client_tags(con)	((con)->con_client_tags)
 /** Get the S2S @time as epoch milliseconds from incoming message. */
@@ -991,8 +1039,11 @@ struct Client {
 /** Get the active draft/persistence profile name (per-connection). */
 #define con_active_profile(con)	((con)->con_active_profile)
 #define cli_active_profile(cli)	con_active_profile(cli_connect(cli))
+#define con_attach_cursor(con)	((con)->con_attach_cursor)
+#define cli_attach_cursor(cli)	con_attach_cursor(cli_connect(cli))
 /** Get the multiline batch ID. */
 #define con_ml_batch_id(con)	((con)->con_ml_batch_id)
+#define con_ml_dead_batch_id(con)	((con)->con_ml_dead_batch_id)
 /** Get the multiline batch target. */
 #define con_ml_target(con)	((con)->con_ml_target)
 /** Get the multiline message list. */
@@ -1033,6 +1084,14 @@ struct Client {
 #define con_ws_frag_len(con)	((con)->con_ws_frag_len)
 /** Get WebSocket first fragment opcode. */
 #define con_ws_frag_opcode(con)	((con)->con_ws_frag_opcode)
+#define con_ws_ctl_since(con)	((con)->con_ws_ctl_since)
+/** Get WebSocket handshake accumulation buffer. */
+#define con_ws_hs_buf(con)	((con)->con_ws_hs_buf)
+/** Get WebSocket handshake accumulation buffer length. */
+#define con_ws_hs_len(con)	((con)->con_ws_hs_len)
+#define con_ws_txrem(con)	((con)->con_ws_txrem)
+#define con_ws_txrem_len(con)	((con)->con_ws_txrem_len)
+#define con_ws_txrem_pos(con)	((con)->con_ws_txrem_pos)
 /** Get per-class recv classifier state. */
 #define con_recv_state(con)     ((con)->con_recv_state)
 /** Get tag-region byte count for the in-flight wire line. */
@@ -1206,18 +1265,28 @@ struct Client {
 #define SendServNotice(x)       HasFlag(x, FLAG_SERVNOTICE)
 /** Return non-zero if the client has set mode +w (wallops). */
 #define SendWallops(x)          HasFlag(x, FLAG_WALLOP)
+/** Return non-zero if the client has set mode +F (auto-follow relocations). */
 /** Return non-zero if the client claims to be a hub. */
 #define IsHub(x)                HasFlag(x, FLAG_HUB)
 /** Return non-zero if the client understands IPv6 addresses in P10. */
 #define IsIPv6(x)               HasFlag(x, FLAG_IPV6)
 /** Return non-zero if the client claims to be a services server. */
 #define IsService(x)            HasFlag(x, FLAG_SERVICE)
+/** A service bot: carries the channel-service user mode (+k) or sits on a
+ * server that announced itself as a service (SERVER ... +s).  Neither
+ * needs a U-line. */
+#define IsServiceClient(x)      (IsChannelService(x) \
+                                 || (cli_user(x) && cli_user(x)->server \
+                                     && IsService(cli_user(x)->server)))
 /** Return non-zero if the client has oplevels support. */
 #define IsOpLevels(x)           HasFlag(x, FLAG_OPLEVELS)
 /** Return non-zero if the server supports P10 multiline batches. */
 #define IsMultiline(x)          HasFlag(x, FLAG_MULTILINE)
 /** Return non-zero if the server speaks IRCv3 message-tag wire extensions. */
 #define IsIRCv3Aware(x)         HasFlag(x, FLAG_IRCV3AWARE)
+/** Return non-zero if the server applies/relays RENAME without being
+ * IRCv3-aware (e.g. X3 advertising 'r'). */
+#define IsRenameCapable(x)      HasFlag(x, FLAG_RENAME_CAPABLE)
 /** Return non-zero if the server emits BX F (reconcile-end) markers. */
 #define IsBxfAware(x)           HasFlag(x, FLAG_BXF_AWARE)
 /** Test if the client speaks the CR (CRDT sync) token. */
@@ -1283,6 +1352,7 @@ struct Client {
 #define IsStartTLS(x)           HasFlag(x, FLAG_STARTTLS)
 /** Return non-zero if the client still needs SSL_accept(). */
 #define IsSSLNeedAccept(x)      HasFlag(x, FLAG_SSLNEEDACCEPT)
+#define IsSSLNeedConnect(x)     HasFlag(x, FLAG_SSLNEEDCONNECT)
 /** Return non-zero if the client is connected via WebSocket. */
 #define IsWebSocket(x)          HasFlag(x, FLAG_WEBSOCKET)
 /** Return non-zero if the client needs WebSocket handshake. */
@@ -1363,6 +1433,7 @@ struct Client {
 #define SetUPing(x)             SetFlag(x, FLAG_UPING)
 /** Mark a client as having mode +w (wallops). */
 #define SetWallops(x)           SetFlag(x, FLAG_WALLOP)
+/** Mark a client as having mode +F (auto-follow relocations). */
 /** Mark a client as having mode +s (server notices). */
 #define SetServNotice(x)        SetFlag(x, FLAG_SERVNOTICE)
 /** Mark a client as being a hub server. */
@@ -1377,6 +1448,8 @@ struct Client {
 #define SetMultiline(x)         SetFlag(x, FLAG_MULTILINE)
 /** Mark a server as speaking IRCv3 message-tag wire extensions. */
 #define SetIRCv3Aware(x)        SetFlag(x, FLAG_IRCV3AWARE)
+/** Mark a server as applying/relaying RENAME without being IRCv3-aware. */
+#define SetRenameCapable(x)     SetFlag(x, FLAG_RENAME_CAPABLE)
 /** Mark a server as supporting the BX F handshake. */
 #define SetBxfAware(x)          SetFlag(x, FLAG_BXF_AWARE)
 /** Mark the client as CR (CRDT sync) capable. */
@@ -1439,6 +1512,7 @@ struct Client {
 #define SetStartTLS(x)          SetFlag(x, FLAG_STARTTLS)
 /** Mark a client as needing SSL_accept(). */
 #define SetSSLNeedAccept(x)     SetFlag(x, FLAG_SSLNEEDACCEPT)
+#define SetSSLNeedConnect(x)    SetFlag(x, FLAG_SSLNEEDCONNECT)
 /** Mark a client as connected via WebSocket. */
 #define SetWebSocket(x)         SetFlag(x, FLAG_WEBSOCKET)
 /** Mark a client as needing WebSocket handshake. */
@@ -1514,6 +1588,7 @@ struct Client {
 #define ClearUPing(x)           ClrFlag(x, FLAG_UPING)
 /** Remove mode +w (wallops) from the client. */
 #define ClearWallops(x)         ClrFlag(x, FLAG_WALLOP)
+/** Remove mode +F (auto-follow relocations) from the client. */
 /** Remove mode +s (server notices) from the client. */
 #define ClearServNotice(x)      ClrFlag(x, FLAG_SERVNOTICE)
 /** Remove mode +x (hidden host) from the client. */
@@ -1566,6 +1641,7 @@ struct Client {
 #define ClearStartTLS(x)        ClrFlag(x, FLAG_STARTTLS)
 /** Client no longer needs SSL_accept(). */
 #define ClearSSLNeedAccept(x)   ClrFlag(x, FLAG_SSLNEEDACCEPT)
+#define ClearSSLNeedConnect(x)  ClrFlag(x, FLAG_SSLNEEDCONNECT)
 /** Client no longer connected via WebSocket. */
 #define ClearWebSocket(x)       ClrFlag(x, FLAG_WEBSOCKET)
 /** Client no longer needs WebSocket handshake. */

@@ -5,6 +5,7 @@
 #ifndef INCLUDED_ircd_string_h
 #define INCLUDED_ircd_string_h
 
+#include <stdint.h>
 #include <string.h> /* for DupString()'s strcpy, strlen */
 
 #ifndef INCLUDED_ircd_chattr_h
@@ -34,6 +35,9 @@ extern int str_appendf(char* buf, size_t buflen, size_t* pos,
 extern int         ircd_strcmp(const char *a, const char *b);
 extern int         ircd_strncmp(const char *a, const char *b, size_t n);
 extern int csv_contains_token(const char* csv, const char* token);
+extern int ircd_utf8_clamp(char* s, size_t maxbytes);
+extern int ircd_text_mentions(const char* text, const char* nick);
+extern char* ircd_json_escape(char* dst, size_t dstlen, const char* src);
 extern int         unique_name_vector(char* names, char token,
                                       char** vector, int size);
 extern int         token_vector(char* names, char token,
@@ -58,6 +62,7 @@ extern int check_if_ipmask(const char *mask);
 
 extern int valid_username(const char* name);
 extern int valid_hostname(const char* name);
+extern int valid_spoofhost(const char* host, int mask);
 
 #define COLOR_BOLD            2   /**< Bold text */
 #define COLOR_COLOR           3   /**< Color text */
@@ -142,6 +147,12 @@ static __inline__ NTL_HDR_strChattr { NTL_SRC_strChattr }
 static __inline__ NTL_HDR_strCasediff { NTL_SRC_strCasediff }
 #endif
 #endif /* FORCEINLINE */
+
+
+extern uint64_t msgid_decode_time_ms(const char *msgid);
+/** Decode a msgid's full HLC stamp (physical ms + logical counter).
+ * Returns 1 on success; 0 for a legacy/foreign msgid. */
+extern int msgid_decode_hlc(const char *msgid, uint64_t *ms_out, uint16_t *logical_out);
 
 #endif /* INCLUDED_ircd_string_h */
 

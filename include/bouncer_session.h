@@ -74,7 +74,7 @@ struct Listener;
 /** Maximum channels tracked per session. */
 #define BOUNCER_MAX_CHANNELS    50
 /** Maximum alias numerics per bouncer session (multi-server presence). */
-#define BOUNCER_MAX_ALIASES     4
+#define BOUNCER_MAX_ALIASES     16
 /** Maximum connection history entries per session (unique hosts). */
 #define BOUNCER_MAX_CONN_HISTORY 10
 /** Maximum legacy-peer-face entries per session (one face per legacy
@@ -102,7 +102,7 @@ struct BounceConnHistory {
 };
 
 /** Current version of the on-disk bouncer session record. */
-#define BOUNCER_DB_VERSION 9
+#define BOUNCER_DB_VERSION 10
 
 /** Persisted alias roster entry (v8+).  Records "this session has an
  * alias on server YY with numeric NNN, last active at T, with caps C."
@@ -180,6 +180,69 @@ struct BounceSessionRecord {
   /* Alias roster (per-alias activity + caps, v8+) */
   uint16_t bsr_aliascount;
   struct BounceSessionAliasRecord bsr_aliases[BOUNCER_MAX_ALIASES];
+  /* Session-anchored oper grant (v9+).  Empty bsr_oper_name = not opered.
+   * On revival, the new primary inherits IsOper via bounce_apply_oper_grant
+   * keyed on bsr_oper_name (looked up in the local O:line config). */
+  char     bsr_oper_name[NICKLEN + 1];
+  int64_t  bsr_oper_granted_at;
+};
+
+/** Frozen v9 layout for migration reads.  Do not modify — must mirror
+ * the on-disk layout produced by code with BOUNCER_DB_VERSION=9 (when
+ * BOUNCER_MAX_ALIASES was 4).  Used exclusively by the v9→v10 migration
+ * path in bounce_db_restore; v10 only grows the alias array to the
+ * current BOUNCER_MAX_ALIASES. */
+struct BounceSessionRecord_v9 {
+  uint32_t bsr_version;
+  /* Session identity */
+  char     bsr_account[ACCOUNTLEN + 1];
+  char     bsr_sessid[BOUNCER_SESSID_LEN];
+  char     bsr_token[BOUNCER_TOKEN_LEN + 1];
+  char     bsr_name[BOUNCER_NAME_LEN];
+  char     bsr_origin[NICKLEN + 1];        /**< Historical: server numeric that created this.
+                                            *   NOT used for authorization or behavior. */
+  int32_t  bsr_hold_override;
+  /* Timestamps */
+  int64_t  bsr_created;
+  int64_t  bsr_disconnect_time;
+  int64_t  bsr_last_active;                /**< Primary's last-active (per-connection split) */
+  int64_t  bsr_last_msg_time;              /**< Last PRIVMSG time (user idle) */
+  int64_t  bsr_total_active;
+  uint32_t bsr_attach_count;
+  uint32_t bsr_connect_count;
+  /* Ghost client identity */
+  char     bsr_nick[NICKLEN + 1];
+  char     bsr_username[USERLEN + 1];
+  char     bsr_realhost[HOSTLEN + 1];
+  char     bsr_host[HOSTLEN + 1];          /**< Displayed/hidden host */
+  char     bsr_realname[REALLEN + 1];
+  char     bsr_account_name[ACCOUNTLEN + 1];
+  int64_t  bsr_acc_create;
+  /* Last connection metadata (historical, reconciled on revive) */
+  struct irc_in_addr bsr_ip;                /**< Last connection IP (binary) */
+  char     bsr_sock_ip[SOCKIPLEN + 1];      /**< Last connection IP (string) */
+  char     bsr_sockhost[HOSTLEN + 1];       /**< Last resolved hostname */
+  uint16_t bsr_listener_port;               /**< Server listener port */
+  /* Session-level aggregate counters (lifetime totals from dead connections) */
+  uint64_t bsr_agg_sendB;
+  uint64_t bsr_agg_receiveB;
+  uint32_t bsr_agg_sendM;
+  uint32_t bsr_agg_receiveM;
+  /* Connection history (unique hosts, most recent first) */
+  uint16_t bsr_histcount;
+  struct BounceConnHistory bsr_history[BOUNCER_MAX_CONN_HISTORY];
+  /* Channel memberships */
+  uint16_t bsr_chancount;
+  struct {
+    char     name[CHANNELLEN + 1];
+    uint32_t modes;
+    int64_t  join_tv_sec;       /**< Original JOIN time (seconds) */
+    int32_t  join_tv_usec;      /**< Original JOIN time (microseconds) */
+    char     join_msgid[16];    /**< Original JOIN msgid */
+  } bsr_channels[BOUNCER_MAX_CHANNELS];
+  /* Alias roster (per-alias activity + caps, v8+) */
+  uint16_t bsr_aliascount;
+  struct BounceSessionAliasRecord bsr_aliases[4]; /* frozen: v9 array size */
   /* Session-anchored oper grant (v9+).  Empty bsr_oper_name = not opered.
    * On revival, the new primary inherits IsOper via bounce_apply_oper_grant
    * keyed on bsr_oper_name (looked up in the local O:line config). */
@@ -309,6 +372,16 @@ struct BounceAlias {
                                  carry their own last_active here.  Used
                                  as the "most-active" disambiguator in
                                  D.2 tiebreaker rules. */
+  time_t ba_last_active_emitted; /**< Local bookkeeping on the alias's own
+                                 server: when its activity was last put on
+                                 the wire (BX U la=).  Not replicated. */
+  int ba_away;              /**< The alias's OWN away state as its server
+                                 reports it (BX U aw=): 0 present, 1 away,
+                                 2 AWAY * (draft/pre-away, not looking).
+                                 The webpush attention rule and the away
+                                 aggregation read this for remote aliases
+                                 instead of the session's mirrored aggregate. */
+  int ba_away_known;        /**< 1 once a BX U aw= arrived for this alias. */
   char ba_active_profile[33]; /**< Phase 4 M4b: alias's active draft/persistence
                                    profile name (PERSISTENCE_PROFILE_NAME_MAX + NUL).
                                    Empty string resolves to "default" by the
@@ -327,6 +400,7 @@ struct BounceAlias {
  * has nothing to wrap. */
 #define BX_CAP_DRAFT_MULTILINE 0x01
 #define BX_CAP_BATCH           0x02
+#define BX_CAP_ECHO_MESSAGE    0x04  /**< echo-message: the connection can display self-sourced messages (session echo) */
 /* Future: 0x04 MSGTAGS, 0x08 LABELEDRESP, 0x10 ECHOMSG */
 
 /** A single bouncer session.
@@ -359,6 +433,13 @@ struct BouncerSession {
   char hs_ghost_numeric[6];           /**< Ghost client numeric during HOLDING */
 
   int hs_hold_override;               /**< -1=use default, 0=no hold, 1=hold */
+  char hs_hold_reason[128];           /**< Why the last hold happened (the
+                                       *   disconnect comment: "Ping timeout",
+                                       *   "Read error: ...", a QUIT message,
+                                       *   "WebSocket closed", ...).  In-memory
+                                       *   diagnostic only -- NOT persisted to
+                                       *   MDBX (a restart clears it); echoed
+                                       *   at resume + shown in /CHECK. */
 
   struct BounceChannel hs_channels[BOUNCER_MAX_CHANNELS];
   int hs_chancount;
@@ -377,6 +458,9 @@ struct BouncerSession {
                                             so a subsequent non-enforced attach can detach
                                             a stale-enforced session. */
 
+  int hs_primary_away;                 /**< The primary's OWN away state as replicated
+                                            (BX U aw=), for servers that do not host it. */
+  int hs_primary_away_known;           /**< 1 once a BX U aw= arrived for the primary. */
   int hs_effective_away;               /**< Last computed effective away: 0=present, 1=away, 2=all-star */
   char hs_effective_away_msg[AWAYLEN + 1]; /**< Last effective away message */
 
@@ -391,6 +475,8 @@ struct BouncerSession {
   time_t hs_oper_granted_at;
 
   int hs_dirty;                       /**< Session state changed, needs periodic persist */
+  time_t hs_restore_deadline;         /**< Restore-pending expiry: a HOLDING ghost
+                                           nothing claims must stop gating bursts. */
   int hs_restore_pending;             /**< Set in bounce_db_restore; cleared on first
                                            successful BX R reconciliation, on any client
                                            attach (revive/alias-create), or when a
@@ -402,6 +488,8 @@ struct BouncerSession {
 
   time_t hs_created;                  /**< When session was created */
   time_t hs_last_active;              /**< Last activity timestamp */
+  time_t hs_last_active_emitted;      /**< Primary's activity last put on the
+                                           wire (BX U la=); local bookkeeping */
   time_t hs_last_msg_time;            /**< Last PRIVMSG time (user idle baseline) */
   time_t hs_disconnect_time;          /**< When client disconnected (0=active) */
   unsigned int hs_attach_count;       /**< Number of times resumed from HOLDING */
@@ -835,6 +923,11 @@ extern void ephemeral_purge_session(struct Client *cli);
  * @param[in] from Source client whose activity to record.
  */
 extern void bounce_record_activity(struct Client *from);
+/** A local session connection's own away state changed (0 present, 1 away,
+ * 2 AWAY *): put it on the wire (BX U aw=) so other servers judge attention
+ * and aggregate away from the connection's own state, not the mirror. */
+extern void bounce_note_away_state(struct Client *who, int state);
+
 
 /** Set a session's user-assigned name.
  * @param[in] session Session to rename.
@@ -855,6 +948,12 @@ extern void bounce_snapshot_channels(struct BouncerSession *session,
  * @return Session pointer, or NULL if client has no bouncer session.
  */
 extern struct BouncerSession *bounce_get_session(struct Client *cptr);
+
+/** Reason recorded at this client's session's last hold, or NULL.
+ * Diagnostic: lets the resume path tell the user why the previous
+ * connection ended (the information is otherwise destroyed -- holds
+ * never emit QUIT or connexit notices). */
+extern const char *bounce_last_hold_reason(struct Client *cptr);
 
 /** Find any session for an account (ACTIVE or HOLDING).
  * Unlike bounce_find_best_held(), this returns any session.
@@ -889,6 +988,22 @@ extern int bounce_compute_effective_away(struct BouncerSession *session,
  * @param[in] session Session to re-aggregate.
  */
 extern void bounce_recompute_session_away(struct BouncerSession *session);
+
+/** Activity replication: a connection's first message after a quiet
+ * period puts its activity on the wire (BX U <numeric> la=<ts>), so every
+ * replica's hs_last_active / ba_last_active tracks live use at a bounded
+ * cost (one line per connection per quiet period).  The period is this
+ * ceiling or half the account's webpush idle window, whichever is
+ * shorter (bounce_activity_quiet): a replica's reading is then always
+ * fresher than the window it is judged against, whatever WEBPUSH_IDLE or
+ * the per-account override is set to. */
+#define BOUNCE_ACTIVITY_QUIET 300
+extern int bounce_activity_quiet(const char *account);
+
+/** Most recent activity across every connection of @a session: the
+ * primary's and each alias's, local from the idle clock, remote from the
+ * replicated value.  0 when nothing is known. */
+extern time_t bounce_session_last_active(struct BouncerSession *session);
 
 /** Replay channel state (JOIN/TOPIC/NAMES) to a client after held session resume.
  * @param[in] cptr Client that just resumed a held session.

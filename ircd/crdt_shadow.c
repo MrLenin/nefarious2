@@ -2935,8 +2935,10 @@ static void reconcile_webpush_set_cb(const char *key, uint32_t key_len,
   if (webpush_store_get_blob(account, endpoint, cur, sizeof cur) == 0 &&
       strcmp(cur, blob) == 0)
     return;                                    /* already materialized, identical */
-  if (webpush_store_add(account, blob) == 0)
+  if (webpush_store_add(account, blob) == 0) {
+    webpush_subs_cache_invalidate(account);   /* the count cache is m_webpush's */
     c->applied++;
+  }
 }
 
 /* Delete-walk (invariant 11): LIVE-walk the store; reap any row whose
@@ -3001,6 +3003,7 @@ void crdt_shadow_reconcile_webpush(void)
     webpush_store_foreach_all(webpush_reap_collect, &g_webpush_reap);
     for (i = 0; i < g_webpush_reap.n; i++) {
       if (webpush_store_remove(g_webpush_reap.acct[i], g_webpush_reap.ep[i]) == 0) {
+        webpush_subs_cache_invalidate(g_webpush_reap.acct[i]);
         removed++;
         round++;
       }
@@ -6237,6 +6240,7 @@ static void crdt_shadow_verify_cb(struct Event *ev)
   crdt_shadow_own_user_reassert(); /* recovery completion: re-mint records of live local users the doc lost (wrong-decommission heal) */
   crdt_shadow_ch_storage_publish(); /* 5-5f B2: publish our CH storage capability (change-gated, so idle ticks are free) */
   crdt_shadow_ch_storage_synth_to(NULL); /* 5-5f B4: synth doc-known stores to legacy links (change-gated per leaf — covers stores that appear AFTER the legacy link's EOB) */
+  chathistory_update_retention_isupport(1); /* the doc may have taught us a store P10 never advertised: re-derive the widest retention (cached compare, no-op when unchanged) */
   crdt_shadow_decomm_sweep();      /* decommission standing sweep: reap residue of operator-asserted-dead servers; auto-dissolve on return */
   crdt_shadow_reconcile_glines();  /* GLINE step 3: drive global G-lines from doc (+gateway) */
   crdt_shadow_reconcile_shuns();   /* SHUN: drive global Shuns from doc (+gateway) */

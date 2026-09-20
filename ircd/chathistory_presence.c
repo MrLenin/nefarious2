@@ -23,6 +23,7 @@
 
 #include "channel.h"
 #include "client.h"
+#include "crdt_hlc.h"
 #include "hash.h"
 #include "history.h"
 #include "db_cursor.h"
@@ -32,6 +33,11 @@
 #include "history.h"
 #include "ircd.h"
 #include "ircd_alloc.h"
+#include "ircd_chattr.h"
+#include "metadata.h"
+#include "msg.h"
+#include "send.h"
+#include "s_debug.h"
 #include "ircd_features.h"
 #include "ircd_log.h"
 #include "ircd_string.h"
@@ -77,8 +83,8 @@ static unsigned int effective_max_intervals(void)
 
 /** A closed presence interval.  Stored compactly in the record. */
 struct presence_interval {
-  int64_t start;   /**< epoch seconds, inclusive */
-  int64_t end;     /**< epoch seconds, inclusive (always >= start) */
+  int64_t start;   /**< packed HLC time (ms<<16 | logical), inclusive */
+  int64_t end;     /**< packed HLC time, inclusive (always >= start) */
 };
 
 /** Per-(anchor, channel) presence record.  Same layout for in-memory
@@ -117,14 +123,37 @@ static struct presence_session_entry *session_buckets[PRESENCE_HASH_SIZE];
 static struct db_cf *presence_cf = NULL;
 static int           presence_persistence_ready = 0;
 
+/** 1 when account-anchored presence has a store to live in. */
+int presence_account_store_ready(void)
+{
+  return presence_persistence_ready && presence_cf != NULL;
+}
+/** Proof-of-life hint for boot-close (epoch ms): the newest row the
+ * history store holds, handed in by ircd.c before presence_init so this
+ * module stays free of history.c (the cmocka harness links it alone). */
+static uint64_t      boot_alive_hint_ms = 0;
+
+void presence_set_boot_alive_hint(uint64_t newest_ms)
+{
+  boot_alive_hint_ms = newest_ms;
+}
+
 /* ---------------------------------------------------------------- */
 /* Helpers                                                            */
 /* ---------------------------------------------------------------- */
 
-/** Case-fold a single ASCII byte (channel names use ASCII case folding). */
+/** Case-fold one byte using the ircd's casemapping (rfc1459: {|}~ fold
+ * to [\\]^, plus the Latin-1 ranges) -- the ASCII-only fold this used
+ * to be disagreed with ircd_strcmp/FindChannel, so equivalently-named
+ * channels could hash to different buckets and key different rows,
+ * silently hiding history (fail-safe direction, but a real hole).
+ * Old rows keyed under the ASCII fold become stale and age out via the
+ * retention sweep. */
 static inline unsigned char to_lower_ascii(unsigned char c)
 {
-  return (c >= 'A' && c <= 'Z') ? (unsigned char)(c + ('a' - 'A')) : c;
+  /* ToLower indexes its table from CHAR_MIN, i.e. by a plain char; an
+   * unsigned byte above 127 would index past it. */
+  return (unsigned char)ToLower((char)c);
 }
 
 /** FNV-1a over a session_id + channel pair, case-folding the channel. */
@@ -214,6 +243,8 @@ static size_t build_acct_key(char *buf, size_t bufsz,
 /** Load the account-anchored record from storage into @a out.  Returns
  * 0 on success, -1 if missing or unavailable.  Zero-fills @a out if
  * the stored record has an unexpected size (treats as missing). */
+static int record_norm_ms(struct presence_record *r);  /* defined with the time helpers */
+
 static int acct_load(const char *account, const char *channel,
                      struct presence_record *out)
 {
@@ -226,7 +257,7 @@ static int acct_load(const char *account, const char *channel,
   memset(out, 0, sizeof(*out));
   if (!presence_persistence_ready || !presence_cf)
     return -1;
-  env = history_get_env();
+  env = metadata_get_env();
   if (!env)
     return -1;
   klen = build_acct_key(keybuf, sizeof(keybuf), account, channel);
@@ -237,8 +268,10 @@ static int acct_load(const char *account, const char *channel,
   rc = db_get(env, presence_cf, keybuf, klen, NULL, &v);
   if (rc != DB_OK)
     return -1;
-  if (v.len == sizeof(*out))
+  if (v.len == sizeof(*out)) {
     memcpy(out, v.base, sizeof(*out));
+    record_norm_ms(out);   /* seconds-era record: read as milliseconds */
+  }
   /* Else: leave @a out zeroed.  Caller will write a fresh record next
    * time anything mutates state, which is the right behavior. */
   db_val_free(&v);
@@ -259,7 +292,7 @@ static int acct_store(const char *account, const char *channel,
 
   if (!presence_persistence_ready || !presence_cf)
     return -1;
-  env = history_get_env();
+  env = metadata_get_env();
   if (!env)
     return -1;
   klen = build_acct_key(keybuf, sizeof(keybuf), account, channel);
@@ -284,55 +317,123 @@ static int acct_store(const char *account, const char *channel,
 /* Core interval algorithms (shared between in-memory and persistent) */
 /* ---------------------------------------------------------------- */
 
+/* ---------------------------------------------------------------- */
+/* Presence time: packed HLC (ms << 16 | logical), since 2026-09-02   */
+/* ---------------------------------------------------------------- */
+
+int64_t presence_norm_time(int64_t v)
+{
+  /* Three eras by magnitude: seconds (~1.7e9, below 1e11), milliseconds
+   * (~1.7e12, below 1e15 -- only ever on the bed), packed HLC (~1.1e17).
+   * 1e11 is the year 5138 in seconds and March 1973 in milliseconds;
+   * 1e15 is the year 33658 in milliseconds and 1970-01-01 plus 19
+   * minutes packed. */
+  if (v <= 0)
+    return v;
+  if (v < 100000000000LL)
+    return PRESENCE_TIME_FROM_MS(v * 1000);
+  if (v < 1000000000000000LL)
+    return PRESENCE_TIME_FROM_MS(v);
+  return v;
+}
+
+int64_t presence_event_time(const char *msgid, uint64_t event_ms)
+{
+  uint64_t ms = 0;
+  uint16_t logical = 0;
+
+  if (msgid && msgid[0] && msgid_decode_hlc(msgid, &ms, &logical)
+      && (!event_ms || ms == event_ms))
+    return PRESENCE_TIME_PACK(ms, logical);
+  return PRESENCE_TIME_FROM_MS(event_ms);
+}
+
+/** Normalize a record read from disk (or replicated) in place.  Returns
+ * nonzero when anything changed, so a sweep can rewrite it. */
+static int record_norm_ms(struct presence_record *r)
+{
+  int changed = 0;
+  uint8_t i;
+  int64_t v;
+
+  v = presence_norm_time(r->open_since);
+  if (v != r->open_since) { r->open_since = v; changed = 1; }
+  for (i = 0; i < r->count; i++) {
+    v = presence_norm_time(r->intervals[i].start);
+    if (v != r->intervals[i].start) { r->intervals[i].start = v; changed = 1; }
+    v = presence_norm_time(r->intervals[i].end);
+    if (v != r->intervals[i].end) { r->intervals[i].end = v; changed = 1; }
+  }
+  return changed;
+}
+
+/** The event time the membership hooks stamp with (see
+ * presence_set_event_time); 0 = none armed. */
+static int64_t presence_event_ctx = 0;
+
+void presence_set_event_time(int64_t t)
+{
+  presence_event_ctx = t;
+}
+
+/** The HLC's current stamp as presence time (no event armed). */
+static int64_t presence_clock_time(void)
+{
+  const struct HLC *h = hlc_global();
+  return PRESENCE_TIME_PACK(h->physical_ms, h->logical);
+}
+
+/** Time for a hook: the armed event time, else the clock. */
+static int64_t presence_now_time(void)
+{
+  if (presence_event_ctx > 0)
+    return presence_event_ctx;
+  return presence_clock_time();
+}
+
 /** Open a new interval if none is open.  Idempotent. */
-static void record_apply_join(struct presence_record *r, time_t when)
+static void record_apply_join(struct presence_record *r, int64_t when)
 {
   if (r->open_since == 0)
     r->open_since = (int64_t)when;
 }
 
-/** Close the open interval, appending it to the closed list.  Drops
- * the oldest closed interval if the cap would be exceeded (hard FIFO
- * — fail-safe).  No-op if no interval is open. */
-static void record_apply_part(struct presence_record *r, time_t when)
+static void record_union_close(struct presence_record *r,
+                               int64_t start, int64_t end);
+
+/** Close the open interval, folding it into the closed list.
+ *
+ * The closed list may already hold windows that START AFTER the open
+ * one (a PN from another connection of the same anchor, or an anchor
+ * transfer carrying an old start), so the fold is a real union, not an
+ * append: record_union_close handles both merge directions, the
+ * reconnect-churn coalesce, the cap (drop-oldest FIFO, fail-safe) and
+ * the swallow of successors.  The old bespoke coalesce only checked
+ * "does the last closed window end near my start" and kept THAT
+ * window's start, erasing the earlier part of the open one
+ * (re-review 2026-09-07 R5).  No-op if no interval is open. */
+static void record_apply_part(struct presence_record *r, int64_t when)
 {
-  int64_t end = (int64_t)when;
+  int64_t start, end = when;
   if (r->open_since == 0)
     return;
-  if (end < r->open_since) {
-    /* Clock skew or out-of-order event; treat as a zero-length visit
-     * and discard the open marker rather than invert the interval. */
-    r->open_since = 0;
-    return;
+  start = r->open_since;
+  if (end < start) {
+    /* Clock skew or out-of-order event: clamp to a zero-length visit
+     * instead of discarding -- a discarded open erased the member's
+     * entire real window under a backward clock step. */
+    end = start;
   }
-  {
-    unsigned int cap = effective_max_intervals();
-    /* Trim down if the runtime cap was lowered below the current
-     * count — drop oldest intervals first, then make room for the
-     * new one if we're still at the cap. */
-    while (r->count > cap) {
-      memmove(&r->intervals[0], &r->intervals[1],
-              sizeof(r->intervals[0]) * (r->count - 1u));
-      r->count--;
-    }
-    if (r->count >= cap) {
-      memmove(&r->intervals[0], &r->intervals[1],
-              sizeof(r->intervals[0]) * (cap - 1u));
-      r->count = (uint8_t)(cap - 1u);
-    }
-  }
-  r->intervals[r->count].start = r->open_since;
-  r->intervals[r->count].end = end;
-  r->count++;
   r->open_since = 0;
+  record_union_close(r, start, end);
 }
 
 /** Test whether @a msg_time falls inside any closed interval or the
  * currently-open one.  Closed intervals are checked inclusively on
  * both ends; the open interval is inclusive on its start. */
-static int record_was_present(const struct presence_record *r, time_t msg_time)
+static int record_was_present(const struct presence_record *r, int64_t msg_ms)
 {
-  int64_t t = (int64_t)msg_time;
+  int64_t t = msg_ms;
   uint8_t i;
   if (r->open_since != 0 && t >= r->open_since)
     return 1;
@@ -347,6 +448,35 @@ static int record_was_present(const struct presence_record *r, time_t msg_time)
 /* Public API                                                         */
 /* ---------------------------------------------------------------- */
 
+/** Meta row key for the last-alive stamp.  Account keys are
+ * "<account>\\0<channel>" and accounts are never empty, so a leading
+ * NUL can never collide with a real record. */
+#define PRESENCE_META_LAST_ALIVE "\0\0last_alive"
+
+/** Persist the current time as the last-alive stamp (see boot-close
+ * in presence_init).  Called from init, each maintenance sweep, and the
+ * minute heartbeat (presence_alive_tick). */
+void presence_touch_last_alive(void)
+{
+  struct db_env *env;
+  struct db_writebatch *wb;
+  int64_t now = presence_clock_time();
+
+  if (!presence_persistence_ready || !presence_cf)
+    return;
+  env = metadata_get_env();
+  if (!env)
+    return;
+  wb = db_writebatch_new(env);
+  if (!wb)
+    return;
+  db_writebatch_put(wb, presence_cf, PRESENCE_META_LAST_ALIVE,
+                    sizeof(PRESENCE_META_LAST_ALIVE) - 1,
+                    &now, sizeof(now));
+  (void)db_writebatch_commit(wb, /*sync_durably=*/0);
+  db_writebatch_destroy(wb);
+}
+
 int presence_init(void)
 {
   struct db_env *env;
@@ -356,12 +486,20 @@ int presence_init(void)
   /* In-memory tables are already zero-initialized at static scope;
    * nothing to do for the session-anchored side. */
 
-  env = history_get_env();
+  env = metadata_get_env();
   if (!env) {
-    /* History storage isn't up yet (or is disabled).  Session-anchored
-     * presence still works; account-anchored is silently unavailable. */
+    /* The metadata env is not up (CAP_draft_metadata_2 off, or its DB
+     * failed).  Session-anchored presence still works in memory;
+     * account-anchored presence has nowhere to live, and under strict
+     * presence that means every authenticated user's history is hidden
+     * -- so never fail quietly (2026-09-06). */
     presence_cf = NULL;
     presence_persistence_ready = 0;
+    if (feature_bool(FEAT_CHATHISTORY_STRICT_PRESENCE))
+      log_write(LS_CONFIG, L_ERROR, 0,
+                "CHATHISTORY_STRICT_PRESENCE is on but the metadata database "
+                "is not available (CAP_draft_metadata_2 off or failed): "
+                "account presence cannot be recorded");
     return -1;
   }
 
@@ -378,6 +516,82 @@ int presence_init(void)
   }
 
   presence_persistence_ready = 1;
+
+  /* Boot-close stale open intervals.  Nothing exits clients at
+   * shutdown (server_die only flushes sockets), so every account-
+   * anchored member of every channel is left with open_since set on
+   * disk -- and an open interval is unbounded FORWARD: a member
+   * removed from the channel during downtime could read everything
+   * since their last join, forever.  Close every open interval at the
+   * last-alive stamp (updated each maintenance sweep; granularity
+   * costs at most one sweep interval of real presence, fail-safe),
+   * clamped no earlier than the interval's own start.  Members still
+   * welcome re-open naturally when they rejoin after reconnect. */
+  {
+    struct db_iter *it = db_iter_open(env, presence_cf, NULL);
+    struct db_writebatch *wb = it ? db_writebatch_new(env) : NULL;
+    int64_t last_alive = 0;
+    unsigned int closed = 0;
+    struct db_val v;
+
+    memset(&v, 0, sizeof(v));
+    if (db_get(env, presence_cf, PRESENCE_META_LAST_ALIVE,
+               sizeof(PRESENCE_META_LAST_ALIVE) - 1, NULL, &v) == DB_OK) {
+      if (v.len == sizeof(last_alive))
+        memcpy(&last_alive, v.base, sizeof(last_alive));
+      last_alive = presence_norm_time(last_alive);
+      db_val_free(&v);
+    }
+    /* The stamp is a heartbeat (presence_alive_tick, once a minute; the
+     * sweep and boot also write it), but the newest row the history
+     * store holds is proof of life on its own: the server was up when it
+     * stored that.  Bound the close by it so a stalled heartbeat can never
+     * close an interval BEFORE messages the member demonstrably saw --
+     * with the hourly-only stamp of 2026-09-05 a restart hid the hours
+     * before it from every restored session ("history ends a few hours
+     * ago"). */
+    if (boot_alive_hint_ms) {
+      int64_t newest = PRESENCE_TIME_FROM_MS_LATE((int64_t)boot_alive_hint_ms);
+      if (newest > last_alive)
+        last_alive = newest;
+    }
+
+    if (it && wb && db_iter_seek_first(it) == DB_OK) {
+      while (db_iter_valid(it)) {
+        size_t klen, vlen;
+        const void *kptr = db_iter_key(it, &klen);
+        const void *vptr = db_iter_value(it, &vlen);
+        struct presence_record r;
+
+        if (vptr && vlen == sizeof(r) && kptr && klen > 0) {
+          memcpy(&r, vptr, sizeof(r));
+          record_norm_ms(&r);
+          if (r.open_since != 0) {
+            int64_t end = last_alive;
+            if (end < r.open_since)
+              end = r.open_since;   /* zero-length: keep the join instant */
+            record_apply_part(&r, end);
+            db_writebatch_put(wb, presence_cf, kptr, klen, &r, sizeof(r));
+            closed++;
+          }
+        }
+        if (db_iter_next(it) != DB_OK)
+          break;
+      }
+    }
+    if (it)
+      db_iter_close(it);
+    if (wb) {
+      if (db_writebatch_count(wb) > 0)
+        (void)db_writebatch_commit(wb, /*sync_durably=*/0);
+      db_writebatch_destroy(wb);
+    }
+    if (closed)
+      log_write(LS_SYSTEM, L_INFO, 0,
+                "presence: boot-closed %u stale open interval(s) at "
+                "last-alive %ld", closed, (long)last_alive);
+    presence_touch_last_alive();
+  }
   return 0;
 }
 
@@ -400,8 +614,117 @@ void presence_shutdown(void)
   presence_persistence_ready = 0;
 }
 
+/** Union-merge one closed interval [start,end] into @a r, preserving
+ * sort order, coalescing overlaps (and near-adjacency, same 30s policy
+ * as record_apply_part), leaving any open interval untouched, and
+ * FIFO-dropping the oldest closed interval at the cap.  The merge is
+ * idempotent and order-independent -- the properties the PN
+ * replication flood needs. */
+static void record_union_close(struct presence_record *r,
+                               int64_t start, int64_t end)
+{
+  unsigned int cap = effective_max_intervals();
+  uint8_t i, pos;
+
+  if (end < start)
+    end = start;   /* degenerate input: clamp to zero-length */
+
+  /* Find insertion position (intervals are sorted by start). */
+  for (pos = 0; pos < r->count && r->intervals[pos].start <= start; pos++)
+    ;
+
+  /* Merge with predecessor when overlapping/adjacent. */
+  if (pos > 0 && r->intervals[pos - 1].end + PRESENCE_COALESCE_TIME >= start) {
+    if (end > r->intervals[pos - 1].end)
+      r->intervals[pos - 1].end = end;
+    pos--;
+  } else {
+    /* Insert at pos. */
+    while (r->count > cap) {   /* runtime cap lowered under us */
+      memmove(&r->intervals[0], &r->intervals[1],
+              sizeof(r->intervals[0]) * (r->count - 1u));
+      r->count--;
+      if (pos > 0) pos--;
+    }
+    if (r->count >= cap) {
+      if (pos == 0)
+        return;   /* older than everything retained -- drop it */
+      /* Drop the oldest: slots 1..pos-1 move down one, which frees slot
+       * pos-1 for the new window; slots pos.. (the later windows) are
+       * already where they belong and MUST NOT be shifted (doing so
+       * overwrote the newest window with its predecessor, 2026-09-06). */
+      memmove(&r->intervals[0], &r->intervals[1],
+              sizeof(r->intervals[0]) * (pos - 1u));
+      pos--;
+      r->count--;
+    } else {
+      memmove(&r->intervals[pos + 1], &r->intervals[pos],
+              sizeof(r->intervals[0]) * (r->count - pos));
+    }
+    r->intervals[pos].start = start;
+    r->intervals[pos].end = end;
+    r->count++;
+  }
+
+  /* Swallow successors the (possibly grown) interval now covers. */
+  i = pos;
+  while (i + 1 < r->count
+         && r->intervals[i].end + PRESENCE_COALESCE_TIME >= r->intervals[i + 1].start) {
+    if (r->intervals[i + 1].end > r->intervals[i].end)
+      r->intervals[i].end = r->intervals[i + 1].end;
+    memmove(&r->intervals[i + 1], &r->intervals[i + 2],
+            sizeof(r->intervals[0]) * (r->count - i - 2u));
+    r->count--;
+  }
+}
+
+void presence_apply_close(const char *anchor, int anchor_is_session,
+                          const char *channel, int64_t start, int64_t end)
+{
+  if (!anchor || !*anchor || !channel || !*channel)
+    return;
+
+  if (anchor_is_session) {
+    struct presence_session_entry *e =
+        session_get_or_create(anchor, channel);
+    record_union_close(&e->record, (int64_t)start, (int64_t)end);
+    return;
+  }
+
+  {
+    struct presence_record r;
+    if (acct_load(anchor, channel, &r) != 0)
+      memset(&r, 0, sizeof(r));
+    record_union_close(&r, (int64_t)start, (int64_t)end);
+    (void)acct_store(anchor, channel, &r);
+  }
+}
+
+/** Broadcast a closed account interval to all servers (PN token).
+ * Readmarker-style flood; receivers apply via presence_apply_close and
+ * relay butone.  Gated on the feature (no traffic while strict
+ * presence is dark) and on server init (conf-parse safety). */
+static void presence_broadcast_close(const char *account,
+                                     const char *channel,
+                                     int64_t start, int64_t end)
+{
+  char sb[24], eb[24];
+
+  if (!feature_bool(FEAT_CHATHISTORY_STRICT_PRESENCE))
+    return;
+  if (!cli_serv(&me))
+    return;
+  /* Packed HLC time on the wire (ms<<16 | logical); receivers normalize
+   * seconds- and milliseconds-era values from older peers by magnitude
+   * (m_markread.c PN handler). */
+  snprintf(sb, sizeof(sb), "%lld", (long long)start);
+  snprintf(eb, sizeof(eb), "%lld", (long long)end);
+  sendcmdto_serv_butone_v3(&me, CMD_PRESENCE, NULL, "%s %s %s %s",
+                           account, channel, sb, eb);
+}
+
 void presence_record_join(const char *anchor, int anchor_is_session,
-                           const char *channel, time_t when)
+                           const char *channel, int64_t when)
 {
   if (!anchor || !*anchor || !channel || !*channel)
     return;
@@ -424,7 +747,7 @@ void presence_record_join(const char *anchor, int anchor_is_session,
 }
 
 void presence_record_part(const char *anchor, int anchor_is_session,
-                           const char *channel, time_t when)
+                           const char *channel, int64_t when)
 {
   if (!anchor || !*anchor || !channel || !*channel)
     return;
@@ -443,15 +766,28 @@ void presence_record_part(const char *anchor, int anchor_is_session,
 
   {
     struct presence_record r;
+    int64_t was_open;
     if (acct_load(anchor, channel, &r) != 0)
       return;  /* nothing to close */
+    was_open = r.open_since;
     record_apply_part(&r, when);
     (void)acct_store(anchor, channel, &r);
+    /* Replicate the just-closed window (#6, metadata-layer
+     * replication): peers union it into their own view, healing
+     * netsplit windows and roaming.  Only account anchors replicate;
+     * session anchors are connection-local by nature. */
+    if (was_open != 0) {
+      int64_t bstart = was_open;
+      int64_t bend = (int64_t)when;
+      if (bend < bstart)
+        bend = bstart;
+      presence_broadcast_close(anchor, channel, bstart, bend);
+    }
   }
 }
 
 int presence_was_present(const char *anchor, int anchor_is_session,
-                          const char *channel, time_t msg_time)
+                          const char *channel, int64_t t)
 {
   if (!anchor || !*anchor || !channel || !*channel)
     return 0;
@@ -460,14 +796,67 @@ int presence_was_present(const char *anchor, int anchor_is_session,
     struct presence_session_entry *e = session_find(anchor, channel);
     if (!e)
       return 0;
-    return record_was_present(&e->record, msg_time);
+    return record_was_present(&e->record, t);
   }
 
   {
     struct presence_record r;
     if (acct_load(anchor, channel, &r) != 0)
       return 0;
-    return record_was_present(&r, msg_time);
+    return record_was_present(&r, t);
+  }
+}
+
+/** Nearest presence boundary in the walk direction (see the header).
+ * Pure interval logic over one record: forward = smallest closed start
+ * (or open_since) strictly after @a t; backward = largest closed end
+ * strictly before @a t.  Inside a window the answer is @a t. */
+static int64_t record_next_visible(const struct presence_record *r,
+                                   int64_t t, int reverse)
+{
+  int64_t best = -1;
+  uint8_t i;
+
+  if (record_was_present(r, t))
+    return t;
+
+  if (!reverse) {
+    if (r->open_since != 0 && r->open_since > t)
+      best = r->open_since;
+    for (i = 0; i < r->count; i++) {
+      if (r->intervals[i].start > t
+          && (best < 0 || r->intervals[i].start < best))
+        best = r->intervals[i].start;
+    }
+  } else {
+    /* An open interval starts after every closed one and (t not being
+     * inside it) lies entirely after t, so only closed ends qualify. */
+    for (i = 0; i < r->count; i++) {
+      if (r->intervals[i].end < t && r->intervals[i].end > best)
+        best = r->intervals[i].end;
+    }
+  }
+  return best;
+}
+
+int64_t presence_next_visible(const char *anchor, int anchor_is_session,
+                              const char *channel, int64_t t, int reverse)
+{
+  if (!anchor || !*anchor || !channel || !*channel)
+    return -1;
+
+  if (anchor_is_session) {
+    struct presence_session_entry *e = session_find(anchor, channel);
+    if (!e)
+      return -1;
+    return record_next_visible(&e->record, t, reverse);
+  }
+
+  {
+    struct presence_record r;
+    if (acct_load(anchor, channel, &r) != 0)
+      return -1;
+    return record_next_visible(&r, t, reverse);
   }
 }
 
@@ -511,6 +900,20 @@ static int anchor_sibling_in_channel(const struct Client *exclude,
     const char *other_anchor;
     if (c == exclude || !c)
       continue;
+    /* Alias memberships never open/close intervals themselves and must
+     * not suppress the primary's interval either.  Without this skip,
+     * add_user_to_channel's bounce_sync_alias_join adds the alias
+     * BEFORE the primary's presence hook runs -- primary and alias
+     * then each saw the other as an existing sibling and NO interval
+     * ever opened for bouncer accounts (the feature's main audience). */
+    if (IsMemberAlias(m))
+      continue;
+    /* A zombie membership (kicked, PART not yet propagated) is not a
+     * live sibling either: it must not keep the interval open when the
+     * live connection parts.  presence_backfill_now already skips it
+     * (re-review 2026-09-07 R18). */
+    if (IsZombie(m))
+      continue;
     other_anchor = presence_anchor_for(c, &other_is_session);
     if (!other_anchor)
       continue;
@@ -545,7 +948,7 @@ void presence_on_channel_add(struct Client *who, struct Channel *chptr)
   if (anchor_sibling_in_channel(who, chptr, anchor, is_session))
     return;
 
-  presence_record_join(anchor, is_session, chptr->chname, CurrentTime);
+  presence_record_join(anchor, is_session, chptr->chname, presence_now_time());
 }
 
 void presence_on_channel_remove(struct Client *who, struct Channel *chptr)
@@ -568,7 +971,193 @@ void presence_on_channel_remove(struct Client *who, struct Channel *chptr)
   if (anchor_sibling_in_channel(who, chptr, anchor, is_session))
     return;
 
-  presence_record_part(anchor, is_session, chptr->chname, CurrentTime);
+  presence_record_part(anchor, is_session, chptr->chname, presence_now_time());
+}
+
+/** Open an interval NOW for every current non-alias member of every
+ * channel.  Called when FEAT_CHATHISTORY_STRICT_PRESENCE flips ON at
+ * runtime: pre-existing memberships otherwise have no open interval
+ * (the join hook early-returns while the feature is off) and their
+ * holders see empty history until they part and rejoin. */
+void presence_backfill_now(void)
+{
+  struct Channel *chptr;
+
+  for (chptr = GlobalChannelList; chptr; chptr = chptr->next) {
+    struct Membership *m;
+    for (m = chptr->members; m; m = m->next_member) {
+      const char *anchor;
+      int is_session = 0;
+      if (!m->user || IsMemberAlias(m) || IsZombie(m))
+        continue;
+      anchor = presence_anchor_for(m->user, &is_session);
+      if (!anchor)
+        continue;
+      /* record_apply_join is idempotent, so same-anchor siblings are
+       * naturally collapsed. */
+      presence_record_join(anchor, is_session, chptr->chname, presence_now_time());
+    }
+  }
+  log_write(LS_SYSTEM, L_INFO, 0,
+            "presence: strict-presence enabled -- backfilled open "
+            "intervals for current channel members");
+}
+
+/** Move a client's presence from one anchor to another across an
+ * account-state transition (unauthed<->authed, or an account CHANGE).
+ * The mirror of channel_account_adjust: the join/part hooks evaluate
+ * the anchor at hook time, so a mid-membership FLAG_ACCOUNT flip
+ * otherwise strands the open interval under the old anchor (the part
+ * under the new anchor misses it -> never closes -> unbounded forward
+ * visibility after deauth) and the new anchor shows no presence at
+ * all for the current window.
+ *
+ * The open-interval START carries over on auth (session->account and
+ * account rename) so the member's continuous physical presence stays
+ * one window; the old anchor's interval is closed at now.  Closed
+ * historical intervals are NOT migrated (documented residue: presence
+ * recorded while unauthed stays queryable only... under the account
+ * they later authed to?  No -- it ages out unqueried; acceptable).
+ *
+ * Skips CHFL_ALIAS memberships and respects same-anchor siblings on
+ * the closing side. */
+void presence_anchor_transfer(struct Client *cptr,
+                              const char *old_anchor, int old_is_session,
+                              const char *new_anchor, int new_is_session)
+{
+  struct Membership *m;
+
+  if (!feature_bool(FEAT_CHATHISTORY_STRICT_PRESENCE))
+    return;
+  if (!cptr || !cli_user(cptr) || !new_anchor || !*new_anchor)
+    return;
+
+  for (m = cli_user(cptr)->channel; m; m = m->next_channel) {
+    struct Channel *chptr = m->channel;
+    int64_t now = presence_now_time();
+    int64_t start = now;
+
+    if (IsMemberAlias(m) || !chptr)
+      continue;
+
+    /* Carry the open-interval start across the transition when the
+     * old anchor holds one. */
+    if (old_anchor && *old_anchor) {
+      if (old_is_session) {
+        struct presence_session_entry *e =
+            session_find(old_anchor, chptr->chname);
+        if (e && e->record.open_since != 0
+            && e->record.open_since < start)
+          start = e->record.open_since;
+      } else {
+        struct presence_record r;
+        if (acct_load(old_anchor, chptr->chname, &r) == 0
+            && r.open_since != 0 && r.open_since < start)
+          start = r.open_since;
+      }
+      /* Close the old anchor's interval unless a same-old-anchor
+       * sibling remains (another connection of the same account). */
+      if (!anchor_sibling_in_channel(cptr, chptr, old_anchor,
+                                     old_is_session))
+        presence_record_part(old_anchor, old_is_session, chptr->chname, now);
+    }
+
+    presence_record_join(new_anchor, new_is_session, chptr->chname, start);
+  }
+}
+
+/** Link-time catch-up (#6 step 2): send this server's account-anchored
+ * closed intervals to a newly-linked peer as PN lines.  Windows that
+ * closed while the peer was unreachable (netsplit, downtime, a brand
+ * new server) were never observed there and their PN broadcasts were
+ * lost -- without this sync the steady-state flood only re-covers what
+ * per-server observation already records.  Union application on the
+ * receiver makes re-sends across repeated relinks harmless.
+ * Bounded by the per-record FIFO cap and the retention sweep; a hard
+ * line ceiling guards pathological stores. */
+void presence_burst_sync(struct Client *cptr)
+{
+  struct db_env *env;
+  struct db_iter *it;
+  unsigned int sent = 0;
+  const unsigned int line_ceiling = 20000;
+
+  if (!feature_bool(FEAT_CHATHISTORY_STRICT_PRESENCE))
+    return;
+  if (!presence_persistence_ready || !presence_cf)
+    return;
+  env = metadata_get_env();
+  if (!env)
+    return;
+
+  it = db_iter_open(env, presence_cf, NULL);
+  if (!it)
+    return;
+  if (db_iter_seek_first(it) == DB_OK) {
+    while (db_iter_valid(it) && sent < line_ceiling) {
+      size_t klen, vlen;
+      const void *kptr = db_iter_key(it, &klen);
+      const void *vptr = db_iter_value(it, &vlen);
+      struct presence_record r;
+
+      /* Key: "<account>\0<channel>"; the meta row starts with NUL and
+       * its value size differs from the record -- both checks skip it. */
+      if (kptr && klen > 2 && ((const char *)kptr)[0] != '\0'
+          && vptr && vlen == sizeof(r)) {
+        const char *account = (const char *)kptr;
+        size_t alen = strnlen(account, klen);
+        if (alen < klen) {
+          const char *channel = account + alen + 1;
+          size_t clen = klen - alen - 1;
+          char chanbuf[CHANNELLEN + 1];
+          uint8_t k;
+          if (clen > 0 && clen <= CHANNELLEN) {
+            memcpy(chanbuf, channel, clen);
+            chanbuf[clen] = '\0';
+            memcpy(&r, vptr, sizeof(r));
+            record_norm_ms(&r);
+            for (k = 0; k < r.count && sent < line_ceiling; k++) {
+              char sb[24], eb[24];
+              snprintf(sb, sizeof(sb), "%lld", (long long)r.intervals[k].start);
+              snprintf(eb, sizeof(eb), "%lld", (long long)r.intervals[k].end);
+              sendcmdto_one(&me, CMD_PRESENCE, cptr, "%s %s %s %s",
+                            account, chanbuf, sb, eb);
+              sent++;
+            }
+            /* An interval still OPEN spans the split the peer lost: send
+             * it as [open, now] so the peer unions it; the real close
+             * later extends the same window.  Closed-only sync left the
+             * peer with a permanent hole across the split (re-review
+             * 2026-09-07 R17). */
+            if (r.open_since != 0 && sent < line_ceiling) {
+              char sb[24], eb[24];
+              int64_t now = presence_clock_time();
+              if (now < r.open_since)
+                now = r.open_since;
+              snprintf(sb, sizeof(sb), "%lld", (long long)r.open_since);
+              snprintf(eb, sizeof(eb), "%lld", (long long)now);
+              sendcmdto_one(&me, CMD_PRESENCE, cptr, "%s %s %s %s",
+                            account, chanbuf, sb, eb);
+              sent++;
+            }
+          }
+        }
+      }
+      if (db_iter_next(it) != DB_OK)
+        break;
+    }
+  }
+  db_iter_close(it);
+  if (sent >= line_ceiling)
+    log_write(LS_SYSTEM, L_WARNING, 0,
+              "presence: burst sync to %s hit the %u-line ceiling; accounts "
+              "sorting after it were NOT synced (their split windows stay "
+              "hidden on that peer until they part and rejoin)",
+              cli_name(cptr), line_ceiling);
+  if (sent)
+    log_write(LS_SYSTEM, L_INFO, 0,
+              "presence: burst-synced %u interval(s) to %s",
+              sent, cli_name(cptr));
 }
 
 void presence_purge_session(const char *session_id)
@@ -596,13 +1185,15 @@ void presence_purge_session(const char *session_id)
   }
 }
 
-/** Parse a HistoryMessage.timestamp string ("seconds.milliseconds")
- * into integer seconds since the epoch.  Returns 0 on parse failure. */
-static time_t parse_history_seconds(const char *ts)
+/** A history row's presence time: its msgid's HLC stamp (validated
+ * against the row's millisecond stamp), else (row ms, 0).  0 when the
+ * stamp is unparseable. */
+static int64_t row_presence_time(const struct HistoryMessage *m)
 {
-  if (!ts || !*ts)
+  uint64_t ms = history_parse_ms(m->timestamp);
+  if (!ms)
     return 0;
-  return (time_t)strtoul(ts, NULL, 10);
+  return presence_event_time(m->msgid, ms);
 }
 
 int presence_filter_messages(struct Client *requestor,
@@ -629,17 +1220,46 @@ int presence_filter_messages(struct Client *requestor,
   if (chptr && (chptr->mode.exmode & EXMODE_PUBLICHISTORY))
     return count_in;
   anchor = presence_anchor_for(requestor, &is_session);
-  if (!anchor)
-    return count_in;   /* no anchor — fail safe by NOT showing extra (but
-                          callers reach here only after check_history_access
-                          accepted the query, so we just pass through) */
+  if (!anchor) {
+    /* No resolvable anchor: fail CLOSED.  The old pass-through showed
+     * the full result to a client whose identity state is broken
+     * (e.g. FLAG_ACCOUNT set with an empty account string) -- the
+     * comment claimed fail-safe while the code did the opposite. */
+    history_free_messages(*head);
+    *head = NULL;
+    log_write(LS_SYSTEM, L_INFO, 0,
+              "presence_filter_messages: target=%s requestor without anchor "
+              "-- dropping %d message(s) (fail-closed)", target, count_in);
+    return 0;
+  }
+
+  /* One record snapshot for the whole page: presence_was_present loads
+   * the ~4 KB account record from the store on EVERY call, and a
+   * 100-row page (200 with redaction inheritance) was 100-200 reads
+   * (re-review 2026-09-07 R22).  The query-time filter already
+   * snapshots once.  No record at all => nothing is visible. */
+  {
+    const struct presence_record *rp = NULL;
+    struct presence_record snap;
+    if (is_session) {
+      struct presence_session_entry *e = session_find(anchor, target);
+      if (e)
+        rp = &e->record;
+    } else if (acct_load(anchor, target, &snap) == 0) {
+      rp = &snap;
+    }
+    if (!rp)
+      memset(&snap, 0, sizeof(snap)), rp = &snap;
 
   pp = head;
   while (*pp) {
     struct HistoryMessage *m = *pp;
-    time_t mtime = parse_history_seconds(m->timestamp);
-    int visible = (mtime == 0) ||
-                  presence_was_present(anchor, is_session, target, mtime);
+    int64_t mtime = row_presence_time(m);
+    /* Unparseable timestamp: fail CLOSED.  Locally-stored stamps are
+     * server-generated, but federated rows arrive over the wire --
+     * visible-if-unparseable was the wrong default for a security
+     * gate. */
+    int visible = (mtime != 0) && record_was_present(rp, mtime);
 
     /* Redaction inheritance: a HISTORY_REDACT entry's visibility is
      * the visibility of its target message, not its own timestamp.
@@ -663,9 +1283,8 @@ int presence_filter_messages(struct Client *requestor,
       target_msgid[i] = '\0';
       if (target_msgid[0]
           && history_msgid_to_timestamp(target_msgid, ts_buf) == 0) {
-        time_t parent_time = parse_history_seconds(ts_buf);
-        if (parent_time != 0
-            && presence_was_present(anchor, is_session, target, parent_time))
+        int64_t parent_time = presence_event_time(target_msgid, history_parse_ms(ts_buf));
+        if (parent_time != 0 && record_was_present(rp, parent_time))
           visible = 1;
       }
     }
@@ -680,6 +1299,7 @@ int presence_filter_messages(struct Client *requestor,
       dropped++;
     }
   }
+  }
   /* Diagnostic: when a full sweep drops everything, the user sees an
    * empty batch and has no way to tell strict-presence apart from
    * msgid-not-found.  Log the breakdown once per call so prod can
@@ -692,15 +1312,118 @@ int presence_filter_messages(struct Client *requestor,
   return kept;
 }
 
+/* ---------------------------------------------------------------- */
+/* Query-time presence filter (presence-aware paging)                */
+/* ---------------------------------------------------------------- */
+
+struct PresenceQueryFilter {
+  struct HistoryRowFilter hook;     /**< handed to history_query_*() */
+  char channel[CHANNELLEN + 1];
+  struct presence_record rec;       /**< ONE snapshot of the anchor's record
+                                     *   (the post-filter re-loads per row) */
+};
+
+/** history.c row hook.  Presence is HLC-granular (packed ms<<16 |
+ * logical); a row exactly on a boundary is inside it (intervals are
+ * inclusive), which is what lets the walk seek to a boundary
+ * (handed to the walk as a millisecond) and trust the landing row. */
+static int presence_row_hook(const struct HistoryMessage *msg, int reverse,
+                             void *ctx, int64_t *skip_to)
+{
+  struct PresenceQueryFilter *pf = (struct PresenceQueryFilter *)ctx;
+  int64_t t = row_presence_time(msg);
+  int64_t next;
+
+  /* Unparseable stamp: fail closed, step on (same rule as the
+   * post-filter). */
+  if (t == 0)
+    return 0;
+  if (record_was_present(&pf->rec, t))
+    return 1;
+  next = record_next_visible(&pf->rec, t, reverse);
+  if (next < 0)
+    return -1;              /* nothing further visible this way: stop */
+  *skip_to = PRESENCE_TIME_MS(next);   /* the walk seeks by millisecond */
+  return 0;
+}
+
+struct PresenceQueryFilter *presence_query_filter_open(
+    struct Client *requestor, const char *target, int effective_override,
+    int *rc_out)
+{
+  struct Channel *chptr;
+  const char *anchor;
+  int is_session = 0;
+  struct PresenceQueryFilter *pf;
+
+  if (rc_out)
+    *rc_out = 0;
+  if (!feature_bool(FEAT_CHATHISTORY_STRICT_PRESENCE))
+    return NULL;
+  if (effective_override)
+    return NULL;
+  if (!target || !IsChannelName(target))
+    return NULL;
+  chptr = FindChannel(target);
+  if (chptr && (chptr->mode.exmode & EXMODE_PUBLICHISTORY))
+    return NULL;
+
+  anchor = presence_anchor_for(requestor, &is_session);
+  if (!anchor) {
+    /* Mirrors presence_filter_messages: broken identity state fails
+     * CLOSED.  The caller answers an empty, complete page. */
+    log_write(LS_SYSTEM, L_INFO, 0,
+              "presence_query_filter_open: target=%s requestor without "
+              "anchor -- failing closed", target);
+    if (rc_out)
+      *rc_out = -1;
+    return NULL;
+  }
+
+  pf = (struct PresenceQueryFilter *)MyCalloc(1, sizeof(*pf));
+  ircd_strncpy(pf->channel, target, sizeof(pf->channel));
+  if (is_session) {
+    struct presence_session_entry *e = session_find(anchor, target);
+    if (e)
+      pf->rec = e->record;
+    /* else: zero record -- no presence at all, nothing visible */
+  } else if (acct_load(anchor, target, &pf->rec) != 0) {
+    /* Store unavailable or no record: a zero record hides everything,
+     * exactly as presence_was_present() answers 0 here. */
+    memset(&pf->rec, 0, sizeof(pf->rec));
+  }
+  pf->hook.fn = presence_row_hook;
+  pf->hook.ctx = pf;
+  if (rc_out)
+    *rc_out = 1;
+  return pf;
+}
+
+struct HistoryRowFilter *presence_query_filter_hook(struct PresenceQueryFilter *pf)
+{
+  return pf ? &pf->hook : NULL;
+}
+
+void presence_query_filter_close(struct PresenceQueryFilter *pf)
+{
+  if (pf)
+    MyFree(pf);
+}
+
 void presence_retention_sweep(void)
 {
   int retention_days = feature_int(FEAT_CHATHISTORY_RETENTION);
   int64_t cutoff;
   unsigned int i;
 
+  /* Keep the crash-recovery stamp fresh regardless of retention
+   * config -- the boot-close pass in presence_init depends on it. */
+  presence_touch_last_alive();
+
   if (retention_days <= 0)
     return;
-  cutoff = (int64_t)CurrentTime - (int64_t)retention_days * 86400;
+  cutoff = PRESENCE_TIME_FROM_MS((int64_t)hlc_global()->physical_ms
+                                 - (int64_t)retention_days * 86400000LL);
 
   /* In-memory side first: drop fully-old intervals; truncate straddlers;
    * delete empty records. */
@@ -733,7 +1456,7 @@ void presence_retention_sweep(void)
    * every FEAT_CHATHISTORY_MAINTENANCE_INTERVAL seconds (default 300),
    * not on the hot path. */
   if (presence_persistence_ready && presence_cf) {
-    struct db_env *env = history_get_env();
+    struct db_env *env = metadata_get_env();
     struct db_iter *it;
     struct db_writebatch *wb;
     unsigned int rewritten = 0, deleted = 0;
@@ -760,6 +1483,8 @@ void presence_retention_sweep(void)
 
         if (vlen == sizeof(r) && kptr && klen > 0) {
           memcpy(&r, vptr, sizeof(r));
+          if (record_norm_ms(&r))
+            changed = 1;   /* seconds-era row: rewrite in milliseconds */
           for (k = 0; k < r.count; k++) {
             if (r.intervals[k].end < cutoff) {
               changed = 1;
@@ -798,4 +1523,12 @@ void presence_retention_sweep(void)
              "presence: retention sweep rewrote %u, deleted %u rows",
              rewritten, deleted));
   }
+}
+
+
+/** Minute heartbeat (ircd.c timer): keep the last-alive stamp fresh so
+ * boot-close after a crash loses at most a minute of presence. */
+void presence_alive_tick(void)
+{
+  presence_touch_last_alive();
 }

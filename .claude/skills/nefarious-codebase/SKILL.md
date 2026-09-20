@@ -51,14 +51,28 @@ Everything else fails — every quoted include, and every angle include naming
 an ircd header. It covers **both** directories (sources and headers). A new
 C-library header goes into `KC_ALLOWED_STD_HDRS`; an ircd header never does.
 
-Because the files carry no `#ifdef`, `--enable-keycloak` gates them at the
-*source-list* level: `configure.in` substitutes `@KC_SRC@` into `IRCD_SRC` and
-`@KC_CMOCKA_TESTPROGS@` into the test `CMOCKA_TESTPROGS`, both empty when
-Keycloak is disabled. Adding a `kc/*.c` file or a kc cmocka suite means adding
-it to `KC_SRC` / `KC_CMOCKA_TESTPROGS` in `configure.in`, not to the Makefiles.
+Because the files carry no `#ifdef`, configure gates them at the *source-list* level:
+`configure.in` substitutes `@KC_SRC@` into `IRCD_SRC` and `@KC_CMOCKA_TESTPROGS@` into the
+test `CMOCKA_TESTPROGS`, both empty when libkc is not built.  Since 2026-09-03 the default is
+**auto**: libkc builds whenever libcurl and libjansson are found (`--enable-keycloak` =
+required, `--disable-keycloak` = out).  The old OFF default let a plain `./configure` ship an
+ircd that advertised `draft/webpush` with no transport and no log line; the ircd now turns the
+cap off at boot with a CONFIG error when the transport is missing, and `STATS webpush` shows a
+Delivery line.  Adding a `kc/*.c` file or a kc cmocka suite means editing `configure.in`, not
+the Makefiles.
 
 If kc code needs something from the ircd, add it to the adapter interface in
 `include/kc/kc_event.h` — do not reach across.
+
+## Persistent store keys fold names
+
+Channel, nick and account names are case-insensitive under the casemapping, but RocksDB compares bytes. **Every key builder folds the name components it embeds** with `db_casefold_bytes()` (`include/db_casefold.h`): `history.c` `build_key` / reply index / msgid-index tail / targets index / quota keys / seek prefixes, `metadata.c` `build_lmdb_key` (target **and** key name) and `build_readmarker_key`, the presence CF's channel half. Msgids, timestamps and session ids are case-sensitive data and stay as written.
+
+- **Never hand-build a key or a seek prefix** with `memcpy` / `ircd_snprintf("%s%c")`; call the builder (`build_key(buf, size, target, NULL, NULL)` yields the `target\0` prefix). A verbatim prefix silently scans an empty range.
+- Names read back from keys are folded. Show clients a live object's spelling (TARGETS uses `FindChannel(...)->chname`); compare stored names with `ircd_strcmp`, never `strcmp`.
+- `ToLower(c)` indexes its table from `CHAR_MIN`: pass a plain `char`. `ToLower((unsigned char)c)` reads past the table for bytes above 127.
+- Existing stores are rewritten once at open by `db_casefold_migrate()` (marker `schema/casefold` in the env's default CF; idempotent without it, so an interrupted run resumes next start). A new name-keyed CF must be added to the `cfs[]` list in `history_init` / `metadata_lmdb_init` with its component mask, plus a case in `ircd/test/db_casefold_cmocka.c` (in-memory fake store, no RocksDB needed).
+- Left unfolded on purpose: `bouncer_sessions` (opaque ids), webpush (canonical accounts only), multiline content (msgid keys).
 
 ## Config File Parsing
 

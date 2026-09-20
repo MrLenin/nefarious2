@@ -28,6 +28,7 @@
 
 #include "bouncer_session.h"
 #include "capab.h"
+#include "authtoken.h"
 #include "client.h"
 #include "ircd.h"
 #include "ircd_chattr.h"
@@ -376,15 +377,19 @@ static struct capabilities {
   _CAP(DRAFT_PREAWAY, 0, "draft/pre-away", FEAT_CAP_draft_pre_away),
   _CAP(DRAFT_MULTILINE, 0, "draft/multiline", FEAT_CAP_draft_multiline),
   _CAP(DRAFT_CHATHISTORY, 0, "draft/chathistory", FEAT_CAP_draft_chathistory),
+  _CAP(SOJU_SEARCH, 0, "soju.im/search", FEAT_CAP_soju_search),
   _CAP(DRAFT_EVENTPLAYBACK, 0, "draft/event-playback", FEAT_CAP_draft_event_playback),
   _CAP(DRAFT_REDACT, 0, "draft/message-redaction", FEAT_CAP_draft_message_redaction),
-  _CAP_V(DRAFT_ACCOUNTREG, 0, "draft/account-registration", FEAT_CAP_draft_account_registration, "before-connect,custom-account-name"),
+  _CAP_V(DRAFT_ACCOUNTREG, 0, "draft/account-registration", FEAT_CAP_draft_account_registration, "before-connect,custom-account-name,min-password-length=5,max-password-length=300"),
   _CAP(DRAFT_READMARKER, 0, "draft/read-marker", FEAT_CAP_draft_read_marker),
   _CAP(DRAFT_CHANRENAME, 0, "draft/channel-rename", FEAT_CAP_draft_channel_rename),
+  _CAP(EVILNET_RELOCATE, 0, "evilnet/channel-relocate", FEAT_CAP_evilnet_channel_relocate),
   _CAP_V(DRAFT_METADATA2, 0, "draft/metadata-2", FEAT_CAP_draft_metadata_2, "before-connect,max-subs=50,max-keys=20,max-value-bytes=300"),
   _CAP(DRAFT_WEBPUSH, 0, "draft/webpush", FEAT_CAP_draft_webpush),
+  _CAP(DRAFT_AUTHTOKEN, 0, "draft/authtoken", FEAT_CAP_draft_authtoken),
   _CAP(DRAFT_BOUNCER, 0, "draft/bouncer", FEAT_CAP_draft_bouncer),
   _CAP(DRAFT_PERSISTENCE, 0, "draft/persistence", FEAT_CAP_draft_persistence),
+  _CAP(DRAFT_OPERTAG, 0, "draft/oper-tag", FEAT_CAP_oper_tag),
 #ifdef USE_SSL
   _CAP(TLS, 0, "tls", FEAT_CAP_tls),
   _CAP(STS, CAPFL_PROHIBIT, "sts", FEAT_CAP_sts),
@@ -395,6 +400,64 @@ static struct capabilities {
 };
 
 #define CAPAB_LIST_LEN (sizeof(capab_list) / sizeof(struct capabilities))
+
+/** Backing store for capability values overridden at runtime.
+ *
+ * capab_list[].value is a plain char* that normally points at the string
+ * literal supplied by _CAP_V(), so an override needs storage that outlives
+ * the cap_set_value() call.  That storage deliberately does NOT live inside
+ * the capab_list entry: find_cap() qsort()s capab_list, and a pointer into
+ * the entry itself would not survive the shuffle.  Slots are keyed by
+ * capability and reused, so a rehash storm cannot exhaust them.
+ */
+#define CAP_VALUE_SLOTS 4
+#define CAP_VALUE_LEN   256
+
+static struct {
+  enum Capab cap;
+  char value[CAP_VALUE_LEN];
+} cap_value_store[CAP_VALUE_SLOTS];
+static int cap_value_count = 0;
+
+/** Overwrite a capability's advertised CAP 302 value at runtime.
+ *
+ * The value is copied, so the caller may pass a temporary.  An empty or
+ * NULL value clears the advertisement (the capability is then listed
+ * without an "=value" suffix).  Used by draft/account-registration to
+ * follow FEAT_REGISTER_VERIFY_EMAIL.
+ *
+ * @param[in] cap Capability to update.
+ * @param[in] value New value string, or NULL/"" to advertise no value.
+ */
+void cap_set_value(enum Capab cap, const char *value)
+{
+  size_t i;
+  int slot = -1;
+
+  for (i = 0; i < (size_t)cap_value_count; i++)
+    if (cap_value_store[i].cap == cap) {
+      slot = (int)i;
+      break;
+    }
+
+  if (slot < 0) {
+    if (cap_value_count >= CAP_VALUE_SLOTS)
+      return;                   /* out of slots; keep the compiled-in value */
+    slot = cap_value_count++;
+    cap_value_store[slot].cap = cap;
+  }
+
+  /* strlcpy semantics: the third argument is the buffer size. */
+  ircd_strncpy(cap_value_store[slot].value, value ? value : "",
+               sizeof(cap_value_store[slot].value));
+
+  for (i = 0; i < CAPAB_LIST_LEN; i++)
+    if (capab_list[i].cap == cap) {
+      capab_list[i].value = cap_value_store[slot].value[0] ?
+                            cap_value_store[slot].value : NULL;
+      return;
+    }
+}
 
 static int
 capab_sort(const struct capabilities *cap1, const struct capabilities *cap2)
@@ -528,6 +591,12 @@ send_caplist(struct Client *sptr, const struct CapSet *set,
     if (capab_list[i].cap == CAP_SASL && is_ls && !sasl_server_available())
       continue;
 
+    /* draft/authtoken is only worth negotiating (registration-burst
+     * SERVICELIST, TOKEN NEW/DEL) when a service exists; the TOKEN
+     * command itself never needs the cap. */
+    if (capab_list[i].cap == CAP_DRAFT_AUTHTOKEN && is_ls && !authtoken_service_count())
+      continue;
+
 #ifdef USE_SSL
     /* STS requires CAP 302+ for values to be meaningful */
     if (capab_list[i].cap == CAP_STS && is_ls && cap_version < 302)
@@ -568,8 +637,15 @@ send_caplist(struct Client *sptr, const struct CapSet *set,
         if (vapid)
           val_len = ircd_snprintf(0, valbuf, sizeof(valbuf), "=vapid=%s", vapid);
       } else if (capab_list[i].cap == CAP_DRAFT_CHATHISTORY) {
-        /* Bare integer for compatibility (goguma does int.parse on the value).
-         * Extended info (retention, pm) is available via ISUPPORT CHATHISTORY. */
+        /* NON-SPEC VALUE, kept deliberately (audit 2026-09-06 #29, checked
+         * against goguma's source): goguma reads this as its page size --
+         * `max = caps.chatHistory; if (max == 0) max = 1000` -- and stops
+         * paging a target's backlog when a page comes back SHORTER than
+         * max.  A bare cap therefore means max = 1000 against our clamp of
+         * CHATHISTORY_MAX rows: every full page looks short and goguma
+         * fetches ONE page per target.  Bare integer; the limit is also
+         * ISUPPORT CHATHISTORY=<n>.  Document any change in
+         * FEATURE_FLAGS_CONFIG.md. */
         val_len = ircd_snprintf(0, valbuf, sizeof(valbuf), "=%d",
                                 feature_int(FEAT_CHATHISTORY_MAX));
 #ifdef USE_SSL

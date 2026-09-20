@@ -30,7 +30,48 @@
 
 #include "ircd_defs.h"
 #include <stddef.h>
+#include <stdint.h>
 #include <time.h>
+
+struct HistoryMessage;
+
+/** Query-time row filter (presence-aware paging, 2026-09-02).
+ *
+ * Handed to history_query_*(); NULL means an unfiltered walk.  The walk
+ * calls @a fn for every row it builds; rows the hook rejects are freed
+ * and do NOT count toward the limit, so a page is @a limit VISIBLE rows
+ * and "fewer than limit" means the walk was exhausted (unless
+ * @a truncated is set).  The hook may name the nearest time in the walk
+ * direction at which rows can become visible again; the walk then seeks
+ * there instead of stepping through an invisible run. */
+struct HistoryRowFilter {
+  /** Return 1 to keep @a msg; 0 to skip it (optionally setting
+   * *@a skip_to, epoch milliseconds, to seek to); -1 to skip it and stop the
+   * walk because nothing further is visible in this direction. */
+  int (*fn)(const struct HistoryMessage *msg, int reverse, void *ctx,
+            int64_t *skip_to);
+  void *ctx;
+  /** Bit per HistoryMessageType the requester can receive; 0 = every
+   * type.  Rows of other types are skipped INSIDE the walk (like hook
+   * rejects, uncounted) instead of at send time, so a run of JOIN/PART
+   * rows longer than the limit can no longer hand a client without
+   * draft/event-playback an empty page while messages sit behind it
+   * (2026-09-06). */
+  unsigned int type_mask;
+  /** Optional per-row veto applied after the type mask: return 1 to skip
+   * the row (uncounted, no seek).  For content-level rejects such as
+   * typing-only TAGMSG rows that should never consume a page slot. */
+  int (*veto)(const struct HistoryMessage *msg, void *veto_ctx);
+  void *veto_ctx;
+  int scan_max;    /**< raw rows examined before giving up; 0 = default */
+  int scanned;     /**< out: raw rows examined (kept + skipped) */
+  int truncated;   /**< out: scan_max hit -- page may be incomplete */
+};
+
+/** Default raw-row scan cap for a filtered walk.  Boundary seeks keep
+ * real walks far below this; it is the safety net against a hook that
+ * never names a boundary. */
+#define HISTORY_FILTER_SCAN_MAX 20000
 
 struct Channel;
 struct Client;
@@ -69,7 +110,13 @@ enum HistoryMessageType {
   HISTORY_TAGMSG  = 8,
   HISTORY_GAP     = 9,  /**< Message not stored (sender opted out via +Y/+y) */
   HISTORY_NICK    = 10, /**< Nick change event */
-  HISTORY_REDACT  = 11  /**< Message redaction event */
+  HISTORY_REDACT  = 11, /**< Message redaction event */
+  HISTORY_MULTILINE = 12 /**< Multiline placeholder: real content lives in
+                          *   the ml_content store keyed by msgid.  The
+                          *   record type (not in-band content bytes) is
+                          *   what marks a record as multiline, so client
+                          *   message bytes can never forge one. */
+  ,HISTORY_TYPE_COUNT       /**< one past the last type (for masks) */
 };
 
 /** Stored message for chathistory retrieval.
@@ -97,6 +144,12 @@ struct HistoryMessage {
   size_t raw_content_len;              /**< Length of raw_content */
   struct HistoryMessage *next;         /**< Next in linked list (for results) */
   int is_context;                      /**< Non-zero if draft/chathistory-context message */
+  char ctx_parent[HISTORY_MSGID_LEN];  /**< Federated context child: parent msgid (else empty) */
+  /** Channel incarnation the row belongs to: the channel's creationtime
+   * at store time (0 = stamped before 2026-09-08, counts as current).
+   * A channel recreated on the losing side of a split is a different
+   * incarnation and its rows are not the surviving channel's history. */
+  time_t incarnation;
 };
 
 /** Target info for CHATHISTORY TARGETS query. */
@@ -201,7 +254,8 @@ extern int history_has_msgid(const char *msgid);
  */
 extern int history_query_before(const char *target, enum HistoryRefType ref_type,
                                  const char *reference, int limit,
-                                 struct HistoryMessage **result);
+                                 struct HistoryMessage **result,
+                                 struct HistoryRowFilter *filter);
 
 /** Query messages after a reference point.
  * @param[in] target Channel or nick to query.
@@ -213,7 +267,8 @@ extern int history_query_before(const char *target, enum HistoryRefType ref_type
  */
 extern int history_query_after(const char *target, enum HistoryRefType ref_type,
                                 const char *reference, int limit,
-                                struct HistoryMessage **result);
+                                struct HistoryMessage **result,
+                                struct HistoryRowFilter *filter);
 
 /** Query the most recent messages.
  * @param[in] target Channel or nick to query.
@@ -225,7 +280,8 @@ extern int history_query_after(const char *target, enum HistoryRefType ref_type,
  */
 extern int history_query_latest(const char *target, enum HistoryRefType ref_type,
                                  const char *reference, int limit,
-                                 struct HistoryMessage **result);
+                                 struct HistoryMessage **result,
+                                 struct HistoryRowFilter *filter);
 
 /** Query the most recent messages, but no older than a floor timestamp.
  * Walks backward from the end of the target's history, collecting up to
@@ -235,12 +291,19 @@ extern int history_query_latest(const char *target, enum HistoryRefType ref_type
  * @param[in] limit Maximum messages to return.
  * @param[in] after_timestamp Floor timestamp (Unix or ISO 8601); messages
  *            at or before this time are excluded.
+ * @param[in] after_msgid Optional msgid of the row AT the floor
+ *            timestamp: the floor becomes that full row key, so rows in
+ *            the same millisecond that sort after it are included and
+ *            the row itself (and its earlier same-ms siblings) is not.
+ *            NULL/empty = exclude the whole floor millisecond.
  * @param[out] result Pointer to result list head (caller must free).
  * @return Number of messages returned, or -1 on error.
  */
 extern int history_query_latest_after(const char *target, int limit,
                                        const char *after_timestamp,
-                                       struct HistoryMessage **result);
+                                       const char *after_msgid,
+                                       struct HistoryMessage **result,
+                                       struct HistoryRowFilter *filter);
 
 /** Query messages around a reference point.
  * Returns limit/2 messages before and limit/2 messages after.
@@ -253,7 +316,18 @@ extern int history_query_latest_after(const char *target, int limit,
  */
 extern int history_query_around(const char *target, enum HistoryRefType ref_type,
                                  const char *reference, int limit,
-                                 struct HistoryMessage **result);
+                                 struct HistoryMessage **result,
+                                 struct HistoryRowFilter *filter);
+
+/** Direction BETWEEN would walk for these selectors: 1 = descending
+ * (first selector newer), 0 = ascending, -1 = a msgid selector could not
+ * be resolved.  Shared by the walk, the federation origin's merge trim
+ * and the responder's overflow trim so all three agree. */
+extern time_t history_live_incarnation(const char *target);
+extern int history_purge_incarnation(const char *channel, time_t incarnation);
+extern int history_between_descending(const char *target,
+                                      enum HistoryRefType ref_type1, const char *reference1,
+                                      enum HistoryRefType ref_type2, const char *reference2);
 
 /** Query messages between two reference points.
  * @param[in] target Channel or nick to query.
@@ -268,7 +342,8 @@ extern int history_query_around(const char *target, enum HistoryRefType ref_type
 extern int history_query_between(const char *target,
                                   enum HistoryRefType ref_type1, const char *reference1,
                                   enum HistoryRefType ref_type2, const char *reference2,
-                                  int limit, struct HistoryMessage **result);
+                                  int limit, struct HistoryMessage **result,
+                                  struct HistoryRowFilter *filter);
 
 /** Query targets with recent message activity.
  * Used for CHATHISTORY TARGETS command.
@@ -278,8 +353,23 @@ extern int history_query_between(const char *target,
  * @param[out] result Pointer to result list head (caller must free).
  * @return Number of targets returned, or -1 on error.
  */
+/** The newest last-activity stamp across every stored target, in epoch
+ * milliseconds; 0 when the store is empty or unavailable.  Proof of life
+ * for crash recovery: the server was alive when it stored that row. */
+extern uint64_t history_newest_activity_ms(void);
+
+/** Per-target keep/skip hook for history_query_targets: 1 keeps the
+ * target (it counts toward the limit), 0 skips it.  The walk is in key
+ * order, not recency, so any filtering the caller would do afterwards
+ * (access, presence) must happen HERE or a server with more active
+ * targets than the limit crowds the caller's own targets out. */
+typedef int (*history_target_filter_fn)(const char *target, const char *last_ts,
+                                        void *ctx);
+
 extern int history_query_targets(const char *timestamp1, const char *timestamp2,
-                                  int limit, struct HistoryTarget **result);
+                                 int include_newer,
+                                 int limit, struct HistoryTarget **result,
+                                 history_target_filter_fn filter, void *filter_ctx);
 
 /** Find the most recent JOIN event for a nick in a channel.
  * Scans backward through the channel's history looking for a JOIN
@@ -323,7 +413,8 @@ extern int history_purge_old(unsigned long max_age_seconds);
 extern int history_msgid_to_timestamp(const char *msgid, char *timestamp);
 
 /** Check whether any PM record under @a target carries
- * `+afternet.org/sid=<sessid>` in its client_tags.  Used by the
+ * `+evilnet.github.io/sid=<sessid>` in its client_tags (legacy
+ * records: `+afternet.org/sid=`).  Used by the
  * chathistory PM access-check path to authorize an ephemeral
  * (unauthed) requester whose only durable identity is the session_id —
  * if the sessid appears in a stored record's tags, the requester was a
@@ -341,6 +432,11 @@ extern int history_msgid_to_timestamp(const char *msgid, char *timestamp);
  * @param sessid  Caller's cli_session_id to match against record tags.
  */
 extern int history_pm_target_has_sessid(const char *target, const char *sessid);
+extern char *history_forward_encode(char *dst, size_t dstsize,
+                                    const char *client_tags, const char *text);
+extern char *history_forward_split(char *content, char **tags_out);
+extern int history_deserialize_record(const void *data, size_t datalen,
+                                      struct HistoryMessage *msg);
 
 /** Redact a message: strip content/tags but keep the entry in the database.
  * Used instead of history_delete_message() to support REDACT-as-context.
@@ -351,6 +447,11 @@ extern int history_pm_target_has_sessid(const char *target, const char *sessid);
  * @return 0 on success, 1 if not found, -1 on error.
  */
 extern int history_redact_message(const char *target, const char *msgid);
+
+/** Has @a msgid under @a target already been redacted, i.e. does a
+ * REDACT context row reference it?
+ * @return 1 if redacted, 0 if not, -1 on error. */
+extern int history_message_is_redacted(const char *target, const char *msgid);
 
 /** Query context messages (reactions, redacts) for a set of parent msgids.
  * Looks up the reply index to find TAGMSG(+draft/react) and REDACT events
@@ -382,6 +483,29 @@ extern int history_is_available(void);
  * @return Pointer to buf.
  */
 extern char *history_format_timestamp(char *buf, size_t buflen);
+
+/** A stored row's time.  One rule for every store site (2026-09-02): the
+ * S2S tag time when the event arrived over @a link (the origin's stamp,
+ * which is also the live @time this server delivered), else the local
+ * HLC's current physical time -- which, read right after
+ * generate_msgid(), is exactly the mint time embedded in that msgid and
+ * the time send.c stamps on the live tag.  Before this every server
+ * stamped rows with its own clock at observation time, so the same
+ * msgid replayed with a different @time than it was delivered with on
+ * every non-origin server.  @a link may be NULL (local event). */
+struct Client;
+extern uint64_t history_event_time_ms(struct Client *link);
+
+/** Format an epoch-millisecond time as the storage stamp "sec.mmm". */
+extern void history_format_ms(char *buf, size_t buflen, uint64_t ms);
+
+/** Parse a storage stamp "sec[.mmm]" back to epoch milliseconds; 0 when
+ * unparseable. */
+extern uint64_t history_parse_ms(const char *ts);
+
+/** Format an epoch-millisecond time as the client @time value
+ * ("YYYY-MM-DDThh:mm:ss.mmmZ"). */
+extern void history_format_iso_ms(char *buf, size_t buflen, uint64_t ms);
 
 /** Convert Unix timestamp to ISO 8601 for client display.
  * @param[in] unix_ts Unix timestamp string (seconds.milliseconds).
@@ -567,14 +691,24 @@ extern int history_quota_check(const char *channel, const char *account, int cha
 
 /** Replay chathistory to a client since a given timestamp.
  * Used by bouncer auto-replay for legacy clients without draft/chathistory.
- * @param[in] sptr Client to send history to.
- * @param[in] target Channel or nick to replay.
- * @param[in] since_timestamp Unix timestamp (seconds.milliseconds) to replay from.
- * @param[in] limit Maximum messages to replay.
- * @return Number of messages replayed, or -1 on error.
+ * Build ONE page of history since a timestamp for a client exactly the way
+ * the on-demand CHATHISTORY handlers do (presence hook + requester type
+ * mask + typing veto inside the walk; context attached; redacted originals
+ * dropped; presence post-filter).  The single page builder shared with the
+ * bouncer reattach replay -- audit 2026-09-06 wave 1: the replay path had
+ * its own bare walk and drifted (replayed redacted content, no type mask).
+ * @param[in] sptr Requesting client.
+ * @param[in] target Storage target (channel, or a:b pair key).
+ * @param[in] limit Page size.
+ * @param[in] since_timestamp Floor ("sec.mmm"); rows at/after it.
+ * @param[out] out Page rows (oldest first), NULL when empty; caller owns.
+ * @param[out] complete 1 when the walk was exhausted (no more pages).
+ * @return Row count (0 = empty page), or -1 on error.
  */
-extern int chathistory_auto_replay(struct Client *sptr, const char *target,
-                                   const char *since_timestamp, int limit);
+extern int chathistory_page_since(struct Client *sptr, const char *target,
+                                  int limit, const char *since_timestamp,
+                                  const char *since_msgid,
+                                  struct HistoryMessage **out, int *complete);
 
 /** Free partial federation chunk reassembly buffers (CH B read responses and
  *  CH WB writes) that arrived from a server link that is now exiting, so they

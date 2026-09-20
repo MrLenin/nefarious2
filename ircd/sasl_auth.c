@@ -14,6 +14,8 @@
 
 #include "sasl_auth.h"
 #include "capab.h"
+#include "channel.h"
+#include "chathistory_presence.h"
 #include "client.h"
 #include "ircd.h"
 #include "ircd_alloc.h"
@@ -618,11 +620,32 @@ void sasl_complete_login(struct Client *sptr, const char *account,
     char type = IsAccount(sptr) ? 'M' : 'R';
 
     if (ircd_strcmp(cli_user(sptr)->account, cli_saslaccount(sptr)) != 0) {
+      char presence_old_acct[ACCOUNTLEN + 1];
+      ircd_strncpy(presence_old_acct, cli_user(sptr)->account,
+                   sizeof(presence_old_acct));
+
       /* Load account-linked metadata BEFORE setting account flag */
       metadata_load_account(sptr, cli_saslaccount(sptr));
 
       ircd_strncpy(cli_user(sptr)->account, cli_saslaccount(sptr), ACCOUNTLEN + 1);
       SetAccount(sptr);
+
+      /* Chathistory gate: this is the post-registration attach the
+       * authusers counter never saw (drift class: FLAG_ACCOUNT flip
+       * mid-membership).  Count only the false->true transition ('R');
+       * an account change ('M') is already counted. */
+      if (type == 'R')
+        channel_account_adjust(sptr, +1);
+
+      /* Strict-presence anchor transfer (self-gated on the feature):
+       * 'R' moves session->account carrying the open-interval start;
+       * 'M' renames account->account. */
+      if (type == 'R')
+        presence_anchor_transfer(sptr, cli_session_id(sptr), 1,
+                                 cli_user(sptr)->account, 0);
+      else
+        presence_anchor_transfer(sptr, presence_old_acct, 0,
+                                 cli_user(sptr)->account, 0);
 
       bounce_emit_alias_update(sptr, "account", cli_user(sptr)->account);
 
@@ -684,6 +707,15 @@ void sasl_complete_login(struct Client *sptr, const char *account,
 
 #ifdef USE_LIBKC
 
+/* Is this deployment's REGISTER policy "account is unusable until the
+ * e-mailed verification link is clicked"?  When it is, a Keycloak
+ * pending-required-action grant failure is a genuine "not verified yet"
+ * rather than an unrelated setup problem. */
+static int register_verify_email_policy(void)
+{
+  return feature_bool(FEAT_REGISTER_VERIFY_EMAIL);
+}
+
 /** Callback from kc_user_verify_password(). */
 static void sasl_plain_cb(int result, const struct kc_access_token *token, void *data)
 {
@@ -727,25 +759,38 @@ static void sasl_plain_cb(int result, const struct kc_access_token *token, void 
     sasl_complete_login(acptr, login_as,
                         token && token->created_at ? token->created_at : 0);
   } else {
-    /* Distinguish auth failures from connectivity errors.
-     * KC_FORBIDDEN = wrong password (HTTP 401/400) — Keycloak is working fine.
-     * KC_NOT_FOUND = user doesn't exist — Keycloak is working fine.
-     * Everything else (KC_ERROR, KC_UNAVAILABLE, KC_TIMEOUT, KC_TOKEN_ERROR,
-     * KC_INVALID_RESPONSE) indicates a connectivity or service problem.
-     */
-    if (result != KC_FORBIDDEN && result != KC_NOT_FOUND) {
-      sasl_mark_unhealthy(result);
-    }
+    if (result == KC_UNVERIFIED) {
+      /* Account exists and Keycloak is healthy — the account has a pending
+       * required action (email verification). Do NOT negcache (the password
+       * may be correct) and do NOT mark unhealthy. */
+      log_write(LS_SYSTEM, L_INFO, 0,
+                "SASL PLAIN: unverified account %s (client %C)",
+                session->authcid, acptr);
+      send_fail(acptr, "AUTHENTICATE", "VERIFICATION_REQUIRED", NULL,
+                "Your account email is not verified - check your email for "
+                "the verification link, then try again");
+      /* fall into the shared cleanup below (state/cookie/timers/session) */
+    } else {
+      /* Distinguish auth failures from connectivity errors.
+       * KC_FORBIDDEN = wrong password (HTTP 401/400) — Keycloak is working fine.
+       * KC_NOT_FOUND = user doesn't exist — Keycloak is working fine.
+       * Everything else (KC_ERROR, KC_UNAVAILABLE, KC_TIMEOUT, KC_TOKEN_ERROR,
+       * KC_INVALID_RESPONSE) indicates a connectivity or service problem.
+       */
+      if (result != KC_FORBIDDEN && result != KC_NOT_FOUND) {
+        sasl_mark_unhealthy(result);
+      }
 
-    /* Update auth caches — only for actual auth failures, not connectivity errors */
-    if ((result == KC_FORBIDDEN || result == KC_NOT_FOUND) && session->cred_hash_valid) {
-      negcache_insert(session->authcid, session->cred_hash);
-      poscache_remove(session->cred_hash);
-    }
+      /* Update auth caches — only for actual auth failures, not connectivity errors */
+      if ((result == KC_FORBIDDEN || result == KC_NOT_FOUND) && session->cred_hash_valid) {
+        negcache_insert(session->authcid, session->cred_hash);
+        poscache_remove(session->cred_hash);
+      }
 
-    log_write(LS_SYSTEM, L_INFO, 0,
-              "SASL PLAIN: Failed authentication for %s (client %C, result %d)",
-              session->authcid, acptr, result);
+      log_write(LS_SYSTEM, L_INFO, 0,
+                "SASL PLAIN: Failed authentication for %s (client %C, result %d)",
+                session->authcid, acptr, result);
+    }
     /* Send failure and clean up */
     send_reply(acptr, ERR_SASLFAIL, "");
     session->state = SASL_STATE_FAILED;
@@ -1333,6 +1378,32 @@ static void sasl_scram_creds_cb(int result, const struct kc_user *user, void *da
     log_write(LS_SYSTEM, L_INFO, 0,
               "SASL SCRAM: No SCRAM credentials for %s (client %C)",
               session->authcid, acptr);
+    send_reply(acptr, ERR_SASLFAIL, "");
+    session->state = SASL_STATE_FAILED;
+    cli_saslcookie(acptr) = 0;
+    cli_saslstart(acptr) = 0;
+    if (t_active(&cli_sasltimeout(acptr)))
+      timer_del(&cli_sasltimeout(acptr));
+    sasl_session_free(acptr);
+    if (cli_auth(acptr))
+      auth_sasl_done(cli_auth(acptr));
+    return;
+  }
+
+  /* Spec: SCRAM verifies locally and bypasses the ROPC required-action
+   * gate, so enforce the verification policy here.  Parity with PLAIN:
+   * key on the pending VERIFY_EMAIL required action (what the ROPC
+   * "Account is not fully set up" error keys on), NOT the bare
+   * emailVerified flag -- legacy accounts all have emailVerified=false
+   * but no pending action, and must not be locked out when the policy
+   * is enabled. */
+  if (register_verify_email_policy() && user->verify_email_pending) {
+    log_write(LS_SYSTEM, L_INFO, 0,
+              "SASL SCRAM: unverified account %s (client %C)",
+              session->authcid, acptr);
+    send_fail(acptr, "AUTHENTICATE", "VERIFICATION_REQUIRED", NULL,
+              "Your account email is not verified - check your email for "
+              "the verification link, then try again");
     send_reply(acptr, ERR_SASLFAIL, "");
     session->state = SASL_STATE_FAILED;
     cli_saslcookie(acptr) = 0;

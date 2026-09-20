@@ -29,6 +29,7 @@
 #include "class.h"
 #include "crdt_hlc.h"
 #include "crdt_shadow.h"
+#include "authtoken.h"
 #include "client.h"
 #include "forwarded_label.h"
 #include "channel.h"
@@ -979,6 +980,14 @@ struct Message msgtab[] = {
     "subcommand target ref [ref] limit - Query message history"
   },
   {
+    MSG_SEARCH,
+    TOK_SEARCH,
+    0, MAXPARA, MFLG_SLOW, 0, NULL,
+    /* UNREG, CLIENT, SERVER, OPER, SERVICE */
+    { m_unregistered, m_search, m_ignore, m_search, m_ignore },
+    "in=<target> [from=<nick>] [text=<words>] [after=<ts>] [before=<ts>] [limit=<n>] - Search message history (soju.im/search)"
+  },
+  {
     MSG_HISTORY,
     TOK_HISTORY,
     0, MAXPARA, MFLG_SLOW, 0, NULL,
@@ -1011,20 +1020,20 @@ struct Message msgtab[] = {
     "<account> <code> - Verify account registration"
   },
   {
-    MSG_REGREPLY,
-    TOK_REGREPLY,
-    0, MAXPARA, 0, 0, NULL,
-    /* UNREG, CLIENT, SERVER, OPER, SERVICE */
-    { m_ignore, m_ignore, ms_regreply, m_ignore, ms_regreply },
-    ""
-  },
-  {
     MSG_MARKREAD,
     TOK_MARKREAD,
     0, MAXPARA, MFLG_SLOW, 0, NULL,
     /* UNREG, CLIENT, SERVER, OPER, SERVICE */
     { m_unregistered, m_markread, ms_markread, m_markread, m_ignore },
     "<target> [timestamp=<ts>] - Get or set read marker for target"
+  },
+  {
+    MSG_PRESENCE,
+    TOK_PRESENCE,
+    0, MAXPARA, MFLG_SLOW, 0, NULL,
+    /* UNREG, CLIENT, SERVER, OPER, SERVICE */
+    { m_unregistered, m_ignore, ms_presencesync, m_ignore, m_ignore },
+    "S2S-only: strict-presence interval replication"
   },
   {
     MSG_RENAME,
@@ -1035,12 +1044,28 @@ struct Message msgtab[] = {
     "<oldchannel> <newchannel> [:<reason>] - Rename a channel"
   },
   {
+    MSG_RELOCATE,
+    TOK_RELOCATE,
+    0, MAXPARA, MFLG_SLOW, 0, NULL,
+    /* UNREG, CLIENT, SERVER, OPER, SERVICE */
+    { m_ignore, m_ignore, m_ignore, m_ignore, m_ignore },
+    "<oldchannel> <newchannel> [:<reason>] - Server-to-client relocation notice (no client command)"
+  },
+  {
     MSG_METADATA,
     TOK_METADATA,
     0, MAXPARA, MFLG_SLOW, 0, NULL,
     /* UNREG, CLIENT, SERVER, OPER, SERVICE */
     { m_metadata, m_metadata, ms_metadata, m_metadata, m_ignore },
     "<subcommand> [args] - Manage user/channel metadata"
+  },
+  {
+    MSG_TOKEN,
+    TOK_TOKEN,
+    0, MAXPARA, MFLG_SLOW, 0, NULL,
+    /* UNREG, CLIENT, SERVER, OPER, SERVICE */
+    { mr_token, m_token, ms_token, m_token, m_ignore },
+    "SERVICELIST|GENERATE <service> [scope]|VALIDATE <service> :<token> - draft/authtoken"
   },
   {
     MSG_WEBPUSH,
@@ -1554,6 +1579,13 @@ parse_client(struct Client *cptr, char *buffer, char *bufend)
           /* IRCv3 CLIENTTAGDENY: check if this tag is blocked by operator config */
           if (is_client_tag_denied(tag_name, tag_len))
             ; /* Tag is denied, silently drop it */
+          /* Reserved vendor namespace: a client must not squat
+           * `+afternet.org/*`, which the server authors and trusts
+           * (e.g. the `+evilnet.github.io/sid=` PM-history auth marker;
+           * the legacy `+afternet.org/` namespace stays reserved too).
+           * Drop silently, same as a denied tag. */
+          else if (is_reserved_vendor_tag(tag_name, tag_len))
+            ; /* Reserved for the server, silently drop it */
           /* Copy client-only tag to buffer for TAGMSG relay.
            * IRCv3 message-tags spec: 4094 bytes max for client-only tags.
            * Silently drop excess tags rather than rejecting the message.

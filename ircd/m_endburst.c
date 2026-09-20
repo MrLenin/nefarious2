@@ -84,6 +84,7 @@
 #include "bouncer_session.h"
 #include "capab.h"
 #include "channel.h"
+#include "chathistory_presence.h"
 #include "client.h"
 #include "crdt_shadow.h"
 #include "handlers.h"
@@ -205,6 +206,17 @@ int ms_end_of_burst(struct Client* cptr, struct Client* sptr, int parc, char* pa
      * been processed and any colliding ghosts have already been
      * killed by m_nick.) */
 
+    /* Strict-presence #6 step 2: catch the newly-linked peer up on
+     * closed account intervals it could not have observed (netsplit
+     * windows, downtime, brand-new servers) -- their PN broadcasts
+     * were lost while the link was down.  Self-gated on the feature
+     * and storage availability; union application on the receiver
+     * makes repeat syncs across relinks harmless. */
+    /* Legacy peers (X3, vanilla ircu) do not speak PN and logged every
+     * line as a parse error -- up to 20000 of them per relink (audit P4). */
+    if (IsIRCv3Aware(sptr))
+      presence_burst_sync(sptr);
+
     /* Advertise chathistory storage capability (CH A S) to newly linked server.
      * Only advertise if we have CHATHISTORY_STORE enabled - this indicates we
      * actually store messages locally, not just handle queries.
@@ -219,6 +231,12 @@ int ms_end_of_burst(struct Client* cptr, struct Client* sptr, int parc, char* pa
       /* Layer 1: Also send channel advertisements (CH A F) */
       send_channel_advertisements(sptr);
     }
+    /* Re-advertise storage servers already known to us so the new peer
+     * can federate to the whole network, not just its own subtree
+     * (audit 2026-09-06 #21).  Independent of OUR storage: the relay-only
+     * hub is exactly the topology that needs it (re-review R11). */
+    if (IsIRCv3Aware(sptr))
+      chathistory_reflood_ads(sptr);
 
     /* 5-5f B4: a legacy CH-capable peer also gets ads synthesized on behalf
      * of doc-known mesh stores it could never hear from directly (their

@@ -60,41 +60,40 @@
  * @param[in] msgid Message ID.
  * @param[in] reason Reason (may be NULL).
  */
+/** Send one REDACT line to a local client that has the capability.
+ * The sender only sees its own REDACT with echo-message, as with any
+ * other message it originates. */
+static void send_redact_to(struct Client *sptr, struct Client *acptr,
+                           const char *target, const char *msgid,
+                           const char *reason)
+{
+  if (!MyUser(acptr) || !CapActive(acptr, CAP_DRAFT_REDACT))
+    return;
+  if (acptr == sptr && !CapOwnHas(sptr, CAP_ECHOMSG))
+    return;
+
+  /* Set stc_withcap so send_buffer routes per-connection */
+  cap_route_ctx.stc_active = 1;
+  cap_route_ctx.stc_withcap = CAP_DRAFT_REDACT;
+  cap_route_ctx.stc_skipcap = CAP_NONE;
+
+  if (reason && *reason)
+    sendcmdto_one(sptr, CMD_REDACT, acptr, "%s %s :%s", target, msgid, reason);
+  else
+    sendcmdto_one(sptr, CMD_REDACT, acptr, "%s %s", target, msgid);
+
+  cap_route_ctx.stc_active = 0;
+  cap_route_ctx.stc_withcap = CAP_NONE;
+}
+
 static void propagate_redact_to_channel(struct Client *sptr, struct Channel *chptr,
                                          const char *target, const char *msgid,
                                          const char *reason)
 {
   struct Membership *member;
 
-  for (member = chptr->members; member; member = member->next_member) {
-    struct Client *acptr = member->user;
-
-    /* Only send to local clients with message-redaction capability */
-    if (!MyUser(acptr))
-      continue;
-    if (!CapActive(acptr, CAP_DRAFT_REDACT))
-      continue;
-
-    /* Sender echo: only send back to sender if they have echo-message */
-    if (acptr == sptr) {
-      if (!CapOwnHas(sptr, CAP_ECHOMSG))
-        continue;
-    }
-
-    /* Set stc_withcap so send_buffer routes per-connection */
-    cap_route_ctx.stc_active = 1;
-    cap_route_ctx.stc_withcap = CAP_DRAFT_REDACT;
-    cap_route_ctx.stc_skipcap = CAP_NONE;
-
-    if (reason && *reason) {
-      sendcmdto_one(sptr, CMD_REDACT, acptr, "%s %s :%s", target, msgid, reason);
-    } else {
-      sendcmdto_one(sptr, CMD_REDACT, acptr, "%s %s", target, msgid);
-    }
-
-    cap_route_ctx.stc_active = 0;
-    cap_route_ctx.stc_withcap = CAP_NONE;
-  }
+  for (member = chptr->members; member; member = member->next_member)
+    send_redact_to(sptr, member->user, target, msgid, reason);
 }
 
 /** m_redact - Handle REDACT command from local client.
@@ -157,10 +156,19 @@ int m_redact(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
               "No such channel");
     return 0;
   }
+  /* The history store is keyed by the channel's canonical spelling
+   * (build_key never folds case); a redaction typed as "#linux" for a
+   * channel created as "#Linux" must delete and record under the
+   * canonical name or it silently never takes effect in history. */
+  target = chptr->chname;
 
   if (!cli_user(sptr)) {
-    send_fail(sptr, "REDACT", "REDACT_FORBIDDEN", NULL,
-              "You must be fully registered to use REDACT");
+    {
+      char fctx[BUFSIZE];   /* spec: <target> <msgid> */
+      ircd_snprintf(0, fctx, sizeof(fctx), "%s %s", target, msgid);
+      send_fail(sptr, "REDACT", "REDACT_FORBIDDEN", fctx,
+                "You must be fully registered to use REDACT");
+    }
     return 0;
   }
 
@@ -191,6 +199,13 @@ int m_redact(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
     } else if (rc < 0) {
       /* Database error - allow redaction anyway (trust client) */
       can_redact = 1;
+    } else if (msg->type != HISTORY_PRIVMSG && msg->type != HISTORY_NOTICE
+               && msg->type != HISTORY_TAGMSG && msg->type != HISTORY_MULTILINE) {
+      /* spec: the msgid MUST name a PRIVMSG, NOTICE or TAGMSG; a JOIN or
+       * MODE row is not redactable (audit 2026-09-06 #59). */
+      send_fail(sptr, "REDACT", "UNKNOWN_MSGID", fail_ctx, "Not a message");
+      history_free_messages(msg);
+      return 0;
     } else {
       /* Found the message - get actual timestamp for window check */
       msg_time = (time_t)strtoul(msg->timestamp, NULL, 10);
@@ -200,8 +215,12 @@ int m_redact(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
         window = (time_t)feature_int(FEAT_REDACT_OPER_WINDOW);
         if (window > 0 && (CurrentTime - msg_time) > window) {
           history_free_messages(msg);
-          send_fail(sptr, "REDACT", "REDACT_WINDOW_EXPIRED", fail_ctx,
-                    "Redaction window has expired");
+          {
+            char wctx[BUFSIZE];   /* spec: <target> <msgid> <window> */
+            ircd_snprintf(0, wctx, sizeof(wctx), "%s %ld", fail_ctx, (long)window);
+            send_fail(sptr, "REDACT", "REDACT_WINDOW_EXPIRED", wctx,
+                      "Redaction window has expired");
+          }
           return 0;
         }
         can_redact = 1;
@@ -226,8 +245,12 @@ int m_redact(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
         window = (time_t)feature_int(FEAT_REDACT_WINDOW);
         if (window > 0 && (CurrentTime - msg_time) > window) {
           history_free_messages(msg);
-          send_fail(sptr, "REDACT", "REDACT_WINDOW_EXPIRED", fail_ctx,
-                    "Redaction window has expired");
+          {
+            char wctx[BUFSIZE];   /* spec: <target> <msgid> <window> */
+            ircd_snprintf(0, wctx, sizeof(wctx), "%s %ld", fail_ctx, (long)window);
+            send_fail(sptr, "REDACT", "REDACT_WINDOW_EXPIRED", wctx,
+                      "Redaction window has expired");
+          }
           return 0;
         }
 
@@ -241,6 +264,18 @@ int m_redact(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
         history_free_messages(msg);
         send_fail(sptr, "REDACT", "REDACT_FORBIDDEN", fail_ctx,
                   "You are not authorized to redact this message");
+        return 0;
+      }
+
+      /* Already redacted: the row is kept as a placeholder with a REDACT
+       * context child (the spec's second option for history), so it still
+       * exists and UNKNOWN_MSGID would be wrong.  Answer the requester as a
+       * success -- a client that missed the first REDACT gets a consistent
+       * reply -- but store no second context row and repeat nothing to the
+       * channel or the network.  The spec is silent on repeats. */
+      if (history_message_is_redacted(target, msgid) == 1) {
+        history_free_messages(msg);
+        send_redact_to(sptr, sptr, target, msgid, reason);
         return 0;
       }
 
@@ -271,12 +306,10 @@ int m_redact(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
    * live channel broadcast, and S2S relay. */
   {
     char redact_msgid[HISTORY_MSGID_LEN];
-    struct timeval tv;
     uint64_t time_ms;
 
     generate_msgid(redact_msgid, sizeof(redact_msgid));
-    gettimeofday(&tv, NULL);
-    time_ms = (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+    time_ms = history_event_time_ms(NULL);   /* the msgid's own mint time (audit #16) */
 
     /* Store REDACT event in history */
     if (history_is_available()) {
@@ -284,9 +317,7 @@ int m_redact(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
       char sender[HISTORY_SENDER_LEN];
       char redact_content[512];
 
-      ircd_snprintf(0, timestamp, sizeof(timestamp), "%lu.%03lu",
-                    (unsigned long)tv.tv_sec,
-                    (unsigned long)(tv.tv_usec / 1000));
+      history_format_ms(timestamp, sizeof(timestamp), time_ms);
       ircd_snprintf(0, sender, sizeof(sender), "%s!%s@%s",
                     cli_name(sptr), cli_user(sptr)->username,
                     cli_user(sptr)->host);
@@ -302,15 +333,20 @@ int m_redact(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
                             cli_user(sptr)->account[0] ? cli_user(sptr)->account : "",
                             HISTORY_REDACT, redact_content, NULL);
 
-      /* Write-forward to STORE servers if we're non-STORE */
-      if (chptr)
+      /* Write-forward to STORE servers if we're non-STORE.  The reason
+       * is client-supplied: sentinel-escape it for the CH W payload. */
+      if (chptr) {
+        char fwd_content[sizeof(redact_content) * 2 + 1];
+        history_forward_encode(fwd_content, sizeof(fwd_content), NULL,
+                               redact_content);
         forward_history_write(chptr, sptr, redact_msgid, timestamp,
-                              HISTORY_REDACT, redact_content);
+                              HISTORY_REDACT, fwd_content);
+      }
     }
 
     /* Set msgid for live channel broadcast */
     if (feature_bool(FEAT_MSGID))
-      sendcmdto_set_client_msgid(redact_msgid);
+      sendcmdto_set_client_event(redact_msgid, time_ms);
 
     /* Propagate to channel members with capability */
     propagate_redact_to_channel(sptr, chptr, target, msgid, reason);
@@ -363,6 +399,8 @@ int ms_redact(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
   if (IsChannelName(target)) {
     chptr = FindChannel(target);
     if (chptr) {
+      /* Store keys are the canonical spelling (see m_redact). */
+      target = chptr->chname;
       /* Redact message: strip content but keep entry for context */
       if (history_is_available()) {
         history_redact_message(target, msgid);
@@ -371,7 +409,6 @@ int ms_redact(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
       /* Use incoming S2S msgid for the REDACT event, or generate new */
       {
         char redact_msgid[HISTORY_MSGID_LEN];
-        struct timeval tv;
         uint64_t time_ms;
 
         if (cli_s2s_msgid(cptr)[0])
@@ -379,15 +416,14 @@ int ms_redact(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
         else
           generate_msgid(redact_msgid, sizeof(redact_msgid));
 
-        if (cli_s2s_time_ms(cptr))
-          time_ms = cli_s2s_time_ms(cptr);
-        else {
-          gettimeofday(&tv, NULL);
-          time_ms = (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
-        }
+        time_ms = history_event_time_ms(cptr);   /* origin tag time, else HLC */
 
-        /* Store REDACT event in history */
-        if (history_is_available()) {
+        /* Store REDACT event in history -- once.  A repeat arriving over
+         * the network (two servers or two users redacting the same message)
+         * is still shown to local members and relayed, but a message has
+         * one REDACT context row. */
+        if (history_is_available()
+            && history_message_is_redacted(target, msgid) != 1) {
           char timestamp[32];
           char sender[HISTORY_SENDER_LEN];
           char redact_content[512];
@@ -418,7 +454,7 @@ int ms_redact(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
 
         /* Set msgid for live channel broadcast */
         if (feature_bool(FEAT_MSGID))
-          sendcmdto_set_client_msgid(redact_msgid);
+          sendcmdto_set_client_event(redact_msgid, time_ms);
 
         /* Propagate to channel members with capability */
         propagate_redact_to_channel(sptr, chptr, target, msgid, reason);

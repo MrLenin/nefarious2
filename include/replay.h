@@ -50,6 +50,13 @@ enum ReplayPhase {
 /** Async replay state, stored on Connection (like ListingArgs for LIST).
  * Handles both single-batch CHATHISTORY and multi-channel bouncer replay.
  */
+/** Flags for the `complete` argument of replay_start_batch and its
+ * callers.  REPLAY_PARTIAL: a known storage server was away over the span
+ * or a responder was cut; the opener carries
+ * evilnet.github.io/chathistory-partial and never chathistory-end. */
+#define REPLAY_COMPLETE 1
+#define REPLAY_PARTIAL  2
+
 struct ReplayState {
   /* === Message-level iteration (current batch) === */
   struct HistoryMessage *messages;    /**< Owned linked list */
@@ -69,6 +76,13 @@ struct ReplayState {
   char label[64];                     /**< Labeled-response label (first batch only) */
   int label_used;                     /**< Whether label was applied */
   int is_last_page;                   /**< True if query returned fewer results than limit */
+  int is_partial;                     /**< evilnet.github.io/chathistory-partial on the opener */
+
+  /** A bouncer catch-up suspended while this on-demand page is served;
+   * reinstalled and continued when this state is freed (audit #26/#20:
+   * the single slot used to CANCEL the catch-up on the client's first
+   * own CHATHISTORY, silently dropping every later channel and PM). */
+  struct ReplayState *resume;
 
   /* === Multi-channel iteration (bouncer replay) === */
   enum ReplayPhase phase;
@@ -78,6 +92,8 @@ struct ReplayState {
   int replay_limit;                   /**< Per-channel/PM message limit */
   time_t since_time;                  /**< Baseline for read marker comparison */
   char since_timestamp[32];          /**< Formatted "unix.000" string */
+  char since_msgid[64];               /**< Cursor row at since_timestamp
+                                           (ATTACH cursor), else empty */
   int total_replayed;                 /**< Running total for summary */
   int chan_count;                      /**< Channels with messages */
   int pm_count;                       /**< PMs replayed */
@@ -106,7 +122,9 @@ struct ReplayState {
  */
 extern void replay_start_batch(struct Client *sptr, const char *target,
                                 struct HistoryMessage *messages, int count,
-                                int ops_override, const char *label);
+                                int ops_override, const char *label,
+                                int complete,
+                               const char *requested);
 
 /** Start async bouncer auto-replay across all channels + PMs.
  * Builds channel name list from current memberships, starts replaying
@@ -115,6 +133,11 @@ extern void replay_start_batch(struct Client *sptr, const char *target,
  * @param[in] since_time Baseline timestamp for replay.
  * @param[in] limit Per-channel/PM message limit.
  */
+extern void replay_start_bouncer_at(struct Client *sptr,
+                                    const char *since_timestamp,
+                                    const char *since_msgid, int limit);
+extern void replay_start_catchup(struct Client *sptr, time_t since_time,
+                                 int limit);
 extern void replay_start_bouncer(struct Client *sptr, time_t since_time,
                                   int limit);
 
@@ -133,6 +156,22 @@ extern void replay_continue(struct Client *sptr);
  */
 extern void replay_cancel(struct Client *sptr);
 
+/** Name the other party of the PM pair key @a pair_key for @a sptr: the
+ * live client on the other half's account, else the newest row's sender
+ * as they last used it (own rows contribute their original target).
+ * @return 1 and the nick in @a buf; 0 when there is nobody to name
+ *         (the other half is a session id with no usable row) or the
+ *         other party is a service bot. */
+extern int replay_pm_display_nick(struct Client *sptr, const char *pair_key,
+                                  char *buf, size_t buflen);
+
+/** The reverse: the PM pair key of @a sptr's conversation whose other
+ * party replay_pm_display_nick names @a nick -- how a departed
+ * unauthenticated correspondent, listed by nick, is found again.
+ * @return 1 and the pair key in @a out, else 0. */
+extern int replay_pm_pair_for_nick(struct Client *sptr, const char *nick,
+                                   char *out, size_t outsz);
+
 /** Check if sendQ has room for more replay messages.
  * Uses FEAT_REPLAY_SENDQ_THRESHOLD (default 50% of limit).
  * Also used by federation replay paths and multiline echo.
@@ -140,5 +179,9 @@ extern void replay_cancel(struct Client *sptr);
  * @return Non-zero if OK to continue, zero if should pause.
  */
 extern int sendq_replay_ok(struct Client *sptr);
+
+/** Is @a m a row @a sptr sent (by account when logged in, else by nick)?
+ * Decides the wire target of a replayed or searched PM row. */
+extern int pm_row_is_own(struct Client *sptr, const struct HistoryMessage *m);
 
 #endif /* INCLUDED_replay_h */

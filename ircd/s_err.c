@@ -1376,7 +1376,7 @@ static Numeric replyTable[] = {
 /* 671 */
   { RPL_WHOISSSL, "%s :is connected via SSL", "671" },
 /* 672 */
-  { 0 },
+  { RPL_WHOISWEBSOCKET, "%s :is connected via WebSocket (origin: %s)", "672" },
 /* 673 */
   { 0 },
 /* 674 */
@@ -1984,6 +1984,14 @@ static Numeric replyTable[] = {
 /* 975 */
   { 0 }
 };
+
+/* replyTable is indexed by numeric value: every unused numeric must hold a
+ * { 0 } placeholder, and a new numeric must REPLACE its placeholder -- an
+ * inserted extra line shifts every later numeric and corrupts all lookups
+ * above it (production assert at get_error_numeric, 2026-08-27).  Fail the
+ * build if the table size ever drifts from the numeric space. */
+typedef char replyTable_must_have_one_slot_per_numeric
+    [(sizeof(replyTable) / sizeof(replyTable[0]) == ERR_LASTERROR + 1) ? 1 : -1];
 
 /** Return a pointer to the Numeric for a particular code.
  * @param n %Numeric to look up.

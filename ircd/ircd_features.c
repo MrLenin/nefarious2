@@ -23,9 +23,12 @@
 #include "config.h"
 
 #include "ircd_features.h"
+#include "handlers.h"
+#include "chathistory_presence.h"
 #include "capab.h"	/* send_cap_notify */
 #include "channel.h"	/* list_set_default */
 #include "class.h"
+#include "authtoken.h"
 #include "client.h"
 #include "hash.h"
 #include "history.h"
@@ -488,9 +491,62 @@ set_isupport_utf8only(void)
 static void
 set_isupport_clienttagdeny(void)
 {
+    /* #600: "Servers MUST NOT advertise the same tag twice in the
+     * list, negated or otherwise."  Sanitize the operator string:
+     * exact duplicates dropped; when a tag appears both negated and
+     * plain, only the negated form survives (matching the evaluator,
+     * where negation wins). */
     const char *deny_list = feature_str(FEAT_CLIENTTAGDENY);
-    if (deny_list && *deny_list)
-        add_isupport_s("CLIENTTAGDENY", deny_list);
+    static char clean[BUFSIZE];
+    char work[BUFSIZE];
+    char haystack[BUFSIZE + 2];
+    char *saveptr = NULL;
+    char *tok;
+
+    if (!deny_list || !*deny_list) {
+        del_isupport("CLIENTTAGDENY");
+        return;
+    }
+
+    ircd_strncpy(work, deny_list, sizeof(work));
+    clean[0] = '\0';
+    for (tok = strtok_r(work, ",", &saveptr); tok;
+         tok = strtok_r(NULL, ",", &saveptr)) {
+        const char *name = (*tok == '-') ? tok + 1 : tok;
+        char probe_neg[520], probe_plain[520];
+        size_t cur;
+        if (!*name)
+            continue;
+        ircd_snprintf(0, probe_neg, sizeof(probe_neg), ",-%s,", name);
+        ircd_snprintf(0, probe_plain, sizeof(probe_plain), ",%s,", name);
+        ircd_snprintf(0, haystack, sizeof(haystack), ",%s,", clean);
+        if (strstr(haystack, probe_neg))
+            continue;   /* negated form already advertised */
+        if (strstr(haystack, probe_plain)) {
+            if (*tok == '-') {
+                /* plain form emitted earlier; negation must win */
+                char *hit = strstr(clean, probe_plain + 1);
+                while (hit && hit != clean && hit[-1] != ',')
+                    hit = strstr(hit + 1, probe_plain + 1);
+                if (hit && strlen(clean) + 2 < sizeof(clean)) {
+                    memmove(hit + 1, hit, strlen(hit) + 1);
+                    *hit = '-';
+                }
+            }
+            continue;
+        }
+        cur = strlen(clean);
+        if (cur + strlen(tok) + 2 >= sizeof(clean))
+            break;
+        if (cur) {
+            clean[cur++] = ',';
+            clean[cur] = '\0';
+        }
+        memcpy(clean + cur, tok, strlen(tok) + 1);
+    }
+
+    if (clean[0])
+        add_isupport_s("CLIENTTAGDENY", clean);
     else
         del_isupport("CLIENTTAGDENY");
 }
@@ -567,7 +623,18 @@ static void feature_notify_cap_##featname(void) { \
 }
 
 /* Generate notify functions for simple caps (no parameters) */
+/** draft/authtoken: CAP NEW only makes sense with a configured service. */
+static void feature_notify_cap_draft_authtoken(void)
+{
+  if (feature_bool(FEAT_CAP_draft_authtoken)) {
+    if (authtoken_service_count())
+      send_cap_notify("draft/authtoken", 1, NULL);
+  } else
+    send_cap_notify("draft/authtoken", 0, NULL);
+}
+
 DEFINE_CAP_NOTIFY("multi-prefix", multi_prefix)
+DEFINE_CAP_NOTIFY("soju.im/search", soju_search)
 DEFINE_CAP_NOTIFY("userhost-in-names", userhost_in_names)
 DEFINE_CAP_NOTIFY("extended-join", extended_join)
 DEFINE_CAP_NOTIFY("away-notify", away_notify)
@@ -576,6 +643,7 @@ DEFINE_CAP_NOTIFY("cap-notify", cap_notify)
 DEFINE_CAP_NOTIFY("server-time", server_time)
 DEFINE_CAP_NOTIFY("echo-message", echo_message)
 DEFINE_CAP_NOTIFY("account-tag", account_tag)
+DEFINE_CAP_NOTIFY("draft/oper-tag", oper_tag)
 DEFINE_CAP_NOTIFY("chghost", chghost)
 DEFINE_CAP_NOTIFY("invite-notify", invite_notify)
 DEFINE_CAP_NOTIFY("labeled-response", labeled_response)
@@ -588,9 +656,9 @@ DEFINE_CAP_NOTIFY("draft/extended-isupport", draft_extended_isupport)
 DEFINE_CAP_NOTIFY("draft/pre-away", draft_pre_away)
 DEFINE_CAP_NOTIFY("draft/event-playback", draft_event_playback)
 DEFINE_CAP_NOTIFY("draft/message-redaction", draft_message_redaction)
-DEFINE_CAP_NOTIFY("draft/account-registration", draft_account_registration)
 DEFINE_CAP_NOTIFY("draft/read-marker", draft_read_marker)
 DEFINE_CAP_NOTIFY("draft/channel-rename", draft_channel_rename)
+DEFINE_CAP_NOTIFY("evilnet/channel-relocate", evilnet_channel_relocate)
 DEFINE_CAP_NOTIFY("draft/metadata-2", draft_metadata_2)
 DEFINE_CAP_NOTIFY("draft/bouncer", draft_bouncer)
 DEFINE_CAP_NOTIFY("draft/persistence", draft_persistence)
@@ -631,6 +699,35 @@ feature_notify_cap_sts(void)
  * Called when CHATHISTORY_RETENTION is modified via SET or REHASH.
  * Only sends if we're a storage server (CHATHISTORY_STORE enabled).
  */
+/** Notify handler for FEAT_CHATHISTORY_STRICT_PRESENCE.  A runtime
+ * flip to ON leaves every pre-existing membership without an open
+ * presence interval (the join hook early-returns while the feature is
+ * off), hiding all history from current members until they part and
+ * rejoin.  Backfill open intervals for everyone present now.  Guarded
+ * for the conf-parse-time firing (no channels exist yet). */
+static void
+feature_notify_strict_presence(void)
+{
+  if (!feature_bool(FEAT_CHATHISTORY_STRICT_PRESENCE))
+    return;
+  if (!cli_serv(&me))
+    return;
+  if (!presence_account_store_ready()) {
+    /* SET at runtime without the metadata env: every authenticated
+     * user would see empty history.  Refuse, loudly (2026-09-06). */
+    static const char *const off[] = { "CHATHISTORY_STRICT_PRESENCE", "FALSE" };
+    log_write(LS_CONFIG, L_ERROR, 0,
+              "CHATHISTORY_STRICT_PRESENCE refused: the metadata database "
+              "(CAP_draft_metadata_2) is not available for account presence");
+    sendto_opmask_butone(0, SNO_OLDSNO,
+                         "CHATHISTORY_STRICT_PRESENCE refused: metadata database "
+                         "not available for account presence records");
+    feature_set(NULL, off, 2);
+    return;
+  }
+  presence_backfill_now();
+}
+
 static void
 feature_notify_chathistory_retention(void)
 {
@@ -708,9 +805,11 @@ feature_notify_chathistory_caps(void)
 
   send_cap_notify("draft/chathistory", 1, valbuf);
 
-  /* Keep ISUPPORT CHATHISTORY token in sync with the CAP value and
-   * push to clients with draft/extended-isupport. */
+  /* Keep ISUPPORT CHATHISTORY (and the fork's CHATHISTORYRETENTION,
+   * seconds, storage servers only) in sync and push to clients with
+   * draft/extended-isupport. */
   add_isupport_i("CHATHISTORY", feature_int(FEAT_CHATHISTORY_MAX));
+  chathistory_update_retention_isupport(0);   /* widest over the reachable stores */
   send_isupport_update();
 
   log_write(LS_SYSTEM, L_INFO, 0,
@@ -1189,6 +1288,10 @@ static struct FeatureDesc {
   F_B(CAP_server_time, 0, 1, feature_notify_cap_server_time),
   F_B(CAP_echo_message, 0, 1, feature_notify_cap_echo_message),
   F_B(CAP_account_tag, 0, 1, feature_notify_cap_account_tag),
+  F_B(CAP_oper_tag, 0, 1, feature_notify_cap_oper_tag),
+  /* Disclose the opername as the draft/oper tag value.  OFF: the bare
+   * tag signals oper status without identifying which oper. */
+  F_B(OPERTAG_VALUE, 0, 0, 0),
   F_B(CAP_chghost, 0, 1, feature_notify_cap_chghost),
   F_B(CAP_invite_notify, 0, 1, feature_notify_cap_invite_notify),
   F_B(CAP_labeled_response, 0, 1, feature_notify_cap_labeled_response),
@@ -1204,17 +1307,58 @@ static struct FeatureDesc {
   F_B(CAP_draft_pre_away, 0, 1, feature_notify_cap_draft_pre_away),
   F_B(CAP_draft_multiline, 0, 1, feature_notify_cap_multiline),
   F_B(CAP_draft_chathistory, 0, 1, feature_notify_cap_chathistory),
+  F_B(CAP_soju_search, 0, 1, feature_notify_cap_soju_search),
   F_B(CAP_draft_event_playback, 0, 0, feature_notify_cap_draft_event_playback),
   F_B(CAP_draft_message_redaction, 0, 0, feature_notify_cap_draft_message_redaction),
-  F_B(CAP_draft_account_registration, 0, 0, feature_notify_cap_draft_account_registration),
-  F_S(REGISTER_SERVER, 0, "*", 0),
+  F_B(CAP_draft_account_registration, 0, 0, feature_notify_cap_accountreg),
+  /* REGISTER policy: when on, accounts are created with emailVerified=false
+   * plus a VERIFY_EMAIL required action and Keycloak mails a verification
+   * link; an email address then becomes mandatory on REGISTER.  The notify
+   * hook rebuilds the draft/account-registration CAP value (email-required)
+   * so a rehash cannot leave a stale advertisement behind. */
+  F_B(REGISTER_VERIFY_EMAIL, 0, 0, feature_notify_accountreg_capvalue),
+  /* Cross-connection REGISTER throttle (register_throttle.c, consulted by
+   * m_register.c): LIMIT counted attempts per PERIOD seconds per client
+   * IP (/64 for IPv6), plus a server-wide GLOBAL backstop per PERIOD.
+   * 0 disables that limiter; attempts are counted, not successes; opers
+   * bypass.  Defaults are meant for an exposed network -- the testnet bed
+   * pins LIMIT/GLOBAL to 0 in its confs. */
+  F_I(POSTREG_GRACE, 0, 20, 0),
+  F_I(REGISTER_THROTTLE_LIMIT, 0, 3, 0),
+  F_I(REGISTER_THROTTLE_PERIOD, 0, 3600, 0),
+  F_I(REGISTER_THROTTLE_GLOBAL, 0, 60, 0),
+  /* Off by default: only a services build that disambiguates RENAME
+   * requests from account-stamp notifications on the AC 'R' subcommand
+   * (see the protocol-history comment in m_rename.c) should have this
+   * enabled. */
+  F_B(RENAME_SERVICES, 0, 0, 0),
+  /* relocation mode -- renames move only the issuer and +F users;
+   * see docs/specs/channel-relocate.md in the testnet repo */
+  F_B(RENAME_CONSENT, 0, 0, 0),
+  F_I(RELOCATE_GRACE, 0, 900, 0),
   F_B(CAP_draft_read_marker, 0, 0, feature_notify_cap_draft_read_marker),
   F_B(CAP_draft_channel_rename, 0, 0, feature_notify_cap_draft_channel_rename),
+  /* Advertised whenever the build supports it; the RENAME_CONSENT feature
+   * gates the relocation BEHAVIOR, not the cap -- negotiating this cap
+   * alone is harmless. */
+  F_B(CAP_evilnet_channel_relocate, 0, 0, feature_notify_cap_evilnet_channel_relocate),
   F_B(CAP_draft_metadata_2, 0, 0, feature_notify_cap_draft_metadata_2),
   F_B(CAP_draft_webpush, 0, 0, 0),  /* webpush has special handling via VAPID key */
+  /* draft/authtoken: advertised only while an Authtoken{} service exists */
+  F_B(CAP_draft_authtoken, 0, 1, feature_notify_cap_draft_authtoken),
+  F_I(AUTHTOKEN_EXPIRE, 0, 600, 0),   /* seconds a generated token stays valid */
+  F_I(AUTHTOKEN_MAX, 0, 4096, 0),     /* outstanding tokens per server */
   F_S(WEBPUSH_DB, 0, "webpush", 0),
   F_B(WEBPUSH_DB_AUTOGROW, 0, 1, 0),
   F_S(WEBPUSH_VAPID_PRIVKEY, 0, "", feature_notify_webpush_vapid_privkey),
+  F_B(WEBPUSH_NOTIFY, 0, 1, 0),
+  F_I(WEBPUSH_COOLDOWN, 0, 60, 0),
+  F_I(WEBPUSH_EXPIRE, 0, 7776000, 0),  /* 90 days since the last REGISTER; 0 disables the sweep */
+  F_I(WEBPUSH_MAX_REGISTRATIONS, 0, 30, 0), /* endpoints per account; 0 = unlimited */
+  F_B(WEBPUSH_HIGHLIGHTS, 0, 1, 0),
+  F_I(WEBPUSH_KEY_ROTATE, 0, 7776000, 0), /* 90 days between VAPID key rotations; 0 = never */
+  F_I(WEBPUSH_IDLE, 0, 900, 0), /* a connection attends while it spoke within this many seconds; 0 = held/away only */
+  F_I(WEBPUSH_MULTILINE_LINES, 0, 8, 0), /* lines of a multiline message pushed, one notification each; below 1 acts as 1, clamped to at most 64 */
   F_I(METADATA_MAX_KEYS, 0, 20, 0),
   F_I(METADATA_MAX_VALUE_BYTES, 0, 300, 0),  /* Limited by 512-byte IRC message size */
   F_I(METADATA_MAX_SUBS, 0, 50, 0),
@@ -1232,7 +1376,7 @@ static struct FeatureDesc {
   F_B(CHATHISTORY_FEDERATION, 0, 1, 0),
   F_I(CHATHISTORY_TIMEOUT, 0, 5, 0),
   F_B(CHATHISTORY_STRICT_TIMESTAMPS, 0, 0, 0),
-  F_B(CHATHISTORY_STORE, 0, 1, 0),
+  F_B(CHATHISTORY_STORE, 0, 1, feature_notify_chathistory_caps),   /* CHATHISTORYRETENTION token follows the store */
   F_B(CHATHISTORY_WRITE_FORWARD, 0, 1, 0),
   F_B(CHATHISTORY_STORE_REGISTERED, 0, 1, 0),
   F_I(CHATHISTORY_HIGH_WATERMARK, 0, 85, 0),
@@ -1240,11 +1384,11 @@ static struct FeatureDesc {
   F_I(CHATHISTORY_MAINTENANCE_INTERVAL, 0, 300, feature_notify_chathistory_maintenance_interval),
   F_I(CHATHISTORY_EVICT_BATCH_SIZE, 0, 1000, 0),
 
-  F_B(CHATHISTORY_OPS_OVERRIDE, 0, 1, 0),
+  F_B(CHATHISTORY_OPS_OVERRIDE, 0, 0, 0), /* :full bypass for channel ops -- default OFF (was on by oversight; grant deliberately per network) */
   F_B(CHATHISTORY_USER_QUOTA, 0, 1, 0),      /* Enable per-user quotas */
   F_I(CHATHISTORY_USER_QUOTA_PCT, 0, 10, 0), /* Max % of channel history per user */
   F_B(CHATHISTORY_REQUIRE_AUTH, 0, 0, 0),   /* Require auth for channel history (non-+H) — default off so unauthed/ephemeral clients can use CHATHISTORY out of the box; Afternet sets this to 1 in ircd.conf */
-  F_B(CHATHISTORY_STRICT_PRESENCE, 0, 0, 0), /* Filter chathistory to caller's presence windows (strict mode) */
+  F_B(CHATHISTORY_STRICT_PRESENCE, 0, 0, feature_notify_strict_presence), /* Filter chathistory to caller's presence windows (strict mode) */
   F_I(CHATHISTORY_PRESENCE_MAX_INTERVALS, 0, 64, 0), /* Per-(anchor,channel) cap on retained presence intervals; oldest evicted FIFO when exceeded */
   F_I(EPHEMERAL_HISTORY_BYTES, 0, 65536, 0), /* Per-Client byte cap on the ephemeral↔ephemeral PM ring (64KB default) */
   F_I(MULTILINE_MAX_BYTES, 0, 16384, feature_notify_multiline),
@@ -1271,9 +1415,9 @@ static struct FeatureDesc {
   F_B(WEBSOCKET, 0, 1, 0),
   F_A(DRAFT_WEBSOCKET, WEBSOCKET),
   F_S(WEBSOCKET_ORIGIN, 0, "", 0),
+  F_I(WEBSOCKET_PING_INTERVAL, 0, 30, 0),
   F_B(MSGID, 0, 1, 0),
   F_B(P10_MESSAGE_TAGS, 0, 0, 0),
-  F_B(PRESENCE_AGGREGATION, 0, 0, 0),
   F_S(AWAY_STAR_MSG, FEAT_NULL, "Away", 0),
   F_I(AWAY_THROTTLE, 0, 0, 0),
   F_B(METADATA_BURST, 0, 1, 0),
@@ -1305,7 +1449,7 @@ static struct FeatureDesc {
   F_B(CAP_draft_persistence, 0, 1, feature_notify_cap_draft_persistence),
   F_I(HISTORY_MAP_SIZE_MB, 0, 1024, 0),
 #ifdef USE_SSL
-  F_B(CAP_tls, 0, 1, feature_notify_cap_tls),
+  F_B(CAP_tls, 0, 0, feature_notify_cap_tls), /* deprecated by IRCv3 (STS replaces it); STARTTLS is refused while off */
   F_B(CAP_sts, 0, 0, feature_notify_cap_sts),
   F_I(STS_PORT, 0, 6697, feature_notify_cap_sts),
   F_I(STS_DURATION, 0, 2592000, feature_notify_cap_sts),  /* 30 days in seconds */
@@ -1353,6 +1497,7 @@ static struct FeatureDesc {
   F_S(GITSYNC_CERT_FILE, 0, "", 0),  /* Empty = use SSL_CERTFILE */
   F_S(GITSYNC_HOST_FINGERPRINT, 0, "", 0),  /* SSH host key fingerprint (TOFU) */
 #endif
+  F_I(BOUNCER_MAX_ALIASES, 0, 4, 0),
 
   /* CRDT mesh S2S — all OFF by default (engine gated; see ircd_features.h).
    * Booleans: master switch + per-phase gates. Ints: GC / batching tuning.

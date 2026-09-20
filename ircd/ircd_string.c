@@ -62,6 +62,13 @@ int string_has_wildcards(const char* str)
 /**
  * Check if a given string is a valid UTF-8 encoded string.
  *
+ * This answers the encoding question only.  C0 control characters are valid
+ * UTF-8 and are accepted: IRC carries CTCP delimiters (0x01) and the mIRC
+ * formatting codes (bold 0x02, colour 0x03, reset 0x0F, reverse 0x16,
+ * monospace 0x11, italic 0x1D, strikethrough 0x1E, underline 0x1F) as bare
+ * control bytes, and rejecting them here would strip them from every message.
+ * A caller that wants printable-only text must check for that separately.
+ *
  * @param str The string to check.
  * @return 1 if the string is valid UTF-8, 0 otherwise.
  */
@@ -73,12 +80,10 @@ int string_is_valid_utf8(const char * str)
     const unsigned char * bytes = (const unsigned char *)str;
     while(*bytes)
     {
-        if( (// ASCII
-             // use bytes[0] <= 0x7F to allow ASCII control characters
-                bytes[0] == 0x09 ||
-                bytes[0] == 0x0A ||
-                bytes[0] == 0x0D ||
-                (0x20 <= bytes[0] && bytes[0] <= 0x7E)
+        if( (// ASCII: every byte 0x01-0x7F is a well-formed single-byte
+             // sequence, C0 control characters included.  0x00 cannot occur
+             // here -- it terminates the string and ends the loop above.
+                bytes[0] <= 0x7F
             )
         ) {
             bytes += 1;
@@ -159,6 +164,13 @@ int string_is_valid_utf8(const char * str)
  * The string is modified in place. Caller should ensure str has at least
  * BUFSIZE bytes available.
  *
+ * Note that "no modification was needed" is also what callers get when the
+ * invalid bytes lie beyond the working buffer: the scan stops at BUFSIZE
+ * while string_is_valid_utf8() scans the whole string, so a long line whose
+ * only bad byte is near the end validates as invalid yet sanitizes to -1.
+ * Callers must therefore treat -1 as "leave the string and its length
+ * alone", never as a length.
+ *
  * @param str The string to sanitize (will be modified).
  * @return Length of sanitized string, or -1 if no modification was needed.
  */
@@ -182,9 +194,8 @@ int string_sanitize_utf8(char *str)
     {
         seq_len = 0;
 
-        /* ASCII printable and common control characters */
-        if (in[0] == 0x09 || in[0] == 0x0A || in[0] == 0x0D ||
-            (0x20 <= in[0] && in[0] <= 0x7E))
+        /* ASCII: any byte 0x01-0x7F, C0 control characters included */
+        if (in[0] <= 0x7F)
         {
             seq_len = 1;
         }
@@ -493,6 +504,101 @@ int ircd_strncmp(const char *a, const char *b, size_t n)
 /** Is @a token a member of the comma/space/tab-separated @a csv list
  * (case-insensitive, exact token match, no prefix match)?  Empty/NULL csv
  * or token denies.  Pure helper; the SASL layer passes feature_str(...) in. */
+/** Truncate \a s in place to at most \a maxbytes bytes (excluding the
+ * NUL), never splitting a UTF-8 sequence: if the cut lands mid-sequence
+ * the whole partial sequence is dropped.
+ * @param[in,out] s        String to clamp (may be NULL).
+ * @param[in]     maxbytes Maximum byte length to keep.
+ * @return 1 if truncation occurred, 0 if the string already fit.
+ */
+int ircd_utf8_clamp(char* s, size_t maxbytes)
+{
+  size_t len;
+
+  if (!s)
+    return 0;
+  len = strlen(s);
+  if (len <= maxbytes)
+    return 0;
+  /* Back off over UTF-8 continuation bytes so the byte at the cut
+   * index is a lead byte (or ASCII); cutting there drops any partial
+   * sequence while keeping every complete one. */
+  while (maxbytes > 0 && ((unsigned char)s[maxbytes] & 0xC0) == 0x80)
+    --maxbytes;
+  s[maxbytes] = '\0';
+  return 1;
+}
+
+/** Case-insensitive word-boundary search for \a nick in \a text, using
+ * the IRC nickname character class as the boundary definition: a match
+ * counts only when the characters on both sides of it are not nickname
+ * characters (start/end of string included).  Comparison uses the
+ * server casemapping (ircd_strncmp).
+ * @param[in] text Message text to scan (may be NULL).
+ * @param[in] nick Nickname to look for (may be NULL/empty).
+ * @return 1 when mentioned, 0 otherwise.
+ */
+int ircd_text_mentions(const char* text, const char* nick)
+{
+  size_t nlen;
+  const char* p;
+
+  if (!text || !nick || !*nick)
+    return 0;
+  nlen = strlen(nick);
+  for (p = text; *p; ++p) {
+    if ((p == text || !IsNickChar(p[-1]))
+        && 0 == ircd_strncmp(p, nick, nlen)
+        && !IsNickChar(p[nlen]))
+      return 1;
+  }
+  return 0;
+}
+
+/** Escape \a src as a JSON string body (no surrounding quotes) into
+ * \a dst: backslash, double-quote, and control characters below 0x20
+ * are escaped; everything else (UTF-8 bytes included) passes through
+ * verbatim.  Output is always NUL-terminated; content that would
+ * overflow is truncated at an escape-sequence boundary.
+ * @param[out] dst    Destination buffer.
+ * @param[in]  dstlen Destination size in bytes (>= 1).
+ * @param[in]  src    Source string (may be NULL == empty).
+ * @return dst.
+ */
+char* ircd_json_escape(char* dst, size_t dstlen, const char* src)
+{
+  size_t o = 0;
+  const unsigned char* p;
+
+  if (!dst || dstlen == 0)
+    return dst;
+  for (p = (const unsigned char*)(src ? src : ""); *p; ++p) {
+    if (*p == '"' || *p == '\\') {
+      if (o + 2 >= dstlen)
+        break;
+      dst[o++] = '\\';
+      dst[o++] = (char)*p;
+    }
+    else if (*p < 0x20) {
+      if (o + 6 >= dstlen)
+        break;
+      dst[o++] = '\\';
+      dst[o++] = 'u';
+      dst[o++] = '0';
+      dst[o++] = '0';
+      dst[o++] = "0123456789abcdef"[*p >> 4];
+      dst[o++] = "0123456789abcdef"[*p & 0xf];
+    }
+    else {
+      if (o + 1 >= dstlen)
+        break;
+      dst[o++] = (char)*p;
+    }
+  }
+  dst[o] = '\0';
+  return dst;
+}
+
 int csv_contains_token(const char* csv, const char* token)
 {
   const char *p;
@@ -1121,6 +1227,133 @@ int valid_hostname(const char* name) {
 
   for (c = name; *c; c++) {
     if (!IsHostChar(*c))
+      return 0;
+  }
+
+  return 1;
+}
+
+/* ------------------------------------------------------------------
+ * msgid intrinsic time decode
+ *
+ * generate_msgid() (send.c) lays a msgid out as
+ *   <node_2><logical_3><time_ms_7><counter_2>   (14 chars)
+ * with time_ms_7 = milliseconds since epoch in the ircd base64
+ * alphabet.  Decoding it lets every msgid resolve to WHEN it was
+ * minted even after the message aged out of history storage (or was
+ * never stored).  Pre-repack msgids carried a monotonic counter in
+ * those positions whose value decodes to ~zero -- far outside the
+ * accepted epoch range -- so legacy ids are rejected cleanly and the
+ * caller falls back to index/failure paths.
+ *
+ * The alphabet below MUST match numnicks.c convert2y; it is duplicated
+ * here because this file stays dependency-light (umkpasswd/table_gen
+ * link it standalone).  A build-time drift would break the round-trip
+ * cmocka test in ircd_string_cmocka.c.
+ * ------------------------------------------------------------------ */
+static const char msgid_b64_alphabet[65] =
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789[]";
+
+/** Decode the intrinsic mint-time from a msgid.
+ * @param[in] msgid The message id (>= 12 chars examined).
+ * @return Milliseconds since epoch, or 0 if the id is not a
+ *         time-carrying msgid (legacy format, malformed, or the
+ *         decoded value falls outside 2020..2100). */
+int msgid_decode_hlc(const char *msgid, uint64_t *ms_out, uint16_t *logical_out)
+{
+  uint64_t ms, logical = 0;
+  int i;
+
+  ms = msgid_decode_time_ms(msgid);
+  if (!ms)
+    return 0;
+  /* <node_2><logical_3><time_7><counter_2>: the logical counter sits in
+   * chars 2..4 (see generate_msgid). */
+  for (i = 2; i < 5; i++) {
+    const char *pos = strchr(msgid_b64_alphabet, msgid[i]);
+    if (!pos)
+      return 0;
+    logical = (logical << 6) | (uint64_t)(pos - msgid_b64_alphabet);
+  }
+  if (ms_out)
+    *ms_out = ms;
+  if (logical_out)
+    *logical_out = (uint16_t)(logical & 0xFFFF);
+  return 1;
+}
+
+uint64_t msgid_decode_time_ms(const char *msgid)
+{
+  uint64_t ms = 0;
+  int i;
+
+  if (!msgid)
+    return 0;
+  for (i = 0; i < 12; i++)
+    if (!msgid[i])
+      return 0;   /* shorter than <node2><logical3><time7> */
+
+  for (i = 5; i < 12; i++) {
+    const char *pos = strchr(msgid_b64_alphabet, msgid[i]);
+    if (!pos)
+      return 0;
+    ms = (ms << 6) | (uint64_t)(pos - msgid_b64_alphabet);
+  }
+
+  /* Sanity: accept 2020-01-01 .. 2100-01-01 only.  Legacy msgids
+   * decode to near-zero here (counter high padding). */
+  if (ms < 1577836800000ULL || ms > 4102444800000ULL)
+    return 0;
+  return ms;
+}
+
+
+/* Check if a spoof host is valid.  A spoof host is a host name, optionally
+ * prefixed with a user name and '@'.  Wildcards are only allowed if mask is
+ * non-zero (Spoofhost blocks using ismask).  Anything else is rejected so
+ * that the spoof host cannot be mistaken for something other than a single
+ * parameter when it is sent to other servers, most notably a spoof host
+ * beginning with a ':'.
+ */
+int valid_spoofhost(const char* host, int mask) {
+  const char *c = NULL;
+  const char *at = NULL;
+
+  /* Empty strings are not valid spoof hosts */
+  if (EmptyString(host))
+    return 0;
+
+  if ((at = strchr(host, '@')) != NULL) {
+    /* Don't allow an empty user name */
+    if (at == host)
+      return 0;
+    /* The user part is copied into cli_user()->sethost[HOSTLEN+USERLEN+2]
+     * downstream with strlcpy semantics; bound it here rather than let
+     * it truncate silently (PR #109 follow-up). */
+    if ((size_t)(at - host) > USERLEN)
+      return 0;
+    for (c = host; c < at; c++) {
+      if (!IsUserChar(*c) && !(mask && ((*c == '*') || (*c == '?'))))
+        return 0;
+    }
+    c = at + 1;
+  } else
+    c = host;
+
+  /* Empty strings are not valid hosts */
+  if (EmptyString(c))
+    return 0;
+  if (strlen(c) > HOSTLEN)
+    return 0;
+  /* Don't allow leading period */
+  if (*c == '.')
+    return 0;
+  /* Don't allow trailing period */
+  if (c[strlen(c)-1] == '.')
+    return 0;
+
+  for ( ; *c; c++) {
+    if (!IsHostChar(*c) && !(mask && ((*c == '*') || (*c == '?'))))
       return 0;
   }
 

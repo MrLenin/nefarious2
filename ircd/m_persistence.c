@@ -45,11 +45,15 @@
 #include "ircd_reply.h"
 #include "ircd_string.h"
 #include "metadata.h"
+#include "webpush.h"
 #include "msg.h"
 #include "numeric.h"
 #include "s_user.h"
 #include "send.h"
 #include "bouncer_session.h"
+#include "s_conf.h"
+#include "class.h"
+#include "ircd_snprintf.h"
 #include "persistence_profile.h"
 
 #include <string.h>
@@ -85,6 +89,17 @@ static int persistence_effective_state(struct Client *cptr)
   if (!cptr || !IsAccount(cptr))
     return 0;
 
+  /* For a live client with an attached session, the truth is whatever
+   * the disconnect path will actually do: bounce_should_hold() -- the
+   * session hold-override > +b/metadata > (bouncer-class || FEAT)
+   * chain.  Consulting it directly keeps STATUS drift-proof against
+   * that logic (spec: <effective-setting> MUST reflect the actual
+   * state).  Previously a class-enforced bouncer connection with no
+   * explicit preference reported DEFAULT OFF while holding on every
+   * disconnect. */
+  if (MyUser(cptr) && bounce_get_session(cptr))
+    return bounce_should_hold(cptr) != NULL;
+
   if (persistence_profile_get_effective(cli_account(cptr),
                                          active_profile_for(cptr),
                                          "hold",
@@ -94,6 +109,13 @@ static int persistence_effective_state(struct Client *cptr)
   if (metadata_account_get(cli_account(cptr), "draft/persistence/hold", hold_val) == 0)
     return (hold_val[0] != '0');
 
+  /* Mirror bounce_should_hold's fallback: a bouncer-enforced class
+   * defaults to hold even when the feature-level default is off. */
+  if (MyConnect(cptr)) {
+    struct ConnectionClass *cls = get_client_class_conf(cptr);
+    if (cls && FlagHas(&cls->restrictflags, CRFLAG_BOUNCER))
+      return 1;
+  }
   return feature_bool(FEAT_BOUNCER_DEFAULT_HOLD) ? 1 : 0;
 }
 
@@ -158,15 +180,49 @@ int persistence_replay_enabled_for(struct Client *cptr)
   return persistence_effective_replay(cptr);
 }
 
-/** Send `:server PERSISTENCE STATUS ON|OFF` to a client.
- * Public — also called from registration (s_user.c) to emit the
- * unsolicited STATUS once the client has negotiated draft/persistence.
+/** Resolve the user's explicitly-set client-setting for hold (the
+ * value before FEAT_* fallthrough).  Returns "ON" / "OFF" / "DEFAULT"
+ * into `out`.  Mirrors persistence_replay_client_setting.
+ */
+static void persistence_client_setting(struct Client *cptr,
+                                       char *out, size_t out_len)
+{
+  char val[METADATA_VALUE_LEN];
+
+  if (IsAccount(cptr)
+      && persistence_profile_get_effective(cli_account(cptr),
+                                           active_profile_for(cptr),
+                                           "hold",
+                                           val, sizeof(val)) == 0
+      && val[0]) {
+    ircd_strncpy(out, val[0] != '0' ? "ON" : "OFF", out_len);
+    return;
+  }
+  if (IsAccount(cptr)
+      && metadata_account_get(cli_account(cptr), "draft/persistence/hold", val) == 0
+      && val[0]) {
+    ircd_strncpy(out, val[0] != '0' ? "ON" : "OFF", out_len);
+    return;
+  }
+  ircd_strncpy(out, "DEFAULT", out_len);
+}
+
+/** Send `:server PERSISTENCE STATUS <client-setting> <effective>` to a
+ * client (client-setting ON|OFF|DEFAULT, effective ON|OFF) per PR #503
+ * and the vendored draft-persistence spec.  Public — also called from
+ * registration (s_user.c) to emit the unsolicited STATUS once the
+ * client has negotiated draft/persistence.
  */
 void persistence_send_status(struct Client *to)
 {
+  char client_setting[16];
+
   if (!to || !MyConnect(to))
     return;
-  send_persistence_reply(to, "STATUS", persistence_state_keyword(to));
+  persistence_client_setting(to, client_setting, sizeof(client_setting));
+  sendrawto_one(to, ":%s PERSISTENCE STATUS %s %s",
+                cli_name(&me), client_setting,
+                persistence_state_keyword(to));
 }
 
 /** Handle STATUS / GET subcommand.  Both report the effective state. */
@@ -707,6 +763,19 @@ static int persistence_cmd_attach(struct Client *sptr, int parc, char *parv[])
                   "No such profile", "ATTACH %s", name);
     return 0;
   }
+  /* Optional trailing arg: the client's last-seen msgid (any buffer —
+   * the newest it holds), the catch-up anchor for server-driven replay
+   * at revive/alias-attach.  Stored on the Connection beside the
+   * profile; resolved (msgid -> timestamp) at the replay trigger. */
+  if (parc > 3 && parv[3] && parv[3][0]) {
+    if (strlen(parv[3]) >= sizeof(con_attach_cursor(cli_connect(sptr)))) {
+      send_fail_ctx(sptr, "PERSISTENCE", "INVALID_PARAMETERS",
+                    "Cursor msgid too long", "ATTACH %s", name);
+      return 0;
+    }
+    ircd_strncpy(cli_attach_cursor(sptr), parv[3],
+                 sizeof(con_attach_cursor(cli_connect(sptr))));
+  }
   ircd_strncpy(cli_active_profile(sptr), name,
                sizeof(con_active_profile(cli_connect(sptr))));
   send_persistence_reply(sptr, "ATTACH", name);
@@ -784,6 +853,12 @@ static int persistence_cmd_detach(struct Client *sptr, int parc, char *parv[])
     return 0;
   }
 
+  /* Force logout also closes the account's webpush subscriptions: the
+   * browser keeps its own subscription object, but the server forgets
+   * every endpoint, so no push can fire for this account until a device
+   * re-registers (which happens automatically on the next login). */
+  webpush_forget_account(cli_user(sptr)->account);
+
   /* Mirror PERSISTENCE SET OFF's tear-down: clear account-global hold
    * preference, broadcast to peers, then destroy the session. */
   metadata_set_client(sptr, "draft/persistence/hold", "0", METADATA_VIS_PRIVATE);
@@ -808,6 +883,79 @@ static int persistence_cmd_detach(struct Client *sptr, int parc, char *parv[])
  * @param[in] parc Argument count (parv[0] is command name).
  * @param[in] parv Argument vector.
  */
+/* ---- LIST subcommand (session enumeration, spec 'LIST extension') ----
+ *
+ * PERSISTENCE LIST
+ *   -> PERSISTENCE SESSION <session-id> <state> <nick> <channels> :<info>
+ *      (zero or more)
+ *   -> PERSISTENCE ENDOFLIST
+ *
+ * Valid post-SASL pre-CAP-END (persistence_account_for resolves the
+ * SASL-complete account before registration) and after registration
+ * (spec: MUST also accept LIST post-registration).  Channels field is
+ * comma-separated or '*'; capped to line budget with the true count in
+ * <info> so a truncated list is detectable. */
+static int persistence_cmd_list(struct Client *sptr)
+{
+  const char *account = persistence_account_for(sptr);
+  struct AccountSessions *as;
+  struct BouncerSession *sess;
+
+  if (!account) {
+    send_fail(sptr, "PERSISTENCE", "ACCOUNT_REQUIRED", "LIST",
+              "You must be authenticated to use PERSISTENCE LIST");
+    return 0;
+  }
+
+  as = bounce_find_by_account(account);
+  for (sess = as ? as->as_sessions : NULL; sess; sess = sess->hs_anext) {
+    char chanbuf[400];
+    char info[160];
+    const char *state;
+    const char *nick;
+    size_t used = 0;
+    int i;
+
+    if (sess->hs_state == BOUNCE_DESTROYING)
+      continue;
+    state = (sess->hs_state == BOUNCE_HOLDING) ? "HELD" : "ACTIVE";
+    nick = (sess->hs_client && cli_name(sess->hs_client)[0])
+             ? cli_name(sess->hs_client) : "*";
+
+    chanbuf[0] = '\0';
+    for (i = 0; i < sess->hs_chancount; i++) {
+      size_t nlen = strlen(sess->hs_channels[i].name);
+      if (used + nlen + 2 >= sizeof(chanbuf))
+        break;  /* line budget; the count in <info> stays truthful */
+      if (used)
+        chanbuf[used++] = ',';
+      memcpy(chanbuf + used, sess->hs_channels[i].name, nlen);
+      used += nlen;
+      chanbuf[used] = '\0';
+    }
+
+    if (sess->hs_state == BOUNCE_HOLDING)
+      ircd_snprintf(0, info, sizeof(info), "held; %d channel%s%s",
+                    sess->hs_chancount,
+                    sess->hs_chancount == 1 ? "" : "s",
+                    (i < sess->hs_chancount) ? " (list truncated)" : "");
+    else
+      ircd_snprintf(0, info, sizeof(info), "active on %s; %d channel%s%s",
+                    (sess->hs_client && cli_user(sess->hs_client)
+                     && cli_user(sess->hs_client)->server)
+                      ? cli_name(cli_user(sess->hs_client)->server) : "*",
+                    sess->hs_chancount,
+                    sess->hs_chancount == 1 ? "" : "s",
+                    (i < sess->hs_chancount) ? " (list truncated)" : "");
+
+    sendrawto_one(sptr, ":%s PERSISTENCE SESSION %s %s %s %s :%s",
+                  cli_name(&me), sess->hs_sessid, state, nick,
+                  used ? chanbuf : "*", info);
+  }
+  sendrawto_one(sptr, ":%s PERSISTENCE ENDOFLIST", cli_name(&me));
+  return 0;
+}
+
 int m_persistence(struct Client *cptr, struct Client *sptr,
                   int parc, char *parv[])
 {
@@ -838,6 +986,9 @@ int m_persistence(struct Client *cptr, struct Client *sptr,
 
   if (0 == ircd_strcmp(sub, "DETACH"))
     return persistence_cmd_detach(sptr, parc, parv);
+
+  if (0 == ircd_strcmp(sub, "LIST"))
+    return persistence_cmd_list(sptr);
 
   send_fail_ctx(sptr, "PERSISTENCE", "INVALID_PARAMETERS",
                 "Unknown PERSISTENCE subcommand",

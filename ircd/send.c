@@ -198,6 +198,30 @@ static char client_msgid_override[64] = "";
  * consistent timestamps across all recipients. */
 static char client_time_override[40] = "";
 
+/** The event's ONE time, in epoch milliseconds, for client-facing @time
+ * tags (2026-09-02).  Armed together with the client msgid (either by
+ * sendcmdto_set_client_event or, for the sites that already stamp the
+ * S2S tag, by sendcmdto_set_s2s_tags) and cleared with it.  Every
+ * client composer used to stamp the wall clock at send time, so a
+ * message's live @time drifted from the row the origin stored (the
+ * HLC's lead over the wall clock, 1 ms in the echo case; tens of ms on
+ * a receiving server whose PART broadcast never carried the tag).
+ * Consumed only while a client msgid is armed, so a stray S2S-only
+ * override can never stamp an unrelated later send. */
+static uint64_t client_event_ms = 0;
+
+/** Wall-clock replacement for client @time composition: the armed
+ * event time when there is one, else the clock. */
+static void client_tag_tv(struct timeval *tv)
+{
+  if (client_msgid_override[0] && client_event_ms) {
+    tv->tv_sec = (time_t)(client_event_ms / 1000);
+    tv->tv_usec = (suseconds_t)((client_event_ms % 1000) * 1000);
+    return;
+  }
+  gettimeofday(tv, NULL);
+}
+
 void sendcmdto_set_client_time(const char *timestr)
 {
   if (timestr)
@@ -210,8 +234,16 @@ void sendcmdto_set_client_msgid(const char *msgid)
 {
   if (msgid)
     ircd_strncpy(client_msgid_override, msgid, sizeof(client_msgid_override));
-  else
+  else {
     client_msgid_override[0] = '\0';
+    client_event_ms = 0;
+  }
+}
+
+void sendcmdto_set_client_event(const char *msgid, uint64_t event_ms)
+{
+  sendcmdto_set_client_msgid(msgid);
+  client_event_ms = msgid ? event_ms : 0;
 }
 
 void sendcmdto_set_fwd_batch(const char *batch_id)
@@ -225,6 +257,10 @@ void sendcmdto_set_fwd_batch(const char *batch_id)
 void sendcmdto_set_s2s_tags(uint64_t time_ms, const char *msgid)
 {
   s2s_time_override = time_ms;
+  /* The same event time serves the client-facing @time (see
+   * client_event_ms); only meaningful while a client msgid is armed. */
+  if (time_ms)
+    client_event_ms = time_ms;
   if (msgid)
     ircd_strncpy(s2s_msgid_override, msgid, sizeof(s2s_msgid_override));
   else
@@ -280,7 +316,7 @@ static char *format_server_time(char *buf, size_t buflen)
   struct timeval tv;
   struct tm tm;
 
-  gettimeofday(&tv, NULL);
+  client_tag_tv(&tv);
   gmtime_r(&tv.tv_sec, &tm);
   snprintf(buf, buflen, "@time=%04d-%02d-%02dT%02d:%02d:%02d.%03ldZ ",
            tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
@@ -329,12 +365,41 @@ static int wants_message_tags(struct Client *to)
           MyConnect(to) && cli_label(to)[0]);
 }
 
+/* draft/oper-tag (#494): a server-attached tag on every command sent
+ * by an operator.  Attached only for DISPLAYED opers (PRIV_DISPLAY and
+ * not +H) -- hidden opers are never disclosed by tag to anyone, which
+ * is the visibility restriction the spec explicitly permits.  The tag
+ * value discloses the opername only under FEAT_OPERTAG_VALUE. */
+static int oper_tag_eligible(struct Client *from)
+{
+  return from && cli_user(from) && IsAnOper(from)
+      && HasPriv(from, PRIV_DISPLAY) && !IsHideOper(from);
+}
+
+static int append_oper_tag(char *buf, size_t buflen, int pos, struct Client *from)
+{
+  const char *name = feature_bool(FEAT_OPERTAG_VALUE)
+      ? cli_user(from)->opername : NULL;
+  if (pos > 1 && pos < (int)buflen - 1)
+    buf[pos++] = ';';
+  if (name && *name && !strpbrk(name, "; "))
+    pos += snprintf(buf + pos, buflen - pos, "draft/oper=%s", name);
+  else
+    pos += snprintf(buf + pos, buflen - pos, "draft/oper");
+  return pos;
+}
+
 /** Flags for format_message_tags_ex() tag selection */
 #define TAGS_TIME     0x01  /**< Include @time tag */
 #define TAGS_ACCOUNT  0x02  /**< Include @account tag */
 #define TAGS_BATCH    0x04  /**< Include @batch tag (network batch) */
 #define TAGS_BOT      0x08  /**< Include @bot tag */
 #define TAGS_MSGID    0x10  /**< Include @msgid tag from client_msgid_override */
+#define TAGS_OPER     0x20  /**< Include @draft/oper tag (eligibility pre-checked) */
+/** Size of per-flag-combination MsgBuf caches: one slot per possible
+ * TAGS_* bitmask.  MUST cover every flag above -- an out-of-range
+ * index reads an uninitialized stack slot as a MsgBuf* (SIGSEGV). */
+#define TAGS_CACHE_SIZE (TAGS_OPER << 1)
 
 /** Format message tags with explicit control over which tags to include.
  * @param[out] buf Buffer to write tags to.
@@ -351,8 +416,9 @@ static char *format_message_tags_ex(char *buf, size_t buflen, struct Client *fro
   int use_batch = (flags & TAGS_BATCH) && active_network_batch_id[0];
   int use_bot = (flags & TAGS_BOT) && from && IsBot(from);
   int use_msgid = (flags & TAGS_MSGID) && client_msgid_override[0];
+  int use_oper = (flags & TAGS_OPER) != 0;
 
-  if (!use_time && !use_account && !use_batch && !use_bot && !use_msgid)
+  if (!use_time && !use_account && !use_batch && !use_bot && !use_msgid && !use_oper)
     return NULL;
 
   buf[0] = '@';
@@ -368,7 +434,7 @@ static char *format_message_tags_ex(char *buf, size_t buflen, struct Client *fro
     struct tm tm;
     if (pos > 1 && pos < (int)buflen - 1)
       buf[pos++] = ';';
-    gettimeofday(&tv, NULL);
+    client_tag_tv(&tv);
     gmtime_r(&tv.tv_sec, &tm);
     pos += snprintf(buf + pos, buflen - pos,
                     "time=%04d-%02d-%02dT%02d:%02d:%02d.%03ldZ",
@@ -388,6 +454,9 @@ static char *format_message_tags_ex(char *buf, size_t buflen, struct Client *fro
       buf[pos++] = ';';
     pos += snprintf(buf + pos, buflen - pos, "account=%s", cli_user(from)->account);
   }
+
+  if (use_oper)
+    pos = append_oper_tag(buf, buflen, pos, from);
 
   /* Add @bot tag if sender has +B mode (IRCv3 bot-mode spec) */
   if (use_bot) {
@@ -422,6 +491,9 @@ static int get_client_tag_flags(struct Client *to, struct Client *from, int incl
     flags |= TAGS_TIME;
   if (feature_bool(FEAT_CAP_account_tag) && CapOwnHas(to, CAP_ACCOUNTTAG))
     flags |= TAGS_ACCOUNT;
+  if (feature_bool(FEAT_CAP_oper_tag) && CapOwnHas(to, CAP_DRAFT_OPERTAG)
+      && oper_tag_eligible(from))
+    flags |= TAGS_OPER;
   if (include_batch && CapOwnHas(to, CAP_BATCH) && active_network_batch_id[0])
     flags |= TAGS_BATCH;
   /* Bot tag requires message-tags capability (server-generated tag per IRCv3) */
@@ -444,12 +516,19 @@ static int get_client_tag_flags(struct Client *to, struct Client *from, int incl
  */
 char *generate_msgid(char *buf, size_t buflen)
 {
-  /* HLC format: YY(node_id 2) + LLL(logical 3) + QQQQQQQQQ(counter 9) = 14 chars */
+  /* Repacked 2026-09-01: <node_2><logical_3><time_ms_7><counter_2>.
+   * The old layout wasted the counter's top chars on zero padding;
+   * they now carry the HLC physical time, so ANY msgid resolves to
+   * its mint time intrinsically (msgid_decode_time_ms) -- cursors and
+   * refs keep working after the message ages out of storage.  12-bit
+   * counter + per-event logical increments keep uniqueness. */
   struct HLC hlc = hlc_global_event();
-  char logical_b64[4], counter_b64[10];
+  char logical_b64[4], time_b64[8], counter_b64[3];
   inttobase64_64(logical_b64, (uint64_t)hlc.logical, 3);
-  inttobase64_64(counter_b64, (uint64_t)(++MsgIdCounter), 9);
-  snprintf(buf, buflen, "%s%s%s", cli_yxx(&me), logical_b64, counter_b64);
+  inttobase64_64(time_b64, hlc.physical_ms, 7);
+  inttobase64_64(counter_b64, (uint64_t)(++MsgIdCounter & 0xFFF), 2);
+  snprintf(buf, buflen, "%s%s%s%s", cli_yxx(&me), logical_b64, time_b64,
+           counter_b64);
   return buf;
 }
 
@@ -575,6 +654,8 @@ static char *format_message_tags_for_ex(char *buf, size_t buflen, struct Client 
 {
   int use_time = feature_bool(FEAT_CAP_server_time) && CapOwnHas(to, CAP_SERVERTIME);
   int use_account = feature_bool(FEAT_CAP_account_tag) && CapOwnHas(to, CAP_ACCOUNTTAG);
+  int use_oper = feature_bool(FEAT_CAP_oper_tag)
+      && CapOwnHas(to, CAP_DRAFT_OPERTAG) && oper_tag_eligible(from);
   int use_label = feature_bool(FEAT_CAP_labeled_response) &&
                   CapOwnHas(to, CAP_LABELEDRESP) &&
                   to && MyConnect(to) && cli_label(to)[0] &&
@@ -586,7 +667,8 @@ static char *format_message_tags_for_ex(char *buf, size_t buflen, struct Client 
   int use_msgid = msgid && *msgid && CapOwnHas(to, CAP_MSGTAGS);
   int pos = 0;
 
-  if (!use_time && !use_account && !use_label && !use_batch && !use_fwd_batch && !use_msgid)
+  if (!use_time && !use_account && !use_label && !use_batch && !use_fwd_batch && !use_msgid
+      && !use_oper)
     return NULL;
 
   buf[0] = '@';
@@ -621,7 +703,7 @@ static char *format_message_tags_for_ex(char *buf, size_t buflen, struct Client 
     } else {
       struct timeval tv;
       struct tm tm;
-      gettimeofday(&tv, NULL);
+      client_tag_tv(&tv);
       gmtime_r(&tv.tv_sec, &tm);
       pos += snprintf(buf + pos, buflen - pos,
                       "time=%04d-%02d-%02dT%02d:%02d:%02d.%03ldZ",
@@ -637,6 +719,9 @@ static char *format_message_tags_for_ex(char *buf, size_t buflen, struct Client 
     pos += snprintf(buf + pos, buflen - pos, "account=%s",
                     cli_user(from)->account);
   }
+
+  if (use_oper)
+    pos = append_oper_tag(buf, buflen, pos, from);
 
   /* Add @bot tag if sender has +B mode (IRCv3 bot-mode spec).
    * Per IRCv3, server-generated tags require message-tags capability. */
@@ -693,6 +778,8 @@ static char *format_message_tags_for_caps(char *buf, size_t buflen,
 {
   int use_time = feature_bool(FEAT_CAP_server_time) && CapHas(caps, CAP_SERVERTIME);
   int use_account = feature_bool(FEAT_CAP_account_tag) && CapHas(caps, CAP_ACCOUNTTAG);
+  int use_oper = feature_bool(FEAT_CAP_oper_tag)
+      && CapHas(caps, CAP_DRAFT_OPERTAG) && oper_tag_eligible(from);
   int use_label = feature_bool(FEAT_CAP_labeled_response) &&
                   CapHas(caps, CAP_LABELEDRESP) &&
                   to && MyConnect(to) && cli_label(to)[0] &&
@@ -702,7 +789,7 @@ static char *format_message_tags_for_caps(char *buf, size_t buflen,
   int use_msgid = msgid && *msgid && CapHas(caps, CAP_MSGTAGS);
   int pos = 0;
 
-  if (!use_time && !use_account && !use_label && !use_batch && !use_msgid)
+  if (!use_time && !use_account && !use_label && !use_batch && !use_msgid && !use_oper)
     return NULL;
 
   buf[0] = '@';
@@ -727,7 +814,7 @@ static char *format_message_tags_for_caps(char *buf, size_t buflen,
     struct tm tm;
     if (pos > 1 && pos < (int)buflen - 1)
       buf[pos++] = ';';
-    gettimeofday(&tv, NULL);
+    client_tag_tv(&tv);
     gmtime_r(&tv.tv_sec, &tm);
     pos += snprintf(buf + pos, buflen - pos,
                     "time=%04d-%02d-%02dT%02d:%02d:%02d.%03ldZ",
@@ -742,6 +829,9 @@ static char *format_message_tags_for_caps(char *buf, size_t buflen,
     pos += snprintf(buf + pos, buflen - pos, "account=%s",
                     cli_user(from)->account);
   }
+
+  if (use_oper)
+    pos = append_oper_tag(buf, buflen, pos, from);
 
   if (from && IsBot(from) && CapHas(caps, CAP_MSGTAGS)) {
     if (pos > 1 && pos < (int)buflen - 1)
@@ -770,6 +860,8 @@ static char *format_message_tags_with_client(char *buf, size_t buflen, struct Cl
 {
   int use_time = feature_bool(FEAT_CAP_server_time) && CapOwnHas(to, CAP_SERVERTIME);
   int use_account = feature_bool(FEAT_CAP_account_tag) && CapOwnHas(to, CAP_ACCOUNTTAG);
+  int use_oper = feature_bool(FEAT_CAP_oper_tag)
+      && CapOwnHas(to, CAP_DRAFT_OPERTAG) && oper_tag_eligible(from);
   int use_label = feature_bool(FEAT_CAP_labeled_response) &&
                   CapOwnHas(to, CAP_LABELEDRESP) &&
                   to && MyConnect(to) && cli_label(to)[0] &&
@@ -780,7 +872,8 @@ static char *format_message_tags_with_client(char *buf, size_t buflen, struct Cl
   int pos = 0;
 
   /* TAGMSG is only useful if there are client-only tags to relay */
-  if (!use_client_tags && !use_time && !use_account && !use_label && !use_batch)
+  if (!use_client_tags && !use_time && !use_account && !use_label && !use_batch
+      && !use_oper)
     return NULL;
 
   buf[0] = '@';
@@ -816,7 +909,7 @@ static char *format_message_tags_with_client(char *buf, size_t buflen, struct Cl
     struct tm tm;
     if (pos > 1 && pos < (int)buflen - 1)
       buf[pos++] = ';';
-    gettimeofday(&tv, NULL);
+    client_tag_tv(&tv);
     gmtime_r(&tv.tv_sec, &tm);
     pos += snprintf(buf + pos, buflen - pos,
                     "time=%04d-%02d-%02dT%02d:%02d:%02d.%03ldZ",
@@ -831,6 +924,9 @@ static char *format_message_tags_with_client(char *buf, size_t buflen, struct Cl
     pos += snprintf(buf + pos, buflen - pos, "account=%s",
                     cli_user(from)->account);
   }
+
+  if (use_oper)
+    pos = append_oper_tag(buf, buflen, pos, from);
 
   /* Add @bot tag if sender has +B mode (IRCv3 bot-mode spec) */
   if (from && IsBot(from) && CapOwnHas(to, CAP_MSGTAGS)) {
@@ -867,6 +963,8 @@ static char *format_message_tags_with_client_caps(char *buf, size_t buflen,
 {
   int use_time = feature_bool(FEAT_CAP_server_time) && CapHas(caps, CAP_SERVERTIME);
   int use_account = feature_bool(FEAT_CAP_account_tag) && CapHas(caps, CAP_ACCOUNTTAG);
+  int use_oper = feature_bool(FEAT_CAP_oper_tag)
+      && CapHas(caps, CAP_DRAFT_OPERTAG) && oper_tag_eligible(from);
   int use_label = feature_bool(FEAT_CAP_labeled_response) &&
                   CapHas(caps, CAP_LABELEDRESP) &&
                   to && MyConnect(to) && cli_label(to)[0] &&
@@ -876,7 +974,8 @@ static char *format_message_tags_with_client_caps(char *buf, size_t buflen,
   int use_client_tags = client_tags && *client_tags && CapHas(caps, CAP_MSGTAGS);
   int pos = 0;
 
-  if (!use_client_tags && !use_time && !use_account && !use_label && !use_batch)
+  if (!use_client_tags && !use_time && !use_account && !use_label && !use_batch
+      && !use_oper)
     return NULL;
 
   buf[0] = '@';
@@ -909,7 +1008,7 @@ static char *format_message_tags_with_client_caps(char *buf, size_t buflen,
     struct tm tm;
     if (pos > 1 && pos < (int)buflen - 1)
       buf[pos++] = ';';
-    gettimeofday(&tv, NULL);
+    client_tag_tv(&tv);
     gmtime_r(&tv.tv_sec, &tm);
     pos += snprintf(buf + pos, buflen - pos,
                     "time=%04d-%02d-%02dT%02d:%02d:%02d.%03ldZ",
@@ -924,6 +1023,9 @@ static char *format_message_tags_with_client_caps(char *buf, size_t buflen,
     pos += snprintf(buf + pos, buflen - pos, "account=%s",
                     cli_user(from)->account);
   }
+
+  if (use_oper)
+    pos = append_oper_tag(buf, buflen, pos, from);
 
   if (from && IsBot(from) && CapHas(caps, CAP_MSGTAGS)) {
     if (pos > 1 && pos < (int)buflen - 1)
@@ -1071,7 +1173,12 @@ void send_queued(struct Client *to)
     if ((len = deliver_it(to, &(cli_sendQ(to))))) {
       msgq_delete(&(cli_sendQ(to)), len);
       cli_lastsq(to) = MsgQLength(&(cli_sendQ(to))) / 1024;
-      if (IsBlocked(to)) {
+      /* Only stay listed for the blocked retry while data remains: a
+       * write that drains the queue exactly as the socket blocks must
+       * fall through to the drop below, or the connection is left on
+       * send_queues with an empty sendQ (the state free_client's linger
+       * path can then orphan permanently — send.c:1019 assert class). */
+      if (IsBlocked(to) && 0 < MsgQLength(&(cli_sendQ(to)))) {
 	update_write(to);
         return;
       }
@@ -1089,6 +1196,25 @@ void send_queued(struct Client *to)
 
   /* Ok, sendq is now empty... */
   client_drop_sendq(cli_connect(to));
+  update_write(to);
+}
+
+/** Reconcile a connection's send_queues membership with its sendQ
+ * contents after the queue was moved or cleared OUTSIDE the normal send
+ * path (the bouncer socket transplant).  Lists the connection and arms
+ * a write event when data is present; delists it otherwise.  Needed
+ * because send_queues is static to this file.
+ * @param[in] to Client whose connection should be reconciled.
+ */
+void client_reconcile_sendq(struct Client *to)
+{
+  assert(0 != to);
+  assert(0 != cli_connect(to));
+
+  if (0 < MsgQLength(&(cli_sendQ(to))))
+    client_add_sendq(cli_connect(to), &send_queues);
+  else
+    client_drop_sendq(cli_connect(to));
   update_write(to);
 }
 
@@ -1399,9 +1525,20 @@ void sendcmdto_one_tags_with_client(struct Client *from,
     /* Server-link destination — use compact S2S tag prefix.
      * IRCV3AWARE peers get @A...,C<client_tags>; legacy peers get the
      * bare command (preserves pre-extension behaviour where direct
-     * PMs to remote users had no @A prefix). */
+     * PMs to remote users had no @A prefix).
+     *
+     * The tag source is the ORIGIN, never `to`: passing the destination
+     * link made format_s2s_tags_with_client read cli_s2s_msgid(to) -- the
+     * last msgid PARSED off that link -- so a local PM sent right after a
+     * services round-trip reused that message's id (2026-09-04).  For a
+     * relayed message the origin link rides in s2s_cptr_override; for a
+     * locally-minted one the caller armed s2s_msgid_override/time with
+     * this message's own id (ext_msgid), which format consumes when the
+     * cptr carries none. */
+    struct Client *tag_cptr = s2s_cptr_override;
+    s2s_cptr_override = NULL;
     if (IsIRCv3Aware(to) &&
-        format_s2s_tags_with_client(s2s_tagbuf, sizeof(s2s_tagbuf), to,
+        format_s2s_tags_with_client(s2s_tagbuf, sizeof(s2s_tagbuf), tag_cptr,
                                     has_ctags ? client_tags : NULL,
                                     NULL, 0)) {
       mb = msgq_make(to, "%s%:#C %s %v", s2s_tagbuf, from, tok, &vd);
@@ -1434,6 +1571,13 @@ void sendcmdto_one_tags_with_client(struct Client *from,
   prio = (feature_bool(FEAT_FLUSH_ULINE_IMMEDIATE) && is_from_uline(from)) ? 1 : 0;
   send_buffer(to, mb, prio);
   msgq_clean(mb);
+
+  /* Consume any tag overrides the caller armed for this one send, so a
+   * local-recipient path or a legacy (untagged) peer cannot leave them
+   * to stamp the next server-bound emit. */
+  s2s_cptr_override = NULL;
+  s2s_msgid_override[0] = '\0';
+  s2s_time_override = 0;
 }
 
 /** Send a (prefixed) command to a single local client with message tags,
@@ -1482,7 +1626,7 @@ void sendcmdto_one_tags_msgid(struct Client *from, const char *cmd, const char *
   }
 
   /* Generate timestamp - ISO for client @time= tag, Unix for storage */
-  gettimeofday(&tv, NULL);
+  client_tag_tv(&tv);
   gmtime_r(&tv.tv_sec, &tm);
   snprintf(timebuf, sizeof(timebuf), "%04d-%02d-%02dT%02d:%02d:%02d.%03ldZ",
            tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
@@ -1856,6 +2000,17 @@ void sendcmdto_serv_butone(struct Client *from, const char *cmd,
         s2s_msgid_override[0] = '\0';
         s2s_time_override = 0;
       }
+    } else {
+      /* No tagged variant was built, so nothing consumed the overrides.
+       * Clear them here or they ride the next server-bound emit: an
+       * ACCOUNT/AWAY relay armed by sendcmdto_set_s2s_tags() without
+       * sendcmdto_want_s2s_tags() stamped the next cross-server PRIVMSG
+       * with the auth-time msgid and timestamp (2026-09-04). */
+      s2s_cptr_override = NULL;
+      s2s_raw_tags[0] = '\0';
+      s2s_msgid_override[0] = '\0';
+      s2s_sessid_override[0] = '\0';
+      s2s_time_override = 0;
     }
 
     /* Untagged variants for legacy peers — also serve as the only
@@ -2008,6 +2163,17 @@ void sendcmdto_serv_butone_v3(struct Client *from, const char *cmd,
         s2s_msgid_override[0] = '\0';
         s2s_time_override = 0;
       }
+    } else {
+      /* No tagged variant was built, so nothing consumed the overrides.
+       * Clear them here or they ride the next server-bound emit: an
+       * ACCOUNT/AWAY relay armed by sendcmdto_set_s2s_tags() without
+       * sendcmdto_want_s2s_tags() stamped the next cross-server PRIVMSG
+       * with the auth-time msgid and timestamp (2026-09-04). */
+      s2s_cptr_override = NULL;
+      s2s_raw_tags[0] = '\0';
+      s2s_msgid_override[0] = '\0';
+      s2s_sessid_override[0] = '\0';
+      s2s_time_override = 0;
     }
   }
 
@@ -2127,6 +2293,17 @@ void sendcmdto_legacy_serv_butone(struct Client *from, const char *cmd,
         s2s_msgid_override[0] = '\0';
         s2s_time_override = 0;
       }
+    } else {
+      /* No tagged variant was built, so nothing consumed the overrides.
+       * Clear them here or they ride the next server-bound emit: an
+       * ACCOUNT/AWAY relay armed by sendcmdto_set_s2s_tags() without
+       * sendcmdto_want_s2s_tags() stamped the next cross-server PRIVMSG
+       * with the auth-time msgid and timestamp (2026-09-04). */
+      s2s_cptr_override = NULL;
+      s2s_raw_tags[0] = '\0';
+      s2s_msgid_override[0] = '\0';
+      s2s_sessid_override[0] = '\0';
+      s2s_time_override = 0;
     }
   }
 
@@ -2199,7 +2376,7 @@ void sendcmdto_common_channels_butone(struct Client *from, const char *cmd,
   struct VarData vd;
   struct MsgBuf *mb;
   /* Per-capability message buffers - only send tags client actually requested */
-  struct MsgBuf *mb_cache[32] = {0};  /* Indexed by TAGS_* flag combinations */
+  struct MsgBuf *mb_cache[TAGS_CACHE_SIZE] = {0};  /* Indexed by TAGS_* flag combinations */
   struct Membership *chan;
   struct Membership *member;
   char tagbuf[128];
@@ -2269,7 +2446,7 @@ void sendcmdto_common_channels_butone(struct Client *from, const char *cmd,
   cap_route_ctx.stc_active = 0;
 
   msgq_clean(mb);
-  for (flags = 0; flags < 32; flags++) {
+  for (flags = 0; flags < TAGS_CACHE_SIZE; flags++) {
     if (mb_cache[flags])
       msgq_clean(mb_cache[flags]);
   }
@@ -2282,6 +2459,17 @@ void sendcmdto_common_channels_butone(struct Client *from, const char *cmd,
  * @param[in] one Client direction to skip (or NULL).
  * @param[in] pattern Format string for command arguments.
  */
+/* An optional SECOND required capability for the next channel-capab send
+ * (sendcmdto_common_channels_capab_butone / sendcmdto_channel_capab_butserv_butone),
+ * consumed by that call.  Lets a caller split one event by two caps, e.g.
+ * away-notify AND draft/pre-away versus away-notify WITHOUT it. */
+static int sendcmdto_extra_withcap = CAP_NONE;
+
+void sendcmdto_set_extra_withcap(int cap)
+{
+  sendcmdto_extra_withcap = cap;
+}
+
 void sendcmdto_common_channels_capab_butone(struct Client *from, const char *cmd,
                                       const char *tok, struct Client *one,
                                       int withcap, int skipcap,
@@ -2290,7 +2478,7 @@ void sendcmdto_common_channels_capab_butone(struct Client *from, const char *cmd
   struct VarData vd;
   struct MsgBuf *mb;
   /* Per-capability message buffers - only send tags client actually requested */
-  struct MsgBuf *mb_cache[32] = {0};  /* Indexed by TAGS_* flag combinations */
+  struct MsgBuf *mb_cache[TAGS_CACHE_SIZE] = {0};  /* Indexed by TAGS_* flag combinations */
   struct Membership *chan;
   struct Membership *member;
   char tagbuf[128];
@@ -2332,6 +2520,9 @@ void sendcmdto_common_channels_capab_butone(struct Client *from, const char *cmd
         continue;
       if ((skipcap != CAP_NONE) && CapActive(member->user, skipcap))
         continue;
+      if ((sendcmdto_extra_withcap != CAP_NONE)
+          && !CapActive(member->user, sendcmdto_extra_withcap))
+        continue;
       {
         cli_sentalong(member->user) = sentalong_marker;
         flags = get_client_tag_flags(member->user, from, 0);
@@ -2369,10 +2560,11 @@ void sendcmdto_common_channels_capab_butone(struct Client *from, const char *cmd
   cap_route_ctx.stc_skipcap = CAP_NONE;
 
   msgq_clean(mb);
-  for (flags = 0; flags < 32; flags++) {
+  for (flags = 0; flags < TAGS_CACHE_SIZE; flags++) {
     if (mb_cache[flags])
       msgq_clean(mb_cache[flags]);
   }
+  sendcmdto_extra_withcap = CAP_NONE;
 }
 
 /** Send a (prefixed) command to all local users on a channel.
@@ -2392,7 +2584,7 @@ void sendcmdto_channel_butserv_butone(struct Client *from, const char *cmd,
   struct VarData vd;
   struct MsgBuf *mb;
   /* Per-capability message buffers - only send tags client actually requested */
-  struct MsgBuf *mb_cache[32] = {0};  /* Indexed by TAGS_* flag combinations */
+  struct MsgBuf *mb_cache[TAGS_CACHE_SIZE] = {0};  /* Indexed by TAGS_* flag combinations */
   struct Membership *member;
   char tagbuf[128];
   int flags;
@@ -2444,7 +2636,7 @@ void sendcmdto_channel_butserv_butone(struct Client *from, const char *cmd,
   cap_route_ctx.stc_active = 0;
 
   msgq_clean(mb);
-  for (flags = 0; flags < 32; flags++) {
+  for (flags = 0; flags < TAGS_CACHE_SIZE; flags++) {
     if (mb_cache[flags])
       msgq_clean(mb_cache[flags]);
   }
@@ -2471,7 +2663,7 @@ void sendcmdto_channel_capab_butserv_butone(struct Client *from, const char *cmd
   struct VarData vd;
   struct MsgBuf *mb;
   /* Per-capability message buffers - only send tags client actually requested */
-  struct MsgBuf *mb_cache[32] = {0};  /* Indexed by TAGS_* flag combinations */
+  struct MsgBuf *mb_cache[TAGS_CACHE_SIZE] = {0};  /* Indexed by TAGS_* flag combinations */
   struct Membership *member;
   char tagbuf[128];
   int flags;
@@ -2504,6 +2696,9 @@ void sendcmdto_channel_capab_butserv_butone(struct Client *from, const char *cmd
         continue;
     if ((skipcap != CAP_NONE) && CapActive(member->user, skipcap))
         continue;
+    if ((sendcmdto_extra_withcap != CAP_NONE)
+        && !CapActive(member->user, sendcmdto_extra_withcap))
+        continue;
     flags = get_client_tag_flags(member->user, from, 0);
     if (flags) {
       /* Build cached message buffer for this flag combination if needed */
@@ -2529,10 +2724,11 @@ void sendcmdto_channel_capab_butserv_butone(struct Client *from, const char *cmd
   cap_route_ctx.stc_skipcap = CAP_NONE;
 
   msgq_clean(mb);
-  for (flags = 0; flags < 32; flags++) {
+  for (flags = 0; flags < TAGS_CACHE_SIZE; flags++) {
     if (mb_cache[flags])
       msgq_clean(mb_cache[flags]);
   }
+  sendcmdto_extra_withcap = CAP_NONE;
 }
 
 /** Send TAGMSG with client-only tags to channel members with message-tags capability.
@@ -2689,7 +2885,7 @@ void sendcmdto_channel_butone(struct Client *from, const char *cmd,
   struct VarData vd;
   struct MsgBuf *user_mb;
   /* Per-capability message buffers - only send tags client actually requested */
-  struct MsgBuf *user_mb_cache[32] = {0};  /* Indexed by TAGS_* flag combinations */
+  struct MsgBuf *user_mb_cache[TAGS_CACHE_SIZE] = {0};  /* Indexed by TAGS_* flag combinations */
   struct MsgBuf *serv_mb;
   struct MsgBuf *serv_mb_tags = NULL;  /* S2S tagged version */
   struct MsgBuf *serv_mb_alias = NULL; /* Alias numeric for primary's server direction */
@@ -2840,7 +3036,7 @@ void sendcmdto_channel_butone(struct Client *from, const char *cmd,
    * MsgBuf whose tflags included TAGS_MSGID — fired on every
    * channel PRIVMSG to a recipient with CAP_MSGTAGS when the relay
    * had a msgid override staged. */
-  for (tflags = 0; tflags < 32; tflags++) {
+  for (tflags = 0; tflags < TAGS_CACHE_SIZE; tflags++) {
     if (user_mb_cache[tflags])
       msgq_clean(user_mb_cache[tflags]);
   }
@@ -3874,7 +4070,7 @@ static void send_standard_reply_ex(struct Client *to, const char *type,
       } else {
         struct timeval tv;
         struct tm tm;
-        gettimeofday(&tv, NULL);
+        client_tag_tv(&tv);
         gmtime_r(&tv.tv_sec, &tm);
         pos += snprintf(tagbuf + pos, sizeof(tagbuf) - pos,
                         "time=%04d-%02d-%02dT%02d:%02d:%02d.%03ldZ",
@@ -3888,14 +4084,14 @@ static void send_standard_reply_ex(struct Client *to, const char *type,
     tagbuf[pos] = '\0';
 
     if (context && *context)
-      mb = msgq_make(to, "%s%s %s %s %s :%s", tagbuf, type, command, code, context, description);
+      mb = msgq_make(to, "%s%:#C %s %s %s %s :%s", tagbuf, &me, type, command, code, context, description);
     else
-      mb = msgq_make(to, "%s%s %s %s :%s", tagbuf, type, command, code, description);
+      mb = msgq_make(to, "%s%:#C %s %s %s :%s", tagbuf, &me, type, command, code, description);
   } else {
     if (context && *context)
-      mb = msgq_make(to, "%s %s %s %s :%s", type, command, code, context, description);
+      mb = msgq_make(to, "%:#C %s %s %s %s :%s", &me, type, command, code, context, description);
     else
-      mb = msgq_make(to, "%s %s %s :%s", type, command, code, description);
+      mb = msgq_make(to, "%:#C %s %s %s :%s", &me, type, command, code, description);
   }
 
   send_buffer(to, mb, 0);
@@ -4073,7 +4269,7 @@ void send_labeled_ack(struct Client *to)
     struct tm tm;
     if (pos < (int)sizeof(tagbuf) - 1)
       tagbuf[pos++] = ';';
-    gettimeofday(&tv, NULL);
+    client_tag_tv(&tv);
     gmtime_r(&tv.tv_sec, &tm);
     pos += snprintf(tagbuf + pos, sizeof(tagbuf) - pos,
                     "time=%04d-%02d-%02dT%02d:%02d:%02d.%03ldZ",

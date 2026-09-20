@@ -535,6 +535,18 @@ extern void pending_rename_complete(struct PendingRename *pr);
 extern void pending_rename_deny(struct PendingRename *pr, const char *reason);
 extern void pending_rename_client_exit(struct Client *cptr);
 
+/* Relocation tombstones (evilnet/channel-relocate).  Called from
+ * destruct_channel() so a tombstone channel that dies before its grace
+ * period elapses takes its record and grace timer with it. */
+extern void relocate_tombstone_channel_gone(struct Channel *chptr);
+
+/* Grace-period member status restore (spec, "Status preservation").  Called
+ * from do_join() once a join to an existing channel has completed; looks up
+ * and CONSUMES a status snapshot for `who` in whichever live tombstone (if
+ * any) currently redirects to `newname`. */
+extern int relocate_snap_lookup(const char *newname, struct Client *who,
+                                unsigned int *flags, int *oplevel);
+
 extern struct Membership* find_member_link(struct Channel * chptr,
                                            const struct Client* cptr);
 extern int sub1_from_channel(struct Channel* chptr);
@@ -555,6 +567,7 @@ extern int client_can_send_to_channel(struct Client *cptr, struct Channel *chptr
 
 extern void remove_user_from_channel(struct Client *sptr, struct Channel *chptr);
 extern void remove_user_from_all_channels(struct Client* cptr);
+extern void channel_account_adjust(struct Client *cptr, int delta);
 
 extern int is_chan_op(struct Client *cptr, struct Channel *chptr);
 extern int is_zombie(struct Client *cptr, struct Channel *chptr);
@@ -610,6 +623,8 @@ extern int mode_parse(struct ModeBuf *mbuf, struct Client *cptr,
 #define MODE_PARSE_BURST	0x80	/**< be even more strict w/extra args */
 #define MODE_PARSE_ISHALFOP	0x100	/**< op and halfop differentiation */
 
+extern int joinbuf_load_s2s_msgids(struct Client *cptr, char out[][16],
+                                   int max);
 extern void joinbuf_init(struct JoinBuf *jbuf, struct Client *source,
 			 struct Client *connect, unsigned int type,
 			 char *comment, time_t create);

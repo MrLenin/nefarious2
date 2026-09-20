@@ -38,6 +38,7 @@
 #include "s_debug.h"
 #include "send.h"
 #include "ssl.h"
+#include "ircd_events.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -62,9 +63,6 @@
 /* WebSocket frame flags */
 #define WS_FIN  0x80
 #define WS_MASK 0x80
-
-/* Maximum WebSocket frame payload we'll accept */
-#define WS_MAX_PAYLOAD 16384
 
 /* Subprotocol types */
 #define WS_SUBPROTO_NONE   0  /**< No subprotocol requested by client */
@@ -182,15 +180,27 @@ static int parse_ws_handshake(const char *buffer, int length,
      * We select the first one we support.
      */
     else if (strncasecmp(line, "Sec-WebSocket-Protocol:", 23) == 0) {
-      const char *text_pos = strstr(line, "text.ircv3.net");
-      const char *binary_pos = strstr(line, "binary.ircv3.net");
-      if (text_pos && binary_pos) {
-        /* Both present — pick whichever appears first (client preference) */
-        *subproto = (binary_pos < text_pos) ? WS_SUBPROTO_BINARY : WS_SUBPROTO_TEXT;
-      } else if (text_pos) {
-        *subproto = WS_SUBPROTO_TEXT;
-      } else if (binary_pos) {
-        *subproto = WS_SUBPROTO_BINARY;
+      /* Token-boundary scan (a hypothetical "notext.ircv3.net" must
+       * not match); first supported token wins, and a preference
+       * already chosen from an earlier header line is never
+       * overridden, so multi-header requests keep client order. */
+      const char *p = line + 23;
+      while (*p && *subproto == WS_SUBPROTO_NONE) {
+        const char *e;
+        size_t n;
+        while (*p == ' ' || *p == '\t' || *p == ',')
+          p++;
+        if (!*p)
+          break;
+        e = p;
+        while (*e && *e != ',' && *e != ' ' && *e != '\t' && *e != '\r')
+          e++;
+        n = (size_t)(e - p);
+        if (n == 14 && 0 == strncasecmp(p, "text.ircv3.net", 14))
+          *subproto = WS_SUBPROTO_TEXT;
+        else if (n == 16 && 0 == strncasecmp(p, "binary.ircv3.net", 16))
+          *subproto = WS_SUBPROTO_BINARY;
+        p = e;
       }
     }
     /* Get Origin header for validation */
@@ -415,16 +425,35 @@ int websocket_handshake(struct Client *cptr, const char *buffer, int length)
   SetWebSocket(cptr);
   ClearWSNeedHandshake(cptr);
 
+  /* Retain the validated Origin for the oper-visible WEBSOCKET mark.
+   * Set pre-registration (no cli_name yet); register_user re-emits it
+   * to peers as MARK_WEBSOCKET, exactly like the SSLCLIFP mark, so any
+   * oper on any server sees it in WHOIS and can match on the origin.
+   * "-" records a WS client that sent no Origin (native ws libs), so
+   * the mark still flags WS-ness with a distinguishable empty origin. */
+  ircd_strncpy(cli_wsorigin(cptr), origin[0] ? origin : "-",
+               sizeof(cli_wsorigin(cptr)));
+
   /* Store subprotocol preference for frame encoding:
    * - text.ircv3.net: Set FLAG_WSTEXT, use text frames
    * - binary.ircv3.net: Don't set FLAG_WSTEXT, use binary frames
-   * - No subprotocol: Set FLAG_WSAUTODETECT, detect from first incoming frame
+   * - No subprotocol: DEFAULT TO TEXT, but keep FLAG_WSAUTODETECT so the
+   *   first incoming frame can still switch us to binary.  Text is the
+   *   right default: browser IRC clients are overwhelmingly text, the
+   *   IRCv3 WebSocket draft treats text (UTF-8) as the normal mode, and
+   *   the pre-registration auth NOTICEs flush at the 101 -- before any
+   *   client frame exists to autodetect from -- so a binary default sent
+   *   those greeting frames as binary to text clients (they arrived as
+   *   opcode-2 while later CAP replies were opcode-1).  A client that then
+   *   sends a binary first frame is switched to binary below; only its two
+   *   greeting notices were text (harmless -- binary-mode clients parse
+   *   bytes and ignore the opcode).
    */
   if (subproto == WS_SUBPROTO_TEXT) {
     SetWSText(cptr);
   } else if (subproto == WS_SUBPROTO_NONE) {
-    /* Legacy client - autodetect mode from first incoming frame */
-    SetWSAutodetect(cptr);
+    SetWSText(cptr);        /* default text ... */
+    SetWSAutodetect(cptr);  /* ... but let a binary first frame override */
   }
   /* For WS_SUBPROTO_BINARY, we leave both flags unset (binary mode) */
 
@@ -441,6 +470,84 @@ int websocket_handshake(struct Client *cptr, const char *buffer, int length)
 #endif
 }
 
+/** Accumulate an HTTP upgrade request across reads and run the handshake
+ * once it is complete.
+ *
+ * The request is collected in a per-connection heap buffer of
+ * WS_HANDSHAKE_MAX + 1 bytes, allocated on the first byte and released
+ * as soon as the handshake succeeds or fails (dealloc_connection() also
+ * frees it if the client goes away first).  Real browsers send 500-700
+ * byte upgrade requests, well over the 512-byte cli_buffer that used to
+ * hold it, so the request must be allowed to span several reads.
+ *
+ * @param[in] cptr Client attempting to connect.
+ * @param[in] data Bytes just read.
+ * @param[in] len Number of bytes in \a data.
+ * @param[out] consumed Number of bytes of \a data that belonged to the
+ *   request.  Any bytes after them arrived in the same read as the end
+ *   of the request and are the client's first WebSocket frames; the
+ *   caller must hand them to the frame decoder rather than drop them.
+ * @return 1 if the handshake completed, 0 if more data is needed, -1 if
+ *   the handshake failed, WS_HANDSHAKE_TOOBIG if WS_HANDSHAKE_MAX bytes
+ *   arrived without a terminating blank line.
+ */
+int websocket_handshake_feed(struct Client *cptr, const char *data,
+                             int len, int *consumed)
+{
+  char *buf = cli_ws_hs_buf(cptr);
+  int have = cli_ws_hs_len(cptr);
+  const char *term;
+  int take, req_len, result;
+
+  *consumed = 0;
+
+  if (!buf) {
+    buf = (char *)MyMalloc(WS_HANDSHAKE_MAX + 1);
+    cli_ws_hs_buf(cptr) = buf;
+    have = 0;
+  }
+
+  /* Append what fits; keep the buffer NUL-terminated for strstr() */
+  take = len;
+  if (take > WS_HANDSHAKE_MAX - have)
+    take = WS_HANDSHAKE_MAX - have;
+  if (take > 0)
+    memcpy(buf + have, data, take);
+  have += take;
+  buf[have] = '\0';
+  cli_ws_hs_len(cptr) = have;
+
+  Debug((DEBUG_DEBUG, "WebSocket handshake: +%d bytes, %d buffered", take, have));
+
+  /* Search from the start so a terminator split across reads is found */
+  term = strstr(buf, "\r\n\r\n");
+  if (!term) {
+    if (have >= WS_HANDSHAKE_MAX) {
+      Debug((DEBUG_DEBUG, "WebSocket: upgrade request from %s exceeds %d bytes",
+             cli_sockhost(cptr), WS_HANDSHAKE_MAX));
+      MyFree(buf);
+      cli_ws_hs_buf(cptr) = NULL;
+      cli_ws_hs_len(cptr) = 0;
+      return WS_HANDSHAKE_TOOBIG;
+    }
+    *consumed = take;
+    return 0;  /* need more data */
+  }
+
+  /* Everything past the blank line came from this read: hand it back */
+  req_len = (term + 4) - buf;
+  *consumed = take - (have - req_len);
+  buf[req_len] = '\0';
+
+  result = websocket_handshake(cptr, buf, req_len);
+
+  MyFree(buf);
+  cli_ws_hs_buf(cptr) = NULL;
+  cli_ws_hs_len(cptr) = 0;
+
+  return result;
+}
+
 /** Decode a WebSocket frame and extract the payload.
  * @param[in] frame Raw WebSocket frame data.
  * @param[in] frame_len Length of frame data.
@@ -449,7 +556,8 @@ int websocket_handshake(struct Client *cptr, const char *buffer, int length)
  * @param[out] payload_len Length of decoded payload.
  * @param[out] opcode The frame opcode.
  * @param[out] is_fin Set to 1 if FIN bit is set (final fragment), 0 otherwise.
- * @return Number of bytes consumed from frame, 0 if incomplete, -1 on error.
+ * @return Number of bytes consumed from frame, 0 if incomplete, -1 on
+ *   error, WS_DECODE_TOOBIG if the payload exceeds WS_MAX_PAYLOAD.
  *
  * RFC 6455 Compliance:
  * - §5.2: RSV1-3 bits MUST be 0 unless extension negotiated (we negotiate none)
@@ -531,10 +639,11 @@ int websocket_decode_frame(const unsigned char *frame, int frame_len,
     return -1;
   }
 
-  /* Sanity check payload length */
+  /* Sanity check payload length.  Distinct return so the caller can
+   * answer with Close 1009 instead of a bare TCP drop. */
   if (plen > WS_MAX_PAYLOAD) {
     Debug((DEBUG_DEBUG, "WebSocket: Frame too large: %llu bytes", plen));
-    return -1;
+    return WS_DECODE_TOOBIG;
   }
 
   /* Get mask (required for client-to-server frames - we already verified masked=1 above) */
@@ -576,6 +685,11 @@ int websocket_encode_frame(const char *data, int data_len,
 {
   int pos = 0;
   int opcode = text_mode ? WS_OPCODE_TEXT : WS_OPCODE_BINARY;
+
+  /* data_len feeds an unchecked memcpy() below; a negative value would be
+   * a SIZE_MAX copy.  Refuse rather than trust the caller. */
+  if (data_len < 0)
+    return -1;
 
   /* First byte: FIN + opcode */
   frame[pos++] = WS_FIN | opcode;
@@ -622,6 +736,14 @@ int websocket_encode_frame(const char *data, int data_len,
  */
 static int ws_send_raw(struct Client *cptr, const unsigned char *data, int len)
 {
+  /* Never interleave with a pending blocked TLS write or a stashed
+   * partial frame: OpenSSL requires the retry SSL_write to present the
+   * SAME buffer (else SSL_ERROR_SSL "bad write retry" kills the
+   * connection), and a plaintext partial frame must be completed before
+   * any new bytes.  All callers are best-effort: WS PING responses are
+   * re-askable and close/keepalive frames are optional. */
+  if (IsBlocked(cptr) || con_ws_txrem(cli_connect(cptr)))
+    return 0;
 #ifdef USE_SSL
   if (cli_socket(cptr).ssl) {
     int result = SSL_write(cli_socket(cptr).ssl, data, len);
@@ -632,6 +754,75 @@ static int ws_send_raw(struct Client *cptr, const unsigned char *data, int len)
     unsigned int bytes_sent;
     return (os_send_nonb(cli_fd(cptr), (char *)data, len, &bytes_sent) == IO_SUCCESS) ? 1 : 0;
   }
+}
+
+/** Send a WebSocket Close frame (RFC 6455 §5.5.1) with a status code.
+ * Best effort, no error reporting: this is used immediately before the
+ * connection is dropped so the client can tell a policy close (e.g.
+ * 1009 Message Too Big) apart from a network failure (1006).
+ * @param[in] cptr Client connection.
+ * @param[in] code Status code.
+ * @param[in] reason Optional reason text (truncated to fit a control frame).
+ */
+void websocket_send_close(struct Client *cptr, int code, const char *reason)
+{
+  unsigned char frame[2 + 125];
+  int rlen = reason ? (int)strlen(reason) : 0;
+
+  if (rlen > 123)
+    rlen = 123;  /* control frame payload <= 125 incl. 2-byte code */
+  frame[0] = WS_FIN | WS_OPCODE_CLOSE;
+  frame[1] = (unsigned char)(2 + rlen);
+  frame[2] = (code >> 8) & 0xFF;
+  frame[3] = code & 0xFF;
+  if (rlen > 0)
+    memcpy(frame + 4, reason, rlen);
+  Debug((DEBUG_DEBUG, "WebSocket: sending Close %d (%s)", code, reason ? reason : ""));
+  ws_send_raw(cptr, frame, 4 + rlen);
+}
+
+/** Send an empty WS protocol-level PING (RFC 6455 5.5.2).  Browsers
+ * auto-PONG these with no JS involvement -- a ~30s cadence keeps mobile
+ * NAT/middlebox mappings alive (their idle timeouts are commonly shorter
+ * than the 90s IRC ping cycle; observed killing mobile WS clients with
+ * "unexpected eof while reading" every few minutes) and surfaces dead
+ * sockets in seconds.  Best-effort via ws_send_raw, which skips while a
+ * TLS write retry is pending. */
+void websocket_send_ping(struct Client *cptr)
+{
+  static const unsigned char ping_frame[2] = { 0x89, 0x00 };
+  ws_send_raw(cptr, ping_frame, sizeof(ping_frame));
+}
+
+static struct Timer ws_ping_timer;
+
+static void ws_ping_callback(struct Event *ev)
+{
+  int i;
+
+  if (ev_type(ev) != ET_EXPIRE)
+    return;
+  for (i = 0; i <= HighestFd; i++) {
+    struct Client *cptr = LocalClientArray[i];
+    if (!cptr || !IsWebSocket(cptr) || IsDead(cptr) || cli_fd(cptr) < 0)
+      continue;
+    if (IsWSNeedHandshake(cptr) || IsWSSniff(cptr))
+      continue;
+    websocket_send_ping(cptr);
+  }
+}
+
+/** Arm the periodic WS keepalive ping timer (boot; interval from
+ * FEAT_WEBSOCKET_PING_INTERVAL, 0 disables, floor 10s). */
+void websocket_ping_timer_init(void)
+{
+  int iv = feature_int(FEAT_WEBSOCKET_PING_INTERVAL);
+
+  if (iv <= 0)
+    return;
+  if (iv < 10)
+    iv = 10;
+  timer_add(timer_init(&ws_ping_timer), ws_ping_callback, 0, TT_PERIODIC, iv);
 }
 
 int websocket_handle_control(struct Client *cptr, int opcode,

@@ -97,6 +97,7 @@
 #include "ircd_features.h"
 #include "history.h"
 #include "crdt_shadow.h"
+#include "chathistory_presence.h"
 
 /* #include <assert.h> -- Now using assert in ircd_log.h */
 #include <sys/time.h>
@@ -112,9 +113,8 @@
  */
 static void store_kick_event(struct Client *sptr, struct Channel *chptr,
                              struct Client *who, const char *comment,
-                             const char *broadcast_msgid)
+                             const char *broadcast_msgid, uint64_t event_ms)
 {
-  struct timeval tv;
   char timestamp[32];
   char fallback_msgid[64];
   const char *msgid;
@@ -129,9 +129,12 @@ static void store_kick_event(struct Client *sptr, struct Channel *chptr,
   if (!feature_bool(FEAT_CHATHISTORY_STORE))
     return;
 
-  /* Only store for local users to avoid duplicates */
-  if (!MyUser(sptr))
-    return;
+  /* Receiver-side storage: every server with the channel stores its
+   * own copy (same policy as store_channel_history -- the old
+   * MyUser-only gate left remote kicks unstored here, so their
+   * delivered msgids never entered the local index).  Cross-server
+   * duplicates don't arise: each server stores into its own DB, and
+   * federated query merges dedup by the now-shared msgid. */
 
   /* Check if channel has +P (no storage) mode */
   if (chptr->mode.exmode & EXMODE_NOSTORAGE)
@@ -143,11 +146,10 @@ static void store_kick_event(struct Client *sptr, struct Channel *chptr,
   else
     msgid = generate_msgid(fallback_msgid, sizeof(fallback_msgid));
 
-  /* Generate Unix timestamp for storage */
-  gettimeofday(&tv, NULL);
-  ircd_snprintf(0, timestamp, sizeof(timestamp), "%lu.%03lu",
-                (unsigned long)tv.tv_sec,
-                (unsigned long)(tv.tv_usec / 1000));
+  /* Row time: the event's one time (the S2S tag time the caller already
+   * put on the wire), else the mint time of the msgid chosen above. */
+  history_format_ms(timestamp, sizeof(timestamp),
+                    event_ms ? event_ms : history_event_time_ms(NULL));
 
   /* Build sender string: nick!user@host */
   if (cli_user(sptr))
@@ -262,21 +264,27 @@ int m_kick(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
               "Kick reason contained invalid UTF-8 and was sanitized");
   }
 
-  /* Generate msgid before S2S relay so both use the same one */
+  /* Unified msgid: reuse the incoming S2S msgid (remote kicks), else
+   * mint -- so every server's delivery, storage and onward relay share
+   * one id instead of a per-hop re-mint. */
   {
     char kick_msgid[64] = "";
+    uint64_t kick_ms = 0;
     if (feature_bool(FEAT_MSGID)) {
-      generate_msgid(kick_msgid, sizeof(kick_msgid));
-      sendcmdto_set_client_msgid(kick_msgid);
+      if (cptr && !MyUser(sptr) && cli_s2s_msgid(cptr)[0])
+        ircd_strncpy(kick_msgid, cli_s2s_msgid(cptr), sizeof(kick_msgid));
+      else
+        generate_msgid(kick_msgid, sizeof(kick_msgid));
+      /* The event's ONE time: the origin's tag time for a relayed kick,
+       * else the mint time.  Row, live @time, S2S @time and the presence
+       * close all use it (audit 2026-09-06 #16). */
+      kick_ms = history_event_time_ms(cptr && !MyUser(sptr) ? cptr : NULL);
+      sendcmdto_set_client_event(kick_msgid, kick_ms);
     }
 
   if (!IsLocalChannel(name)) {
-    if (kick_msgid[0]) {
-      struct timeval tv;
-      gettimeofday(&tv, NULL);
-      sendcmdto_set_s2s_tags(
-        (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000, kick_msgid);
-    }
+    if (kick_msgid[0])
+      sendcmdto_set_s2s_tags(kick_ms, kick_msgid);
     sendcmdto_want_s2s_tags(1);
     /* Phase 3k: KICK rides CRDT between CRDT-primary peers — suppress the P10 KICK
      * to CRDT-aware servers (they learn it via the CHANOP tombstone + kick_info +
@@ -309,8 +317,11 @@ int m_kick(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
 #ifdef USE_ROCKSDB
     /* Store KICK event in history — same msgid as broadcast */
     store_kick_event(sptr, chptr, who, comment,
-                     kick_msgid[0] ? kick_msgid : NULL);
+                     kick_msgid[0] ? kick_msgid : NULL, kick_ms);
 #endif
+    /* The victim's presence interval closes at the kick's time, not at
+     * whenever make_zombie's removal happens to run (P2). */
+    presence_set_event_time(kick_msgid[0] ? presence_event_time(kick_msgid, kick_ms) : 0);
   }
 
   if (feature_bool(FEAT_CRDT_PRIMARY)) {
@@ -319,11 +330,14 @@ int m_kick(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
      * and immediate removal avoids a reconcile double-KICK on this origin (local
      * clients already got the KICK above). The CHANOP tombstone is minted before
      * the remove so it covers the member's add-tags (crdt_shadow_part's later
-     * USER-priority remove then finds nothing uncovered). */
+     * USER-priority remove then finds nothing uncovered).  The presence event
+     * time set above covers this removal too (the interval closes at the
+     * kick's time either way). */
     crdt_shadow_kick(chptr, who, sptr, comment, cptr);
     remove_user_from_channel(who, chptr);
   } else
     make_zombie(member, who, cptr, sptr, chptr);
+  presence_set_event_time(0);
 
   return 0;
 }
@@ -372,7 +386,11 @@ int ms_kick(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
      */
     if (sptr == cli_user(who)->server)
     {
+      /* Presence closes at the KICK's own HLC stamp (the origin's). */
+      presence_set_event_time(presence_event_time(cli_s2s_msgid(cptr),
+                                                  history_event_time_ms(cptr)));
       remove_user_from_channel(who, chptr);
+      presence_set_event_time(0);
     }
     /* Otherwise, we treat zombies like they are not channel members. */
     member = 0;
@@ -430,11 +448,8 @@ int ms_kick(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
 
     /* Propagate kick with consistent S2S msgid... */
     if (kick_msgid[0]) {
-      if (!kick_time_ms) {
-        struct timeval tv;
-        gettimeofday(&tv, NULL);
-        kick_time_ms = (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
-      }
+      if (!kick_time_ms)
+        kick_time_ms = history_event_time_ms(NULL);  /* mint time */
       sendcmdto_set_s2s_tags(kick_time_ms, kick_msgid);
     }
     sendcmdto_want_s2s_tags(1);
@@ -450,7 +465,7 @@ int ms_kick(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
 
     if (member) { /* and tell the channel about it */
       if (kick_msgid[0])
-        sendcmdto_set_client_msgid(kick_msgid);
+        sendcmdto_set_client_event(kick_msgid, kick_time_ms);
 
       if (IsDelayedJoin(member)) {
         if (MyUser(who))
@@ -464,6 +479,7 @@ int ms_kick(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
 
       sendcmdto_set_client_msgid(NULL);
 
+      presence_set_event_time(kick_msgid[0] ? presence_event_time(kick_msgid, kick_time_ms) : 0);
       if (feature_bool(FEAT_CRDT_PRIMARY)) {
         /* Phase 3k: gateway-inbound (legacy→CRDT) or local — mint the CRDT kick +
          * remove immediately (no zombie). crdt_shadow_kick self-gates when @a cptr
@@ -472,6 +488,7 @@ int ms_kick(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
         remove_user_from_channel(who, chptr);
       } else
         make_zombie(member, who, cptr, sptr, chptr);
+      presence_set_event_time(0);
     }
   }
 

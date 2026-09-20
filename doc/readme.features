@@ -813,6 +813,18 @@ This is the maximum number of seconds to wait for the ident lookup and
 the DNS query to succeed.  On older (pre 2.10.11.06) servers this was
 hard coded to 60 seconds.
 
+BOUNCER_MAX_ALIASES
+ * Type: integer
+ * Default: 4
+
+Maximum number of simultaneous alias connections (additional clients on
+the same account attaching to one bouncer session) this server will
+ADMIT locally.  Settable at runtime with /SET, clamped to the compiled
+array size (16).  Lowering it never disturbs existing aliases; it only
+gates new attach attempts.  A connection refused here (and unable to
+attach any other way) is rejected with "Account already has an active
+session on this network".
+
 IPCHECK_CLONE_LIMIT
  * Type: integer
  * Default: 4
@@ -1860,3 +1872,58 @@ UPING_PORT
 
 The default UDP ping server port. Change requires a restart of the
 IRCd.
+
+REGISTER_VERIFY_EMAIL
+ * Type: boolean
+ * Default: FALSE
+
+Controls whether accounts created via the IRCv3 draft/account-registration
+REGISTER command require e-mail verification before they are usable. When
+enabled, REGISTER creates the Keycloak account with emailVerified set to
+false and a pending VERIFY_EMAIL required action; Keycloak mails the
+verification link and the client is sent a REGISTER VERIFICATION_REQUIRED
+reply instead of being logged in. The draft/account-registration CAP 302
+value also gains the "email-required" token so clients can detect the
+policy before registering. When disabled, REGISTER creates a fully usable,
+already-verified account and logs the client in immediately.
+
+Both SASL PLAIN and SASL SCRAM-SHA-256 gate on the same signal: a
+pending VERIFY_EMAIL required action on the Keycloak account (PLAIN via
+the ROPC "Account is not fully set up" error, SCRAM via the
+requiredActions field fetched with the user).  Accounts that predate
+this feature have emailVerified=false but no pending required action,
+so enabling the policy does not lock them out of either mechanism; only
+accounts created by REGISTER while the policy is on (which carry the
+required action until the verification link is followed) are held to
+verification.
+
+REGISTER_THROTTLE_LIMIT
+ * Type: integer
+ * Default: 3
+
+Maximum counted REGISTER attempts per client IP address (per /64 for
+IPv6) within REGISTER_THROTTLE_PERIOD seconds.  Attempts are counted,
+not successes: a rejected duplicate account name or a failed backend
+call still consumes budget, so account-name enumeration is rate-limited
+too.  A throttled client receives FAIL REGISTER RATE_LIMITED.  IRC
+operators bypass the throttle.  0 disables the per-IP limiter.
+
+REGISTER_THROTTLE_PERIOD
+ * Type: integer
+ * Default: 3600
+
+The window, in seconds, for both REGISTER_THROTTLE_LIMIT and
+REGISTER_THROTTLE_GLOBAL.  A client's per-IP window resets once this
+many seconds pass after its last counted attempt.  0 disables both
+limiters.
+
+REGISTER_THROTTLE_GLOBAL
+ * Type: integer
+ * Default: 60
+
+Server-wide cap on counted REGISTER attempts per
+REGISTER_THROTTLE_PERIOD, regardless of source IP -- the backstop that
+bounds account minting from a botnet spread across many addresses.
+Trips are logged at L_WARNING.  Note this is per-server, not
+per-network: each server enforces its own budget.  0 disables the
+global limiter.

@@ -52,6 +52,7 @@ extern void send_buffer(struct Client* to, struct MsgBuf* buf, int prio);
 extern void kill_highest_sendq(int servers_too);
 extern void flush_connections(struct Client* cptr);
 extern void send_queued(struct Client *to);
+extern void client_reconcile_sendq(struct Client *to);
 
 /* Send a raw message to one client; USE ONLY IF YOU MUST SEND SOMETHING
  * WITHOUT A PREFIX!
@@ -83,8 +84,13 @@ extern void sendcmdto_want_s2s_tags(int want);
 extern void sendcmdto_set_fwd_batch(const char *batch_id);
 /* Override msgid for client-side channel broadcasts (caller must clear after use) */
 extern void sendcmdto_set_client_msgid(const char *msgid);
+/** Second required cap for the next channel-capab send (consumed by it). */
+extern void sendcmdto_set_extra_withcap(int cap);
 /* Override server-time for client-side tag formatting (caller must clear after use) */
 extern void sendcmdto_set_client_time(const char *timestr);
+/** Arm the client msgid AND the event's time (epoch ms) for the
+ * client-facing @time tag; cleared by sendcmdto_set_client_msgid(NULL). */
+extern void sendcmdto_set_client_event(const char *msgid, uint64_t event_ms);
 /* Override S2S compact tag time/msgid for forwarded commands (auto-cleared) */
 extern void sendcmdto_set_s2s_tags(uint64_t time_ms, const char *msgid);
 /* Override S2S compact tag bouncer session-id hint (,S segment) for the next

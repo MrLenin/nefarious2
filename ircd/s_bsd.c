@@ -298,6 +298,32 @@ static IOResult client_sendv(struct Client *cptr, struct MsgQ *buf, unsigned int
   else
     return os_sendv_nonb(cli_fd(cptr), buf, count_in, count_out);
 }
+
+/** Set the event interest of a socket whose TLS handshake is still in
+ * progress to what OpenSSL needs next: readable always (the peer's next
+ * flight, an alert, or a close can arrive at any point), writable only
+ * while SSL_accept holds handshake bytes the kernel would not take.
+ *
+ * The write side is the one that matters.  Client listeners give their
+ * accepted sockets a CLIENT_TCP_WINDOW send buffer (2 KB, which the
+ * kernel doubles), and a server flight with a real certificate chain is
+ * larger than that, so SSL_accept regularly writes the first 4 KB, gets
+ * EAGAIN, and returns SSL_ERROR_WANT_WRITE.  Nothing else arms writable
+ * interest for it: the auth notices are queued behind the handshake, and
+ * once the idle-socket spin was fixed their interest is dropped whenever
+ * SSL_accept waits to read.  The handshake then sat until an unrelated
+ * event (a late DNS notice, or the peer poking the socket) or the connect
+ * timeout -- which the client saw as an EOF mid-handshake.
+ *
+ * Called after every SSL_accept that reports the handshake still pending.
+ * Anything queued meanwhile gets the writable interest back through
+ * update_write once the handshake completes. */
+static void ssl_handshake_events(struct Client *cptr)
+{
+  socket_events(&(cli_socket(cptr)),
+                SOCK_ACTION_SET | SOCK_EVENT_READABLE
+                | (ssl_want_write(cptr) ? SOCK_EVENT_WRITABLE : 0));
+}
 #endif /* USE_SSL */
 
 /** Attempt to send a sequence of bytes to the connection.
@@ -321,6 +347,15 @@ unsigned int deliver_it(struct Client *cptr, struct MsgQ *buf)
    */
   if (IsWSNeedHandshake(cptr) || IsWSSniff(cptr)) {
     SetFlag(cptr, FLAG_BLOCKED);
+    /* Nothing can go out until the sniff/handshake decides, so drop
+     * write interest: the auth notices queued at accept had armed it,
+     * and an idle socket is always writable, so leaving it armed made
+     * epoll return instantly for the life of the connection -- one
+     * silent TCP connection pinned a core for CONNECTTIMEOUT seconds.
+     * The paths that resolve the state (sniff -> plain IRC, handshake
+     * complete) call send_queued, which re-arms via update_write if the
+     * socket then really blocks. */
+    socket_events(&(cli_socket(cptr)), SOCK_ACTION_DEL | SOCK_EVENT_WRITABLE);
     return 0;
   }
 
@@ -337,6 +372,51 @@ unsigned int deliver_it(struct Client *cptr, struct MsgQ *buf)
     IOResult result = IO_SUCCESS;
     int text_mode = IsWSText(cptr) ? 1 : 0;
     unsigned int total_ws_written = 0;
+    unsigned int consumed = 0;  /* input bytes whose frames were FULLY written */
+    struct Connection *wcon = cli_connect(cptr);
+
+    /* A previous flush left a partially-written frame on the wire
+     * (plaintext short write).  Its line was already consumed from the
+     * queue, so the REST of that exact frame must go out before any new
+     * frame -- resending from the frame start would corrupt the stream. */
+    if (con_ws_txrem(wcon)) {
+      unsigned int remlen = (unsigned)(con_ws_txrem_len(wcon) - con_ws_txrem_pos(wcon));
+      unsigned int wrote = 0;
+      IOResult r = IO_BLOCKED;
+#ifdef USE_SSL
+      if (cli_socket(cptr).ssl) {
+        int sr = SSL_write(cli_socket(cptr).ssl,
+                           con_ws_txrem(wcon) + con_ws_txrem_pos(wcon), remlen);
+        if (sr > 0) { wrote = (unsigned)sr; r = IO_SUCCESS; }
+        else {
+          int se = SSL_get_error(cli_socket(cptr).ssl, sr);
+          r = (se == SSL_ERROR_WANT_WRITE || se == SSL_ERROR_WANT_READ)
+                ? IO_BLOCKED : IO_FAILURE;
+        }
+      } else
+#endif
+        r = os_send_nonb(cli_fd(cptr), con_ws_txrem(wcon) + con_ws_txrem_pos(wcon),
+                         remlen, &wrote);
+      if (wrote) {
+        total_ws_written += wrote;
+        con_ws_txrem_pos(wcon) += (int)wrote;
+      }
+      if (con_ws_txrem_pos(wcon) >= con_ws_txrem_len(wcon)) {
+        MyFree(con_ws_txrem(wcon));
+        con_ws_txrem(wcon) = NULL;
+        con_ws_txrem_len(wcon) = con_ws_txrem_pos(wcon) = 0;
+      } else {
+        cli_sendB(cptr) += total_ws_written;
+        cli_sendB(&me)  += total_ws_written;
+        if (r == IO_FAILURE) {
+          cli_error(cptr) = errno;
+          SetFlag(cptr, FLAG_DEADSOCKET);
+          return 0;
+        }
+        SetFlag(cptr, FLAG_BLOCKED);
+        return 0;  /* remainder still pending; nothing new consumed */
+      }
+    }
 
     /* Get data from message queue as iovecs */
     iovcnt = msgq_mapiov(buf, iov, IOV_MAX, &bytes_count);
@@ -362,15 +442,19 @@ unsigned int deliver_it(struct Client *cptr, struct MsgQ *buf)
       while (pos < end) {
         char *crlf = strstr(pos, "\r\n");
         int line_len;
+        int in_len;
         int frame_len;
 
         if (!crlf) {
-          /* Incomplete line (no \r\n) — shouldn't happen in normal IRC,
-           * but handle gracefully: send what we have */
-          line_len = end - pos;
-        } else {
-          line_len = crlf - pos;  /* exclude \r\n */
+          /* Incomplete tail: an artifact of the concat_buf cap when the
+           * mapped batch exceeded it.  Do NOT frame a truncated line --
+           * leave it queued (consumed stops before it) and the next
+           * flush re-frames it whole.  Every sender terminates lines
+           * with \r\n, so a permanent crlf-less tail cannot occur. */
+          break;
         }
+        line_len = crlf - pos;  /* exclude \r\n */
+        in_len = line_len + 2;  /* this line's share of queue bytes */
 
         if (line_len > 0) {
           char irc_line[FULL_MSG_SIZE + 4];
@@ -384,7 +468,16 @@ unsigned int deliver_it(struct Client *cptr, struct MsgQ *buf)
            * using text messages. We replace invalid bytes with U+FFFD.
            */
           if (text_mode && !string_is_valid_utf8(irc_line)) {
-            line_len = string_sanitize_utf8(irc_line);
+            /* string_sanitize_utf8() returns -1 for "nothing modified",
+             * which happens whenever the offending bytes sit past its
+             * BUFSIZE working window: the line is then unchanged and its
+             * original length still stands.  Assigning that -1 into
+             * line_len would hand websocket_encode_frame() a data_len of
+             * -1, i.e. memcpy(..., SIZE_MAX).  The inbound path at the
+             * bottom of this file already guards it; do the same here. */
+            int sanitized_len = string_sanitize_utf8(irc_line);
+            if (sanitized_len >= 0)
+              line_len = sanitized_len;
           }
 
           /* Encode as WebSocket frame using client's negotiated/detected mode */
@@ -394,12 +487,24 @@ unsigned int deliver_it(struct Client *cptr, struct MsgQ *buf)
           Debug((DEBUG_DEBUG, "WebSocket deliver: line_len=%d, frame_len=%d, msg='%.50s'",
                  line_len, frame_len, irc_line));
 
+          if (frame_len <= 0) {
+            /* Un-encodable line: consume and SKIP it.  (PR #102 wrote a
+             * bare break against the old return-bytes_count accounting,
+             * where the batch was deleted wholesale; under per-line
+             * consumed accounting a break would leave this line at the
+             * queue head and stall the connection's output forever.) */
+            consumed += (unsigned)in_len;
+            pos = crlf + 2;
+            continue;
+          }
+
 #ifdef USE_SSL
           if (cli_socket(cptr).ssl) {
             int send_result = SSL_write(cli_socket(cptr).ssl, ws_frame, frame_len);
             if (send_result > 0) {
               result = IO_SUCCESS;
               total_ws_written += send_result;
+              consumed += (unsigned)in_len;
             } else {
               int ssl_err = SSL_get_error(cli_socket(cptr).ssl, send_result);
               if (ssl_err == SSL_ERROR_WANT_WRITE || ssl_err == SSL_ERROR_WANT_READ)
@@ -416,20 +521,30 @@ unsigned int deliver_it(struct Client *cptr, struct MsgQ *buf)
             if (result == IO_SUCCESS) {
               total_ws_written += frame_written;
               if (frame_written < (unsigned)frame_len) {
+                /* Short write: part of this frame is on the wire.  Stash
+                 * the remainder to be completed FIRST next flush, and
+                 * count the line consumed (its bytes precede everything
+                 * still queued). */
+                int rem = frame_len - (int)frame_written;
+                con_ws_txrem(wcon) = (char *)MyMalloc(rem);
+                memcpy(con_ws_txrem(wcon), ws_frame + frame_written, rem);
+                con_ws_txrem_len(wcon) = rem;
+                con_ws_txrem_pos(wcon) = 0;
+                consumed += (unsigned)in_len;
                 result = IO_BLOCKED;
-                break;  /* Partial write — stop */
+                break;
               }
+              consumed += (unsigned)in_len;
             } else {
               break;  /* Error — stop sending */
             }
           }
+        } else {
+          consumed += (unsigned)in_len;  /* bare CRLF: swallow */
         }
 
         /* Advance past this message (including \r\n) */
-        if (crlf)
-          pos = crlf + 2;
-        else
-          break;
+        pos = crlf + 2;
       }
     }
 
@@ -438,18 +553,24 @@ unsigned int deliver_it(struct Client *cptr, struct MsgQ *buf)
       ClrFlag(cptr, FLAG_BLOCKED);
       cli_sendB(cptr) += total_ws_written;
       cli_sendB(&me)  += total_ws_written;
-      /* Return original byte count so msgq knows how much to delete */
-      bytes_written = bytes_count;
+      /* Consumed = bytes of lines whose frames were fully written.  Not
+       * bytes_count: a concat_buf-capped tail was never framed and must
+       * stay queued (the old return silently DROPPED it). */
+      bytes_written = consumed;
       break;
     case IO_BLOCKED:
       SetFlag(cptr, FLAG_BLOCKED);
       cli_sendB(cptr) += total_ws_written;
       cli_sendB(&me)  += total_ws_written;
-      /* Partial delivery — tell msgq we consumed everything we could.
-       * Since we can't partially consume msgq entries, report 0 to
-       * retry the whole batch next time, or bytes_count if we sent
-       * all frames despite a partial write on the last one. */
-      bytes_written = 0;
+      /* Consume exactly the fully-sent lines so the BLOCKED line sits at
+       * the queue head for the retry.  The retry then re-frames the SAME
+       * bytes into the same static buffer, satisfying OpenSSL's
+       * retry-same-buffer rule.  (The old return of 0 re-framed from the
+       * batch start: after a mid-batch WANT_WRITE the next SSL_write
+       * presented a DIFFERENT frame -> SSL_ERROR_SSL "bad write retry"
+       * -> the mid-session "Internal OpenSSL error" kill -- and every
+       * already-sent frame went out again as a duplicate.) */
+      bytes_written = consumed;
       break;
     case IO_FAILURE:
       cli_error(cptr) = errno;
@@ -531,8 +652,22 @@ static int completed_connection(struct Client* cptr)
       sendto_opmask_butone(0, SNO_OLDSNO, "Connection failed to %s: Unable to select SSL ciphers",
                            cli_name(cptr));
       return 0;
-    } else if (r == 0)
+    } else if (r == 0) {
+      /* TCP is up and the TLS handshake waits on the peer.  Leave the
+       * connect-pending state: its interest is write-only, and an
+       * established socket is always writable, so the loop re-entered
+       * here on every iteration until the peer's flight arrived -- a peer
+       * that accepts and then stalls pinned a core until the connect
+       * timeout.  Wait instead on what OpenSSL asks for (the accept
+       * side's ssl_handshake_events); the read and write handlers bring
+       * the handshake back here while the flag is set. */
+      SetSSLNeedConnect(cptr);
+      if (s_state(&(cli_socket(cptr))) == SS_CONNECTING)
+        socket_state(&(cli_socket(cptr)), SS_CONNECTED);
+      ssl_handshake_events(cptr);
       return 1;
+    }
+    ClearSSLNeedConnect(cptr);
     sslfp = ssl_get_fingerprint(cli_socket(cptr).ssl);
     if (sslfp) {
       ircd_strncpy(cli_sslclifp(cptr), sslfp, BUFSIZE+1);
@@ -867,8 +1002,12 @@ void add_connection(struct Listener* listener, int fd) {
 /* End Gline */
 
   cli_fd(new_client) = fd;
+  /* Readable from the start: nothing is delivered before this function
+   * returns, and the TLS handshake below is driven by read events (plus
+   * write interest while OpenSSL asks for it -- ssl_handshake_events). */
   if (!socket_add(&(cli_socket(new_client)), client_sock_callback,
-		  (void*) cli_connect(new_client), SS_CONNECTED, 0, fd)) {
+		  (void*) cli_connect(new_client), SS_CONNECTED,
+		  SOCK_EVENT_READABLE, fd)) {
     ++ServerStats->is_ref;
 #ifdef USE_SSL
     ssl_murder(ssl, fd, register_message);
@@ -891,6 +1030,10 @@ void add_connection(struct Listener* listener, int fd) {
       cli_fd(new_client) = -1;
       return;
     }
+    /* The ClientHello may already have been waiting, in which case the
+     * server flight just went out -- possibly only part of it. */
+    if (IsSSLNeedAccept(new_client))
+      ssl_handshake_events(new_client);
   }
 #endif
 
@@ -1093,43 +1236,48 @@ ssl_read_again:
      */
     if (IsWSNeedHandshake(cptr)) {
       int result;
-      char *client_buffer;
-      char *endp;
-      const char *src;
+      int consumed;
 
       Debug((DEBUG_DEBUG, "Client WebSocket handshake: length=%d", length));
 
-      /* Accumulate data in client buffer for HTTP request */
-      client_buffer = cli_buffer(cptr);
-      endp = client_buffer + cli_count(cptr);
-      src = readbuf;
+      /*
+       * The request is accumulated in a per-connection buffer of up to
+       * WS_HANDSHAKE_MAX bytes (browsers send 500-700 byte requests,
+       * more than cli_buffer holds) and the handshake runs once the
+       * blank line arrives, however many reads that takes.
+       */
 
-      /* Copy incoming data to buffer */
-      while (length > 0 && (endp - client_buffer) < BUFSIZE - 1) {
-        *endp++ = *src++;
-        length--;
+      /* The sniff step above may have parked up to 3 bytes in
+       * cli_buffer; they are the start of the request.  Too short to
+       * complete anything, so the result is not interesting. */
+      if (cli_count(cptr) > 0) {
+        (void)websocket_handshake_feed(cptr, cli_buffer(cptr), cli_count(cptr),
+                                       &consumed);
+        cli_count(cptr) = 0;
       }
-      *endp = '\0';
-      cli_count(cptr) = endp - client_buffer;
 
-      /* Try to complete handshake */
-      result = websocket_handshake(cptr, client_buffer, cli_count(cptr));
+      result = websocket_handshake_feed(cptr, readbuf, length, &consumed);
       if (result == 0) {
         /* Need more data */
         return 1;
+      } else if (result == WS_HANDSHAKE_TOOBIG) {
+        return exit_client(cptr, cptr, &me, "WebSocket handshake too large");
       } else if (result < 0) {
         /* Handshake failed */
         return exit_client(cptr, cptr, &me, "WebSocket handshake failed");
       }
-      /* Handshake succeeded - clear buffer and unblock sends */
+      /* Handshake succeeded - unblock sends */
       Debug((DEBUG_DEBUG, "WebSocket handshake completed successfully"));
-      cli_count(cptr) = 0;
       ClrFlag(cptr, FLAG_BLOCKED);  /* Allow queued messages to be sent */
       /* Trigger send of queued data */
       send_queued(cptr);
-      /* If no remaining data, we're done for now */
+      /* Anything after the request in this read is already WebSocket
+       * frame data: move it to the front of readbuf for the decoder
+       * below instead of dropping it. */
+      length -= consumed;
       if (length <= 0)
         return 1;
+      memmove(readbuf, readbuf + consumed, length);
     }
 
     /*
@@ -1138,41 +1286,71 @@ ssl_read_again:
      * Supports RFC 6455 fragmentation and partial frame buffering.
      */
     if (length > 0 && IsWebSocket(cptr)) {
-      char ws_payload[BUFSIZE + 16];  /* Stack-local, not static */
-      int ws_len, opcode, consumed, is_fin;
+      /* Decode buffer.  The decoder rejects any payload >= the buffer
+       * size, so this must be larger than WS_MAX_PAYLOAD (the largest
+       * frame it accepts) plus the '\n' appended below.  Static rather
+       * than stack: 16 KB is too much stack, and read_packet() is not
+       * reentrant anyway (readbuf is static too). */
+      static char ws_payload[WS_MAX_PAYLOAD + 2];
+      int ws_len = 0, opcode = 0, consumed, is_fin = 0;
       unsigned char *ws_data;
       int ws_remaining;
       int copy_len;
+      const char *src = readbuf;
+      int src_len = length;
 
       Debug((DEBUG_DEBUG, "WebSocket receive: length=%d, IsWebSocket=%d", length, IsWebSocket(cptr)));
 
-      /* Prepend any partial frame from previous read */
-      if (cli_ws_frame_len(cptr) > 0) {
-        copy_len = length;
-        if (copy_len > BUFSIZE - cli_ws_frame_len(cptr))
-          copy_len = BUFSIZE - cli_ws_frame_len(cptr);
-        memcpy(cli_ws_frame_buf(cptr) + cli_ws_frame_len(cptr), readbuf, copy_len);
-        ws_data = cli_ws_frame_buf(cptr);
-        ws_remaining = cli_ws_frame_len(cptr) + copy_len;
-      } else {
-        ws_data = (unsigned char *)readbuf;
-        ws_remaining = length;
-      }
+      /*
+       * All input goes through the per-connection frame buffer, which
+       * holds exactly one maximum-size frame (WS_MAX_FRAME).  readbuf
+       * (SERVER_TCP_WINDOW) can be much larger than that, so the loop
+       * below tops the frame buffer up from readbuf whenever it holds
+       * no complete frame, decodes what it can, and repeats until the
+       * read is drained.  A frame split across reads is thus reassembled
+       * whatever its size, and bytes after a completed frame are never
+       * dropped.
+       */
+      ws_data = cli_ws_frame_buf(cptr);
+      ws_remaining = cli_ws_frame_len(cptr);
 
-      while (ws_remaining > 0) {
-        consumed = websocket_decode_frame(ws_data, ws_remaining,
-                                          ws_payload, sizeof(ws_payload),
-                                          &ws_len, &opcode, &is_fin);
-        Debug((DEBUG_DEBUG, "WebSocket decode: consumed=%d, ws_len=%d, opcode=%d, is_fin=%d, remaining=%d",
-               consumed, ws_len, opcode, is_fin, ws_remaining));
+      while (ws_remaining > 0 || src_len > 0) {
+        consumed = 0;
+        if (ws_remaining > 0) {
+          consumed = websocket_decode_frame(ws_data, ws_remaining,
+                                            ws_payload, sizeof(ws_payload),
+                                            &ws_len, &opcode, &is_fin);
+          Debug((DEBUG_DEBUG, "WebSocket decode: consumed=%d, ws_len=%d, opcode=%d, is_fin=%d, remaining=%d",
+                 consumed, ws_len, opcode, is_fin, ws_remaining));
+        }
         if (consumed == 0) {
-          /* Incomplete frame - save for next read */
-          Debug((DEBUG_DEBUG, "WebSocket: Incomplete frame, saving %d bytes", ws_remaining));
-          if (ws_remaining > 0 && ws_remaining < BUFSIZE) {
-            memmove(cli_ws_frame_buf(cptr), ws_data, ws_remaining);
-            cli_ws_frame_len(cptr) = ws_remaining;
+          /* Incomplete frame (or empty buffer): pull in more of the read */
+          if (src_len <= 0) {
+            Debug((DEBUG_DEBUG, "WebSocket: Incomplete frame, saving %d bytes", ws_remaining));
+            break;  /* tail is saved after the loop */
           }
-          break;
+          if (ws_remaining > 0 && ws_data != cli_ws_frame_buf(cptr))
+            memmove(cli_ws_frame_buf(cptr), ws_data, ws_remaining);
+          ws_data = cli_ws_frame_buf(cptr);
+          copy_len = (int)sizeof(cli_ws_frame_buf(cptr)) - ws_remaining;
+          if (copy_len <= 0) {
+            /* Buffer full and still no complete frame.  Cannot happen for
+             * a frame the decoder accepts (WS_MAX_FRAME covers the largest
+             * header plus WS_MAX_PAYLOAD), so treat it as a protocol error
+             * rather than spin. */
+            return exit_client(cptr, cptr, &me, "WebSocket frame error");
+          }
+          if (copy_len > src_len)
+            copy_len = src_len;
+          memcpy(cli_ws_frame_buf(cptr) + ws_remaining, src, copy_len);
+          ws_remaining += copy_len;
+          src += copy_len;
+          src_len -= copy_len;
+          continue;
+        } else if (consumed == WS_DECODE_TOOBIG) {
+          /* Over WS_MAX_PAYLOAD: tell the client why before dropping it */
+          websocket_send_close(cptr, 1009, "Message too big");
+          return exit_client(cptr, cptr, &me, "WebSocket message too big");
         } else if (consumed < 0) {
           /* Frame error */
           Debug((DEBUG_DEBUG, "WebSocket: Frame error (consumed=%d)", consumed));
@@ -1180,12 +1358,42 @@ ssl_read_again:
         }
 
         Debug((DEBUG_DEBUG, "WebSocket frame payload: '%.50s'", ws_payload));
-        cli_ws_frame_len(cptr) = 0;  /* Frame consumed successfully */
+
+        /* Frames that put nothing on the recvQ never meet fakelag, so a
+         * 6-byte PING (or an empty TEXT frame) cost a decode iteration,
+         * and for PING a TLS record and a syscall, unbounded.  They are
+         * metered on their own clock (see WS_CONTROL_FLOOD_CEIL).  CLOSE
+         * ends the connection; an empty FIN continuation completes a
+         * fragmented message, so both stay free. */
+        if ((opcode >= WS_OPCODE_CLOSE && opcode != WS_OPCODE_CLOSE)
+            || (opcode < WS_OPCODE_CLOSE && ws_len == 0
+                && !(opcode == WS_OPCODE_CONTINUATION && is_fin))) {
+          if (cli_ws_ctl_since(cptr) < CurrentTime)
+            cli_ws_ctl_since(cptr) = CurrentTime;
+          cli_ws_ctl_since(cptr) += WS_CONTROL_FLOOD_CHARGE;
+          if (cli_ws_ctl_since(cptr) - CurrentTime > WS_CONTROL_FLOOD_CEIL) {
+            websocket_send_close(cptr, 1008, "Excess Flood");
+            return exit_client(cptr, cptr, &me, "Excess Flood");
+          }
+        }
 
         /* Handle control frames (always complete, can be interleaved) */
         if (opcode >= WS_OPCODE_CLOSE) {
           if (!websocket_handle_control(cptr, opcode, ws_payload, ws_len)) {
-            /* Close frame received */
+            /* Close frame received.  A WS CLOSE is transport teardown --
+             * the WebSocket-layer FIN -- so route it through the bouncer
+             * hold gate exactly like the dead-link path below (~1746)
+             * does for a TCP drop.  Every other disconnect entry point
+             * (dead-link, QUIT, ping timeout) consults the gate; without
+             * this, a clean WS close destroyed a persistent session an
+             * unclean drop would have kept.  Mirrors the dead-link
+             * shape deliberately: no immediate-promote shortcut here
+             * (see that site's comment for the promote/BX X race). */
+            if (IsUser(cptr) && bounce_should_hold(cptr)) {
+              if (bounce_hold_client(cptr, "WebSocket closed") == 0)
+                return CPTR_KILLED; /* held: ghost owns the socket now */
+              /* hold failed -> fall through to normal exit */
+            }
             return exit_client(cptr, cptr, &me, "WebSocket closed");
           }
         }
@@ -1223,11 +1431,13 @@ ssl_read_again:
         }
         /* Handle data frames (TEXT or BINARY) */
         else if (opcode == WS_OPCODE_TEXT || opcode == WS_OPCODE_BINARY) {
-          /* Autodetect mode for legacy clients based on first incoming frame */
+          /* Autodetect mode from the first incoming frame.  Text is the
+           * default (set at handshake), so only a BINARY first frame
+           * changes anything -- switch this client to binary. */
           if (IsWSAutodetect(cptr)) {
-            if (opcode == WS_OPCODE_TEXT)
-              SetWSText(cptr);
-            /* Binary mode is default (no flag set) */
+            if (opcode == WS_OPCODE_BINARY)
+              ClearWSText(cptr);
+            /* TEXT: leave the default text flag set */
             ClearWSAutodetect(cptr);
             Debug((DEBUG_DEBUG, "WebSocket: Autodetected mode from opcode %d, text=%d",
                    opcode, IsWSText(cptr)));
@@ -1275,6 +1485,11 @@ ssl_read_again:
         ws_data += consumed;
         ws_remaining -= consumed;
       }
+
+      /* Keep any partial frame at the front of the buffer for the next read */
+      if (ws_remaining > 0 && ws_data != cli_ws_frame_buf(cptr))
+        memmove(cli_ws_frame_buf(cptr), ws_data, ws_remaining);
+      cli_ws_frame_len(cptr) = ws_remaining;
       length = 0; /* Data processed via WebSocket path */
     }
 
@@ -1720,6 +1935,10 @@ void client_sock_callback(struct Event* ev)
     if (IsSSLNeedAccept(cptr)) {
       int r = ssl_accept(cptr);
       if (r == 1) {
+        /* Still in progress: wait for what OpenSSL needs.  This drops
+         * the writable interest an auth notice may have armed, so an
+         * idle socket (no ClientHello yet) does not spin the loop. */
+        ssl_handshake_events(cptr);
         break;
       } else if (r == 0) {
         SetFlag(cptr, FLAG_DEADSOCKET);
@@ -1729,8 +1948,13 @@ void client_sock_callback(struct Event* ev)
         break;
       }
     }
-    if (s_state(&(con_socket(con))) == SS_CONNECTING) {
-      completed_connection(cptr);
+    if (s_state(&(con_socket(con))) == SS_CONNECTING || IsSSLNeedConnect(cptr)) {
+      if (!completed_connection(cptr)) {
+        fallback = cli_info(cptr);
+        break;
+      }
+      if (IsSSLNeedConnect(cptr))
+        break;   /* still handshaking: nothing to write yet */
     }
 #endif
     ClrFlag(cptr, FLAG_BLOCKED);
@@ -1748,6 +1972,10 @@ void client_sock_callback(struct Event* ev)
       if (IsSSLNeedAccept(cptr)) {
         int r = ssl_accept(cptr);
         if (r == 1) {
+          /* Usually the ClientHello was just consumed and the server
+           * flight written; when only part of it fit the socket buffer
+           * this arms the writable interest that finishes it. */
+          ssl_handshake_events(cptr);
           break;
         } else if (r == 0) {
           SetFlag(cptr, FLAG_DEADSOCKET);
@@ -1756,9 +1984,18 @@ void client_sock_callback(struct Event* ev)
           ssl_abort(cptr);
           break;
         }
+        /* Handshake done: whatever was queued meanwhile (the auth
+         * notices) needs the writable interest the handshake did not. */
+        update_write(cptr);
       }
-      if (s_state(&(con_socket(con))) == SS_CONNECTING)
-        completed_connection(cptr);
+      if (s_state(&(con_socket(con))) == SS_CONNECTING || IsSSLNeedConnect(cptr)) {
+        if (!completed_connection(cptr)) {
+          fallback = cli_info(cptr);
+          break;
+        }
+        if (IsSSLNeedConnect(cptr))
+          break;   /* still handshaking: nothing to read as data yet */
+      }
 #endif
       Debug((DEBUG_DEBUG, "Reading data from %C", cptr));
       if (read_packet(cptr, 1) == 0) /* error while reading packet */

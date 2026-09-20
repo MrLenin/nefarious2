@@ -100,6 +100,7 @@
 #include "metadata.h"
 #include "channel.h"
 #include "crdt_shadow.h"        /* 3l account-prop: re-mint the doc user record on account change */
+#include "chathistory_presence.h"
 
 /* #include <assert.h> -- Now using assert in ircd_log.h */
 #include <stdlib.h>
@@ -232,19 +233,26 @@ int ms_account(struct Client* cptr, struct Client* sptr, int parc,
          * string is still set so the LMDB lookup key is valid. */
         metadata_clear_client(acptr);
 
-        /* Decrement authusers for all channels this user is in */
-        {
-          struct Membership *chan;
-          for (chan = cli_user(acptr)->channel; chan; chan = chan->next_channel) {
-            if (chan->channel->authusers > 0)
-              --chan->channel->authusers;
-          }
-        }
+        /* Decrement authusers for all channels this user is in.
+         * channel_account_adjust skips CHFL_ALIAS memberships, so an
+         * AC U addressed at an alias numeric cannot steal counts the
+         * alias never added. */
+        channel_account_adjust(acptr, -1);
+
+        /* Strict-presence anchor transfer: account -> session, closing
+         * the account-anchored open interval (deauth previously left
+         * it open forever -- unbounded forward visibility). */
+        presence_anchor_transfer(acptr, cli_user(acptr)->account, 0,
+                                 cli_session_id(acptr), 1);
+
+        /* Emit the alias account-clear BEFORE ClearAccount:
+         * bounce_emit_alias_update bails on !IsAccount(primary), so
+         * the old order (clear first) silently stranded every alias
+         * with a stale FLAG_ACCOUNT after deauth. */
+        bounce_emit_alias_update(acptr, "account", "");
 
         ClearAccount(acptr);
         ircd_strncpy(cli_user(acptr)->account, "", ACCOUNTLEN + 1);
-
-        bounce_emit_alias_update(acptr, "account", "");
 
         {
           char ac_msgid[64] = "";
@@ -268,6 +276,7 @@ int ms_account(struct Client* cptr, struct Client* sptr, int parc,
               ac_time = (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
             }
             sendcmdto_set_s2s_tags(ac_time, ac_msgid);
+            sendcmdto_want_s2s_tags(1);
           }
         }
 
@@ -297,17 +306,33 @@ int ms_account(struct Client* cptr, struct Client* sptr, int parc,
         /* Load account-linked metadata BEFORE setting account flag */
         metadata_load_account(acptr, parv[3]);
 
-        ircd_strncpy(cli_user(acptr)->account, parv[3], ACCOUNTLEN + 1);
-        SetAccount(acptr);
-
-        bounce_emit_alias_update(acptr, "account", cli_user(acptr)->account);
-
-        /* Increment authusers for all channels this user is in */
         {
-          struct Membership *chan;
-          for (chan = cli_user(acptr)->channel; chan; chan = chan->next_channel) {
-            ++chan->channel->authusers;
-          }
+          int was_account = IsAccount(acptr);
+          char presence_old_acct[ACCOUNTLEN + 1];
+          ircd_strncpy(presence_old_acct, cli_user(acptr)->account,
+                       sizeof(presence_old_acct));
+
+          ircd_strncpy(cli_user(acptr)->account, parv[3], ACCOUNTLEN + 1);
+          SetAccount(acptr);
+
+          bounce_emit_alias_update(acptr, "account", cli_user(acptr)->account);
+
+          /* Count this member's channels only on a false->true account
+           * transition.  An account CHANGE ('M') arrives with the user
+           * already counted -- the old unconditional loop double-counted
+           * every re-login on every receiving server, leaking authusers
+           * upward and desyncing the storage gate across the network. */
+          if (!was_account)
+            channel_account_adjust(acptr, +1);
+
+          /* Strict-presence anchor transfer: R = session->account,
+           * M = account rename. */
+          if (!was_account)
+            presence_anchor_transfer(acptr, cli_session_id(acptr), 1,
+                                     cli_user(acptr)->account, 0);
+          else
+            presence_anchor_transfer(acptr, presence_old_acct, 0,
+                                     cli_user(acptr)->account, 0);
         }
 
         if (parc > 4) {
@@ -337,6 +362,7 @@ int ms_account(struct Client* cptr, struct Client* sptr, int parc,
               ac_time = (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
             }
             sendcmdto_set_s2s_tags(ac_time, ac_msgid);
+            sendcmdto_want_s2s_tags(1);
           }
         }
 
@@ -398,31 +424,32 @@ int ms_account(struct Client* cptr, struct Client* sptr, int parc,
       if (parc < 3)
         return need_more_params(sptr, "ACCOUNT");
 
-      /* First check if this is a server numeric (LOC reply) */
-      acptr = FindNServer(parv[1]);
-
-      if (!acptr) {
-        /* Not a server numeric - check for rename permission response */
+      /* Rename reply carries the explicit RENAME discriminator (parv[3]);
+       * route by cookie without FindNServer so a decimal cookie can't
+       * alias a server numeric (F2). */
+      if (parc > 3 && !ircd_strcmp(parv[3], "RENAME")) {
         unsigned int cookie = atoi(parv[1]);
         struct PendingRename *pr = pending_rename_find(cookie);
 
         if (pr) {
-          /* Found a pending rename with this cookie */
           if (type == 'A') {
             Debug((DEBUG_DEBUG, "ACCOUNT rename allow cookie=%u", cookie));
             pending_rename_complete(pr);
           } else {
-            /* Deny response: parv[3] contains the reason (trailing param) */
-            const char *reason = (parc > 3) ? parv[3] : "Permission denied";
+            /* Deny response: parv[4] contains the reason (trailing param) */
+            const char *reason = (parc > 4) ? parv[4] : "Permission denied";
             Debug((DEBUG_DEBUG, "ACCOUNT rename deny cookie=%u reason=%s", cookie, reason));
             pending_rename_deny(pr, reason);
           }
-          return 0;
         }
-
-        /* Neither LOC reply nor rename reply - ignore */
         return 0;
       }
+
+      /* First check if this is a server numeric (LOC reply) */
+      acptr = FindNServer(parv[1]);
+
+      if (!acptr)
+        return 0; /* unknown numeric - ignore */
 
       /* LOC reply - need at least 4 params */
       if (parc < 4)
@@ -520,6 +547,13 @@ int ms_account(struct Client* cptr, struct Client* sptr, int parc,
 
     ircd_strncpy(cli_user(acptr)->account, parv[2], ACCOUNTLEN + 1);
     SetAccount(acptr);
+    /* Chathistory-gate parity with the EXTENDED_ACCOUNTS branch: count
+     * the member's channels (the !IsAccount bail above guarantees this
+     * is a false->true transition). */
+    channel_account_adjust(acptr, +1);
+    /* Strict-presence anchor transfer: session -> account. */
+    presence_anchor_transfer(acptr, cli_session_id(acptr), 1,
+                             cli_user(acptr)->account, 0);
 
     {
       char ac_msgid[64] = "";
@@ -542,6 +576,7 @@ int ms_account(struct Client* cptr, struct Client* sptr, int parc,
           ac_time = (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
         }
         sendcmdto_set_s2s_tags(ac_time, ac_msgid);
+        sendcmdto_want_s2s_tags(1);
       }
     }
 

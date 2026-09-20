@@ -63,10 +63,12 @@
 #include "send.h"
 #include "struct.h"
 #include "sys.h"
+#include "websocket.h"
 #include "uping.h"
 #include "userload.h"
 #include "watch.h"
 #include "history.h"
+#include "chathistory_presence.h"
 #include "sasl_auth.h"
 
 /* #include <assert.h> -- Now using assert in ircd_log.h */
@@ -186,37 +188,10 @@ const char* get_client_name(const struct Client* sptr, int showip)
 }
 
 #ifdef USE_ROCKSDB
-/** Derive a per-channel msgid from a base msgid and channel name.
- * Deterministic: same (base, channel) -> same result on every server.
- * Used for QUIT events where one S2S msgid maps to N channel entries.
- * @param[out] buf Output buffer for derived msgid.
- * @param[in] buflen Size of output buffer.
- * @param[in] base_msgid Base msgid from S2S tag.
- * @param[in] channel Channel name.
- * @return Pointer to buf.
- */
-static char *derive_channel_msgid(char *buf, size_t buflen,
-                                  const char *base_msgid, const char *channel)
-{
-  /* FNV-1a hash of channel name (case-insensitive) */
-  uint32_t h = 2166136261u;
-  const char *p;
-  char disc[7];
-
-  for (p = channel; *p; p++) {
-    unsigned char c = (unsigned char)*p;
-    if (c >= 'A' && c <= 'Z')
-      c += 'a' - 'A';
-    h ^= (uint32_t)c;
-    h *= 16777619u;
-  }
-
-  /* 6 base64 chars encodes 32 bits (top 4 bits zero).
-   * Birthday collision at 1000 channels: ~10^-4. Acceptable. */
-  inttobase64(disc, h, 6);
-  snprintf(buf, buflen, "%s%s", base_msgid, disc);
-  return buf;
-}
+/* derive_channel_msgid removed: the multi-target msgid index in
+ * history.c makes one shared msgid per multi-channel event correct in
+ * storage; per-channel derived msgids (which would have broken the
+ * one-msgid-per-event invariant) were the rejected alternative. */
 
 /** Store QUIT events in history for all channels the user is on.
  * Uses the same msgid that was broadcast to clients so they can deduplicate.
@@ -224,11 +199,27 @@ static char *derive_channel_msgid(char *buf, size_t buflen,
  * @param[in] comment The quit message.
  * @param[in] msgid The msgid used in the live broadcast.
  */
+/* A remote user's own QUIT line: ms_quit arms the line's msgid/time here
+ * before calling exit_client, which is the only way exit_client can tell
+ * that exit apart from a KILL, collision or SQUIT of the same user. */
+static char exit_armed_msgid[S2S_MSGID_BUFSIZE];
+static uint64_t exit_armed_ms;
+
+void exit_arm_s2s_event(const char *msgid, uint64_t ms)
+{
+  if (msgid && *msgid) {
+    ircd_strncpy(exit_armed_msgid, msgid, sizeof(exit_armed_msgid) - 1);
+    exit_armed_ms = ms;
+  } else {
+    exit_armed_msgid[0] = '\0';
+    exit_armed_ms = 0;
+  }
+}
+
 static void store_quit_events(struct Client *sptr, const char *comment,
-                              const char *broadcast_msgid)
+                              const char *broadcast_msgid, uint64_t event_ms)
 {
   struct Membership *member;
-  struct timeval tv;
   char timestamp[32];
   char fallback_msgid[64];
   const char *msgid;
@@ -242,9 +233,8 @@ static void store_quit_events(struct Client *sptr, const char *comment,
   if (!feature_bool(FEAT_CHATHISTORY_STORE))
     return;
 
-  /* Only store for local users to avoid duplicates */
-  if (!MyUser(sptr))
-    return;
+  /* Receiver-side storage (see store_kick_event): every server with
+   * channels in common stores its own copy under the unified msgid. */
 
   /* Note: +Y user mode only blocks message storage (PRIVMSG/NOTICE),
    * not channel events (JOIN/PART/QUIT) which are metadata */
@@ -268,11 +258,18 @@ static void store_quit_events(struct Client *sptr, const char *comment,
   else
     msgid = generate_msgid(fallback_msgid, sizeof(fallback_msgid));
 
-  /* Generate Unix timestamp (same for all channels) */
-  gettimeofday(&tv, NULL);
-  ircd_snprintf(0, timestamp, sizeof(timestamp), "%lu.%03lu",
-                (unsigned long)tv.tv_sec,
-                (unsigned long)(tv.tv_usec / 1000));
+  /* Row time (same for all channels): a local quitter's stamp is the
+   * mint time of the msgid chosen above (a KILL victim carries it in
+   * cli_s2s_time_ms); a remote quitter's QUIT reaches exit_client from
+   * several contexts (SQUIT, ping-out, KILL) where the link's tag stash
+   * may belong to an unrelated earlier message, so it is NOT consulted:
+   * remote QUIT rows keep a local mint time (documented residue). */
+  /* The exit's ONE event time (exit_client computed it alongside the
+   * msgid: own stash for a local quitter, the armed QUIT line's tags for a
+   * remote one) -- remote QUIT rows used to keep a local mint time. */
+  history_format_ms(timestamp, sizeof(timestamp),
+                    event_ms ? event_ms
+                             : history_event_time_ms(MyConnect(sptr) ? sptr : NULL));
 
   /* Build sender string: nick!user@host */
   if (cli_user(sptr))
@@ -490,8 +487,8 @@ static void exit_one_client(struct Client* bcptr, const char* comment)
     /*
      * Stop a running chathistory replay clean
      */
-    if (MyUser(bcptr) && cli_replay(bcptr))
-      replay_cancel(bcptr);
+    while (MyUser(bcptr) && cli_replay(bcptr))
+      replay_cancel(bcptr);   /* a cancel may reinstall a suspended catch-up */
     /*
      * Clean up any pending forwarded label batches (no BATCH close sent)
      */
@@ -516,25 +513,48 @@ static void exit_one_client(struct Client* bcptr, const char* comment)
      * loop also skips when this flag is set; without the same skip on
      * the common-channel broadcast at this point, the QUIT routed via
      * channel members reaches legacy peers anyway. */
+    int64_t quit_time = 0;   /* presence stamp for the removals below */
+    uint64_t quit_ms_for_rows = 0;
     if (!IsBouncerInternalDestroy(bcptr)) {
       char quit_msgid[64] = "";
       if (feature_bool(FEAT_MSGID)) {
-        if (cli_s2s_msgid(bcptr)[0])
+        uint64_t quit_ms;
+        if (MyConnect(bcptr) && cli_s2s_msgid(bcptr)[0]) {
+          /* Local user: its own connection's stash -- its own QUIT line,
+           * or the KILL pre-stamp. */
           ircd_strncpy(quit_msgid, cli_s2s_msgid(bcptr), sizeof(quit_msgid));
-        else
+          quit_ms = history_event_time_ms(bcptr);
+        } else if (!MyConnect(bcptr) && exit_armed_msgid[0]) {
+          /* Remote user leaving on its OWN QUIT line: ms_quit armed that
+           * line's tags.  cli_s2s_msgid() of a remote user is the server
+           * LINK's stash -- the last line parsed on that link -- so reading
+           * it for a KILL / collision / SQUIT exit stamped some unrelated
+           * message's id on N QUIT rows and overwrote that message's index
+           * entry (audit 2026-09-06 #13). */
+          ircd_strncpy(quit_msgid, exit_armed_msgid, sizeof(quit_msgid));
+          quit_ms = exit_armed_ms ? exit_armed_ms : history_event_time_ms(NULL);
+        } else {
           generate_msgid(quit_msgid, sizeof(quit_msgid));
-        sendcmdto_set_client_msgid(quit_msgid);
+          quit_ms = history_event_time_ms(NULL);
+        }
+        quit_ms_for_rows = quit_ms;
+        sendcmdto_set_client_event(quit_msgid, quit_ms);
+        quit_time = presence_event_time(quit_msgid, quit_ms);
       }
       sendcmdto_common_channels_butone(bcptr, CMD_QUIT, NULL, ":%s", comment);
       sendcmdto_set_client_msgid(NULL);
 
 #ifdef USE_ROCKSDB
       /* Store QUIT events in history before removing from channels */
-      store_quit_events(bcptr, comment, quit_msgid[0] ? quit_msgid : NULL);
+      store_quit_events(bcptr, comment, quit_msgid[0] ? quit_msgid : NULL,
+                        quit_ms_for_rows);
 #endif
     }
 
+    /* Presence closes at the QUIT's own HLC stamp (the rows' time). */
+    presence_set_event_time(quit_time);
     remove_user_from_all_channels(bcptr);
+    presence_set_event_time(0);
 
     /* Clean up invitefield */
     while ((lp = cli_user(bcptr)->invited))
@@ -887,6 +907,13 @@ int exit_client(struct Client *cptr,
   if (MyConnect(victim))
   {
     SetFlag(victim, FLAG_CLOSING);
+
+    /* WebSocket farewell (best effort): label the close with the exit
+     * reason so browser clients can distinguish a server-side close
+     * from a network cut (otherwise every death is a bare 1006).
+     * Dead sockets can't be written to -- skip. */
+    if (IsWebSocket(victim) && !IsDead(victim) && cli_fd(victim) >= 0)
+      websocket_send_close(victim, 1000, comment);
 
     if (feature_bool(FEAT_CONNEXIT_NOTICES) && IsUser(victim))
       sendto_opmask_butone_global(&me, SNO_CONNEXIT,

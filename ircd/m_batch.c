@@ -59,16 +59,31 @@
 #include "send.h"
 #include "s_misc.h"
 #include "s_user.h"
+#include "ircd_relay.h"
 #include "msgq.h"
 #include "class.h"
 #include "bouncer_session.h"
 #include "history.h"
 #include "ml_content.h"
 #include "paste_listener.h"
+#include "webpush.h"
+#include "webpush_store.h"
 
 /* #include <assert.h> -- Now using assert in ircd_log.h */
 #include <string.h>
 #include <sys/time.h>
+
+static void format_time_tag(char *buf, size_t buflen);   /* defined below */
+
+/** Format an epoch-millisecond time as a server-time tag value
+ * (YYYY-MM-DDThh:mm:ss.sssZ) -- the batch's one event time, not "now". */
+static void ms_to_time_tag(char *buf, size_t buflen, uint64_t ms)
+{
+  char unix_ts[32];
+  history_format_ms(unix_ts, sizeof(unix_ts), ms);
+  if (history_unix_to_iso(unix_ts, buf, buflen) != 0)
+    format_time_tag(buf, buflen);   /* unreachable in practice: keep a valid tag */
+}
 
 /*
  * generate_paste_url - Generate a paste secret and URL for multiline fallback.
@@ -685,6 +700,12 @@ multiline_apply_cooldown(struct Connection *con)
 static void
 clear_multiline_batch(struct Connection *con)
 {
+  /* Remember the ref: any further @batch=<ref> lines are ignored per
+   * spec ("all past and future messages in this batch will be
+   * ignored") instead of leaking into channels as plain messages. */
+  if (con_ml_batch_id(con)[0])
+    ircd_strncpy(con_ml_dead_batch_id(con), con_ml_batch_id(con),
+                 sizeof(con->con_ml_dead_batch_id));
   struct SLink *lp, *next;
 
   /* Free all stored messages */
@@ -810,8 +831,11 @@ multiline_add_message(struct Client *sptr, const char *target,
   }
 
   {
+    /* Spec: "Each line feed used to join line messages contributes one
+     * byte towards the max-bytes limit." */
+    int join_extra = (con_ml_msg_count(con) > 0 && !concat) ? 1 : 0;
     int max_bytes = feature_int(FEAT_MULTILINE_MAX_BYTES);
-    if (con_ml_total_bytes(con) + len > max_bytes) {
+    if (con_ml_total_bytes(con) + len + join_extra > max_bytes) {
       send_fail_ctx(sptr, "BATCH", "MULTILINE_MAX_BYTES",
                     "Multiline batch max-bytes exceeded", "%d", max_bytes);
       clear_multiline_batch(con);
@@ -839,7 +863,8 @@ multiline_add_message(struct Client *sptr, const char *target,
   }
 
   con_ml_msg_count(con)++;
-  con_ml_total_bytes(con) += len;
+  con_ml_total_bytes(con) += len
+      + ((con_ml_msg_count(con) > 1 && !concat) ? 1 : 0);
 
   return 0;
 }
@@ -939,15 +964,13 @@ process_multiline_batch(struct Client *sptr)
    */
   generate_msgid(batch_base_msgid, sizeof(batch_base_msgid));
 
-  /* Capture time ONCE for consistent timestamps across all recipients */
+  /* ONE time for the whole batch: the msgid's own mint time, read right
+   * after the mint (the truncation notices mint again later).  Row, live
+   * @time, S2S @time and ml_content all use it -- this used to be four
+   * different times under one msgid (audit 2026-09-06 #12). */
   char batch_timebuf[32];
-  uint64_t batch_time_ms;
-  {
-    struct timeval btv;
-    gettimeofday(&btv, NULL);
-    batch_time_ms = (uint64_t)btv.tv_sec * 1000 + btv.tv_usec / 1000;
-  }
-  format_time_tag(batch_timebuf, sizeof(batch_timebuf));
+  uint64_t batch_time_ms = history_event_time_ms(NULL);
+  ms_to_time_tag(batch_timebuf, sizeof(batch_timebuf), batch_time_ms);
 
   /* Set global time override so all send.c tag formatters use the same
    * timestamp as the batch opener. Cleared at the end of this function. */
@@ -1293,12 +1316,19 @@ process_multiline_batch(struct Client *sptr)
         struct BouncerSession *sender_sess = bounce_get_session(sender_primary);
         /* Echo to primary if sender is an alias and primary != acptr
          * (avoid double-delivery on self-session DM). */
+        /* Session echoes go only to connections that negotiated
+         * echo-message (see bounce_echo_pm_to_session): a client without
+         * it files a self-sourced PRIVMSG under its source, i.e. a query
+         * with the user's own nick.  Remote members are pre-filtered by
+         * the replicated BX_CAP_ECHO_MESSAGE where known and gated again
+         * on the receiving server. */
         if (sender_primary != sptr && sender_primary != acptr) {
           if (MyConnect(sender_primary)) {
-            deliver_multiline_dm_to_one(sptr, sender_primary, acptr,
-                                        batch_base_msgid, batch_timebuf,
-                                        batch_paste_url, is_notice, cmd_str,
-                                        0);
+            if (CapActive(sender_primary, CAP_ECHOMSG))
+              deliver_multiline_dm_to_one(sptr, sender_primary, acptr,
+                                          batch_base_msgid, batch_timebuf,
+                                          batch_paste_url, is_notice, cmd_str,
+                                          0);
           } else if (IsMultiline(cli_from(sender_primary))) {
             char primary_nn[6];
             ircd_snprintf(0, primary_nn, sizeof(primary_nn), "%s%s",
@@ -1335,6 +1365,10 @@ process_multiline_batch(struct Client *sptr)
             int member_use_bxm;
             if (!member || member == sptr || member == acptr
                 || !IsBouncerAlias(member))
+              continue;
+            if (MyConnect(member) ? !CapActive(member, CAP_ECHOMSG)
+                : (sender_sess->hs_aliases[i].ba_caps_known
+                   && !(sender_sess->hs_aliases[i].ba_caps & BX_CAP_ECHO_MESSAGE)))
               continue;
             /* Pick BX M when the alias's actual cap state is known
              * and includes both DRAFT_MULTILINE and BATCH.  Fall back
@@ -1721,25 +1755,98 @@ process_multiline_batch(struct Client *sptr)
     }
     history_content[content_len] = '\0';
 
-    /* Get timestamp for storage */
-    history_format_timestamp(timestamp, sizeof(timestamp));
+    /* Row time = the batch's one event time (see batch_time_ms). */
+    history_format_ms(timestamp, sizeof(timestamp), batch_time_ms);
 
-    /* Check if channel has +P (no storage) mode or sender has +Y */
-    if ((is_channel && (chptr->mode.exmode & EXMODE_NOSTORAGE)) || IsNoStorage(sptr)) {
-      /* Skip storage but still clear batch */
-    } else {
-      /* Store content in unified ml_content + history sentinel atomically */
-      int store_result = history_store_multiline(batch_base_msgid, timestamp,
-                          is_channel ? chptr->chname : cli_name(acptr),
-                          is_channel ? NULL : cli_name(acptr),
-                          sender_mask,
-                          cli_user(sptr)->account[0] ? cli_user(sptr)->account : NULL,
-                          history_content, content_len,
-                          batch_paste_secret[0] ? batch_paste_secret : NULL);
-      log_write(LS_SYSTEM, L_INFO, 0, "multiline: history_store_multiline returned %d for msgid=%s target=%s",
-                store_result, batch_base_msgid, is_channel ? chptr->chname : cli_name(acptr));
+    /* Storage keying + consent.  Channels: store under the channel
+     * name gated on +P / +Y.  DMs: store under the IDENTITY PAIR-KEY --
+     * the only key the PM query/replay paths ever look up
+     * (normalize_pm_target / is_pm_target_for_client).  The old code
+     * stored DMs under the recipient NICK (unreachable by any query)
+     * and bypassed the PM consent gates entirely. */
+    {
+      char pm_pairkey[PM_PAIRKEY_BUFSIZE];
+      const char *store_target = NULL;
+      int dm_gap = 0;
+
+      if (is_channel) {
+        if (!(chptr->mode.exmode & EXMODE_NOSTORAGE) && !IsNoStorage(sptr))
+          store_target = chptr->chname;
+      } else if (IsServer(sptr) || IsServer(acptr)
+                 || IsServiceClient(sptr) || IsServiceClient(acptr)) {
+        /* Service traffic is not a conversation -- the same gate as the
+         * single-line PM store in ircd_relay.c.  Storing it keyed rows on
+         * the bot's session id and put that id in every user's TARGETS
+         * (audit 2026-09-06 #15). */
+        store_target = NULL;
+      } else {
+        char id_s[S2S_SESSID_BUFSIZE], id_a[S2S_SESSID_BUFSIZE];
+        history_pm_identity(sptr, id_s, sizeof(id_s));
+        history_pm_identity(acptr, id_a, sizeof(id_a));
+        if (ircd_strcmp(id_s, id_a) < 0)
+          ircd_snprintf(0, pm_pairkey, sizeof(pm_pairkey), "%s:%s", id_s, id_a);
+        else
+          ircd_snprintf(0, pm_pairkey, sizeof(pm_pairkey), "%s:%s", id_a, id_s);
+
+        if (!feature_bool(FEAT_CHATHISTORY_PRIVATE))
+          ; /* PM history disabled -- no store */
+        else if (!IsAccount(sptr) && !IsAccount(acptr))
+          ; /* fully-ephemeral pair: no multiline ring exists -- no store
+             * (singleline goes to the ephemeral ring; multiline skipping
+             * is the conservative parity choice, noted in the plan) */
+        else if (
+#ifdef USE_ROCKSDB
+                 has_pm_optout(sptr) || has_pm_optout(acptr) ||
+#endif
+                 IsNoStorage(sptr))
+          dm_gap = 1; /* consent refused -- keep the msgid resolvable */
+        else
+          store_target = pm_pairkey;
+      }
+
+      if (dm_gap) {
+        history_store_message(batch_base_msgid, timestamp, pm_pairkey,
+                              cli_name(acptr), sender_mask,
+                              cli_user(sptr)->account[0] ? cli_user(sptr)->account : NULL,
+                              HISTORY_GAP, "", NULL);
+      } else if (store_target) {
+        int store_result = history_store_multiline(batch_base_msgid, timestamp,
+                            store_target,
+                            is_channel ? NULL : cli_name(acptr),
+                            sender_mask,
+                            cli_user(sptr)->account[0] ? cli_user(sptr)->account : NULL,
+                            history_content, content_len,
+                            batch_paste_secret[0] ? batch_paste_secret : NULL);
+        (void)store_result;
+        log_write(LS_SYSTEM, L_INFO, 0, "multiline: history_store_multiline returned %d for msgid=%s target=%s",
+                  store_result, batch_base_msgid, store_target);
+      }
     }
     MyFree(history_content);
+  }
+
+  /* Web push: the batch is one message -- push its lines (one IRC message
+   * per push) to unattended recipients.  Not gated on history, like the
+   * single-message triggers in ircd_relay.c.  Skip the list walk and the
+   * MyMalloc entirely when the feature is off. */
+  if (feature_bool(FEAT_WEBPUSH_NOTIFY) && webpush_store_available()) {
+    int n = 0, i = 0;
+    struct webpush_batch_line *wl;
+    char ml_ts[32];
+
+    history_format_ms(ml_ts, sizeof(ml_ts), batch_time_ms);
+
+    for (lp = con_ml_messages(con); lp; lp = lp->next)
+      n++;
+    wl = (struct webpush_batch_line *)MyMalloc(sizeof(*wl) * n);
+    for (lp = con_ml_messages(con); lp; lp = lp->next, i++) {
+      wl[i].concat = lp->value.cp[0];
+      wl[i].text = lp->value.cp + 1;
+    }
+    webpush_notify_multiline(sptr, is_channel ? chptr : NULL,
+                             is_channel ? NULL : acptr,
+                             wl, n, batch_base_msgid, ml_ts, is_notice);
+    MyFree(wl);
   }
 
   /* Clear the time override set at the start of this function */
@@ -1802,9 +1909,17 @@ int m_batch(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
   if (!IsUser(sptr))
     return 0;
 
-  /* Require draft/multiline capability */
-  if (!CapActive(sptr, CAP_DRAFT_MULTILINE))
+  /* Require draft/multiline capability: it is the only client batch
+   * type accepted.  A client that opens some other type without the
+   * cap (a draft/authtoken batch, say) still deserves the answer the
+   * client-batch spec asks for, FAIL BATCH UNKNOWN_TYPE, rather than
+   * silence; batch ends and malformed starts stay quiet. */
+  if (!CapActive(sptr, CAP_DRAFT_MULTILINE)) {
+    if (parc >= 3 && parv[1][0] == '+' && !EmptyString(parv[2])
+        && ircd_strcmp(parv[2], "draft/multiline") != 0)
+      send_fail(sptr, "BATCH", "UNKNOWN_TYPE", parv[2], "Unknown batch type");
     return 0;
+  }
 
   if (parc < 2 || EmptyString(parv[1]))
     return send_reply(sptr, ERR_NEEDMOREPARAMS, "BATCH");
@@ -1842,6 +1957,8 @@ int m_batch(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
   if (!is_valid_batch_reftag(batch_ref)) {
     send_fail(sptr, "BATCH", "INVALID_REFTAG", batch_ref,
               "Invalid batch reference tag");
+      ircd_strncpy(cli_ml_dead_batch_id(sptr), batch_ref,
+                   sizeof(cli_connect(sptr)->con_ml_dead_batch_id));
     return 0;
   }
 
@@ -1850,6 +1967,8 @@ int m_batch(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
     if (ircd_strcmp(batch_type, "draft/multiline") != 0) {
       send_fail(sptr, "BATCH", "UNKNOWN_TYPE", batch_type,
                 "Unknown batch type");
+      ircd_strncpy(cli_ml_dead_batch_id(sptr), batch_ref,
+                   sizeof(cli_connect(sptr)->con_ml_dead_batch_id));
       return 0;
     }
 
@@ -1893,7 +2012,9 @@ int m_batch(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
       clear_multiline_batch(con);
     }
 
-    /* Start new multiline batch */
+    /* Start new multiline batch (a fresh open also clears any
+     * dead-batch swallow state from a previous failure) */
+    con_ml_dead_batch_id(con)[0] = '\0';
     ircd_strncpy(con_ml_batch_id(con), batch_ref,
                  sizeof(con->con_ml_batch_id) - 1);
     con_ml_batch_id(con)[sizeof(con->con_ml_batch_id) - 1] = '\0';
@@ -2327,7 +2448,9 @@ deliver_s2s_multiline_batch(struct S2SMultilineBatch *batch, struct Client *cptr
          * client-only tags go on the BATCH + opener. */
         {
           char tagbuf[512];
-          format_time_tag(timebuf, sizeof(timebuf));
+          ms_to_time_tag(timebuf, sizeof(timebuf),
+                         batch->time_ms ? batch->time_ms
+                                        : msgid_decode_time_ms(batch_base_msgid));
           int taglen = format_batch_open_tags(tagbuf, sizeof(tagbuf), to, sptr,
                          timebuf, batch_base_msgid, NULL,
                          batch->client_tags[0] ? batch->client_tags : NULL);
@@ -2379,7 +2502,9 @@ deliver_s2s_multiline_batch(struct S2SMultilineBatch *batch, struct Client *cptr
        * client-only tags go on the BATCH + opener. */
       {
         char tagbuf[512];
-        format_time_tag(timebuf, sizeof(timebuf));
+        ms_to_time_tag(timebuf, sizeof(timebuf),
+                       batch->time_ms ? batch->time_ms
+                                      : msgid_decode_time_ms(batch_base_msgid));
         int taglen = format_batch_open_tags(tagbuf, sizeof(tagbuf), acptr, sptr,
                        timebuf, batch_base_msgid, NULL,
                        batch->client_tags[0] ? batch->client_tags : NULL);
@@ -2521,21 +2646,105 @@ deliver_s2s_multiline_batch(struct S2SMultilineBatch *batch, struct Client *cptr
     }
     history_content[content_len] = '\0';
 
-    /* Get timestamp for storage */
-    history_format_timestamp(timestamp, sizeof(timestamp));
+    /* Row time = the ORIGIN's batch time carried on the S2S open, so
+     * every server stores this msgid at one time; the msgid's intrinsic
+     * mint time is the fallback for a legacy sender. */
+    history_format_ms(timestamp, sizeof(timestamp),
+                      batch->time_ms ? batch->time_ms
+                                     : msgid_decode_time_ms(batch_base_msgid));
 
-    /* Check if channel has +P (no storage) mode or sender has +Y */
-    if (!((is_channel && (chptr->mode.exmode & EXMODE_NOSTORAGE)) || IsNoStorage(sptr))) {
-      /* Store content in unified ml_content + history sentinel atomically */
-      history_store_multiline(batch_base_msgid, timestamp,
-                              is_channel ? chptr->chname : cli_name(acptr),
-                              is_channel ? NULL : cli_name(acptr),
-                              sender_mask,
+    /* Storage keying + consent.  Channels: store under the channel
+     * name gated on +P / +Y.  DMs: store under the IDENTITY PAIR-KEY --
+     * the only key the PM query/replay paths ever look up
+     * (normalize_pm_target / is_pm_target_for_client).  The old code
+     * stored DMs under the recipient NICK (unreachable by any query)
+     * and bypassed the PM consent gates entirely. */
+    {
+      char pm_pairkey[PM_PAIRKEY_BUFSIZE];
+      const char *store_target = NULL;
+      int dm_gap = 0;
+
+      if (is_channel) {
+        if (!(chptr->mode.exmode & EXMODE_NOSTORAGE) && !IsNoStorage(sptr))
+          store_target = chptr->chname;
+      } else if (IsServer(sptr) || IsServer(acptr)
+                 || IsServiceClient(sptr) || IsServiceClient(acptr)) {
+        /* Service traffic is not a conversation -- the same gate as the
+         * single-line PM store in ircd_relay.c.  Storing it keyed rows on
+         * the bot's session id and put that id in every user's TARGETS
+         * (audit 2026-09-06 #15). */
+        store_target = NULL;
+      } else {
+        char id_s[S2S_SESSID_BUFSIZE], id_a[S2S_SESSID_BUFSIZE];
+        history_pm_identity(sptr, id_s, sizeof(id_s));
+        history_pm_identity(acptr, id_a, sizeof(id_a));
+        if (ircd_strcmp(id_s, id_a) < 0)
+          ircd_snprintf(0, pm_pairkey, sizeof(pm_pairkey), "%s:%s", id_s, id_a);
+        else
+          ircd_snprintf(0, pm_pairkey, sizeof(pm_pairkey), "%s:%s", id_a, id_s);
+
+        if (!feature_bool(FEAT_CHATHISTORY_PRIVATE))
+          ; /* PM history disabled -- no store */
+        else if (!IsAccount(sptr) && !IsAccount(acptr))
+          ; /* fully-ephemeral pair: no multiline ring exists -- no store
+             * (singleline goes to the ephemeral ring; multiline skipping
+             * is the conservative parity choice, noted in the plan) */
+        else if (
+#ifdef USE_ROCKSDB
+                 has_pm_optout(sptr) || has_pm_optout(acptr) ||
+#endif
+                 IsNoStorage(sptr))
+          dm_gap = 1; /* consent refused -- keep the msgid resolvable */
+        else
+          store_target = pm_pairkey;
+      }
+
+      if (dm_gap) {
+        history_store_message(batch_base_msgid, timestamp, pm_pairkey,
+                              cli_name(acptr), sender_mask,
                               cli_user(sptr)->account[0] ? cli_user(sptr)->account : NULL,
-                              history_content, content_len,
-                              s2s_paste_secret[0] ? s2s_paste_secret : NULL);
+                              HISTORY_GAP, "", NULL);
+      } else if (store_target) {
+        int store_result = history_store_multiline(batch_base_msgid, timestamp,
+                            store_target,
+                            is_channel ? NULL : cli_name(acptr),
+                            sender_mask,
+                            cli_user(sptr)->account[0] ? cli_user(sptr)->account : NULL,
+                            history_content, content_len,
+                            s2s_paste_secret[0] ? s2s_paste_secret : NULL);
+        (void)store_result;
+      }
     }
     MyFree(history_content);
+  }
+
+  /* Web push for the batch, as on the local path.  The push time is the
+   * originating server's batch time when it sent one.  Skip the list walk
+   * and the MyMalloc entirely when the feature is off. */
+  if (feature_bool(FEAT_WEBPUSH_NOTIFY) && webpush_store_available()) {
+    char ml_ts[32];
+    uint64_t ms = batch->time_ms;
+    int n = 0, i = 0;
+    struct webpush_batch_line *wl;
+
+    if (!ms) {
+      struct timeval tv;
+      gettimeofday(&tv, NULL);
+      ms = (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+    }
+    history_format_ms(ml_ts, sizeof(ml_ts), ms);
+
+    for (lp = batch->messages; lp; lp = lp->next)
+      n++;
+    wl = (struct webpush_batch_line *)MyMalloc(sizeof(*wl) * n);
+    for (lp = batch->messages; lp; lp = lp->next, i++) {
+      wl[i].concat = lp->value.cp[0];
+      wl[i].text = lp->value.cp + 1;
+    }
+    webpush_notify_multiline(sptr, is_channel ? chptr : NULL,
+                             is_channel ? NULL : acptr,
+                             wl, n, batch_base_msgid, ml_ts, is_notice);
+    MyFree(wl);
   }
 }
 

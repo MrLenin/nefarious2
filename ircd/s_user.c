@@ -27,13 +27,16 @@
 #include "config.h"
 
 #include "s_user.h"
+#include "webpush.h"
 #include "bouncer_session.h"
 #include "history.h"
 #include "capab.h"
 #include "IPcheck.h"
 #include "channel.h"
 #include "crdt_shadow.h"
+#include "chathistory_presence.h"
 #include "class.h"
+#include "authtoken.h"
 #include "client.h"
 #include "hash.h"
 #include "ircd.h"
@@ -86,15 +89,6 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <unistd.h>
-
-/** Sends response \a m of length \a l to client \a c. */
-#ifdef USE_SSL
-#define sendheader(c, m, l) \
-   ssl_send(c, m, l)
-#else
-#define sendheader(c, m, l) \
-   send(cli_fd(c), m, l, 0)
-#endif /* USE_SSL */
 
 /** Count of allocated User structures. */
 static int userCount = 0;
@@ -255,11 +249,32 @@ int hunt_server_cmd(struct Client *from, const char *cmd, const char *tok,
 
   parv[server] = (char *) acptr; /* HACK! HACK! HACK! ARGH! */
 
+  /* Bouncer invariant #10: an alias numeric is introduced only via
+   * BX C, which legacy peers never see -- sourced from the alias, a
+   * routed command is an unknown source at the first legacy hop and
+   * is dropped silently (no reply, no error).  Rewrite to the primary
+   * unless the route heads toward the primary's own server, which
+   * knows the alias (and where a primary-sourced line would be a fake
+   * direction).  Replies then arrive addressed to the primary; the
+   * numeric relay mirrors them to the session's local aliases. */
+  if (IsBouncerAlias(from) && cli_user(from) && cli_user(from)->alias_primary) {
+    struct Client *prim = cli_user(from)->alias_primary;
+    if (MyUser(prim) || cli_from(prim) != cli_from(acptr))
+      from = prim;
+  }
+
   /* Save label and generate compact tag for forwarded labeled commands.
-   * Must happen before sendcmdto_one which picks up the s2s overrides. */
+   * Must happen before sendcmdto_one which picks up the s2s overrides.
+   *
+   * Only toward an IRCv3-aware destination: the label is correlated to
+   * the reply by the compact msgid, which a legacy server neither
+   * receives (send.c gates the @A prefix on IsIRCv3Aware) nor echoes.
+   * With no possible correlation the honest outcome is the plain
+   * labeled ACK now and untagged numerics when they arrive. */
   if (MyConnect(from) && cli_label(from)[0] &&
       feature_bool(FEAT_CAP_labeled_response) &&
-      CapActive(from, CAP_LABELEDRESP) && CapActive(from, CAP_BATCH)) {
+      CapActive(from, CAP_LABELEDRESP) && CapActive(from, CAP_BATCH) &&
+      IsIRCv3Aware(acptr)) {
     char msgid[S2S_MSGID_BUFSIZE];
     uint64_t time_ms;
     if (fwd_label_save(from, cmd, msgid, &time_ms)) {
@@ -336,10 +351,26 @@ int hunt_server_prio_cmd(struct Client *from, const char *cmd, const char *tok,
 
   parv[server] = (char *) acptr; /* HACK! HACK! HACK! ARGH! */
 
-  /* Save label and generate compact tag for forwarded labeled commands. */
+  /* Bouncer invariant #10: an alias numeric is introduced only via
+   * BX C, which legacy peers never see -- sourced from the alias, a
+   * routed command is an unknown source at the first legacy hop and
+   * is dropped silently (no reply, no error).  Rewrite to the primary
+   * unless the route heads toward the primary's own server, which
+   * knows the alias (and where a primary-sourced line would be a fake
+   * direction).  Replies then arrive addressed to the primary; the
+   * numeric relay mirrors them to the session's local aliases. */
+  if (IsBouncerAlias(from) && cli_user(from) && cli_user(from)->alias_primary) {
+    struct Client *prim = cli_user(from)->alias_primary;
+    if (MyUser(prim) || cli_from(prim) != cli_from(acptr))
+      from = prim;
+  }
+
+  /* Save label and generate compact tag for forwarded labeled commands.
+   * IRCv3-aware destinations only -- see hunt_server_cmd. */
   if (MyConnect(from) && cli_label(from)[0] &&
       feature_bool(FEAT_CAP_labeled_response) &&
-      CapActive(from, CAP_LABELEDRESP) && CapActive(from, CAP_BATCH)) {
+      CapActive(from, CAP_LABELEDRESP) && CapActive(from, CAP_BATCH) &&
+      IsIRCv3Aware(acptr)) {
     char msgid[S2S_MSGID_BUFSIZE];
     uint64_t time_ms;
     if (fwd_label_save(from, cmd, msgid, &time_ms)) {
@@ -444,6 +475,15 @@ int register_user(struct Client *cptr, struct Client *sptr)
     connclass = get_client_class_conf(sptr);
     if (connclass && FlagHas(&connclass->restrictflags, CRFLAG_REQUIRE_SASL) &&
         !IsAccount(sptr)) {
+      /* #585: FAIL * ACCOUNT_REQUIRED is the signal that makes our
+       * advertised before-connect registration actionable -- a
+       * conformant client reacts by offering REGISTER/SASL instead of
+       * showing a bare disconnect.  (Clients that DO complete
+       * registration on a gated class also see the per-connection
+       * draft/ACCOUNTREQUIRED ISUPPORT token -- send_supported.) */
+      send_fail(sptr, "*", "ACCOUNT_REQUIRED", NULL,
+                "Authentication required; register an account (REGISTER) "
+                "or log in with SASL");
       ++ServerStats->is_ref;
       return exit_client(cptr, sptr, &me,
                          "SASL authentication required for this connection class");
@@ -540,6 +580,10 @@ int register_user(struct Client *cptr, struct Client *sptr)
                    infochanmodes, infochanmodeswithparams);
         send_supported(ghost);
 
+        /* draft/authtoken service list: mirror of the register_user emit */
+        if (CapActive(ghost, CAP_BATCH) && CapActive(ghost, CAP_DRAFT_AUTHTOKEN))
+          authtoken_send_servicelist(ghost);
+
 #ifdef USE_SSL
         if (cli_socket(ghost).ssl) {
           sendcmdto_one(&me, CMD_NOTICE, ghost,
@@ -559,6 +603,19 @@ int register_user(struct Client *cptr, struct Client *sptr)
           persistence_send_status(ghost);
 
         motd_signon(ghost);
+        /* Post-registration fakelag credit: modern clients burst init
+         * commands (MONITOR, METADATA SUB, WHO, MODE...) right after 001;
+         * the default ~10s cli_since headroom covers only ~5 of them.
+         * Start the client in surplus -- every command is still CHARGED
+         * (credit, not exemption), the one-shot grace just raises the
+         * initial burst budget; recvq byte caps still bound the wire.
+   * Authenticated clients only: an anonymous connection (the
+   * drive-by/WS-flood surface) keeps the classic ~5-command burst. */
+        {
+          int grace = feature_int(FEAT_POSTREG_GRACE);
+          if (grace > 0 && IsAccount(ghost))
+            cli_since(ghost) = CurrentTime - grace;
+        }
 
         /* IRCv3 draft/metadata-2: mirror the normal-path self-metadata
          * BATCH so a reviving client sees its persisted keys at attach
@@ -577,9 +634,10 @@ int register_user(struct Client *cptr, struct Client *sptr)
         /* Async auto-replay missed messages for legacy clients,
          * unless the user has disabled it via PERSISTENCE REPLAY SET
          * OFF on their active profile or account-global. */
-        if (!CapOwnHas(ghost, CAP_DRAFT_CHATHISTORY)
+        if ((!CapOwnHas(ghost, CAP_DRAFT_CHATHISTORY)
+             || cli_attach_cursor(ghost)[0])
             && persistence_replay_enabled_for(ghost)) {
-          replay_start_bouncer(ghost, saved_since_time, 0);
+          replay_start_catchup(ghost, saved_since_time, 0);
         }
 
         /* Return special code — caller must not dereference sptr */
@@ -672,10 +730,14 @@ int register_user(struct Client *cptr, struct Client *sptr)
 
     if (feature_bool(FEAT_CTCP_VERSIONING)) {
       if (feature_str(FEAT_CTCP_VERSIONING_NOTICE)) {
-        char strver[BUFSIZE] = "";
-        ircd_snprintf(0, strver, strlen(feature_str(FEAT_CTCP_VERSIONING_NOTICE)) + 16,
-                      "NOTICE * :%s\r\n", feature_str(FEAT_CTCP_VERSIONING_NOTICE));
-        sendheader(sptr, strver, strlen(strver));
+        /* Through the normal send path (NOT a raw socket write): the
+         * old sendheader macro bypassed deliver_it's WebSocket framing,
+         * so every WS client received these bytes unframed and died
+         * with "invalid opcode".  Same fix s_auth.c's sendheader got;
+         * this was the last raw-write straggler.  (Upstream master
+         * s_user.c:83/416 has the identical defect.) */
+        sendrawto_one(sptr, "NOTICE * :%s",
+                      feature_str(FEAT_CTCP_VERSIONING_NOTICE));
       }
 
       if (!EmptyString(feature_str(FEAT_CTCP_VERSIONING_NICK)))
@@ -711,6 +773,12 @@ int register_user(struct Client *cptr, struct Client *sptr)
                infochanmodes, infochanmodeswithparams);
     send_supported(sptr);
 
+    /* IRCv3 draft/authtoken: service list rides the registration burst
+     * when batch + draft/authtoken were negotiated (after ISUPPORT,
+     * before LUSERS).  Mirrored on both bouncer fast paths. */
+    if (CapActive(sptr, CAP_BATCH) && CapActive(sptr, CAP_DRAFT_AUTHTOKEN))
+      authtoken_send_servicelist(sptr);
+
 #ifdef USE_SSL
     if (cli_socket(sptr).ssl)
     {
@@ -733,6 +801,19 @@ int register_user(struct Client *cptr, struct Client *sptr)
       persistence_send_status(sptr);
 
     motd_signon(sptr);
+    /* Post-registration fakelag credit: modern clients burst init
+     * commands (MONITOR, METADATA SUB, WHO, MODE...) right after 001;
+     * the default ~10s cli_since headroom covers only ~5 of them.
+     * Start the client in surplus -- every command is still CHARGED
+     * (credit, not exemption), the one-shot grace just raises the
+     * initial burst budget; recvq byte caps still bound the wire.
+   * Authenticated clients only: an anonymous connection (the
+   * drive-by/WS-flood surface) keeps the classic ~5-command burst. */
+    {
+      int grace = feature_int(FEAT_POSTREG_GRACE);
+      if (grace > 0 && IsAccount(sptr))
+        cli_since(sptr) = CurrentTime - grace;
+    }
 
     /* IRCv3 draft/metadata-2: burst client's own metadata after registration.
      * Spec requires METADATA commands in a metadata batch with target param.
@@ -757,10 +838,13 @@ int register_user(struct Client *cptr, struct Client *sptr)
       int pre_away_type = con_pre_away(cli_connect(sptr));
       if (pre_away_type) {
         if (pre_away_type == 2) {
-          /* AWAY * - set away but with empty message (hidden connection) */
+          /* AWAY * - away with an unspecified reason, stored as the star
+           * (shown to non-pre-away clients as FEAT_AWAY_STAR_MSG at
+           * emission, see away_text_for). */
           if (!user->away) {
-            user->away = (char*) MyMalloc(1);
-            user->away[0] = '\0';
+            user->away = (char*) MyMalloc(2);
+            user->away[0] = '*';
+            user->away[1] = '\0';
           }
           /* Don't broadcast AWAY * to servers - it's a hidden connection */
         } else {
@@ -787,9 +871,10 @@ int register_user(struct Client *cptr, struct Client *sptr)
 
       /* Async auto-replay for legacy clients (no chathistory CAP),
        * unless the user has disabled it via PERSISTENCE REPLAY. */
-      if (!CapOwnHas(sptr, CAP_DRAFT_CHATHISTORY)
+      if ((!CapOwnHas(sptr, CAP_DRAFT_CHATHISTORY)
+           || cli_attach_cursor(sptr)[0])
           && persistence_replay_enabled_for(sptr))
-        replay_start_bouncer(sptr, saved_since_time, 0);
+        replay_start_catchup(sptr, saved_since_time, 0);
     }
   }
   else {
@@ -925,6 +1010,9 @@ int register_user(struct Client *cptr, struct Client *sptr)
       if (feature_bool(FEAT_CERT_EXPIRY_TRACKING) && cli_sslcliexp(sptr) > 0)
         sendcmdto_serv_butone(&me, CMD_MARK, cptr, "%s %s :%lu", cli_name(cptr), MARK_SSLCLIEXP, (unsigned long)cli_sslcliexp(sptr));
     }
+
+    if (!EmptyString(cli_wsorigin(sptr)))
+      sendcmdto_serv_butone(&me, CMD_MARK, cptr, "%s %s :%s", cli_name(cptr), MARK_WEBSOCKET, cli_wsorigin(sptr));
 
     if (cli_version(sptr) && !EmptyString(cli_version(sptr))) {
       sendcmdto_serv_butone(&me, CMD_MARK, cptr, "%s %s :%s", cli_name(cptr), MARK_CVERSION, cli_version(sptr));
@@ -1223,8 +1311,16 @@ int set_nick_name(struct Client* cptr, struct Client* sptr,
       {
         char nick_msgid[64] = "";
         if (feature_bool(FEAT_MSGID)) {
-          generate_msgid(nick_msgid, sizeof(nick_msgid));
-          sendcmdto_set_client_msgid(nick_msgid);
+          /* Unified msgid: reuse the incoming S2S msgid for remote
+           * nick changes so all servers share one id. */
+          if (!MyUser(sptr) && cli_s2s_msgid(cptr)[0])
+            ircd_strncpy(nick_msgid, cli_s2s_msgid(cptr), sizeof(nick_msgid));
+          else
+            generate_msgid(nick_msgid, sizeof(nick_msgid));
+          /* One time per event: the origin's tag time for a remote nick
+           * change, the msgid's mint time for a local one. */
+          sendcmdto_set_client_event(nick_msgid,
+                                     history_event_time_ms(MyUser(sptr) ? NULL : cptr));
         }
 
         /* If sender has a labeled-response label, send them a labeled NICK
@@ -1243,9 +1339,10 @@ int set_nick_name(struct Client* cptr, struct Client* sptr,
 #ifdef USE_ROCKSDB
         /* Store NICK event in chathistory for each common channel.
          * cli_name(sptr) still has the OLD nick at this point. */
-        if (MyUser(sptr) && history_is_available() && feature_bool(FEAT_CHATHISTORY_STORE)) {
+        /* Receiver-side storage (see store_kick_event): remote nick
+         * changes store too, under the unified msgid. */
+        if (history_is_available() && feature_bool(FEAT_CHATHISTORY_STORE)) {
           struct Membership *chan;
-          struct timeval tv;
           char timestamp[32];
           char old_sender[HISTORY_SENDER_LEN];
           const char *account = (cli_user(sptr) && cli_user(sptr)->account[0])
@@ -1254,9 +1351,9 @@ int set_nick_name(struct Client* cptr, struct Client* sptr,
           ircd_snprintf(0, old_sender, sizeof(old_sender), "%s!%s@%s",
                         cli_name(sptr), cli_user(sptr)->username, cli_user(sptr)->host);
 
-          gettimeofday(&tv, NULL);
-          ircd_snprintf(0, timestamp, sizeof(timestamp), "%lu.%03lu",
-                        (unsigned long)tv.tv_sec, (unsigned long)(tv.tv_usec / 1000));
+          /* Same event time the live NICK was tagged with (above) */
+          history_format_ms(timestamp, sizeof(timestamp),
+                            history_event_time_ms(MyUser(sptr) ? NULL : cptr));
 
           for (chan = cli_user(sptr)->channel; chan; chan = chan->next_channel) {
             if (chan->channel->mode.exmode & EXMODE_NOSTORAGE)
@@ -1271,11 +1368,10 @@ int set_nick_name(struct Client* cptr, struct Client* sptr,
       /* Set S2S msgid override so NICK relay carries same msgid as local storage.
        * Static globals survive past the nick_msgid scope closure. */
       if (nick_msgid[0]) {
-        struct timeval nick_tv;
-        gettimeofday(&nick_tv, NULL);
-        sendcmdto_set_s2s_tags(
-          (uint64_t)nick_tv.tv_sec * 1000 + nick_tv.tv_usec / 1000,
-          nick_msgid);
+        /* The same event time the rows were stored with (above), so every
+         * server stores this msgid at ONE time (audit 2026-09-06 #16). */
+        sendcmdto_set_s2s_tags(history_event_time_ms(MyUser(sptr) ? NULL : cptr),
+                               nick_msgid);
         sendcmdto_want_s2s_tags(1);
       }
       }
@@ -1588,7 +1684,7 @@ int whisper(struct Client* source, const char* nick, const char* channel,
   {
     char wmid[64];
     if (cli_user(dest)->away)
-      send_reply(source, RPL_AWAY, cli_name(dest), cli_user(dest)->away);
+      send_reply(source, RPL_AWAY, cli_name(dest), away_text_for(source, cli_user(dest)->away));
     generate_msgid(wmid, sizeof(wmid));
     if (!crdt_route_unicast_try(source, 'P', dest, wmid, text))
       sendcmdto_one(source, CMD_PRIVATE, dest, "%C :%s", dest, text);
@@ -1800,9 +1896,7 @@ hide_hostmask(struct Client *cptr)
                                          IsAccount(cptr) ? cli_account(cptr) : "*",
                                          cli_info(cptr));
       if (cli_user(cptr)->away)
-        sendcmdto_channel_capab_butserv_butone(cptr, CMD_AWAY, chan->channel, NULL, SKIP_CHGHOST,
-                                               CAP_AWAYNOTIFY, CAP_NONE, ":%s",
-                                               cli_user(cptr)->away);
+        away_notify_channel(cptr, chan->channel, cli_user(cptr)->away);
     }
     if (IsChanOp(chan) && IsHalfOp(chan) && HasVoice(chan))
       sendcmdto_channel_butserv_butone(&his, CMD_MODE, chan->channel, cptr, SKIP_CHGHOST,
@@ -1903,9 +1997,7 @@ unhide_hostmask(struct Client *cptr)
                                          IsAccount(cptr) ? cli_account(cptr) : "*",
                                          cli_info(cptr));
       if (cli_user(cptr)->away)
-        sendcmdto_channel_capab_butserv_butone(cptr, CMD_AWAY, chan->channel, NULL, SKIP_CHGHOST,
-                                               CAP_AWAYNOTIFY, CAP_NONE, ":%s",
-                                               cli_user(cptr)->away);
+        away_notify_channel(cptr, chan->channel, cli_user(cptr)->away);
     }
     if (IsChanOp(chan) && IsHalfOp(chan) && HasVoice(chan))
       sendcmdto_channel_butserv_butone(&his, CMD_MODE, chan->channel, cptr, SKIP_CHGHOST,
@@ -2607,6 +2699,17 @@ int set_user_mode(struct Client *cptr, struct Client *sptr, int parc,
        * still carries "name:ts". */
       if (IsRegistered(acptr))
         metadata_load_account(acptr, cli_user(acptr)->account);
+      /* Fork chathistory gate: the authusers counter (born c07b9d9) never
+       * learned about this upstream-era account attach.  A live client
+       * gaining an account here must be counted, or its eventual PART
+       * decrements a count it never added and the REQUIRE_AUTH storage
+       * gate drifts low.  Pre-registration clients (mid burst-intro)
+       * hold no memberships, so the walk no-ops for them. */
+      channel_account_adjust(acptr, +1);
+      /* Strict-presence anchor transfer: session -> stamped account.
+       * Pre-registration clients hold no memberships; the walk no-ops. */
+      presence_anchor_transfer(acptr, cli_session_id(acptr), 1,
+                               cli_user(acptr)->account, 0);
   }
 
   if (!FlagHas(&setflags, FLAG_CLOAKIP) && IsCloakIP(acptr))
@@ -3474,7 +3577,36 @@ void init_isupport(void)
   if (feature_bool(FEAT_CAP_draft_chathistory)) {
     add_isupport_i("CHATHISTORY", feature_int(FEAT_CHATHISTORY_MAX));
     add_isupport_s("MSGREFTYPES", "timestamp,msgid");
+    /* Fork extension: how far back this server keeps history, in
+     * seconds: the widest retention over the stores this server can reach
+     * (chathistory_retention_advertised), so a client does not page past
+     * the horizon (a goguma
+     * kept asking for May with a pre-repack msgid, 2026-09-08).  A hint,
+     * not a permission: older requests are still answered honestly.
+     * Storage servers only; federated peers may keep more or less.
+     * Vendor-prefixed like draft/ICON (network-icon spec): fork-only
+     * tokens belong under evilnet/ (bare RELOCATE predates that rule;
+     * VAPID is draft/webpush's own).  See docs/features/chathistory.md. */
+    chathistory_update_retention_isupport(0);   /* widest over the reachable stores */
   }
+
+  /* IRCv3 draft/FILEHOST (PR #562): the upload URL, when an Authtoken
+   * service named FILEHOST is configured.  goguma keys on the soju
+   * spelling, so both are published (documented compatibility alias). */
+  {
+    const char *fh = authtoken_filehost_url();
+    if (fh) {
+      add_isupport_s("draft/FILEHOST", fh);
+      add_isupport_s("soju.im/FILEHOST", fh);
+    } else {
+      del_isupport("draft/FILEHOST");
+      del_isupport("soju.im/FILEHOST");
+    }
+  }
+
+  /* evilnet/channel-relocate: relocation mode + tombstone grace period */
+  if (feature_bool(FEAT_RENAME_CONSENT))
+    add_isupport_i("RELOCATE", feature_int(FEAT_RELOCATE_GRACE));
 
   /* IRCv3 CLIENTTAGDENY - advertise blocked client-only tag patterns */
   {
@@ -3492,12 +3624,27 @@ int
 send_supported(struct Client *cptr)
 {
   struct SLink *line;
+  struct ConnectionClass *cclass;
 
   if (isupport && !isupport_lines)
     build_isupport_lines();
 
   for (line = isupport_lines; line; line = line->next)
     send_reply(cptr, RPL_ISUPPORT, line->value.cp);
+
+  /* #585 draft/ACCOUNTREQUIRED: per-CONNECTION, not static -- our
+   * account gating is class-conditional (require_sasl on the resolved
+   * connection class, which ports select via Client blocks), so the
+   * token is true exactly for clients whose class carries the gate.
+   * A client seeing it either authenticated already or is inside a
+   * grace the class allows. */
+  cclass = get_client_class_conf(cptr);
+  if (cclass && FlagHas(&cclass->restrictflags, CRFLAG_REQUIRE_SASL))
+    send_reply(cptr, RPL_ISUPPORT, "draft/ACCOUNTREQUIRED");
+
+  /* The VAPID token the client just saw is the key it will register
+   * under (draft/webpush key binding). */
+  webpush_note_key_seen(cptr);
 
   return 0; /* convenience return, if it's ever needed */
 }
@@ -3534,6 +3681,7 @@ send_supported_batched(struct Client *cptr)
     /* No batch support, fall back to regular ISUPPORT */
     for (line = isupport_lines; line; line = line->next)
       send_reply(cptr, RPL_ISUPPORT, line->value.cp);
+    webpush_note_key_seen(cptr);
     return 0;
   }
 
@@ -3552,8 +3700,20 @@ send_supported_batched(struct Client *cptr)
                   line->value.cp);
   }
 
+  /* Per-connection draft/ACCOUNTREQUIRED (see send_supported) */
+  {
+    struct ConnectionClass *cclass = get_client_class_conf(cptr);
+    if (cclass && FlagHas(&cclass->restrictflags, CRFLAG_REQUIRE_SASL))
+      sendrawto_one(cptr, "@batch=%s :%s 005 %s draft/ACCOUNTREQUIRED "
+                    ":are supported by this server",
+                    batchid, cli_name(&me),
+                    IsRegistered(cptr) ? cli_name(cptr) : "*");
+  }
+
   /* End batch: BATCH -id */
   sendcmdto_one(&me, CMD_BATCH_CMD, cptr, "-%s", batchid);
+
+  webpush_note_key_seen(cptr);
 
   return 0;
 }

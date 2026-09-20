@@ -216,6 +216,7 @@ int server_estab(struct Client *cptr, struct ConfItem *aconf)
 		  IsHub(cptr) ? "h" : "", IsService(cptr) ? "s" : "",
 		  IsIPv6(cptr) ? "6" : "", IsOpLevels(cptr) ? "o" : "",
 		  IsIRCv3Aware(cptr) ? "v" : "",
+		  IsRenameCapable(cptr) ? "r" : "",
 		  IsBxfAware(cptr) ? "F" : "",
 		  IsCrdtAware(cptr) ? "C" : "",
                   cli_info(cptr));
@@ -230,8 +231,10 @@ int server_estab(struct Client *cptr, struct ConfItem *aconf)
   jupe_burst(cptr);
   zline_burst(cptr);
 
-  /* Burst webpush subscriptions to newly linked server */
-  if (feature_bool(FEAT_CAP_draft_webpush))
+  /* Burst webpush subscriptions to newly linked server.  Gate on
+   * IsIRCv3Aware like ML below — legacy peers (X3) error on unknown
+   * tokens, and X3's snoop was echoing every WP B into its log channel. */
+  if (feature_bool(FEAT_CAP_draft_webpush) && IsIRCv3Aware(cptr))
     webpush_burst(cptr);
 
   /* Bouncer sessions are burst AFTER client introduction (below) so that
@@ -298,12 +301,13 @@ int server_estab(struct Client *cptr, struct ConfItem *aconf)
       if (crdt_server_intro_suppress(cptr, acptr))
         continue;
       sendcmdto_one(cli_serv(acptr)->up, CMD_SERVER, cptr,
-		    "%s %d 0 %Tu %s%u %s%s +%s%s%s%s%s%s%s :%s", cli_name(acptr),
+		    "%s %d 0 %Tu %s%u %s%s +%s%s%s%s%s%s%s%s :%s", cli_name(acptr),
 		    cli_hopcount(acptr) + 1, cli_serv(acptr)->timestamp,
 		    protocol_str, Protocol(acptr), NumServCap(acptr),
 		    IsHub(acptr) ? "h" : "", IsService(acptr) ? "s" : "",
 		    IsIPv6(acptr) ? "6" : "", IsOpLevels(acptr) ? "o" : "",
 		    IsIRCv3Aware(acptr) ? "v" : "",
+		    IsRenameCapable(acptr) ? "r" : "",
 		    IsBxfAware(acptr) ? "F" : "", IsCrdtAware(acptr) ? "C" : "",
                     cli_info(acptr));
     }
@@ -494,6 +498,10 @@ int server_finish_burst(struct Client *cptr)
           sendcmdto_one(cli_user(acptr)->server, CMD_MARK, cptr, "%s %s :%lu",
                         cli_name(acptr), MARK_SSLCLIEXP, (unsigned long)cli_sslcliexp(acptr));
       }
+
+      if (!EmptyString(cli_wsorigin(acptr)))
+        sendcmdto_one(cli_user(acptr)->server, CMD_MARK, cptr, "%s %s :%s",
+                      cli_name(acptr), MARK_WEBSOCKET, cli_wsorigin(acptr));
 
       if (cli_killmark(acptr) && !EmptyString(cli_killmark(acptr)))
         sendcmdto_one(cli_user(acptr)->server, CMD_MARK, cptr, "%s %s :%s",

@@ -95,15 +95,19 @@ enum Capab {
   _CAP(DRAFT_PREAWAY, 0, "draft/pre-away", 0),
   _CAP(DRAFT_MULTILINE, 0, "draft/multiline", 0),
   _CAP(DRAFT_CHATHISTORY, 0, "draft/chathistory", 0),
+  _CAP(SOJU_SEARCH, 0, "soju.im/search", 0),
   _CAP(DRAFT_EVENTPLAYBACK, 0, "draft/event-playback", 0),
   _CAP(DRAFT_REDACT, 0, "draft/message-redaction", 0),
   _CAP(DRAFT_ACCOUNTREG, 0, "draft/account-registration", 0),
   _CAP(DRAFT_READMARKER, 0, "draft/read-marker", 0),
   _CAP(DRAFT_CHANRENAME, 0, "draft/channel-rename", 0),
+  _CAP(EVILNET_RELOCATE, 0, "evilnet/channel-relocate", 0),
   _CAP(DRAFT_METADATA2, 0, "draft/metadata-2", 0),
   _CAP(DRAFT_WEBPUSH, 0, "draft/webpush", 0),
+  _CAP(DRAFT_AUTHTOKEN, 0, "draft/authtoken", 0),
   _CAP(DRAFT_BOUNCER, 0, "draft/bouncer", 0),
   _CAP(DRAFT_PERSISTENCE, 0, "draft/persistence", 0),
+  _CAP(DRAFT_OPERTAG, 0, "draft/oper-tag", 0),
 #ifdef USE_SSL
   _CAP(TLS, 0, "tls", 0),
   _CAP(STS, CAPFL_PROHIBIT, "sts", 0),
@@ -132,6 +136,16 @@ extern int cap_lookup(const char **caplist_p, int *neg_p, int *cap_out, unsigned
 
 /* IRCv3 cap-notify: send CAP NEW/DEL notifications to clients */
 extern void send_cap_notify(const char *capname, int available, const char *value);
+
+/* Overwrite a capability's advertised CAP 302 value at runtime (the value is
+ * copied).  NULL/"" advertises the capability with no value. */
+extern void cap_set_value(enum Capab cap, const char *value);
+
+/* Feature-notify hook (ircd_features.c table): rebuilds the
+ * draft/account-registration CAP value from FEAT_REGISTER_VERIFY_EMAIL.
+ * Defined in m_register.c. */
+extern void feature_notify_accountreg_capvalue(void);
+extern void feature_notify_cap_accountreg(void);
 
 /* CAP notify batching for rehash - aggregates multiple CAP NEW/DEL into single messages */
 extern void cap_notify_begin_batch(void);

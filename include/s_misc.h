@@ -76,6 +76,9 @@ struct ServerStatistics {
 
 extern int check_registered(struct Client *sptr);
 extern int check_registered_user(struct Client *sptr);
+/** Arm the msgid/time of a remote user's own QUIT line for the exit that
+ * follows (s_misc.c); pass NULL to clear.  See exit_client. */
+extern void exit_arm_s2s_event(const char *msgid, uint64_t ms);
 extern int exit_client(struct Client *cptr, struct Client *bcptr,
     struct Client *sptr, const char *comment);
 extern char *myctime(time_t value);

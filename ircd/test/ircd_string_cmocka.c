@@ -9,8 +9,10 @@
 #include <setjmp.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 #include <cmocka.h>
 
+#include "ircd_defs.h"
 #include "ircd_string.h"
 #include "ircd_chattr.h"
 
@@ -373,6 +375,55 @@ static void test_valid_hostname(void **state)
 }
 
 
+
+/* PR #109 + follow-up: Spoofhost block validation.  The user part takes
+ * IsUserChar (alphanumerics, Latin-1 letters and .-_^'`~ -- so the
+ * no-ident '~' prefix is fine); it is bounded by USERLEN and the host part
+ * by HOSTLEN because both are strlcpy'd into sethost[HOSTLEN + USERLEN + 2]
+ * downstream; an IPv6 literal is not a host. */
+static void test_valid_spoofhost(void **state)
+{
+    char longuser[USERLEN + 2 + 16];
+    char longhost[HOSTLEN + 2 + 16];
+    (void)state;
+
+    assert_true(valid_spoofhost("example.com", 0));
+    assert_true(valid_spoofhost("user@example.com", 0));
+    assert_true(valid_spoofhost("~user@example.com", 0));
+    assert_true(valid_spoofhost("*", 1));
+    assert_true(valid_spoofhost("us?r@*.example.com", 1));
+
+    assert_false(valid_spoofhost("", 0));
+    assert_false(valid_spoofhost("@example.com", 0));
+    assert_false(valid_spoofhost("user@", 0));
+    assert_false(valid_spoofhost(":evil@example.com", 0));
+    assert_false(valid_spoofhost("us er@example.com", 0));
+    assert_true(valid_spoofhost("u.s-e_r@example.com", 0));
+    assert_false(valid_spoofhost(".example.com", 0));
+    assert_false(valid_spoofhost("example.com.", 0));
+    assert_false(valid_spoofhost("2001:db8::1", 0));          /* IPv6 literal */
+    assert_false(valid_spoofhost("*", 0));                    /* wildcard needs ismask */
+
+    memset(longuser, 'a', sizeof(longuser) - 1);
+    longuser[sizeof(longuser) - 1] = '\0';
+    {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "%.*s@example.com", USERLEN + 1, longuser);
+        assert_false(valid_spoofhost(buf, 0));
+        snprintf(buf, sizeof(buf), "%.*s@example.com", USERLEN, longuser);
+        assert_true(valid_spoofhost(buf, 0));
+    }
+    memset(longhost, 'h', sizeof(longhost) - 1);
+    longhost[sizeof(longhost) - 1] = '\0';
+    {
+        char buf[160];
+        snprintf(buf, sizeof(buf), "%.*s", HOSTLEN + 1, longhost);
+        assert_false(valid_spoofhost(buf, 0));
+        snprintf(buf, sizeof(buf), "%.*s", HOSTLEN, longhost);
+        assert_true(valid_spoofhost(buf, 0));
+    }
+}
+
 /* ========== Character classification string functions ========== */
 /* NOTE: strIsDigit/strIsAlpha/strIsAlnum tests removed because strChattr()
  * is conditionally compiled with FORCEINLINE and difficult to link in tests.
@@ -453,9 +504,320 @@ static void test_csv_contains_token_match_and_case(void **state)
 }
 
 
+/* --- ircd_json_escape --- */
+
+static void test_json_escape_passthrough(void **state)
+{
+  char buf[64];
+  (void)state;
+  assert_string_equal(ircd_json_escape(buf, sizeof(buf), "plain text"),
+                      "plain text");
+  assert_string_equal(ircd_json_escape(buf, sizeof(buf), NULL), "");
+}
+
+static void test_json_escape_specials(void **state)
+{
+  char buf[64];
+  (void)state;
+  assert_string_equal(ircd_json_escape(buf, sizeof(buf), "a\"b\\c"),
+                      "a\\\"b\\\\c");
+  assert_string_equal(ircd_json_escape(buf, sizeof(buf), "x\ny"),
+                      "x\\u000ay");
+}
+
+static void test_json_escape_truncates_cleanly(void **state)
+{
+  char buf[4];
+  (void)state;
+  /* 2-byte escape does not fit in the 1 remaining slot: clean stop. */
+  assert_string_equal(ircd_json_escape(buf, sizeof(buf), "ab\"cd"), "ab");
+}
+
+/* --- ircd_text_mentions --- */
+
+static void test_mentions_basic_and_case(void **state)
+{
+  (void)state;
+  assert_int_equal(1, ircd_text_mentions("hey rubin look", "rubin"));
+  assert_int_equal(1, ircd_text_mentions("hey RUBIN look", "rubin"));
+  assert_int_equal(1, ircd_text_mentions("rubin: ping", "Rubin"));
+}
+
+static void test_mentions_boundaries(void **state)
+{
+  (void)state;
+  assert_int_equal(1, ircd_text_mentions("rubin", "rubin"));      /* whole text */
+  assert_int_equal(1, ircd_text_mentions("(rubin)", "rubin"));    /* punct sides */
+  assert_int_equal(1, ircd_text_mentions("cc rubin", "rubin"));   /* end of text */
+}
+
+static void test_mentions_substring_rejected(void **state)
+{
+  (void)state;
+  assert_int_equal(0, ircd_text_mentions("rubinstein plays", "rubin"));
+  assert_int_equal(0, ircd_text_mentions("subrubin here", "rubin"));
+  assert_int_equal(0, ircd_text_mentions("rubin2 spoke", "rubin"));
+}
+
+static void test_mentions_null_safe(void **state)
+{
+  (void)state;
+  assert_int_equal(0, ircd_text_mentions(NULL, "x"));
+  assert_int_equal(0, ircd_text_mentions("text", NULL));
+  assert_int_equal(0, ircd_text_mentions("text", ""));
+}
+
+/* --- ircd_utf8_clamp --- */
+
+static void test_utf8_clamp_fits_untouched(void **state)
+{
+  char buf[32] = "hello";
+  (void)state;
+  assert_int_equal(0, ircd_utf8_clamp(buf, 10));
+  assert_string_equal(buf, "hello");
+  assert_int_equal(0, ircd_utf8_clamp(buf, 5)); /* exact fit */
+  assert_string_equal(buf, "hello");
+}
+
+static void test_utf8_clamp_ascii_cut(void **state)
+{
+  char buf[32] = "hello world";
+  (void)state;
+  assert_int_equal(1, ircd_utf8_clamp(buf, 5));
+  assert_string_equal(buf, "hello");
+}
+
+static void test_utf8_clamp_multibyte_boundary(void **state)
+{
+  /* "aX" where X = 2-byte U+00E9 (0xC3 0xA9).  Cutting at 2 lands on
+   * the continuation byte -> whole sequence dropped. */
+  char buf[8] = "a\303\251";
+  (void)state;
+  assert_int_equal(1, ircd_utf8_clamp(buf, 2));
+  assert_string_equal(buf, "a");
+}
+
+static void test_utf8_clamp_keeps_complete_sequence(void **state)
+{
+  /* Cutting exactly after the full 2-byte sequence keeps it. */
+  char buf[8] = "a\303\251b";
+  (void)state;
+  assert_int_equal(1, ircd_utf8_clamp(buf, 3));
+  assert_string_equal(buf, "a\303\251");
+}
+
+static void test_utf8_clamp_null_safe(void **state)
+{
+  (void)state;
+  assert_int_equal(0, ircd_utf8_clamp(NULL, 5));
+}
+
+/* --- string_is_valid_utf8 / string_sanitize_utf8 --- */
+
+/* A line as an IRC client actually sends it: CTCP delimiters and the mIRC
+ * formatting codes are bare C0 control bytes, and every one of them is a
+ * well-formed single-byte UTF-8 sequence. */
+#define CTCP_ACTION_LINE "\001ACTION waves\001"
+#define FORMATTED_LINE   "\002bold\002 \037under\037 \003" "04red\003 \035it\035 \017"
+
+static void test_utf8_valid_plain_ascii(void **state)
+{
+  (void)state;
+  assert_int_equal(1, string_is_valid_utf8(""));
+  assert_int_equal(1, string_is_valid_utf8("hello world"));
+  assert_int_equal(1, string_is_valid_utf8("tab\there\r\n"));
+}
+
+static void test_utf8_valid_control_characters(void **state)
+{
+  (void)state;
+  /* CTCP delimiter and the mIRC formatting codes. */
+  assert_int_equal(1, string_is_valid_utf8(CTCP_ACTION_LINE));
+  assert_int_equal(1, string_is_valid_utf8(FORMATTED_LINE));
+  /* Every byte 0x01-0x7F on its own. */
+  {
+    char one[2] = {0, 0};
+    int c;
+    for (c = 0x01; c <= 0x7F; c++) {
+      one[0] = (char)c;
+      assert_int_equal(1, string_is_valid_utf8(one));
+    }
+  }
+}
+
+static void test_utf8_valid_multibyte(void **state)
+{
+  (void)state;
+  assert_int_equal(1, string_is_valid_utf8("caf\303\251"));          /* U+00E9 */
+  assert_int_equal(1, string_is_valid_utf8("\342\202\254"));         /* U+20AC */
+  assert_int_equal(1, string_is_valid_utf8("\360\237\222\251"));     /* U+1F4A9 */
+  assert_int_equal(1, string_is_valid_utf8("\355\237\277"));         /* U+D7FF */
+}
+
+static void test_utf8_invalid_sequences(void **state)
+{
+  (void)state;
+  assert_int_equal(0, string_is_valid_utf8("\200"));                 /* lone continuation */
+  assert_int_equal(0, string_is_valid_utf8("\300\200"));             /* overlong NUL */
+  assert_int_equal(0, string_is_valid_utf8("\301\277"));             /* overlong */
+  assert_int_equal(0, string_is_valid_utf8("\340\200\200"));         /* overlong 3-byte */
+  assert_int_equal(0, string_is_valid_utf8("\355\240\200"));         /* U+D800 surrogate */
+  assert_int_equal(0, string_is_valid_utf8("\342\202"));             /* truncated 3-byte */
+  assert_int_equal(0, string_is_valid_utf8("\364\220\200\200"));     /* > U+10FFFF */
+  assert_int_equal(0, string_is_valid_utf8("\365\200\200\200"));     /* 0xF5 lead */
+  assert_int_equal(0, string_is_valid_utf8("\376\377"));             /* never valid */
+  assert_int_equal(0, string_is_valid_utf8("ok then \377 no"));      /* mid-string */
+}
+
+static void test_utf8_sanitize_leaves_control_codes_alone(void **state)
+{
+  char buf[BUFSIZE];
+  (void)state;
+
+  strcpy(buf, FORMATTED_LINE);
+  assert_int_equal(-1, string_sanitize_utf8(buf));   /* -1 == nothing modified */
+  assert_string_equal(buf, FORMATTED_LINE);
+
+  strcpy(buf, CTCP_ACTION_LINE);
+  assert_int_equal(-1, string_sanitize_utf8(buf));
+  assert_string_equal(buf, CTCP_ACTION_LINE);
+}
+
+static void test_utf8_sanitize_replaces_invalid_bytes(void **state)
+{
+  char buf[BUFSIZE];
+  (void)state;
+
+  /* One bad byte becomes the 3-byte U+FFFD, so the string grows by two. */
+  strcpy(buf, "bad\377end");
+  assert_int_equal((int)strlen("bad") + 3 + (int)strlen("end"),
+                   string_sanitize_utf8(buf));
+  assert_string_equal(buf, "bad\357\277\275end");
+
+  /* Valid multibyte text survives untouched alongside a bad byte:
+   * "caf" (3) + U+00E9 (2) + U+FFFD for the 0x80 (3) + "!" (1) = 9. */
+  strcpy(buf, "caf\303\251\200!");
+  assert_int_equal(9, string_sanitize_utf8(buf));
+  assert_string_equal(buf, "caf\303\251\357\277\275!");
+}
+
+static void test_utf8_sanitize_keeps_formatted_line_intact(void **state)
+{
+  /* The WebSocket text-frame path (s_bsd.c) validates and then sanitizes:
+   * a formatted line must come out of both steps byte-for-byte unchanged. */
+  char buf[BUFSIZE];
+  (void)state;
+
+  strcpy(buf, "\002Rubin\002: Pong!");
+  assert_int_equal(1, string_is_valid_utf8(buf));
+  assert_int_equal(-1, string_sanitize_utf8(buf));
+  assert_string_equal(buf, "\002Rubin\002: Pong!");
+}
+
+
+static void test_utf8_sanitize_returns_minus_one_past_its_window(void **state)
+{
+  /* string_sanitize_utf8() only scans until its output buffer is nearly
+   * full (BUFSIZE), while string_is_valid_utf8() scans the whole string.
+   * A long line whose only bad byte sits past that window is therefore
+   * "invalid" but sanitizes to -1 == "nothing modified".  s_bsd.c used to
+   * assign that straight into the WebSocket frame length, i.e. memcpy() of
+   * SIZE_MAX bytes; pin the contract here so it stays visible. */
+  char buf[BUFSIZE * 4];
+  size_t i;
+  (void)state;
+
+  for (i = 0; i < BUFSIZE + 100; i++)
+    buf[i] = 'x';
+  buf[i++] = (char)0xFF;      /* the one malformed byte, past the window */
+  buf[i] = '\0';
+
+  assert_int_equal(0, string_is_valid_utf8(buf));
+  assert_int_equal(-1, string_sanitize_utf8(buf));
+  assert_int_equal(BUFSIZE + 101, (int)strlen(buf));  /* left untouched */
+}
+
+static void test_utf8_sanitize_truncates_at_a_sequence_boundary(void **state)
+{
+  /* A bad byte inside the window is replaced, and the result is clamped to
+   * the working buffer without splitting a multibyte sequence. */
+  char buf[BUFSIZE * 4];
+  size_t i;
+  int n;
+  (void)state;
+
+  buf[0] = (char)0x80;        /* lone continuation, inside the window */
+  for (i = 1; i < BUFSIZE * 2; i++)
+    buf[i] = 'z';
+  buf[i] = '\0';
+
+  n = string_sanitize_utf8(buf);
+  assert_true(n > 0);
+  assert_true(n < BUFSIZE);
+  assert_int_equal(n, (int)strlen(buf));
+  assert_int_equal(1, string_is_valid_utf8(buf));
+}
+
+
+
+/* ---- msgid intrinsic time decode (2026-09 repack) ---- */
+
+static const char *msgid_test_alphabet =
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789[]";
+
+static void msgid_encode7(char *out, unsigned long long ms)
+{
+  int i;
+  for (i = 6; i >= 0; i--) {
+    out[i] = msgid_test_alphabet[ms & 63];
+    ms >>= 6;
+  }
+  out[7] = '\0';
+}
+
+static void test_msgid_decode_roundtrip(void **state)
+{
+  char id[16];
+  char t7[8];
+  unsigned long long samples[] = {
+    1577836800000ULL,          /* 2020-01-01 floor */
+    1788112345678ULL,          /* ~now */
+    4102444799999ULL,          /* just under the 2100 ceiling */
+  };
+  size_t i;
+  (void)state;
+
+  for (i = 0; i < sizeof(samples)/sizeof(samples[0]); i++) {
+    msgid_encode7(t7, samples[i]);
+    snprintf(id, sizeof(id), "Bj" "AAB" "%s" "Ac", t7);
+    assert_int_equal((unsigned long long)msgid_decode_time_ms(id), samples[i]);
+  }
+}
+
+static void test_msgid_decode_rejects(void **state)
+{
+  (void)state;
+  /* Legacy layout: counter high padding decodes to ~0 -> rejected. */
+  assert_int_equal(msgid_decode_time_ms("BjAABAAAAAAAAB"), 0);
+  /* Garbage char in the time field. */
+  assert_int_equal(msgid_decode_time_ms("BjAAB!!!!!!!Ac"), 0);
+  /* Too short. */
+  assert_int_equal(msgid_decode_time_ms("BjAAB"), 0);
+  assert_int_equal(msgid_decode_time_ms(NULL), 0);
+  /* Below the 2020 floor (counter-era values). */
+  {
+    char id[16], t7[8];
+    msgid_encode7(t7, 123456ULL);
+    snprintf(id, sizeof(id), "BjAAB%sAc", t7);
+    assert_int_equal(msgid_decode_time_ms(id), 0);
+  }
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
+    cmocka_unit_test(test_msgid_decode_roundtrip),
+    cmocka_unit_test(test_msgid_decode_rejects),
         /* ircd_strncpy */
         cmocka_unit_test(test_ircd_strncpy_normal),
         cmocka_unit_test(test_ircd_strncpy_truncation),
@@ -497,6 +859,7 @@ int main(void)
         /* Username/hostname validation */
         cmocka_unit_test(test_valid_username),
         cmocka_unit_test(test_valid_hostname),
+        cmocka_unit_test(test_valid_spoofhost),
 
         /* str_appendf */
         cmocka_unit_test(test_str_appendf_basic),
@@ -507,6 +870,35 @@ int main(void)
         /* csv_contains_token */
         cmocka_unit_test(test_csv_contains_token_empty_denies),
         cmocka_unit_test(test_csv_contains_token_match_and_case),
+
+        /* ircd_utf8_clamp */
+        cmocka_unit_test(test_utf8_clamp_fits_untouched),
+        cmocka_unit_test(test_utf8_clamp_ascii_cut),
+        cmocka_unit_test(test_utf8_clamp_multibyte_boundary),
+        cmocka_unit_test(test_utf8_clamp_keeps_complete_sequence),
+        cmocka_unit_test(test_utf8_clamp_null_safe),
+
+        /* ircd_text_mentions */
+        cmocka_unit_test(test_mentions_basic_and_case),
+        cmocka_unit_test(test_mentions_boundaries),
+        cmocka_unit_test(test_mentions_substring_rejected),
+        cmocka_unit_test(test_mentions_null_safe),
+
+        /* ircd_json_escape */
+        cmocka_unit_test(test_json_escape_passthrough),
+        cmocka_unit_test(test_json_escape_specials),
+        cmocka_unit_test(test_json_escape_truncates_cleanly),
+
+        /* string_is_valid_utf8 / string_sanitize_utf8 */
+        cmocka_unit_test(test_utf8_valid_plain_ascii),
+        cmocka_unit_test(test_utf8_valid_control_characters),
+        cmocka_unit_test(test_utf8_valid_multibyte),
+        cmocka_unit_test(test_utf8_invalid_sequences),
+        cmocka_unit_test(test_utf8_sanitize_leaves_control_codes_alone),
+        cmocka_unit_test(test_utf8_sanitize_replaces_invalid_bytes),
+        cmocka_unit_test(test_utf8_sanitize_keeps_formatted_line_intact),
+        cmocka_unit_test(test_utf8_sanitize_returns_minus_one_past_its_window),
+        cmocka_unit_test(test_utf8_sanitize_truncates_at_a_sequence_boundary),
     };
 
     return cmocka_run_group_tests(tests, NULL, NULL);

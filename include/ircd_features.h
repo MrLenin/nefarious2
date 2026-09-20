@@ -345,6 +345,8 @@ enum Feature {
   FEAT_CAP_server_time,
   FEAT_CAP_echo_message,
   FEAT_CAP_account_tag,
+  FEAT_CAP_oper_tag,
+  FEAT_OPERTAG_VALUE,
   FEAT_CAP_chghost,
   FEAT_CAP_invite_notify,
   FEAT_CAP_labeled_response,
@@ -360,17 +362,39 @@ enum Feature {
   FEAT_CAP_draft_pre_away,
   FEAT_CAP_draft_multiline,
   FEAT_CAP_draft_chathistory,
+  FEAT_CAP_soju_search,
   FEAT_CAP_draft_event_playback,
   FEAT_CAP_draft_message_redaction,
   FEAT_CAP_draft_account_registration,
-  FEAT_REGISTER_SERVER,
+  FEAT_REGISTER_VERIFY_EMAIL,
+  FEAT_POSTREG_GRACE,
+  FEAT_REGISTER_THROTTLE_LIMIT,
+  FEAT_REGISTER_THROTTLE_PERIOD,
+  FEAT_REGISTER_THROTTLE_GLOBAL,
+  FEAT_RENAME_SERVICES,
+  /* relocation mode -- renames move only the issuer and +F users;
+   * see docs/specs/channel-relocate.md in the testnet repo */
+  FEAT_RENAME_CONSENT,
+  FEAT_RELOCATE_GRACE,
   FEAT_CAP_draft_read_marker,
   FEAT_CAP_draft_channel_rename,
+  FEAT_CAP_evilnet_channel_relocate,
   FEAT_CAP_draft_metadata_2,
   FEAT_CAP_draft_webpush,
+  FEAT_CAP_draft_authtoken,
+  FEAT_AUTHTOKEN_EXPIRE,
+  FEAT_AUTHTOKEN_MAX,
   FEAT_WEBPUSH_DB,
   FEAT_WEBPUSH_DB_AUTOGROW,
   FEAT_WEBPUSH_VAPID_PRIVKEY,
+  FEAT_WEBPUSH_NOTIFY,
+  FEAT_WEBPUSH_COOLDOWN,
+  FEAT_WEBPUSH_EXPIRE,
+  FEAT_WEBPUSH_MAX_REGISTRATIONS,
+  FEAT_WEBPUSH_HIGHLIGHTS,
+  FEAT_WEBPUSH_KEY_ROTATE,
+  FEAT_WEBPUSH_IDLE,
+  FEAT_WEBPUSH_MULTILINE_LINES,
   FEAT_METADATA_MAX_KEYS,
   FEAT_METADATA_MAX_VALUE_BYTES,
   FEAT_METADATA_MAX_SUBS,
@@ -416,9 +440,9 @@ enum Feature {
   FEAT_WEBSOCKET,
   FEAT_DRAFT_WEBSOCKET, /* backward compat alias */
   FEAT_WEBSOCKET_ORIGIN,
+  FEAT_WEBSOCKET_PING_INTERVAL,
   FEAT_MSGID,
   FEAT_P10_MESSAGE_TAGS,
-  FEAT_PRESENCE_AGGREGATION,
   FEAT_AWAY_STAR_MSG,
   FEAT_AWAY_THROTTLE,
   FEAT_METADATA_BURST,
@@ -520,6 +544,7 @@ enum Feature {
   FEAT_CRDT_BOUNCER_DOC,        /* 5-5e M6: the CRDT doc is the AUTHORITATIVE transport for bouncer session/connection/lease state among CRDT peers (reconcile-from-doc drives live state + suppress P10 BS/BX relay toward CRDT peers + §17.7 gateway synthesizes legacy BS/BX). Default off, rolled node-by-node. The M2-M5 shadow mirror stays under FEAT_CRDT_PRIMARY; this flag flips read/authority on. */
   FEAT_CRDT_OWNER_SWEEP,        /* orphan-reap owner sweep: each node reaps its OWN-origin doc user records with no live Client by minting the DELETE itself (resurrection-zombie / restart-residue / hookless-teardown catch-all; single-writer clean). DESTRUCTIVE (mints real tombstones) -> dedicated kill-switch, default off, rolled node-by-node */
   FEAT_CRDT_OVERLAY_PRIMARY,    /* MR-6-1: this node's PRIMARY transport is the CR overlay mesh — zero P10 tree links by design (cold boot syncs via CR F pull + beacon-burst only; legacy reached via the gateway). Declarative + observability now (status render, §2.8 redundancy guard: warn while <2 live overlay edges); 6-2/6-3 behaviors gate on it. Default off, per-node config */
+  FEAT_BOUNCER_MAX_ALIASES,
 
   FEAT_LAST_F
 };

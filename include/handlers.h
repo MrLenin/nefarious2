@@ -298,13 +298,17 @@ extern int m_batch(struct Client*, struct Client*, int, char*[]);
 extern int check_client_batch_timeout(struct Client*);
 extern int ms_multiline(struct Client*, struct Client*, int, char*[]);
 extern int m_chathistory(struct Client*, struct Client*, int, char*[]);
+extern int m_search(struct Client*, struct Client*, int, char*[]);
 extern int ms_chathistory(struct Client*, struct Client*, int, char*[]);
 extern int m_history(struct Client*, struct Client*, int, char*[]);
 extern int has_chathistory_advertisement(struct Client*);
 extern int server_retention_days(struct Client*);
+extern int chathistory_retention_advertised(void);
+extern void chathistory_update_retention_isupport(int announce);
 extern int server_retention_covers(struct Client*, time_t);
 extern void clear_server_ad(struct Client*);
 extern void chathistory_report_ads(struct Client*, const struct StatDesc*, char*);
+extern void chathistory_reflood_ads(struct Client *newpeer);
 extern void forward_history_write(struct Channel*, struct Client*, const char*, const char*, int, const char*);
 extern int send_channel_advertisements(struct Client*);
 extern void broadcast_channel_advertisement(const char*);
@@ -313,9 +317,9 @@ extern int m_redact(struct Client*, struct Client*, int, char*[]);
 extern int ms_redact(struct Client*, struct Client*, int, char*[]);
 extern int m_register(struct Client*, struct Client*, int, char*[]);
 extern int m_verify(struct Client*, struct Client*, int, char*[]);
-extern int ms_regreply(struct Client*, struct Client*, int, char*[]);
 extern int m_markread(struct Client*, struct Client*, int, char*[]);
 extern int ms_markread(struct Client*, struct Client*, int, char*[]);
+extern int ms_presencesync(struct Client*, struct Client*, int, char*[]);
 extern void send_markread_on_join(struct Client*, const char*);
 extern int m_rename(struct Client*, struct Client*, int, char*[]);
 extern int ms_rename(struct Client*, struct Client*, int, char*[]);
@@ -357,7 +361,7 @@ extern int crdt_route_unicast_try(struct Client* from, char cmd, struct Client* 
  *  dead-sink anchor; @a body = the verbatim P10 param tail.  REPLY: same, for the x3-reply
  *  reverse leg on the gateway (target may be a user/anchor; uses IsMeshStub directly).  Each
  *  returns 1 if tunneled (skip the P10 send) / 0 to fall back to P10.  @a p10cmd is the one-letter
- *  code (A=SASL C=ACCOUNT G=REGISTER V=VERIFY R=REGREPLY Q=XQUERY Y=XREPLY). */
+ *  code (A=SASL C=ACCOUNT Q=XQUERY Y=XREPLY; G/V/R retired with the local REGISTER flow). */
 extern int crdt_route_services_try(struct Client* dstsrv, char p10cmd, const char* body);
 extern int crdt_route_services_reply_try(struct Client* tgt, char p10cmd, const char* body);
 extern int crdt_route_services_reply_by_num(const char* srvnum, char p10cmd, const char* body);

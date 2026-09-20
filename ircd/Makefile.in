@@ -87,7 +87,7 @@ UMKPASSWD_SRC = ${CRYPTO_SRC} \
 	memdebug.c \
 	umkpasswd.c
 
-# @KC_SRC@ below is the nine vendored ircd/kc/*.c sources.  configure
+# The KC_SRC list below is the vendored ircd/kc/*.c sources.  configure
 # substitutes them only under --enable-keycloak, and nothing otherwise:
 # unlike every other optional consumer (sasl_auth.c, ircd_kc_adapter.c,
 # ...) the kc/ sources are verbatim from evilnet/libkc and carry no
@@ -110,6 +110,7 @@ IRCD_SRC = \
 	crule.c \
 	dbuf.c \
 	db_rocksdb.c \
+	db_casefold.c \
 	destruct_event.c \
 	dnsbl.c \
 	fileio.c \
@@ -217,7 +218,14 @@ IRCD_SRC = \
 	m_persistence.c \
 	persistence_profile.c \
 	m_rename.c \
+	m_token.c \
 	m_webpush.c \
+	webpush_mute.c \
+	webpush_expiry.c \
+	webpush_keyring.c \
+	webpush_attention.c \
+	bouncer_converge.c \
+	webpush_line.c \
 	metadata.c \
 	m_rehash.c \
 	m_remove.c \
@@ -285,6 +293,7 @@ IRCD_SRC = \
 	querycmds.c \
 	random.c \
 	recv_classify.c \
+	register_throttle.c \
 	replay.c \
 	s_auth.c \
 	s_bsd.c \
@@ -297,6 +306,7 @@ IRCD_SRC = \
 	s_stats.c \
 	s_user.c \
 	sasl_auth.c \
+	authtoken.c \
 	sasl_conf.c \
 	sasl_webhook.c \
 	send.c \
@@ -331,6 +341,7 @@ all:
 .SUFFIXES: .c .o
 
 .c.o:
+	@d=`dirname $@`; test -d "$$d" || mkdir -p "$$d"
 	${CC} ${CFLAGS} ${CPPFLAGS} -c $< -o $@
 
 # The kc/ subtree is the vendored libkc (sources ircd/kc/*.c, headers
@@ -367,7 +378,11 @@ KC_ALLOWED_STD_HDRS = \
 	dirent.h dlfcn.h fcntl.h grp.h netdb.h poll.h pthread.h pwd.h \
 	regex.h sched.h semaphore.h strings.h syslog.h termios.h unistd.h
 
-KC_BOUNDARY_FILES = ${srcdir}/kc/*.c ${srcdir}/kc/*.h ${top_srcdir}/include/kc/*.h
+# Subdirectory globs are listed so a future ircd/kc/<sub>/ is covered too; a
+# glob that matches nothing stays literal and is skipped by the -f test below.
+KC_BOUNDARY_FILES = ${srcdir}/kc/*.c ${srcdir}/kc/*.h \
+	${srcdir}/kc/*/*.c ${srcdir}/kc/*/*.h \
+	${top_srcdir}/include/kc/*.h ${top_srcdir}/include/kc/*/*.h
 
 check-kc-boundary:
 	@bad=''; \
@@ -389,6 +404,9 @@ check-kc-boundary:
 				for s in ${KC_ALLOWED_STD_HDRS}; do \
 					if [ "$$h" = "$$s" ]; then ok=yes; break; fi; \
 				done ;; \
+			esac; \
+			case "$$h" in \
+			*..*) ok=no ;; \
 			esac; \
 			if [ "$$ok" = no ]; then bad="$$bad $$f:$$h"; fi; \
 		done; \
@@ -489,7 +507,7 @@ uninstall:
 	@echo "Please remove the contents of ${DPATH} manually"
 
 clean:
-	${RM} -f *.o *.bak ircd umkpasswd convert-conf chattr.tab.c table_gen y.tab.* lex.yy.* version.c
+	${RM} -f *.o kc/*.o *.bak ircd umkpasswd convert-conf chattr.tab.c table_gen y.tab.* lex.yy.* version.c
 
 distclean: clean
 	${RM} -f Makefile stamp-m
@@ -566,6 +584,9 @@ db_rocksdb.o: db_rocksdb.c ../config.h ../include/client.h \
   ../include/db_cursor.h ../include/db_env.h ../include/db_txn.h \
   ../include/db_types.h ../include/ircd_alloc.h ../include/ircd_log.h \
   ../include/ircd_snprintf.h
+db_casefold.o: db_casefold.c ../config.h ../include/db_casefold.h \
+  ../include/db_cursor.h ../include/db_env.h ../include/db_txn.h \
+  ../include/db_types.h ../include/ircd_chattr.h ../include/ircd_log.h
 destruct_event.o: destruct_event.c ../config.h ../include/channel.h \
   ../include/destruct_event.h ../include/s_debug.h ../include/ircd_alloc.h \
   ../include/ircd.h ../include/ircd_events.h ../include/ircd_log.h \

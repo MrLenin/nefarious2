@@ -72,6 +72,7 @@
 #include "handlers.h"
 #include "bouncer_session.h"
 #include "forwarded_label.h"
+#include "webpush.h"
 
 /* #include <assert.h> -- Now using assert in ircd_log.h */
 #include <stdio.h>
@@ -176,24 +177,28 @@ void store_channel_history(struct Client *sptr, struct Channel *chptr,
   const char *account;
   int has_local_interest;
 
+  /* WebPush v2: channel-highlight pushes for held members.  PRIVMSG
+   * only (channel NOTICEs are bot noise by design); before the history
+   * gates so pushes don't depend on chathistory storage. */
+  if (type == HISTORY_PRIVMSG)
+    webpush_notify_channel(sptr, chptr, text, msgid, timestamp);
+
   if (!history_is_available())
     return;
 
   /* Check if chathistory storage is enabled */
   if (!feature_bool(FEAT_CHATHISTORY_STORE)) {
     /* If write forwarding is enabled, forward to a storage server.
-     * Encode client tags into the content using \x06 sentinel so they
-     * survive the CH W wire format transparently. */
+     * history_forward_encode sentinel-escapes the payload and brackets
+     * the client tags in \x06 so the storage server can split them back
+     * out (process_write_forward) without raw client bytes ever reading
+     * as structure. */
     if (feature_bool(FEAT_CHATHISTORY_WRITE_FORWARD)) {
-      if (client_tags && client_tags[0]) {
-        char tagged_content[HISTORY_CONTENT_LEN + 512];
-        ircd_snprintf(0, tagged_content, sizeof(tagged_content),
-                      "\x06%s\x06%s", client_tags, text ? text : "");
-        forward_history_write(chptr, sptr, msgid, timestamp, type,
-                              tagged_content);
-      } else {
-        forward_history_write(chptr, sptr, msgid, timestamp, type, text);
-      }
+      char tagged_content[(512 + 512) * 2 + 3];
+      history_forward_encode(tagged_content, sizeof(tagged_content),
+                             client_tags, text);
+      forward_history_write(chptr, sptr, msgid, timestamp, type,
+                            tagged_content);
     }
     return;
   }
@@ -253,7 +258,11 @@ void store_channel_history(struct Client *sptr, struct Channel *chptr,
   if (feature_bool(FEAT_CHATHISTORY_REQUIRE_AUTH)
       && chptr->authusers == 0
       && !(chptr->mode.exmode & EXMODE_PUBLICHISTORY))
-    return;
+    return;   /* no content stored; the delivered msgid still resolves
+               * to its mint time intrinsically (2026-09 repack), so no
+               * anchor row is needed.  +Y/opt-out GAPs below are kept
+               * for their visible unavailable-marker role, not
+               * anchoring. */
 
   /* Check if sender has +Y (no storage) user mode — store gap marker */
   if (IsNoStorage(sptr)) {
@@ -279,7 +288,7 @@ void store_channel_history(struct Client *sptr, struct Channel *chptr,
  * @param[in] cptr Client to check.
  * @return 1 if opted out, 0 otherwise.
  */
-static int has_pm_optout(struct Client *cptr)
+int has_pm_optout(struct Client *cptr)
 {
   struct MetadataEntry *entry;
 
@@ -328,7 +337,7 @@ static int should_store_pm(struct Client *sender, struct Client *recipient)
  * @param[in] msgid Message ID (same one sent to clients via echo-message).
  * @param[in] timestamp ISO 8601 timestamp.
  */
-static void store_private_history(struct Client *sptr, struct Client *acptr,
+void store_private_history(struct Client *sptr, struct Client *acptr,
                                    const char *text, enum HistoryMessageType type,
                                    const char *msgid, const char *timestamp,
                                    const char *client_tags)
@@ -337,6 +346,23 @@ static void store_private_history(struct Client *sptr, struct Client *acptr,
   char target[PM_PAIRKEY_BUFSIZE];  /* identity pair-key */
   const char *account;
   const char *nick1, *nick2;
+
+  /* WebPush v1 trigger: PM/NOTICE toward a held bouncer session.
+   * Deliberately BEFORE the history feature gates -- push delivery
+   * must not depend on chathistory storage being enabled.  All gating
+   * (hold state, subscriptions, cooldown, FEAT) lives inside. */
+  if (type != HISTORY_TAGMSG)
+    webpush_notify_pm(sptr, acptr, text, type == HISTORY_NOTICE,
+                      msgid, timestamp);
+
+  /* Service traffic is not a conversation: AuthServ's "I recognize you"
+   * and "X authed to your account" notices, and the user's own commands
+   * to a bot (which can carry a password).  Storing them keyed the rows
+   * on the bot's session id -- it has no account -- and put that id in
+   * every user's CHATHISTORY TARGETS.  Servers likewise. */
+  if (IsServer(sptr) || IsServer(acptr)
+      || IsServiceClient(sptr) || IsServiceClient(acptr))
+    return;
 
   if (!history_is_available())
     return;
@@ -423,9 +449,16 @@ static void store_private_history(struct Client *sptr, struct Client *acptr,
    * the ephemeral can match their cli_session_id against the stored
    * tag to prove "I'm the same session as the one that participated."
    *
-   * Stored as `+afternet.org/sid=<sessid>` in client_tags.  Tag is
-   * server-injected and trusted (not echoed from the client's own
-   * tags), so the auth check can rely on it. */
+   * Stored as `+evilnet.github.io/sid=<sessid>` in client_tags
+   * (evilnet = the upstream-org vendor namespace, same host as the
+   * evilnet.github.io/bouncer-replay batch; records written before
+   * 2026-08-29 carry the legacy `+afternet.org/sid=` form, which the
+   * auth check still accepts).  Tag is
+   * server-injected and trusted: the whole `+afternet.org/` vendor
+   * namespace is reserved at tag capture (parse.c drops any
+   * client-supplied tag in it via is_reserved_vendor_tag), so the
+   * client_tags appended below cannot carry a forged sid marker and
+   * the auth check can rely on this one. */
   {
     char tagbuf[768];
     const char *eph_sessid = NULL;
@@ -436,7 +469,7 @@ static void store_private_history(struct Client *sptr, struct Client *acptr,
 
     if (eph_sessid) {
       ircd_snprintf(0, tagbuf, sizeof(tagbuf),
-                    "+afternet.org/sid=%s%s%s",
+                    "+evilnet.github.io/sid=%s%s%s",
                     eph_sessid,
                     (client_tags && *client_tags) ? ";" : "",
                     client_tags ? client_tags : "");
@@ -540,23 +573,23 @@ void relay_channel_message(struct Client* sptr, const char* name, const char* te
 
 #ifdef USE_ROCKSDB
     if (feature_bool(FEAT_MSGID)) {
-      struct timeval tv;
-      gettimeofday(&tv, NULL);
-      ircd_snprintf(0, timestamp, sizeof(timestamp), "%lu.%03lu",
-                    (unsigned long)tv.tv_sec,
-                    (unsigned long)(tv.tv_usec / 1000));
+      uint64_t event_ms;
+      /* msgid FIRST: minting advances the HLC, and the row time read
+       * after it is the msgid's own mint time -- the same number the
+       * live @time and the S2S tag carry (one time per message). */
       generate_msgid(msgid, sizeof(msgid));
+      event_ms = history_event_time_ms(NULL);
+      history_format_ms(timestamp, sizeof(timestamp), event_ms);
 
       /* Set S2S msgid override so the S2S relay carries the same msgid
        * that we store locally — prevents federation dedup failures. */
-      sendcmdto_set_s2s_tags(
-        (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000, msgid);
+      sendcmdto_set_s2s_tags(event_ms, msgid);
     }
 #endif
 
     /* Set msgid override so channel broadcast includes it in client tags */
     if (msgid[0])
-      sendcmdto_set_client_msgid(msgid);
+      sendcmdto_set_client_event(msgid, history_parse_ms(timestamp));
 
     /* Alias source rewriting: use primary's numeric for S2S delivery.
      * When primary is remote, use split S2S delivery: primary numeric for
@@ -639,14 +672,20 @@ void relay_channel_message(struct Client* sptr, const char* name, const char* te
       if (echo_ctags && *echo_ctags && CapOwnHas(sptr, CAP_MSGTAGS)) {
         /* Include client tags in echo */
         if (msgid[0])
-          sendcmdto_set_client_msgid(msgid);
+          sendcmdto_set_client_event(msgid, history_parse_ms(timestamp));
         sendcmdto_one_client_tags(sptr, MSG_PRIVATE, sptr, echo_ctags,
                                   "%H :%s", chptr, mytext);
         sendcmdto_set_client_msgid(NULL);
       } else {
 #ifdef USE_ROCKSDB
+        /* Arm the event so the echo's @time is the row's time, not the
+         * clock at send (the composer only honours it while a client
+         * msgid is armed). */
+        if (msgid[0])
+          sendcmdto_set_client_event(msgid, history_parse_ms(timestamp));
         sendcmdto_one_tags_ext(sptr, CMD_PRIVATE, sptr, msgid,
                                "%H :%s", chptr, mytext);
+        sendcmdto_set_client_msgid(NULL);
 #else
         sendcmdto_one_tags(sptr, CMD_PRIVATE, sptr, "%H :%s", chptr, mytext);
 #endif
@@ -745,21 +784,19 @@ void relay_channel_notice(struct Client* sptr, const char* name, const char* tex
 
 #ifdef USE_ROCKSDB
     if (feature_bool(FEAT_MSGID)) {
-      struct timeval tv;
-      gettimeofday(&tv, NULL);
-      ircd_snprintf(0, timestamp, sizeof(timestamp), "%lu.%03lu",
-                    (unsigned long)tv.tv_sec,
-                    (unsigned long)(tv.tv_usec / 1000));
+      uint64_t event_ms;
+      /* msgid first, then its mint time (see relay_channel_message) */
       generate_msgid(msgid, sizeof(msgid));
+      event_ms = history_event_time_ms(NULL);
+      history_format_ms(timestamp, sizeof(timestamp), event_ms);
 
-      sendcmdto_set_s2s_tags(
-        (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000, msgid);
+      sendcmdto_set_s2s_tags(event_ms, msgid);
     }
 #endif
 
     /* Set msgid override so channel broadcast includes it in client tags */
     if (msgid[0])
-      sendcmdto_set_client_msgid(msgid);
+      sendcmdto_set_client_event(msgid, history_parse_ms(timestamp));
 
     /* Alias source rewriting (see relay_channel_message) */
     {
@@ -828,14 +865,19 @@ void relay_channel_notice(struct Client* sptr, const char* name, const char* tex
       const char *echo_ctags = cli_client_tags(sptr);
       if (echo_ctags && *echo_ctags && CapOwnHas(sptr, CAP_MSGTAGS)) {
         if (msgid[0])
-          sendcmdto_set_client_msgid(msgid);
+          sendcmdto_set_client_event(msgid, history_parse_ms(timestamp));
         sendcmdto_one_client_tags(sptr, MSG_NOTICE, sptr, echo_ctags,
                                   "%H :%s", chptr, mytext);
         sendcmdto_set_client_msgid(NULL);
       } else {
 #ifdef USE_ROCKSDB
+        /* Arm the event so the echo's @time is the row's time (see the
+         * PRIVMSG echo above). */
+        if (msgid[0])
+          sendcmdto_set_client_event(msgid, history_parse_ms(timestamp));
         sendcmdto_one_tags_ext(sptr, CMD_NOTICE, sptr, msgid,
                                "%H :%s", chptr, mytext);
+        sendcmdto_set_client_msgid(NULL);
 #else
         sendcmdto_one_tags(sptr, CMD_NOTICE, sptr, "%H :%s", chptr, mytext);
 #endif
@@ -920,7 +962,7 @@ void server_relay_channel_message(struct Client* sptr, const char* name, const c
         ircd_strncpy(relay_msgid, s2s_mid, sizeof(relay_msgid));
       else
         generate_msgid(relay_msgid, sizeof(relay_msgid));
-      sendcmdto_set_client_msgid(relay_msgid);
+      sendcmdto_set_client_event(relay_msgid, history_event_time_ms(one));
     }
 
     /* R4a (channel-over-mesh): per-server local-delivery dedup (see relay_channel_message). */
@@ -976,15 +1018,14 @@ void server_relay_channel_message(struct Client* sptr, const char* name, const c
 
 #ifdef USE_ROCKSDB
     /* Store server-relayed message in history database.
-     * Uses the same msgid that was broadcast to clients above. */
+     * Uses the same msgid that was broadcast to clients above, and the
+     * origin's time from the same S2S tag -- the @time this server just
+     * delivered live.  It used to stamp the local wall clock here, so
+     * the row replayed with a different time than it was delivered with. */
     if (relay_msgid[0]) {
       char timestamp[32];
-      struct timeval tv;
 
-      gettimeofday(&tv, NULL);
-      ircd_snprintf(0, timestamp, sizeof(timestamp), "%lu.%03lu",
-                    (unsigned long)tv.tv_sec,
-                    (unsigned long)(tv.tv_usec / 1000));
+      history_format_ms(timestamp, sizeof(timestamp), history_event_time_ms(one));
       store_channel_history(sptr, chptr, text, HISTORY_PRIVMSG, relay_msgid, timestamp, NULL);
     }
 #endif
@@ -1055,7 +1096,7 @@ void server_relay_channel_notice(struct Client* sptr, const char* name, const ch
         ircd_strncpy(relay_msgid, s2s_mid, sizeof(relay_msgid));
       else
         generate_msgid(relay_msgid, sizeof(relay_msgid));
-      sendcmdto_set_client_msgid(relay_msgid);
+      sendcmdto_set_client_event(relay_msgid, history_event_time_ms(one));
     }
 
     /* R4a (channel-over-mesh): per-server local-delivery dedup (see relay_channel_message). */
@@ -1106,15 +1147,12 @@ void server_relay_channel_notice(struct Client* sptr, const char* name, const ch
 
 #ifdef USE_ROCKSDB
     /* Store server-relayed notice in history database.
-     * Uses the same msgid that was broadcast to clients above. */
+     * Same msgid and same origin time as the live delivery (see
+     * server_relay_channel_message). */
     if (relay_msgid[0]) {
       char timestamp[32];
-      struct timeval tv;
 
-      gettimeofday(&tv, NULL);
-      ircd_snprintf(0, timestamp, sizeof(timestamp), "%lu.%03lu",
-                    (unsigned long)tv.tv_sec,
-                    (unsigned long)(tv.tv_usec / 1000));
+      history_format_ms(timestamp, sizeof(timestamp), history_event_time_ms(one));
       store_channel_history(sptr, chptr, text, HISTORY_NOTICE, relay_msgid, timestamp, NULL);
     }
 #endif
@@ -1411,7 +1449,7 @@ void relay_private_message(struct Client* sptr, const char* name, const char* te
    * send away message if user away
    */
   if (cli_user(acptr) && cli_user(acptr)->away)
-    send_reply(sptr, RPL_AWAY, cli_name(acptr), cli_user(acptr)->away);
+    send_reply(sptr, RPL_AWAY, cli_name(acptr), away_text_for(sptr, cli_user(acptr)->away));
   /*
    * deliver the message
    */
@@ -1422,12 +1460,10 @@ void relay_private_message(struct Client* sptr, const char* name, const char* te
   pm_msgid[0] = '\0';
   pm_timestamp[0] = '\0';
   if (feature_bool(FEAT_MSGID)) {
-    struct timeval tv;
+    /* msgid first, then its mint time (one time per message) */
     generate_msgid(pm_msgid, sizeof(pm_msgid));
-    gettimeofday(&tv, NULL);
-    ircd_snprintf(0, pm_timestamp, sizeof(pm_timestamp), "%lu.%03lu",
-                  (unsigned long)tv.tv_sec,
-                  (unsigned long)(tv.tv_usec / 1000));
+    history_format_ms(pm_timestamp, sizeof(pm_timestamp),
+                      history_event_time_ms(NULL));
   }
 
   /* Tier2 T2-b / MR-1: route the PM over the CRDT mesh instead of the P10 tree when
@@ -1456,7 +1492,7 @@ void relay_private_message(struct Client* sptr, const char* name, const char* te
     if (client_tags && *client_tags && MyConnect(acptr) && CapActive(acptr, CAP_MSGTAGS)) {
       /* Set msgid override so format_message_tags_with_client includes it */
       if (pm_msgid[0])
-        sendcmdto_set_client_msgid(pm_msgid);
+        sendcmdto_set_client_event(pm_msgid, history_parse_ms(pm_timestamp));
       sendcmdto_one_client_tags(from, MSG_PRIVATE, acptr, client_tags,
                                 "%C :%s", acptr, mytext);
       sendcmdto_set_client_msgid(NULL);
@@ -1468,6 +1504,10 @@ void relay_private_message(struct Client* sptr, const char* name, const char* te
        * also adds the @A...,C<client_tags> compact-tag prefix so the
        * remote server can forward client-only tags to its local recipient
        * (per p10-compact-client-tags plan). */
+      /* Locally minted: this message's own id and time ride the wire,
+       * not whatever was last parsed off the destination link. */
+      if (from == sptr && pm_msgid[0])
+        sendcmdto_set_s2s_tags(history_parse_ms(pm_timestamp), pm_msgid);
       sendcmdto_one_tags_with_client(from, CMD_PRIVATE, acptr,
                                      pm_msgid, client_tags,
                                      "%C :%s", acptr, mytext);
@@ -1504,12 +1544,14 @@ void relay_private_message(struct Client* sptr, const char* name, const char* te
         if (pm_msgid[0])
           tpos += snprintf(echo_tagbuf + tpos, sizeof(echo_tagbuf) - tpos, ";msgid=%s", pm_msgid);
         if (feature_bool(FEAT_CAP_server_time) && CapActive(sptr, CAP_SERVERTIME)) {
-          struct timeval tv; struct tm tm;
-          gettimeofday(&tv, NULL); gmtime_r(&tv.tv_sec, &tm);
+          /* The echo carries the message's one time (the stored row's),
+           * not the wall clock at send. */
+          char iso[40];
+          history_format_iso_ms(iso, sizeof(iso),
+                                pm_timestamp[0] ? history_parse_ms(pm_timestamp)
+                                                : history_event_time_ms(NULL));
           tpos += snprintf(echo_tagbuf + tpos, sizeof(echo_tagbuf) - tpos,
-                           ";time=%04d-%02d-%02dT%02d:%02d:%02d.%03ldZ",
-                           tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-                           tm.tm_hour, tm.tm_min, tm.tm_sec, tv.tv_usec / 1000);
+                           ";time=%s", iso);
         }
         echo_tagbuf[tpos] = '\0';
         sendrawto_one(sptr, "%s :%s!%s@%s PRIVMSG %C :%s",
@@ -1544,12 +1586,14 @@ void relay_private_message(struct Client* sptr, const char* name, const char* te
         if (pm_msgid[0])
           tpos += snprintf(echo_tagbuf + tpos, sizeof(echo_tagbuf) - tpos, ";msgid=%s", pm_msgid);
         if (feature_bool(FEAT_CAP_server_time) && CapActive(sptr, CAP_SERVERTIME)) {
-          struct timeval tv; struct tm tm;
-          gettimeofday(&tv, NULL); gmtime_r(&tv.tv_sec, &tm);
+          /* The echo carries the message's one time (the stored row's),
+           * not the wall clock at send. */
+          char iso[40];
+          history_format_iso_ms(iso, sizeof(iso),
+                                pm_timestamp[0] ? history_parse_ms(pm_timestamp)
+                                                : history_event_time_ms(NULL));
           tpos += snprintf(echo_tagbuf + tpos, sizeof(echo_tagbuf) - tpos,
-                           ";time=%04d-%02d-%02dT%02d:%02d:%02d.%03ldZ",
-                           tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
-                           tm.tm_hour, tm.tm_min, tm.tm_sec, tv.tv_usec / 1000);
+                           ";time=%s", iso);
         }
         echo_tagbuf[tpos] = '\0';
         sendrawto_one(sptr, "%s :%s!%s@%s PRIVMSG %C :%s",
@@ -1643,12 +1687,10 @@ void relay_private_notice(struct Client* sptr, const char* name, const char* tex
   pm_msgid[0] = '\0';
   pm_timestamp[0] = '\0';
   if (feature_bool(FEAT_MSGID)) {
-    struct timeval tv;
+    /* msgid first, then its mint time (one time per message) */
     generate_msgid(pm_msgid, sizeof(pm_msgid));
-    gettimeofday(&tv, NULL);
-    ircd_snprintf(0, pm_timestamp, sizeof(pm_timestamp), "%lu.%03lu",
-                  (unsigned long)tv.tv_sec,
-                  (unsigned long)(tv.tv_usec / 1000));
+    history_format_ms(pm_timestamp, sizeof(pm_timestamp),
+                      history_event_time_ms(NULL));
   }
 
   /* Tier2 T2-b / MR-1: route the NOTICE over the CRDT mesh instead of the P10 tree
@@ -1672,7 +1714,7 @@ void relay_private_notice(struct Client* sptr, const char* name, const char* tex
 
     if (client_tags && *client_tags && MyConnect(acptr) && CapActive(acptr, CAP_MSGTAGS)) {
       if (pm_msgid[0])
-        sendcmdto_set_client_msgid(pm_msgid);
+        sendcmdto_set_client_event(pm_msgid, history_parse_ms(pm_timestamp));
       sendcmdto_one_client_tags(from, MSG_NOTICE, acptr, client_tags,
                                 "%C :%s", acptr, mytext);
       sendcmdto_set_client_msgid(NULL);
@@ -1680,7 +1722,11 @@ void relay_private_notice(struct Client* sptr, const char* name, const char* tex
       if (from != sptr)
         sendcmdto_set_s2s_cptr(cli_from(sptr));
       /* Tag-aware send; for S2S to IRCV3AWARE peers also includes
-       * @A...,C<client_tags> compact-tag prefix. */
+       * @A...,C<client_tags> compact-tag prefix.  Locally minted: this
+       * message's own id and time ride the wire, not whatever was last
+       * parsed off the destination link. */
+      if (from == sptr && pm_msgid[0])
+        sendcmdto_set_s2s_tags(history_parse_ms(pm_timestamp), pm_msgid);
       sendcmdto_one_tags_with_client(from, CMD_NOTICE, acptr,
                                      pm_msgid, client_tags,
                                      "%C :%s", acptr, mytext);
@@ -1780,7 +1826,6 @@ void server_relay_private_message(struct Client* sptr, const char* name, const c
   pm_timestamp[0] = '\0';
   if (feature_bool(FEAT_MSGID)) {
     const char *s2s_mid = NULL;
-    struct timeval tv;
 
     if (feature_bool(FEAT_P10_MESSAGE_TAGS) && cli_from(sptr)
         && cli_s2s_msgid(cli_from(sptr))[0])
@@ -1791,10 +1836,10 @@ void server_relay_private_message(struct Client* sptr, const char* name, const c
     else
       generate_msgid(pm_msgid, sizeof(pm_msgid));
 
-    gettimeofday(&tv, NULL);
-    ircd_snprintf(0, pm_timestamp, sizeof(pm_timestamp), "%lu.%03lu",
-                  (unsigned long)tv.tv_sec,
-                  (unsigned long)(tv.tv_usec / 1000));
+    /* One time per message: the origin's tag time when the msgid came
+     * over the link, else the mint time of the msgid just generated. */
+    history_format_ms(pm_timestamp, sizeof(pm_timestamp),
+                      history_event_time_ms(s2s_mid ? cli_from(sptr) : NULL));
   }
 
   /* Tier2 P2 / MR-1: remote-origin (server-relayed) PM -> route over the CRDT mesh
@@ -1815,7 +1860,7 @@ void server_relay_private_message(struct Client* sptr, const char* name, const c
 
     /* Set client msgid so local client gets @msgid= tag */
     if (pm_msgid[0])
-      sendcmdto_set_client_msgid(pm_msgid);
+      sendcmdto_set_client_event(pm_msgid, history_parse_ms(pm_timestamp));
 
     if (client_tags && *client_tags && MyConnect(acptr) && CapActive(acptr, CAP_MSGTAGS)) {
       sendcmdto_one_client_tags(send_from, MSG_PRIVATE, acptr, client_tags,
@@ -1896,7 +1941,6 @@ void server_relay_private_notice(struct Client* sptr, const char* name, const ch
   pm_timestamp[0] = '\0';
   if (feature_bool(FEAT_MSGID)) {
     const char *s2s_mid = NULL;
-    struct timeval tv;
 
     if (feature_bool(FEAT_P10_MESSAGE_TAGS) && cli_from(sptr)
         && cli_s2s_msgid(cli_from(sptr))[0])
@@ -1907,10 +1951,10 @@ void server_relay_private_notice(struct Client* sptr, const char* name, const ch
     else
       generate_msgid(pm_msgid, sizeof(pm_msgid));
 
-    gettimeofday(&tv, NULL);
-    ircd_snprintf(0, pm_timestamp, sizeof(pm_timestamp), "%lu.%03lu",
-                  (unsigned long)tv.tv_sec,
-                  (unsigned long)(tv.tv_usec / 1000));
+    /* One time per message: the origin's tag time when the msgid came
+     * over the link, else the mint time of the msgid just generated. */
+    history_format_ms(pm_timestamp, sizeof(pm_timestamp),
+                      history_event_time_ms(s2s_mid ? cli_from(sptr) : NULL));
   }
 
   /* Tier2 P2 / MR-1: remote-origin NOTICE -> route over the CRDT mesh instead of the
@@ -1930,7 +1974,7 @@ void server_relay_private_notice(struct Client* sptr, const char* name, const ch
 
     /* Set client msgid so local client gets @msgid= tag */
     if (pm_msgid[0])
-      sendcmdto_set_client_msgid(pm_msgid);
+      sendcmdto_set_client_event(pm_msgid, history_parse_ms(pm_timestamp));
 
     /* Check for forwarded label batch in DRAINING state */
     if (MyConnect(acptr) && feature_bool(FEAT_CAP_labeled_response)) {

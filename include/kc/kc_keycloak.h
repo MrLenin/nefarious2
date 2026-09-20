@@ -26,7 +26,9 @@ enum kc_error {
     KC_TIMEOUT          = -6,   /* Connection timeout */
     KC_UNAVAILABLE      = -7,   /* Server unavailable */
     KC_TOKEN_ERROR      = -8,   /* Token refresh/acquisition failed */
-    KC_INVALID_RESPONSE = -9    /* Server returned unexpected response */
+    KC_INVALID_RESPONSE = -9,   /* Server returned unexpected response */
+    KC_UNVERIFIED       = -10,  /* credentials OK-shaped but account not fully set up (pending required action) */
+    KC_CONFLICT         = -11   /* create: username/email already exists (HTTP 409) */
 };
 
 /* Keycloak configuration */
@@ -63,13 +65,23 @@ struct kc_user {
     char *email;
     size_t email_size;
     bool email_verified;
+    /* Top-level requiredActions[] contains "VERIFY_EMAIL": verification
+     * was requested for this account and is still pending.  Distinguishes
+     * a daemon-born unverified account (action pending -> refuse) from a
+     * legacy account that merely predates emailVerified (no action ->
+     * allow).  Parsed in parse_user(); scalar, so kc_user_free() is
+     * untouched. */
+    bool verify_email_pending;
     int opserv_level;             /* Custom attribute: x3_opserv_level */
 
-    /* SCRAM-SHA-256 credentials (from user attributes, may be NULL) */
-    char *scram_salt;             /* x3_scram_salt or x3_scram_sha256_salt (base64) */
-    int   scram_iterations;       /* x3_scram_iterations or x3_scram_sha256_iterations */
-    char *scram_stored_key;       /* x3_scram_stored_key or x3_scram_sha256_stored_key (base64) */
-    char *scram_server_key;       /* x3_scram_server_key or x3_scram_sha256_server_key (base64) */
+    /* SCRAM-SHA-256 credentials (from user attributes, may be NULL).
+     * Read order: scram_sha256_* (registration-time; kc_cred_derive.c /
+     * keycloak-webhook-spi lockstep) then x3_scram_* then x3_scram_sha256_*
+     * (legacy). See parse_user() in kc_keycloak.c. */
+    char *scram_salt;             /* base64 */
+    int   scram_iterations;
+    char *scram_stored_key;       /* base64 */
+    char *scram_server_key;       /* base64 */
 
     /* ECDSA public key (from user attributes, may be NULL) */
     char *ecdsa_pubkey;           /* ecdsa_pubkey (PEM or base64) */
@@ -141,6 +153,15 @@ const struct kc_access_token *kc_token_cached(void);
 
 /*
  * User operations (all async)
+ *
+ * CALLBACK CONTRACT, relied on by every caller that heap-allocates its
+ * `data` context:
+ *   - return 0  => the callback WILL be invoked exactly once and takes
+ *                  ownership of `data`.  It may fire synchronously, before
+ *                  the start function returns, so the caller must not touch
+ *                  `data` after a successful start.
+ *   - return -1 => the callback was NOT and will NOT be invoked; `data` is
+ *                  still the caller's to free.
  */
 
 /* Get user by exact username match */
@@ -152,10 +173,41 @@ int kc_user_get_by_id(const char *id, kc_user_cb cb, void *data);
 /* Search users (may return multiple) */
 int kc_user_search(const char *query, bool exact, kc_users_cb cb, void *data);
 
-/* Create user with pre-hashed password (PBKDF2 credential import) */
+/* Create user with pre-hashed password (PBKDF2 credential import).
+ * Thin wrapper over kc_user_create_full(): username, cred_data, and
+ * secret_data are all REQUIRED — NULL in any of them (or a NULL cb)
+ * returns -1 without making a request; there is no credential-less create
+ * path (via this function or kc_user_create_full()). This differs from
+ * the pre-Task-2 behavior, which silently created a credential-less user
+ * when cred_data/secret_data were NULL; that shorthand no longer exists.
+ * To set emailVerified/requiredActions or custom attributes on create,
+ * call kc_user_create_full() directly (it still requires credentials). */
 int kc_user_create(const char *username, const char *email,
                    const char *cred_data, const char *secret_data,
                    kc_result_cb cb, void *data);
+
+/* Full user-create request: pre-hashed credential (Task 1
+ * kc_pbkdf2_cred_build output) plus optional emailVerified/requiredActions
+ * and parallel attribute-name/value arrays (e.g. registration-time
+ * scram_sha256_* SCRAM attributes). */
+struct kc_user_create_req {
+    const char *username;            /* required */
+    const char *email;               /* optional */
+    const char *cred_data;           /* required: Task 1 kc_pbkdf2_cred_build output */
+    const char *secret_data;         /* required */
+    int set_email_verified;          /* 1 => include emailVerified:false + requiredActions */
+    const char *const *attr_keys;    /* optional parallel arrays (SCRAM attrs) */
+    const char *const *attr_values;
+    size_t n_attrs;
+};
+
+/* Create user with the full request shape above. req->username,
+ * req->cred_data, and req->secret_data are all REQUIRED (see the struct's
+ * field comments) — NULL in any of them (or a NULL req/cb) returns -1
+ * without making a request; there is no credential-less create path.
+ * Result callback receives KC_CONFLICT (not KC_USER_EXISTS) on HTTP 409. */
+int kc_user_create_full(const struct kc_user_create_req *req,
+                        kc_result_cb cb, void *data);
 
 /* Delete user by ID */
 int kc_user_delete(const char *id, kc_result_cb cb, void *data);
@@ -174,6 +226,10 @@ int kc_user_set_password(const char *id, const char *password,
 /* Verify password via resource owner password grant */
 int kc_user_verify_password(const char *username, const char *password,
                             kc_token_cb cb, void *data);
+
+/* Trigger Keycloak's built-in "verify email" flow for user id (PUT
+ * .../send-verify-email; no body). */
+int kc_user_send_verify_email(const char *id, kc_result_cb cb, void *data);
 
 /*
  * Group operations

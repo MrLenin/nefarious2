@@ -33,6 +33,7 @@
 #include "class.h"
 #include "client.h"
 #include "hash.h"
+#include "chathistory_presence.h"
 #include "history.h"
 #include "ircd.h"
 #include "ircd_alloc.h"
@@ -46,6 +47,7 @@
 #include "s_bsd.h"
 #include "send.h"
 
+#include <ctype.h>
 #include <string.h>
 
 /* These are defined in m_chathistory.c and made extern for replay use */
@@ -75,25 +77,118 @@ static int is_pm_target_for_client(const char *target, struct Client *cptr)
   return 0;
 }
 
+/** history_query_targets filter for the bouncer PM leg: a pair key that
+ * involves the reattaching client. */
+static int replay_pm_target_cb(const char *target, const char *last_ts, void *ctx)
+{
+  (void)last_ts;
+  return strchr(target, ':') != NULL
+      && is_pm_target_for_client(target, (struct Client *)ctx);
+}
+
+/** Cap on the session's own PM conversations listed for one replay. */
+#define REPLAY_PM_TARGETS_MAX 200
+
 /* Recover the counterparty DISPLAY nick from the batch's messages.
  * `me` tiebreak uses current nick — display-only (access already
  * authorized), so a mutable nick is acceptable here.  Returns 1+fills
  * buf, else 0. */
+/** Copy the nick part of a stored sender mask ("nick!user@host"). */
+static void pm_sender_nick(const struct HistoryMessage *m, char *buf, size_t buflen)
+{
+  const char *bang = strchr(m->sender, '!');
+  size_t n = bang ? (size_t)(bang - m->sender) : strlen(m->sender);
+  if (n >= buflen) n = buflen - 1;
+  memcpy(buf, m->sender, n);
+  buf[n] = '\0';
+}
+
+/** A per-connection session id: 22 chars of base64 (UUID v7).  The one
+ * identity half that is not a name anyone could have typed; an account
+ * name, by contrast, is a reasonable label even when nobody is logged
+ * into it. */
+static int pm_half_is_session_id(const char *s, size_t len)
+{
+  size_t i;
+  if (len != 22)
+    return 0;
+  for (i = 0; i < len; i++) {
+    char c = s[i];
+    if (!(isalnum((unsigned char)c) || c == '+' || c == '/' || c == '_' || c == '-'))
+      return 0;
+  }
+  return 1;
+}
+
+/** The live client logged into @a account, if any.  First match on the
+ * global list: a bouncer primary and its aliases share the account and
+ * the nick, so any of them will do. */
+static struct Client *pm_live_client_for_account(const char *account)
+{
+  struct Client *acptr;
+  if (!account || !*account)
+    return NULL;
+  for (acptr = GlobalClientList; acptr; acptr = cli_next(acptr)) {
+    if (!IsUser(acptr) || !IsAccount(acptr) || !cli_user(acptr))
+      continue;
+    if (cli_user(acptr)->account[0]
+        && ircd_strcmp(cli_user(acptr)->account, account) == 0)
+      return acptr;
+  }
+  return NULL;
+}
+
+/** Is @a m a row the replaying client sent?  By sender account when the
+ * client is logged in (the client may have changed nick since the row
+ * was stored, and an older nick of their own must not read as the
+ * other party); by sender nick otherwise. */
+int pm_row_is_own(struct Client *sptr, const struct HistoryMessage *m)
+{
+  char snick[NICKLEN + 1];
+  if (IsAccount(sptr) && cli_user(sptr) && cli_user(sptr)->account[0]
+      && m->account[0]
+      && ircd_strcmp(m->account, cli_user(sptr)->account) == 0)
+    return 1;
+  pm_sender_nick(m, snick, sizeof(snick));
+  return ircd_strcmp(snick, cli_name(sptr)) == 0;
+}
+
+/** Derive the other party's nick for a PM page.  The page can span
+ * months of one pair key, so rows carry whatever nicks both sides had
+ * at the time: identify the caller's own rows by identity, take the
+ * NEWEST row the other party sent, and show that party under their
+ * current nick when they are online -- a client that opens the
+ * conversation under a stale nick fragments it. */
 static int pm_other_nick_from_messages(struct Client *sptr,
                                        const struct HistoryMessage *msgs,
                                        char *buf, size_t buflen)
 {
-  const char *me = cli_name(sptr);
   const struct HistoryMessage *m;
+  const struct HistoryMessage *other = NULL;   /* newest row the other party sent */
+  const struct HistoryMessage *own = NULL;     /* newest own row naming its target */
+
   for (m = msgs; m; m = m->next) {
-    char snick[NICKLEN + 1];
-    const char *bang = strchr(m->sender, '!');
-    size_t n = bang ? (size_t)(bang - m->sender) : strlen(m->sender);
-    if (n >= sizeof(snick)) n = sizeof(snick) - 1;
-    memcpy(snick, m->sender, n);
-    snick[n] = '\0';
-    if (0 != ircd_strcmp(snick, me)) { ircd_strncpy(buf, snick, buflen); return 1; }
-    if (m->original_target[0])       { ircd_strncpy(buf, m->original_target, buflen); return 1; }
+    if (!pm_row_is_own(sptr, m)) {
+      if (!other || strcmp(m->timestamp, other->timestamp) > 0)
+        other = m;
+    } else if (m->original_target[0]) {
+      if (!own || strcmp(m->timestamp, own->timestamp) > 0)
+        own = m;
+    }
+  }
+
+  if (other) {
+    struct Client *live = other->account[0]
+                          ? pm_live_client_for_account(other->account) : NULL;
+    if (live)
+      ircd_strncpy(buf, cli_name(live), buflen);
+    else
+      pm_sender_nick(other, buf, buflen);
+    return 1;
+  }
+  if (own) {
+    ircd_strncpy(buf, own->original_target, buflen);
+    return 1;
   }
   return 0;
 }
@@ -110,21 +205,23 @@ static int pm_other_nick_from_messages(struct Client *sptr,
  * Shared between the bouncer auto-replay path (replay_next_pm) and
  * the on-demand CHATHISTORY query path (replay_start_batch).
  */
-static void replay_set_target_from_storage(struct Client *sptr,
-                                            struct ReplayState *rs,
-                                            const char *storage_target)
+/** @return 1 when the wire target names a person (channel, a nick from
+ * the rows, or the live client on the other half's account); 0 when it
+ * fell back to the raw other half of the key, which for an account-less
+ * party is a session id nobody would recognise.  On-demand queries echo
+ * what the client asked for; the bouncer's auto-replay skips such pages. */
+static int replay_set_target_from_storage(struct Client *sptr,
+                                           struct ReplayState *rs,
+                                           const char *storage_target)
 {
   const char *colon;
-  const char *mynick;
-  size_t mynick_len, nick1_len;
-  const char *other_nick;
-  char other_nick_buf[CHANNELLEN + 1];
+  int named = 0;
 
   if (!storage_target || !*storage_target) {
     rs->target[0] = '\0';
     rs->other_nick[0] = '\0';
     rs->is_pm = 0;
-    return;
+    return 0;
   }
 
   colon = strchr(storage_target, ':');
@@ -133,28 +230,145 @@ static void replay_set_target_from_storage(struct Client *sptr,
     ircd_strncpy(rs->target, storage_target, sizeof(rs->target));
     rs->other_nick[0] = '\0';
     rs->is_pm = 0;
-    return;
+    return 1;
   }
 
   rs->is_pm = 1;
   if (pm_other_nick_from_messages(sptr, rs->messages,
                                   rs->other_nick, sizeof(rs->other_nick))) {
-    /* real nick from the stream */
+    named = 1;   /* real nick from the stream */
   } else {
-    /* Empty batch: fall back to the non-caller identity half of the key.
-     * May surface an account/session id on an EMPTY PM batch — cosmetic,
-     * no content, never leaks the colon. */
+    /* No usable row: the other half of the key is an identity, an
+     * account or a session id.  A live client on that account gives a
+     * nick; otherwise the raw half stands and the caller decides. */
     size_t left_len = (size_t)(colon - storage_target);
-    if (history_pm_identity_matches(sptr, storage_target, left_len))
-      ircd_strncpy(rs->other_nick, colon + 1, sizeof(rs->other_nick));
-    else {
-      size_t cl = left_len < sizeof(rs->other_nick) ? left_len
-                                                    : sizeof(rs->other_nick) - 1;
-      memcpy(rs->other_nick, storage_target, cl);
-      rs->other_nick[cl] = '\0';
+    const char *other;
+    size_t olen;
+    struct Client *live;
+
+    if (history_pm_identity_matches(sptr, storage_target, left_len)) {
+      other = colon + 1;
+      olen = strlen(other);
+    } else {
+      other = storage_target;
+      olen = left_len;
+    }
+    if (olen >= sizeof(rs->other_nick))
+      olen = sizeof(rs->other_nick) - 1;
+    memcpy(rs->other_nick, other, olen);
+    rs->other_nick[olen] = '\0';
+
+    live = pm_live_client_for_account(rs->other_nick);
+    if (live) {
+      ircd_strncpy(rs->other_nick, cli_name(live), sizeof(rs->other_nick));
+      named = 1;
+    } else if (!pm_half_is_session_id(rs->other_nick, strlen(rs->other_nick))) {
+      named = 1;   /* an account name: a label a person would recognise */
     }
   }
   ircd_strncpy(rs->target, rs->other_nick, sizeof(rs->target));
+  return named;
+}
+
+int replay_pm_display_nick(struct Client *sptr, const char *pair_key,
+                           char *buf, size_t buflen)
+{
+  const char *colon = pair_key ? strchr(pair_key, ':') : NULL;
+  struct Client *live;
+  char half[CHANNELLEN + 1];
+  int named = 0;
+
+  if (!colon || !buf || buflen == 0)
+    return 0;
+  buf[0] = '\0';
+
+  /* The other half of the key, and the live client on that account. */
+  {
+    size_t left_len = (size_t)(colon - pair_key);
+    const char *other;
+    size_t olen;
+
+    if (history_pm_identity_matches(sptr, pair_key, left_len)) {
+      other = colon + 1;
+      olen = strlen(other);
+    } else {
+      other = pair_key;
+      olen = left_len;
+    }
+    if (olen >= sizeof(half))
+      return 0;
+    memcpy(half, other, olen);
+    half[olen] = '\0';
+    live = pm_live_client_for_account(half);
+    if (live) {
+      ircd_strncpy(buf, cli_name(live), buflen);
+      named = 1;
+    }
+  }
+
+  /* Else the newest rows: the other party's nick as they last used it. */
+  if (!named) {
+    struct HistoryMessage *msgs = NULL;
+    if (history_query_latest(pair_key, HISTORY_REF_NONE, NULL, 20, &msgs, NULL) > 0
+        && msgs) {
+      named = pm_other_nick_from_messages(sptr, msgs, buf, buflen);
+      history_free_messages(msgs);
+    }
+  }
+
+  /* Else an account name is still a label; a session id is not. */
+  if (!named && !pm_half_is_session_id(half, strlen(half))) {
+    ircd_strncpy(buf, half, buflen);
+    named = 1;
+  }
+  if (!named)
+    return 0;
+
+  /* A service bot is not a correspondent (rows from before service
+   * traffic stopped being stored). */
+  live = FindUser(buf);
+  if (live && IsServiceClient(live))
+    return 0;
+  return 1;
+}
+
+int replay_pm_pair_for_nick(struct Client *sptr, const char *nick,
+                            char *out, size_t outsz)
+{
+  struct HistoryTarget *list = NULL, *t;
+  const char *best_ts = NULL;
+  int found = 0;
+
+  if (!nick || !*nick || !out || outsz == 0)
+    return 0;
+  out[0] = '\0';
+
+  /* Every target on this server -- the walk TARGETS makes, unbounded,
+   * because the index is in key order and a limit would cut off the
+   * newest pairs -- kept to the PM pairs that involve the caller.  Of
+   * those whose other party the TARGETS derivation names @a nick, the
+   * most recently active wins: a guest nick is reused by different
+   * people over time. */
+  if (history_query_targets("0", "99999999999.999", 1, 200, &list, replay_pm_target_cb, sptr) <= 0
+      || !list)
+    return 0;
+  for (t = list; t; t = t->next) {
+    char name[NICKLEN + 1];
+    if (IsChannelName(t->target) || !strchr(t->target, ':'))
+      continue;
+    if (!is_pm_target_for_client(t->target, sptr))
+      continue;
+    if (best_ts && strcmp(t->last_timestamp, best_ts) <= 0)
+      continue;   /* older than the best match so far */
+    if (replay_pm_display_nick(sptr, t->target, name, sizeof(name))
+        && ircd_strcmp(name, nick) == 0) {
+      ircd_strncpy(out, t->target, outsz);
+      best_ts = t->last_timestamp;
+      found = 1;
+    }
+  }
+  history_free_targets(list);
+  return found;
 }
 
 /** Lazily emit the outer evilnet.github.io/bouncer-replay batch on first
@@ -192,26 +406,38 @@ static void replay_open_batch(struct Client *sptr, struct ReplayState *rs)
   replay_emit_outer_batch_if_needed(sptr, rs);
 
   if (rs->outer_batch_open) {
-    ircd_snprintf(0, outer_buf, sizeof(outer_buf), "batch=%s;", rs->outer_batch_id);
+    ircd_snprintf(0, outer_buf, sizeof(outer_buf), "batch=%s", rs->outer_batch_id);
     outer_tag = outer_buf;
   }
 
   if (CapRecipientHas(sptr, CAP_BATCH)) {
-    const char *end_tag = rs->is_last_page ? "draft/chathistory-end;" : "";
-
-    if (!rs->label_used && rs->label[0] &&
+    /* Assemble the tag list so it never ends in ';' -- a truncated inner
+     * page used to open as "@batch=<outer>; :srv BATCH ..." (an empty
+     * trailing tag, illegal per message-tags; audit 2026-09-06 #13). */
+    char tagbuf[256];
+    int tl = 0;
+    int want_label = !rs->label_used && rs->label[0] &&
         feature_bool(FEAT_CAP_labeled_response) &&
-        CapRecipientHas(sptr, CAP_LABELEDRESP)) {
-      sendrawto_one(sptr, "@%s%slabel=%s :%s " MSG_BATCH_CMD " +%s chathistory %s",
-                    outer_tag, end_tag, rs->label, cli_name(&me),
-                    rs->batch_id, rs->target);
+        CapRecipientHas(sptr, CAP_LABELEDRESP);
+    tagbuf[0] = '\0';
+    if (outer_tag[0])
+      tl += ircd_snprintf(0, tagbuf + tl, sizeof(tagbuf) - tl, "%s%s", tl ? ";" : "", outer_tag);
+    if (rs->is_last_page && !rs->is_partial)
+      tl += ircd_snprintf(0, tagbuf + tl, sizeof(tagbuf) - tl, "%sdraft/chathistory-end", tl ? ";" : "");
+    if (rs->is_partial)
+      tl += ircd_snprintf(0, tagbuf + tl, sizeof(tagbuf) - tl,
+                          "%sevilnet.github.io/chathistory-partial", tl ? ";" : "");
+    if (want_label)
+      tl += ircd_snprintf(0, tagbuf + tl, sizeof(tagbuf) - tl, "%slabel=%s", tl ? ";" : "", rs->label);
+
+    if (want_label) {
+      sendrawto_one(sptr, "@%s :%s " MSG_BATCH_CMD " +%s chathistory %s",
+                    tagbuf, cli_name(&me), rs->batch_id, rs->target);
       cli_label_responded(sptr) = 1;
       rs->label_used = 1;
-    } else if (rs->is_last_page || outer_tag[0]) {
-      sendrawto_one(sptr, "@%s%s :%s " MSG_BATCH_CMD " +%s chathistory %s",
-                    outer_tag,
-                    rs->is_last_page ? "draft/chathistory-end" : "",
-                    cli_name(&me), rs->batch_id, rs->target);
+    } else if (tagbuf[0]) {
+      sendrawto_one(sptr, "@%s :%s " MSG_BATCH_CMD " +%s chathistory %s",
+                    tagbuf, cli_name(&me), rs->batch_id, rs->target);
     } else {
       sendcmdto_one(&me, CMD_BATCH_CMD, sptr, "+%s chathistory %s",
                     rs->batch_id, rs->target);
@@ -304,44 +530,30 @@ static int replay_send_messages(struct Client *sptr, struct ReplayState *rs)
         gap_count++;
       }
 
-      send_gap_marker(sptr, rs->target, batchid, time_str,
-                       gap_start->msgid, gap_start->sender, gap_count);
+      send_gap_marker(sptr,
+                      rs->is_pm ? (pm_row_is_own(sptr, gap_start) ? rs->other_nick
+                                                                   : cli_name(sptr))
+                                : rs->target,
+                      batchid, time_str,
+                      gap_start->msgid, gap_start->sender, gap_count);
       rs->current = msg->next;
       rs->total_replayed += gap_count;
     } else {
       const char *per_msg_target = rs->target;
 
-      cmd = (msg->type <= HISTORY_REDACT) ? msg_type_cmd[msg->type] : "PRIVMSG";
+      cmd = (msg->type <= HISTORY_MULTILINE) ? msg_type_cmd[msg->type] : "PRIVMSG";
 
-      /* For PM batches, the BATCH-level target (rs->target = other party's
-       * nick) is correct for the BATCH start line and for the replaying
-       * client's outgoing messages, but incoming messages need the
-       * client's own nick as the per-message PRIVMSG target.  Prefer the
-       * stored original_target (set on new entries); fall back to
-       * direction reconstruction from msg->sender for legacy entries
-       * predating the original_target field.
-       */
-      if (rs->is_pm) {
-        if (msg->original_target[0]) {
-          per_msg_target = msg->original_target;
-        } else {
-          const char *bang = strchr(msg->sender, '!');
-          size_t sender_nick_len = bang ? (size_t)(bang - msg->sender)
-                                         : strlen(msg->sender);
-          const char *mynick = cli_name(sptr);
-          size_t mynick_len = strlen(mynick);
-
-          if (sender_nick_len == mynick_len &&
-              ircd_strncmp(msg->sender, mynick, sender_nick_len) == 0) {
-            /* Outgoing — sender is the replaying client; recipient is
-             * the other party. */
-            per_msg_target = rs->other_nick;
-          } else {
-            /* Incoming — sender is the other party; recipient was self. */
-            per_msg_target = mynick;
-          }
-        }
-      }
+      /* For PM batches the wire target follows the row's DIRECTION, in
+       * today's nicks: the replaying client's own rows go to the other
+       * party's current nick (rs->other_nick), incoming rows to the
+       * client's own current nick.  The stored original_target is the
+       * nick typed when the row was written; replaying it would scatter
+       * a conversation that spans nick changes across several buffers
+       * (the storage-key leak this path was fixed for, in another
+       * guise). */
+      if (rs->is_pm)
+        per_msg_target = pm_row_is_own(sptr, msg) ? rs->other_nick
+                                                  : cli_name(sptr);
 
       send_history_message(sptr, msg, per_msg_target, batchid, time_str, cmd);
       rs->current = msg->next;
@@ -366,7 +578,6 @@ static int replay_next_channel(struct Client *sptr, struct ReplayState *rs)
   while (rs->chan_index < rs->num_channels) {
     const char *channame = rs->chan_names[rs->chan_index];
     const char *chan_since = rs->since_timestamp;
-    char marker_ts[32];
     struct HistoryMessage *messages = NULL;
     struct Channel *chptr;
     int count;
@@ -378,20 +589,35 @@ static int replay_next_channel(struct Client *sptr, struct ReplayState *rs)
     if (!chptr || !find_member_link(chptr, sptr))
       continue;
 
-    /* Use read marker if it's ahead of the since time */
-    if (IsAccount(sptr) &&
-        metadata_readmarker_get(cli_account(sptr), channame, marker_ts) == 0 &&
-        strcmp(marker_ts, rs->since_timestamp) > 0) {
-      chan_since = marker_ts;
-    }
+    /* NOTE: replay used to fast-forward past the account's READ MARKER
+     * here ("don't re-send what was read").  Markers are account-global
+     * and every device advances them, so a phone reattaching after a
+     * day of desktop use replayed NOTHING for the whole day -- "history
+     * skipped all day long activity" (Rubin, 2026-08-30).  Read-on-one-
+     * device is not delivered-to-another: markers are unread-pointer
+     * UX, not delivery accounting.  Replay everything since the
+     * cursor/detach point; msgid-deduping clients drop true dupes. */
 
-    /* Query history */
-    count = history_query_latest_after(channame, rs->replay_limit,
-                                        chan_since, &messages);
-    if (count <= 0 || !messages) {
-      if (messages)
-        history_free_messages(messages);
-      continue;
+    /* Query one past the limit: an over-limit result means this leg is
+     * TRUNCATED at the server cap.  A complete leg carries the
+     * @draft/chathistory-end tag on its batch opener ("no more
+     * pages"); a truncated leg withholds it so the client knows to
+     * backfill via CHATHISTORY (#104 note; spec: Auto-replay
+     * completeness).  The list is chronological (oldest first) of the
+     * LATEST results, so the overflow extra is the head -- drop it to
+     * keep exactly the limit-sized set the old query returned. */
+    /* The on-demand page builder: presence hook + type mask + typing
+     * veto inside the walk, context attached, redacted originals
+     * dropped.  A bare walk here replayed redacted content and let a
+     * JOIN/PART run empty the page (audit 2026-09-06, wave 1). */
+    {
+      int complete = 1;
+      count = chathistory_page_since(sptr, channame, rs->replay_limit,
+                                     chan_since, rs->since_msgid,
+                                     &messages, &complete);
+      if (count <= 0 || !messages)
+        continue;
+      rs->is_last_page = complete;
     }
 
     /* Set up new batch */
@@ -425,13 +651,16 @@ static int replay_next_pm(struct Client *sptr, struct ReplayState *rs)
     if (!strchr(tgt->target, ':') || !is_pm_target_for_client(tgt->target, sptr))
       continue;
 
-    /* Query history */
-    count = history_query_latest_after(tgt->target, rs->replay_limit,
-                                        rs->since_timestamp, &messages);
-    if (count <= 0 || !messages) {
-      if (messages)
-        history_free_messages(messages);
-      continue;
+    /* Same page builder as the channel leg: complete => the opener
+     * carries @draft/chathistory-end, else the tag is withheld. */
+    {
+      int complete = 1;
+      count = chathistory_page_since(sptr, tgt->target, rs->replay_limit,
+                                     rs->since_timestamp, rs->since_msgid,
+                                     &messages, &complete);
+      if (count <= 0 || !messages)
+        continue;
+      rs->is_last_page = complete;
     }
 
     /* Set up new batch.  Storage key is "lowerNick:higherNick" — the
@@ -442,7 +671,15 @@ static int replay_next_pm(struct Client *sptr, struct ReplayState *rs)
      * derives the display nick from the message stream. */
     rs->messages = messages;
     rs->current = messages;
-    replay_set_target_from_storage(sptr, rs, tgt->target);
+    if (!replay_set_target_from_storage(sptr, rs, tgt->target)) {
+      /* Nobody to name the page after (the other half is a session id
+       * with no usable row): an auto-replay must not open a
+       * conversation on it. */
+      history_free_messages(messages);
+      rs->messages = NULL;
+      rs->current = NULL;
+      continue;
+    }
 
     rs->pm_count++;
 
@@ -481,6 +718,15 @@ static void replay_send_summary(struct Client *sptr, struct ReplayState *rs)
                     "%C :Session resumed. You are in %d channel(s). No missed messages.",
                     sptr, total_chans);
     }
+  }
+
+  /* Diagnostic: why did the previous connection end?  Holds destroy
+   * the QUIT/notice trail, so this is the user's only view of it. */
+  {
+    const char *why = bounce_last_hold_reason(sptr);
+    if (why)
+      sendcmdto_one(&me, CMD_NOTICE, sptr,
+                    "%C :Previous disconnect: %s", sptr, why);
   }
 }
 
@@ -524,8 +770,11 @@ void replay_continue(struct Client *sptr)
     return;
   }
 
-  /* If we have messages queued, keep sending */
+  /* If we have messages queued, keep sending.  A page resumed after a
+   * suspension has rows but its batch was closed: reopen it. */
   if (rs->current) {
+    if (!rs->batch_open)
+      replay_open_batch(sptr, rs);
     if (!replay_send_messages(sptr, rs))
       return;  /* Paused for sendQ */
 
@@ -569,8 +818,15 @@ void replay_continue(struct Client *sptr)
         char now_timestamp[HISTORY_TIMESTAMP_LEN];
         ircd_snprintf(0, now_timestamp, sizeof(now_timestamp), "%lu.000",
                       (unsigned long)CurrentTime);
-        history_query_targets(rs->since_timestamp, now_timestamp, 50,
-                              &rs->pm_targets);
+        /* Auto-replay wants the plain in-window view: no veto rows
+         * (this is a local availability sweep, not #565 matching).
+         * The filter keeps only THIS session's pair keys inside the
+         * walk: the targets CF is in key order with channels first, so
+         * an unfiltered 50-row window never reached the PMs on a busy
+         * server (audit 2026-09-06, wave 1). */
+        history_query_targets(rs->since_timestamp, now_timestamp,
+                              /*include_newer=*/0, REPLAY_PM_TARGETS_MAX,
+                              &rs->pm_targets, replay_pm_target_cb, sptr);
         rs->pm_cursor = rs->pm_targets;
         rs->phase = REPLAY_PHASE_PMS;
       } else {
@@ -610,12 +866,29 @@ void replay_continue(struct Client *sptr)
   }
 }
 
+/** An on-demand query answers about the target the client named.  For a
+ * plain nick that is the batch target and the wire target of the caller's
+ * own rows, whatever the storage key's other half resolves to: a session
+ * id for an account-less partner with no rows yet, or -- for two
+ * connections of one account -- an arbitrary live client on that account,
+ * often the requester (2026-09-04).  Channels keep the canonical name and
+ * an explicit "a:b" request keeps the derived other party. */
+static void replay_name_after_request(struct ReplayState *rs, const char *requested)
+{
+  if (!requested || !*requested || !rs->is_pm
+      || IsChannelName(requested) || strchr(requested, ':'))
+    return;
+  ircd_strncpy(rs->target, requested, sizeof(rs->target));
+  ircd_strncpy(rs->other_nick, requested, sizeof(rs->other_nick));
+}
+
 /** Start async replay of a single chathistory batch.
  * Transfers ownership of messages to the ReplayState.
  */
 void replay_start_batch(struct Client *sptr, const char *target,
                          struct HistoryMessage *messages, int count,
-                         int ops_override, const char *label)
+                         int ops_override, const char *label, int complete,
+                         const char *requested)
 {
   struct ReplayState *rs;
   /* Translate `target` (may be a PM storage key "nick1:nick2") to the
@@ -624,55 +897,98 @@ void replay_start_batch(struct Client *sptr, const char *target,
    * BATCH tag and every per-message PRIVMSG target — see project
    * memory project_pm_replay_storage_key_leak. */
   struct ReplayState tmp_rs;
+  struct ReplayState *suspended = NULL;
+  int partial = (complete & REPLAY_PARTIAL) != 0;
 
-  /* Cancel any existing replay */
-  if (cli_replay(sptr))
-    replay_cancel(sptr);
+  /* A partial page is never "the end": a known store was away over the
+   * span or a responder was cut (docs/features/chathistory.md). */
+  complete = (complete & REPLAY_COMPLETE) && !partial;
+
+  /* An in-flight bouncer catch-up is SUSPENDED, not cancelled: its
+   * inner and outer batches close cleanly here, its cursor (phase,
+   * channel index, PM list, the rest of the current page) stays in the
+   * state, and replay_cancel reinstalls it when this on-demand page is
+   * done.  The user's own query is served first; nothing is dropped.
+   * Anything else in the slot (another on-demand page) is cancelled as
+   * before. */
+  if (cli_replay(sptr)) {
+    struct ReplayState *old = cli_replay(sptr);
+    if (old->phase == REPLAY_PHASE_CHANNELS || old->phase == REPLAY_PHASE_PMS) {
+      if (old->batch_open && !IsDead(sptr))
+        replay_close_batch(sptr, old);
+      if (old->outer_batch_open && !IsDead(sptr))
+        replay_close_outer_batch(sptr, old);
+      cli_replay(sptr) = NULL;
+      suspended = old;
+    } else {
+      replay_cancel(sptr);
+    }
+  }
 
   /* Pre-translate the wire target for the empty-batch path which
    * doesn't allocate a full ReplayState. */
   memset(&tmp_rs, 0, sizeof(tmp_rs));
   replay_set_target_from_storage(sptr, &tmp_rs, target);
+  replay_name_after_request(&tmp_rs, requested);
 
   if (!messages || count == 0) {
-    /* Send empty batch synchronously — always last page */
+    /* Empty batch.  NOT inherently the last page: reply-side filters
+     * (redact originals, cap-gated REDACT events, strict presence) can
+     * empty a page whose QUERY was not exhausted -- claiming finality
+     * there stopped paginators with history remaining.  Honor the
+     * caller's query-exhaustion verdict. */
     char batchid[REPLAY_BATCH_ID_LEN];
+    char tagbuf[128];
+    int tl = 0;
     generate_batch_id(batchid, sizeof(batchid), sptr);
 
     if (CapRecipientHas(sptr, CAP_BATCH)) {
-      /* Empty batch is always the last page — tag on BATCH start */
-      if (label && label[0] && feature_bool(FEAT_CAP_labeled_response) &&
-          CapRecipientHas(sptr, CAP_LABELEDRESP)) {
-        sendrawto_one(sptr, "@draft/chathistory-end;label=%s :%s " MSG_BATCH_CMD " +%s chathistory %s",
-                      label, cli_name(&me), batchid, tmp_rs.target);
+      int want_label = label && label[0] && feature_bool(FEAT_CAP_labeled_response)
+                       && CapRecipientHas(sptr, CAP_LABELEDRESP);
+      tagbuf[0] = '\0';
+      if (complete)
+        tl += ircd_snprintf(0, tagbuf + tl, sizeof(tagbuf) - tl, "%sdraft/chathistory-end", tl ? ";" : "");
+      if (partial)
+        tl += ircd_snprintf(0, tagbuf + tl, sizeof(tagbuf) - tl, "%sevilnet.github.io/chathistory-partial", tl ? ";" : "");
+      if (want_label) {
+        tl += ircd_snprintf(0, tagbuf + tl, sizeof(tagbuf) - tl, "%slabel=%s", tl ? ";" : "", label);
         cli_label_responded(sptr) = 1;
-      } else {
-        sendrawto_one(sptr, "@draft/chathistory-end :%s " MSG_BATCH_CMD " +%s chathistory %s",
-                      cli_name(&me), batchid, tmp_rs.target);
       }
+      if (tl)
+        sendrawto_one(sptr, "@%s :%s " MSG_BATCH_CMD " +%s chathistory %s",
+                      tagbuf, cli_name(&me), batchid, tmp_rs.target);
+      else
+        sendrawto_one(sptr, ":%s " MSG_BATCH_CMD " +%s chathistory %s",
+                      cli_name(&me), batchid, tmp_rs.target);
       sendcmdto_one(&me, CMD_BATCH_CMD, sptr, "-%s", batchid);
     }
 
     if (messages)
       history_free_messages(messages);
+    if (suspended) {
+      cli_replay(sptr) = suspended;
+      update_write(sptr);   /* ET_WRITE -> replay_continue picks it up */
+    }
     return;
   }
 
   rs = MyCalloc(1, sizeof(struct ReplayState));
+  rs->resume = suspended;
   rs->messages = messages;
   rs->current = messages;
   replay_set_target_from_storage(sptr, rs, target);
+  replay_name_after_request(rs, requested);
   rs->ops_override = ops_override;
   if (label && label[0])
     ircd_strncpy(rs->label, label, sizeof(rs->label));
   rs->phase = REPLAY_PHASE_SINGLE;
-  /* Single-shot on-demand chathistory query — no pagination continuation,
-   * so the BATCH we're about to open IS the last page.  Setting this
-   * before replay_open_batch ensures the @draft/chathistory-end tag
-   * lands on the BATCH start line.  Without it, callers like
-   * chathistory_latest set is_last_page only AFTER replay_open_batch
-   * has already emitted the BATCH start, and the end-tag is lost. */
-  rs->is_last_page = 1;
+  /* Single-shot on-demand query.  "No continuation" is NOT "history
+   * exhausted": the old unconditional is_last_page=1 stamped EVERY
+   * page final, so end-tag-honoring paginators stopped at filter-
+   * shrunk pages with history remaining.  The caller judged
+   * completeness on the raw pre-filter row count. */
+  rs->is_last_page = complete ? 1 : 0;
+  rs->is_partial = partial;
 
   cli_replay(sptr) = rs;
 
@@ -696,12 +1012,32 @@ void replay_start_batch(struct Client *sptr, const char *target,
  */
 void replay_start_bouncer(struct Client *sptr, time_t since_time, int limit)
 {
+  char ts[32];
+
+  if (since_time == 0)
+    return;
+  ircd_snprintf(0, ts, sizeof(ts), "%lu.000", (unsigned long)since_time);
+  replay_start_bouncer_at(sptr, ts, NULL, limit);
+}
+
+/** Start a bouncer auto-replay from an explicit "sec.msec" timestamp
+ * cursor (millisecond-precise — used by the ATTACH catch-up cursor,
+ * where the anchor comes from the msgid index rather than a time_t).
+ * Same semantics as replay_start_bouncer otherwise.
+ */
+void replay_start_bouncer_at(struct Client *sptr, const char *since_timestamp,
+                             const char *since_msgid, int limit)
+{
   struct ReplayState *rs;
   struct Membership *member;
+  time_t since_time;
   int count = 0;
 
   if (!feature_bool(FEAT_BOUNCER_AUTO_REPLAY))
     return;
+  if (!since_timestamp || !since_timestamp[0])
+    return;
+  since_time = (time_t)strtoul(since_timestamp, NULL, 10);
   if (since_time == 0)
     return;
 
@@ -732,8 +1068,15 @@ void replay_start_bouncer(struct Client *sptr, time_t since_time, int limit)
   if (rs->replay_limit <= 0)
     rs->replay_limit = 100;
   rs->since_time = since_time;
-  ircd_snprintf(0, rs->since_timestamp, sizeof(rs->since_timestamp),
-                "%lu.000", (unsigned long)since_time);
+  ircd_strncpy(rs->since_timestamp, since_timestamp,
+               sizeof(rs->since_timestamp));
+  /* The ATTACH cursor names the exact last-seen row: the page floor is
+   * that row's full key, so same-millisecond rows minted after it are
+   * replayed (re-review 2026-09-07 R3).  Applied to every target: for
+   * the cursor's own target it is exact, elsewhere it orders same-ms
+   * rows by msgid, the same order the store keys use. */
+  if (since_msgid && since_msgid[0])
+    ircd_strncpy(rs->since_msgid, since_msgid, sizeof(rs->since_msgid));
 
   /* Copy channel names — safe across event loop iterations */
   if (count > 0) {
@@ -751,16 +1094,44 @@ void replay_start_bouncer(struct Client *sptr, time_t since_time, int limit)
   replay_continue(sptr);
 }
 
+/** Start the post-revive/attach catch-up replay: resolve the client's
+ * PERSISTENCE ATTACH cursor (last-seen msgid) to a millisecond
+ * timestamp via the global msgid index and replay from there;
+ * without a cursor — or when the msgid is unknown/evicted — fall back
+ * to the server-derived since_time.  On an unknown cursor the client
+ * gets FAIL PERSISTENCE CURSOR_UNKNOWN (it converged, but should
+ * consider a full resync) rather than a silent divergence.
+ */
+void replay_start_catchup(struct Client *sptr, time_t since_time, int limit)
+{
+  const char *cursor = cli_attach_cursor(sptr);
+
+  if (cursor[0]) {
+    char ts[HISTORY_TIMESTAMP_LEN];
+
+    if (history_msgid_to_timestamp(cursor, ts) == 0) {
+      replay_start_bouncer_at(sptr, ts, cursor, limit);
+      return;
+    }
+    send_fail(sptr, "PERSISTENCE", "CURSOR_UNKNOWN", cursor,
+              "Cursor msgid not found; replaying from last activity");
+  }
+  replay_start_bouncer(sptr, since_time, limit);
+}
+
 /** Cancel and clean up any in-progress replay.
  * Called on disconnect, new CHATHISTORY, new replay, etc.
  */
 void replay_cancel(struct Client *sptr)
 {
   struct ReplayState *rs = cli_replay(sptr);
+  struct ReplayState *resume;
   int i;
 
   if (!rs)
     return;
+  resume = rs->resume;
+  rs->resume = NULL;
 
   /* Close open batch */
   if (rs->batch_open && !IsDead(sptr))
@@ -787,5 +1158,16 @@ void replay_cancel(struct Client *sptr)
 
   MyFree(rs);
   cli_replay(sptr) = NULL;
+
+  /* Reinstall a suspended bouncer catch-up.  Its current page (if any)
+   * continues in a fresh inner batch, the outer wrapper reopens lazily
+   * (replay_open_batch); a dead client just tears it down too. */
+  if (resume) {
+    cli_replay(sptr) = resume;
+    if (IsDead(sptr)) {
+      replay_cancel(sptr);
+      return;
+    }
+  }
   update_write(sptr);
 }

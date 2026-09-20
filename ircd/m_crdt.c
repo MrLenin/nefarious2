@@ -550,9 +550,9 @@ static void crdt_services_reemit(struct Client *srcsrv, struct Client *dsrv, cha
   switch (p10cmd) {
     case 'A': sendcmdto_one(src, CMD_SASL,     dsrv, "%s", body); break;
     case 'C': sendcmdto_one(src, CMD_ACCOUNT,  dsrv, "%s", body); break;
-    case 'G': sendcmdto_one(src, CMD_REGISTER, dsrv, "%s", body); break;
-    case 'V': sendcmdto_one(src, CMD_VERIFY,   dsrv, "%s", body); break;
-    case 'R': sendcmdto_one(src, CMD_REGREPLY, dsrv, "%s", body); break;
+    /* 'G'/'V'/'R' (REGISTER/VERIFY/REGREPLY) retired with the fork's local
+     * Keycloak /REGISTER flow (no services round trip any more); a frame
+     * carrying them from an older peer is dropped here. */
     case 'Q': sendcmdto_one(src, CMD_XQUERY,   dsrv, "%s", body); break;
     case 'Y': sendcmdto_one(src, CMD_XREPLY,   dsrv, "%s", body); break;
     /* Cluster A: services force-commands toward a user homed on/behind @a dsrv */
@@ -676,7 +676,6 @@ static void crdt_services_reinject(char p10cmd, char *body)
   switch (p10cmd) {
     case 'A': ms_sasl(&me, &me, parc, parv); break;
     case 'C': ms_account(&me, &me, parc, parv); break;
-    case 'R': ms_regreply(&me, &me, parc, parv); break;
     case 'Q': ms_xquery(&me, &me, parc, parv); break;
     case 'Y': ms_xreply(&me, &me, parc, parv); break;
     /* Cluster A: services force-commands, re-injected at the target's home.
@@ -692,7 +691,7 @@ static void crdt_services_reinject(char p10cmd, char *body)
      * parv[1] and resolves targets from the body's numerics — no source
      * gate, so a &me re-inject applies exactly like the P10 arrival. */
     case 'B': ms_bouncer_transfer(&me, &me, parc, parv); break;
-    /* 'G'/'V' (REGISTER/VERIFY) are forward-only to services -> never re-injected at a leaf */
+    /* 'G'/'V'/'R' (REGISTER/VERIFY/REGREPLY): retired, see crdt_services_reemit */
     default: break;
   }
 }
@@ -1054,12 +1053,15 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
         struct Client *wsptr = srcu ? srcu
             : ((srcsrv && !MyConnect(srcsrv)) ? srcsrv : NULL);
         if (wsptr) {
+          /* One time per message (fork rule): the row carries the
+           * origin's event time, which the HLC-seeded msgid encodes;
+           * a legacy msgid falls back to the HLC's current physical
+           * time, never the wall clock. */
           char wts[32];
-          struct timeval wtv;
-          gettimeofday(&wtv, NULL);
-          ircd_snprintf(0, wts, sizeof(wts), "%lu.%03lu",
-                        (unsigned long)wtv.tv_sec,
-                        (unsigned long)(wtv.tv_usec / 1000));
+          uint64_t wms = msgid_decode_time_ms(m_msgid);
+          if (!wms)
+            wms = history_event_time_ms(NULL);
+          history_format_ms(wts, sizeof(wts), wms);
           store_channel_history(wsptr, ch, m_text,
                                 (m_cmd[0] == 'N') ? HISTORY_NOTICE
                                                   : HISTORY_PRIVMSG,

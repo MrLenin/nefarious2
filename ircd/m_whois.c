@@ -239,7 +239,7 @@ static void do_whois(struct Client* sptr, struct Client *acptr, int parc)
   if (user)
   {
     if (user->away)
-       send_reply(sptr, RPL_AWAY, name, user->away);
+       send_reply(sptr, RPL_AWAY, name, away_text_for(sptr, user->away));
 
     if (SeeOper(sptr,acptr)) {
        if (IsAdmin(acptr))
@@ -295,6 +295,14 @@ static void do_whois(struct Client* sptr, struct Client *acptr, int parc)
         send_reply(sptr, RPL_WHOISSSLFP, name, cli_sslclifp(acptr));
     }
 
+    /* Oper-only: flag WebSocket-connected users and expose the Origin.
+     * Gated on cli_wsorigin (non-empty iff the client is WS, set locally
+     * at handshake or via MARK on remote servers) — NOT IsWebSocket,
+     * which is a local-only behavioral flag not set on remote users.
+     * IsAnOper gate matches the surrounding oper-visible whois lines. */
+    if (IsAnOper(sptr) && !EmptyString(cli_wsorigin(acptr)))
+      send_reply(sptr, RPL_WHOISWEBSOCKET, name, cli_wsorigin(acptr));
+
     if (!EmptyString(user->swhois))
       send_reply(sptr, RPL_WHOISSPECIAL, name, user->swhois);
 
@@ -325,9 +333,21 @@ static void do_whois(struct Client* sptr, struct Client *acptr, int parc)
 
     if (MyConnect(acptr) && (IsAnOper(sptr) || (!IsNoIdle(acptr) &&
           (!feature_bool(FEAT_HIS_WHOIS_IDLETIME) || sptr == acptr ||
-             parc >= 3))))
-       send_reply(sptr, RPL_WHOISIDLE, name, CurrentTime - user->last,
-                  cli_firsttime(acptr));
+             parc >= 3)))) {
+      /* A bouncer session is one user on several connections: idle is
+       * measured from the most recent activity on any of them (aliases
+       * on other servers via the replicated activity), not just the
+       * primary's own clock. */
+      time_t last = user->last;
+      struct BouncerSession *isess = bounce_get_session(acptr);
+      if (isess) {
+        time_t sl = bounce_session_last_active(isess);
+        if (sl > last)
+          last = sl;
+      }
+      send_reply(sptr, RPL_WHOISIDLE, name, CurrentTime - last,
+                 cli_firsttime(acptr));
+    }
 
     if (IsOper(acptr) && IsWhoisNotice(acptr) && (sptr != acptr))
       sendcmdto_one(&me, CMD_NOTICE, acptr,

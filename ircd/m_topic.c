@@ -54,9 +54,8 @@
  */
 static void store_topic_event(struct Client *sptr, struct Channel *chptr,
                               const char *topic,
-                              const char *broadcast_msgid)
+                              const char *broadcast_msgid, uint64_t event_ms)
 {
-  struct timeval tv;
   char timestamp[32];
   char fallback_msgid[64];
   const char *msgid;
@@ -70,9 +69,9 @@ static void store_topic_event(struct Client *sptr, struct Channel *chptr,
   if (!feature_bool(FEAT_CHATHISTORY_STORE))
     return;
 
-  /* Only store for local users to avoid duplicates */
-  if (!MyUser(sptr))
-    return;
+  /* Receiver-side storage (see store_kick_event): every server with
+   * the channel stores its own copy; the msgid is unified via the S2S
+   * tag, so federated merges dedup cleanly. */
 
   /* Check if channel has +P (no storage) mode */
   if (chptr->mode.exmode & EXMODE_NOSTORAGE)
@@ -88,11 +87,10 @@ static void store_topic_event(struct Client *sptr, struct Channel *chptr,
   else
     msgid = generate_msgid(fallback_msgid, sizeof(fallback_msgid));
 
-  /* Generate Unix timestamp for storage */
-  gettimeofday(&tv, NULL);
-  ircd_snprintf(0, timestamp, sizeof(timestamp), "%lu.%03lu",
-                (unsigned long)tv.tv_sec,
-                (unsigned long)(tv.tv_usec / 1000));
+  /* Row time: the event's one time (the S2S tag time the caller already
+   * put on the wire), else the mint time of the msgid chosen above. */
+  history_format_ms(timestamp, sizeof(timestamp),
+                    event_ms ? event_ms : history_event_time_ms(NULL));
 
   /* Build sender string: nick!user@host */
   if (cli_user(sptr))
@@ -178,11 +176,8 @@ static void do_settopic(struct Client *sptr, struct Client *cptr,
    if (!IsLocalChannel(chptr->chname))
    {
      if (topic_msgid[0]) {
-       if (!topic_time_ms) {
-         struct timeval tv;
-         gettimeofday(&tv, NULL);
-         topic_time_ms = (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
-       }
+       if (!topic_time_ms)
+         topic_time_ms = history_event_time_ms(NULL);  /* mint time */
        sendcmdto_set_s2s_tags(topic_time_ms, topic_msgid);
      }
      sendcmdto_want_s2s_tags(1);
@@ -222,7 +217,7 @@ static void do_settopic(struct Client *sptr, struct Client *cptr,
      /* Use the same msgid for broadcast and chathistory storage */
      {
        if (topic_msgid[0])
-         sendcmdto_set_client_msgid(topic_msgid);
+         sendcmdto_set_client_event(topic_msgid, topic_time_ms);
 
        sendcmdto_channel_butserv_butone(from, CMD_TOPIC, chptr, NULL, 0,
                                         (setter ? "%H :%s (%s)" : "%H :%s%s"),
@@ -233,7 +228,7 @@ static void do_settopic(struct Client *sptr, struct Client *cptr,
 #ifdef USE_ROCKSDB
        /* Store TOPIC event in history — same msgid as broadcast */
        store_topic_event(sptr, chptr, chptr->topic,
-                         topic_msgid[0] ? topic_msgid : NULL);
+                         topic_msgid[0] ? topic_msgid : NULL, topic_time_ms);
 #endif
      }
    }
