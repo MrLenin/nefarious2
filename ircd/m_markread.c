@@ -467,7 +467,12 @@ int ms_presencesync(struct Client *cptr, struct Client *sptr, int parc,
 
   if (parc < 5)
     return 0;
-  if (!IsServer(sptr))
+  /* A legacy server relayed through the mesh is a synthetic anchor here
+   * (STAT_MESH_SERVER, not IsServer) — crdt-mesh hard invariant 2, the
+   * same handler-side gate ms_chathistory takes.  Without it every PN a
+   * gateway forwarded for the legacy primary was a protocol violation on
+   * the inner nodes (seen 2026-09-20). */
+  if (!IsServer(sptr) && !IsMeshStub(sptr) && !IsMe(sptr))
     return protocol_violation(cptr, "PRESENCE from non-server %s",
                               cli_name(sptr));
 
