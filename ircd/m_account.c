@@ -142,6 +142,23 @@ static struct Client *decode_auth_id(const char *id)
  * parv[1] = numeric of client to act on
  * parv[2] = account name (12 characters or less)
  */
+
+/** Compare a stamped account with an account parameter as it arrives on
+ * the wire ("name" or "name:timestamp").  0 when they name the same
+ * account. */
+static int account_name_matches(const char *have, const char *wire)
+{
+  size_t n;
+  const char *colon;
+  if (!have || !wire)
+    return 1;
+  colon = strchr(wire, ':');
+  n = colon ? (size_t)(colon - wire) : strlen(wire);
+  if (n != strlen(have))
+    return 1;
+  return ircd_strncmp(have, wire, n) != 0;
+}
+
 /** MR-6-2 auth carrier: tunnel an applied ACCOUNT change to a target whose HOME
  * server is mesh-only (an overlay-only node, unreachable by the P10 relay).
  *
@@ -287,10 +304,17 @@ int ms_account(struct Client* cptr, struct Client* sptr, int parc,
           return need_more_params(sptr, "ACCOUNT");
 
         if (type == 'R') {
-          if (IsAccount(acptr))
+          if (IsAccount(acptr)) {
+            /* The same account again is not a violation: on the CRDT
+             * mesh the doc delta stamps the user before the tree copy
+             * of this AC lands (hub2<->leaf2 both ways, 2026-09-20).
+             * Idempotent -> drop silently; a DIFFERENT account still is. */
+            if (0 == account_name_matches(cli_user(acptr)->account, parv[3]))
+              return 0;
             return protocol_violation(cptr, "ACCOUNT for already registered user %s "
                                       "(%s -> %s)", cli_name(acptr),
                                       cli_user(acptr)->account, parv[3]);
+          }
           assert(0 == cli_user(acptr)->account[0]);
         }
 
@@ -523,10 +547,13 @@ int ms_account(struct Client* cptr, struct Client* sptr, int parc,
     if (!(acptr = findNUser(parv[1])))
       return 0; /* Ignore ACCOUNT for a user that QUIT; probably crossed */
 
-    if (IsAccount(acptr))
+    if (IsAccount(acptr)) {
+      if (0 == account_name_matches(cli_user(acptr)->account, parv[2]))
+        return 0;   /* same account re-stamped: idempotent (see the R form) */
       return protocol_violation(cptr, "ACCOUNT for already registered user %s "
                                 "(%s -> %s)", cli_name(acptr),
                                 cli_user(acptr)->account, parv[2]);
+    }
 
     assert(0 == cli_user(acptr)->account[0]);
 
