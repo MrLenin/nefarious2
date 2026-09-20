@@ -3897,8 +3897,6 @@ void chathistory_legacy_ads_foreach(void (*fn)(const char *srvnum, unsigned int 
     server = FindNServer(inttobase64(num, i, 2));
     if (!server || server == &me || !IsServer(server) || IsCrdtAware(server))
       continue;
-    if (is_ulined_server(server))
-      continue;
     fn(num, (unsigned int)(ad->retention_days < 0 ? 0 : ad->retention_days), ctx);
   }
 }
@@ -5037,8 +5035,8 @@ static void collect_doc_target(const char *srvnum, unsigned int retention,
   } else {
     if (IsMeshStub(server) && !crdt_ch_tunnel_avail())
       return;
-    if (is_ulined_server(server))
-      return;
+    /* No U-line skip: a doc storage record is minted only by a storing
+     * server (or its gateway on its behalf). */
     if (ctx->query_time != 0 && !server_retention_covers(server, ctx->query_time))
       return;
     tunnel = IsMeshStub(server) ? 1 : 0;
@@ -5111,8 +5109,9 @@ static int collect_storage_targets(const char *target, time_t query_time)
       continue;
     if (IsMeshStub(server) && !crdt_ch_tunnel_avail())
       continue;
-    if (is_ulined_server(server))
-      continue;
+    /* No U-line skip here: the entry exists only because this server sent
+     * CH A S, and services never do.  A U-lined IRCd that advertises
+     * storage (the bed's CRDT slots U-line the primary) is a store. */
     if (query_time != 0 && !server_retention_covers(server, query_time))
       continue;
 
