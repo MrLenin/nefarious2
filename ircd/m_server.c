@@ -895,6 +895,14 @@ int ms_server(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
     return exit_client_msg(cptr, cptr, &me, "Bogus server name (%s)", host);
   }
 
+  /* A mesh stub or anchor never introduces servers: its subtree is doc
+   * state, and a relink through any path retires the stub before the
+   * SERVER line that re-creates it (above, T2-a), so anything it sources
+   * here means the peer's tree and ours disagree.  Drop it, loudly. */
+  if (IsMeshStub(sptr))
+    return protocol_violation(cptr, "SERVER %s introduced by mesh stub %s",
+                              host, cli_name(sptr));
+
   /*
    * Detect protocol
    */
