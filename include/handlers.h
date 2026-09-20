@@ -387,7 +387,7 @@ extern void crdt_wall_flood(struct Client* from, char cmd, struct Channel* chptr
 extern int  crdt_ch_tunnel_avail(void);
 extern int  crdt_ch_tunnel_try(const char* dstyxx, const char* body);
 extern void crdt_ch_tunnel_reply(const char* dstyxx, const char* body);
-extern void crdt_ch_tunnel_dispatch(char* body);
+extern void crdt_ch_tunnel_dispatch(const char *srcyxx, char *body);
 /** Tier2 full-partition liveness: gossip an ephemeral CR H liveness beacon
  *  (CR H <ourYXX> <CurrentTime>) over every CRDT transport.  Receivers track
  *  the last beacon per server; a mesh stub whose beacon goes stale is retired. */

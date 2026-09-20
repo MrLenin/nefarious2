@@ -1400,7 +1400,7 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
       ircd_strncpy(bodybuf, x_body, sizeof bodybuf);
       if (x_cmd == 'H')                  /* 5-5f B3: chathistory needs the reply
                                           * tunnel armed around its dispatch */
-        crdt_ch_tunnel_dispatch(bodybuf);
+        crdt_ch_tunnel_dispatch(srcyxx, bodybuf);
       else
         crdt_services_reinject(x_cmd, bodybuf);
       log_write(LS_SYSTEM, L_INFO, 0, "Tier B CR-X: re-injected locally cmd=%c", x_cmd);

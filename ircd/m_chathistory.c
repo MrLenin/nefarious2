@@ -108,6 +108,10 @@ extern int  ms_chathistory(struct Client *cptr, struct Client *sptr,
  */
 static char ch_tunnel_dst[3];
 static int  ch_tunnel_on;
+/* The responder a tunneled reply came FROM (the CR-X frame's src), so the
+ * origin's per-responder CH E guard keys on the real responder and not on
+ * &me, which every re-injected frame presents as its source. */
+static char ch_tunnel_src[3];
 
 /** Bytes the CR-X wrapper adds to a tunneled reply line.
  * The wrapper (":XX CR X <msgid> <src> <dst> H <ttl> :") replaces the bare
@@ -4938,6 +4942,8 @@ static void fed_timeout_callback(struct Event *ev)
      * Don't free here - timer_run will send ET_DESTROY after we return. */
     req->timer_active = 0;
     if (req->servers_pending > 0) {
+      Debug((DEBUG_DEBUG, "CH fed timeout: reqid %s target %s still waiting on %d responder(s)",
+             req->reqid, req->target, req->servers_pending));
       req->fed_truncated = 1;
       req->cut = 1;   /* a responder never answered: partial */
     }
@@ -5315,6 +5321,15 @@ static struct FedRequest *start_fed_query(struct Client *sptr, const char *targe
    */
   {
     int ti;
+    {
+      char tl[BUFSIZE]; size_t tp = 0;
+      for (ti = 0; ti < server_count && tp + 6 < sizeof(tl); ti++)
+        tp += ircd_snprintf(0, tl + tp, sizeof(tl) - tp, "%s%s%s", ti ? "," : "",
+                            fed_target_buf[ti].yxx, fed_target_buf[ti].tunnel ? "(t)" : "");
+      tl[tp] = '\0';
+      Debug((DEBUG_DEBUG, "CH fed dispatch: reqid %s target %s pending %d -> %s",
+             reqid, target, server_count, tl));
+    }
     for (ti = 0; ti < server_count; ti++) {
       /* Layer 1 channel-list filter intentionally NOT applied here —
        * see the matching rationale in count_storage_servers(): CH A F
@@ -6049,12 +6064,16 @@ static void forward_fed_reply(struct Client *sptr, struct Client *cptr,
  * dispatched with the tunnel disarmed.  Context is cleared unconditionally —
  * ms_chathistory never recurses into itself.
  */
-void crdt_ch_tunnel_dispatch(char *body)
+void crdt_ch_tunnel_dispatch(const char *srcyxx, char *body)
 {
   char *parv[MAXPARA + 3];
   int parc = 0;
   char *s = body;
 
+  if (srcyxx && srcyxx[0])
+    ircd_strncpy(ch_tunnel_src, srcyxx, sizeof(ch_tunnel_src));
+  else
+    ch_tunnel_src[0] = '\0';
   parv[parc++] = cli_name(&me);
   while (*s && parc < MAXPARA + 2) {
     while (*s == ' ')
@@ -6080,6 +6099,7 @@ void crdt_ch_tunnel_dispatch(char *body)
   }
   ms_chathistory(&me, &me, parc, parv);
   ch_tunnel_on = 0;
+  ch_tunnel_src[0] = '\0';
   ch_tunnel_dst[0] = '\0';
 }
 
@@ -6809,12 +6829,20 @@ int ms_chathistory(struct Client *cptr, struct Client *sptr, int parc, char *par
      * from one server completed the request without the others' rows
      * (audit 2026-09-06 #14). */
     {
-      int si = server_ad_index(sptr);
+      /* The responder: a real or anchored server by its numeric, or the
+       * CR-X frame's source for a tunneled reply (sptr is &me then). */
+      int si = -1;
+      if (IsServer(sptr) || IsMeshStub(sptr))
+        si = base64toint(cli_yxx(sptr));
+      else if (IsMe(sptr) && ch_tunnel_src[0])
+        si = base64toint(ch_tunnel_src);
       if (si >= 0 && si < MAX_AD_SERVERS) {
         if (req->e_seen[si >> 3] & (1u << (si & 7)))
           return 0;
         req->e_seen[si >> 3] |= (unsigned char)(1u << (si & 7));
       }
+      Debug((DEBUG_DEBUG, "CH E: reqid %s responder %d count %d -> pending %d",
+             reqid, si, count, req->servers_pending - 1));
     }
     req->servers_pending--;
 
