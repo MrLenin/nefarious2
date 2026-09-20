@@ -37,7 +37,9 @@
 #include "ircd_relay.h"   /* 5-5f B1: store_channel_history (CR-M witness store) */
 #include "history.h"      /* 5-5f B1: HISTORY_PRIVMSG/NOTICE type enum */
 
+#include "chathistory_presence.h"   /* PN over the mesh: presence_apply_close */
 #include "crdt_shadow.h"
+#include "s_debug.h"        /* Debug() */
 #include "crdt_meshmap.h"  /* MR-1: crdt_meshmap_nexthop + crdt_route_action */
 #include "crdt_wire.h"
 #include "s2s_chunk.h"
@@ -992,6 +994,34 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
       struct Client *wsrc = srcu ? srcu : srcsrv;
       if (wsrc)
         sendwallto_local(wsrc, WALL_WALLUSERS, m_text);
+    } else if (m_cmd[0] == 'S' && target[0] == '*') {  /* PN (strict-presence closed
+                                            * interval) over the mesh: "<account>
+                                            * <channel> <start> <end>", the P10 PN
+                                            * body verbatim.  LOCAL apply only (CI
+                                            * precedent): the origin's tree copy
+                                            * serves legacy peers, and a P10 re-emit
+                                            * here would open a dual-plane echo.  The
+                                            * shared flood relay below carries it
+                                            * mesh-wide, msgid-deduped. */
+      char pb[BUFSIZE];
+      char *pv[6];
+      int pc = 0;
+      char *q;
+      ircd_strncpy(pb, m_text, sizeof pb);
+      for (q = pb; *q && pc < 4; ) {
+        while (*q == ' ') *q++ = '\0';
+        if (!*q) break;
+        pv[pc++] = q;
+        while (*q && *q != ' ') q++;
+      }
+      if (pc == 4) {
+        int64_t ps = presence_norm_time((int64_t)strtoull(pv[2], NULL, 10));
+        int64_t pe = presence_norm_time((int64_t)strtoull(pv[3], NULL, 10));
+        if (ps != 0 && pe != 0) {
+          Debug((DEBUG_DEBUG, "CRDT PN: mesh interval %s %s %s..%s", pv[0], pv[1], pv[2], pv[3]));
+          presence_apply_close(pv[0], /*is_session=*/0, pv[1], ps, pe);
+        }
+      }
     } else if (m_cmd[0] == 'I' && target[0] == '*') {  /* CI (target "*") — NOT INVITE.
                                             * INVITE also rides cmd 'I' but always carries a
                                             * USER numeric target; CI always "*".  Without

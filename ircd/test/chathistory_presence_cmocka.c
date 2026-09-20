@@ -281,6 +281,13 @@ void sendcmdto_serv_butone_v3(struct Client *from, const char *cmd,
   (void)from; (void)cmd; (void)tok; (void)one; (void)pattern;
 }
 struct db_env *metadata_get_env(void) { return NULL; }
+/* The mesh copy of the same emit (PN over CR M, 2026-09-20): same story. */
+void generate_msgid(char *buf, size_t len) { if (buf && len) buf[0] = '\0'; }
+void crdt_gossip_message(struct Client *from, char cmd, const char *target,
+                         const char *msgid, const char *text)
+{
+  (void)from; (void)cmd; (void)target; (void)msgid; (void)text;
+}
 /* presence's fallback clock when no caller supplied an event time
  * (SQUIT teardown, backfill); this suite always passes explicit times. */
 static struct HLC test_hlc;

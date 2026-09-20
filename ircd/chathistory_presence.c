@@ -19,6 +19,7 @@
  */
 #include "config.h"
 
+#include "handlers.h"      /* crdt_gossip_message (PN over the mesh) */
 #include "chathistory_presence.h"
 
 #include "channel.h"
@@ -721,6 +722,20 @@ static void presence_broadcast_close(const char *account,
   snprintf(eb, sizeof(eb), "%lld", (long long)end);
   sendcmdto_serv_butone_v3(&me, CMD_PRESENCE, NULL, "%s %s %s %s",
                            account, channel, sb, eb);
+  /* Mesh copy (CI precedent, letter 'S', target "*"): the tree copy above
+   * never reaches an overlay-only CRDT node, and among CRDT peers the tree
+   * is retired, so without this a presence interval closed here was
+   * unknown to the stores that page by it.  crdt_gossip_message self-gates
+   * (shadow active + FEAT_CRDT_ROUTE_BCAST + bcast-stable): mesh off ->
+   * exactly the old tree-only behaviour.  Receivers apply locally only;
+   * legacy peers ride the origin's tree copy. */
+  {
+    char msgidbuf[64];
+    char body[ACCOUNTLEN + CHANNELLEN + 64];
+    generate_msgid(msgidbuf, sizeof msgidbuf);
+    snprintf(body, sizeof body, "%s %s %s %s", account, channel, sb, eb);
+    crdt_gossip_message(&me, 'S', "*", msgidbuf, body);
+  }
 }
 
 void presence_record_join(const char *anchor, int anchor_is_session,
