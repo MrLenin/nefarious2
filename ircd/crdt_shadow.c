@@ -150,6 +150,15 @@ int crdt_shadow_beacon_record(unsigned int num, time_t emit_ts,
    * its last real beacon — the identical bound already accepted today. */
   crdt_beacon[num].recv_ts         = CurrentTime;
   crdt_beacon[num].seen_since_tick = 1;
+  /* A doc-known store that beacons is reachable: close any absence the
+   * stale sweep opened for it (idempotent; the chathistory side keeps the
+   * state, so this is one map lookup per beacon). */
+  {
+    char bnum[3];
+    inttobase64(bnum, num, 2);
+    if (crdt_shadow_ch_storage_lookup(bnum, NULL))
+      chathistory_store_reachable(num);
+  }
   if (emit_ts <= crdt_beacon[num].emit_ts)
     return 0;                       /* relay/dedup gate ONLY — terminates the gossip flood */
   crdt_beacon[num].emit_ts = emit_ts;
@@ -1222,6 +1231,28 @@ static void ch_storage_iter_shim(const char *key, uint32_t key_len,
   memcpy(num, key, key_len);
   num[key_len] = '\0';
   shim->fn(num, (unsigned int)rec->retention_days, shim->ctx);
+}
+
+/* Absence table feed (verify tick): a doc-known store is reachable while its
+ * beacon is fresh or it is a live P10 server here; otherwise it is absent
+ * from the moment of its last beacon.  chathistory_store_* keep the state
+ * and only act on transitions, so this walk is cheap every tick. */
+static void ch_storage_reach_sweep_one(const char *srvnum, unsigned int retention,
+                                       void *ctx)
+{
+  unsigned int num = (unsigned int)base64toint(srvnum);
+  struct Client *srv;
+  int reachable;
+  (void)retention; (void)ctx;
+  if (num >= CRDT_MAX_SERVERS || num == (unsigned int)base64toint(cli_yxx(&me)))
+    return;
+  srv = FindNServer(srvnum);
+  reachable = crdt_shadow_server_beacon_fresh((uint16_t)num)
+           || (srv && IsServer(srv) && !IsMeshStub(srv) && !IsDead(srv));
+  if (reachable)
+    chathistory_store_reachable(num);
+  else
+    chathistory_store_unreachable(num, crdt_beacon[num].recv_ts);
 }
 
 void crdt_shadow_ch_storage_foreach(crdt_ch_storage_iter_fn fn, void *ctx)
@@ -6239,6 +6270,7 @@ static void crdt_shadow_verify_cb(struct Event *ev)
   crdt_shadow_own_user_sweep();    /* orphan-reap owner sweep: reap MY-origin doc records with no live client (resurrection zombies / restart residue / hookless teardowns) */
   crdt_shadow_own_user_reassert(); /* recovery completion: re-mint records of live local users the doc lost (wrong-decommission heal) */
   crdt_shadow_ch_storage_publish(); /* 5-5f B2: publish our CH storage capability (change-gated, so idle ticks are free) */
+  crdt_shadow_ch_storage_foreach(ch_storage_reach_sweep_one, NULL); /* absence table: doc-known stores go absent on a stale beacon, back on a fresh one */
   crdt_shadow_ch_storage_synth_to(NULL); /* 5-5f B4: synth doc-known stores to legacy links (change-gated per leaf — covers stores that appear AFTER the legacy link's EOB) */
   chathistory_update_retention_isupport(1); /* the doc may have taught us a store P10 never advertised: re-derive the widest retention (cached compare, no-op when unchanged) */
   crdt_shadow_decomm_sweep();      /* decommission standing sweep: reap residue of operator-asserted-dead servers; auto-dissolve on return */

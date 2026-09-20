@@ -1576,7 +1576,7 @@ struct StorageAbsence {
 };
 static struct StorageAbsence *absences[MAX_AD_SERVERS];
 
-static void absence_open(int idx)
+static void absence_open_since(int idx, time_t since)
 {
   struct StorageAbsence *a;
   int i;
@@ -1590,8 +1590,13 @@ static void absence_open(int idx)
       return;   /* already open */
   /* Shift the oldest out, newest at [0]. */
   memmove(&a[1], &a[0], sizeof(a[0]) * (MAX_ABSENCES - 1));
-  a[0].start = CurrentTime;
+  a[0].start = (since > 0 && since <= CurrentTime) ? since : CurrentTime;
   a[0].end = 0;
+}
+
+static void absence_open(int idx)
+{
+  absence_open_since(idx, 0);
 }
 
 static void absence_close(int idx)
@@ -1604,6 +1609,40 @@ static void absence_close(int idx)
   for (i = 0; i < MAX_ABSENCES; i++)
     if (a[i].start && a[i].end == 0)
       a[i].end = CurrentTime;
+}
+
+/* Store reachability on the CRDT mesh (2026-09-20, post catch-up).
+ * On the tree a store's absence is bracketed by its SQUIT (clear_server_ad)
+ * and its next CH A S (EOB).  Among CRDT peers neither event means what it
+ * says: a SQUIT of a mesh-reachable peer keeps it as a stub whose store is
+ * still queried over the CR-X tunnel, and a peer that comes back through the
+ * mesh alone never sends CH A S again.  There the truth is the CR H beacon:
+ * a doc-known store is absent while its beacon is stale and back when a
+ * fresh one arrives.  crdt_shadow drives the two transitions below; the
+ * absence is backdated to the last beacon we saw, the last moment we knew
+ * the store was reachable, not to the tick that noticed. */
+static unsigned char store_reach_state[MAX_AD_SERVERS];   /* 0 unknown, 1 reachable, 2 absent */
+void chathistory_update_retention_isupport(int announce);   /* defined below */
+
+void chathistory_store_unreachable(unsigned int num, time_t since)
+{
+  /* Only a store we have SEEN reachable can become absent: right after a
+   * boot the doc knows stores whose first beacon is still on its way, and
+   * opening an absence for them would make every first page partial. */
+  if (num >= MAX_AD_SERVERS || store_reach_state[num] != 1)
+    return;
+  store_reach_state[num] = 2;
+  absence_open_since((int)num, since);
+  chathistory_update_retention_isupport(1);   /* it may have been the widest store */
+}
+
+void chathistory_store_reachable(unsigned int num)
+{
+  if (num >= MAX_AD_SERVERS || store_reach_state[num] == 1)
+    return;
+  store_reach_state[num] = 1;
+  absence_close((int)num);
+  chathistory_update_retention_isupport(1);
 }
 
 /** Does [lo, hi] (unix seconds; 0 = unbounded on that side) overlap any
