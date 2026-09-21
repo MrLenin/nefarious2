@@ -350,7 +350,10 @@ static void do_whois(struct Client* sptr, struct Client *acptr, int parc)
                  cli_firsttime(acptr));
     }
 
-    if (IsOper(acptr) && IsWhoisNotice(acptr) && (sptr != acptr))
+    /* cli_user(sptr): the requester reached us over the mesh line carrier and
+     * may be a server, a mesh anchor or &me when its numeric resolves to no
+     * local Client (invariant 2) -- then there is no one to name. */
+    if (IsOper(acptr) && IsWhoisNotice(acptr) && (sptr != acptr) && cli_user(sptr))
       sendcmdto_one(&me, CMD_NOTICE, acptr,
                     "%C :*** Notice -- %s (%s@%s) did a /whois on you.",
                     acptr, cli_name(sptr), cli_user(sptr)->username,

@@ -112,7 +112,11 @@ int ms_pong(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
   char*          destination;
   assert(0 != cptr);
   assert(0 != sptr);
-  assert(IsServer(cptr));
+  /* Invariant 2: the mesh line carrier re-injects with cptr = &me (STAT_ME),
+   * which IsServer -- being EXACT -- rejects.  Asserts are compiled in by
+   * default (configure.in:283), so this aborted the recipient's own server
+   * when a PONG answered a user homed on a mesh stub. */
+  assert(IsServer(cptr) || IsMe(cptr));
 
   if (parc < 2 || EmptyString(parv[1])) {
     return protocol_violation(sptr,"No Origin on PONG");

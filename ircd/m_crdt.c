@@ -595,6 +595,40 @@ static struct Client *crdt_line_source(const struct CrdtP10Line *ln)
   return src;
 }
 
+/* Which tokens the line carriers move.  The re-inject hands a line to a SERVER
+ * handler with cptr = &me and sptr = the line's own source -- a mesh stub, or
+ * &me itself when the source has no Client here.  NEITHER satisfies the EXACT
+ * IsServer test that many handlers, and eight asserts, still use (invariant 2:
+ * IsServer is == STAT_SERVER, and &me is STAT_ME), and a handler that gates on
+ * a privileged cptr answers ERR_NOPRIVILEGES when it is &me.  So the carriers
+ * move what they were built to move -- server->user replies, and the read-only
+ * informational hunts -- and refuse the rest loudly rather than entering
+ * ninety-odd handlers that were never written for this source.
+ *
+ * Deliberately NOT here: MODE (the user record carries umodes); KILL/INVITE/
+ * TAGMSG (their own CR M letters); STATS/TRACE/LINKS/MAP (oper introspection,
+ * `/CRDT map|peers|status` is the substitute); REHASH/CONNECT/UPING/SETTIME/
+ * RPING (oper ACTIONS -- the carrier cannot convey the authority they check,
+ * so they would answer "permission denied" even if they ran).
+ * Widen only after reading the handler for invariant 2 AND for authority it
+ * cannot be given here. */
+static int crdt_line_token_ok(const char *tok, int hunt)
+{
+  static const char *const reply_toks[] = {
+    TOK_NOTICE, TOK_PRIVATE, TOK_PONG, TOK_PRIVS, TOK_ACCOUNT,
+    TOK_BOUNCER_TRANSFER, TOK_BOUNCER_SESSION, NULL
+  };
+  static const char *const hunt_toks[] = {
+    TOK_VERSION, TOK_TIME, TOK_ADMIN, TOK_INFO, TOK_LUSERS, TOK_MOTD,
+    TOK_RULES, TOK_WHOIS, TOK_PRIVS, NULL
+  };
+  const char *const *p;
+  for (p = hunt ? hunt_toks : reply_toks; *p; p++)
+    if (!strcmp(tok, *p))
+      return 1;
+  return 0;
+}
+
 /* Re-inject a verbatim server-form line locally.  @a line is copied; the token's SERVER
  * handler (or do_numeric) runs with cptr = &me and sptr = the resolved source (a server, a
  * mesh anchor, a user known here) -- &me when the source has no Client here (the same rewrite
@@ -602,7 +636,7 @@ static struct Client *crdt_line_source(const struct CrdtP10Line *ln)
  * do_numeric reads for a LOCAL recipient's forwarded-label batch) and, for a user source
  * homed on a stub, on that stub's dead Connection (what send_reply reads, via cli_from(to),
  * when the handler answers the requester). */
-static void crdt_line_reinject(const char *line)
+static void crdt_line_reinject(const char *line, int hunt)
 {
   struct CrdtP10Line ln;
   struct Client *src, *tagged = NULL;
@@ -648,7 +682,13 @@ static void crdt_line_reinject(const char *line)
     do_numeric(atoi(tokbuf), 1, &me, src, parc, parv);
   } else {
     struct Message *mptr = msg_find_token(tokbuf);
-    if (mptr && mptr->handlers[SERVER_HANDLER]) {
+    if (!mptr || !mptr->handlers[SERVER_HANDLER])
+      Debug((DEBUG_DEBUG, "CRDT line re-inject: no server handler for %s", tokbuf));
+    else if (!crdt_line_token_ok(mptr->tok, hunt))
+      log_write(LS_SYSTEM, L_NOTICE, 0,
+                "CRDT line re-inject: %s not carried (%s set) -- see crdt_line_token_ok",
+                mptr->tok, hunt ? "hunt" : "reply");
+    else {
       /* Same cap parse_server applies (parse.c:2178): split into at most
        * mptr->parameters, the last of which keeps the rest of the line. */
       int cap = (int)mptr->parameters;
@@ -657,8 +697,7 @@ static void crdt_line_reinject(const char *line)
       parc = 1 + crdt_p10_split(buf, parv + 1, cap);
       parv[parc] = NULL;
       (*mptr->handlers[SERVER_HANDLER])(&me, src, parc, parv);
-    } else
-      Debug((DEBUG_DEBUG, "CRDT line re-inject: no server handler for %s", tokbuf));
+    }
   }
 
   crdt_line_tags_apply(&me, NULL, 0);
@@ -718,7 +757,8 @@ int crdt_hunt_route_try(struct Client *from, struct Client *dstsrv, const char *
 {
   char line[BUFSIZE + 64], tag[40] = "", srcfull[16], dstyxx[4], oyxx[4];
   struct Client *osrv;
-  if (!crdt_hunt_avail() || !from || !dstsrv || !tok || !params)
+  if (!crdt_hunt_avail() || !from || !dstsrv || !tok || !params ||
+      !crdt_line_token_ok(tok, 1))
     return 0;
   if (msgid && *msgid) {
     char t[8];
@@ -1706,7 +1746,7 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
         /* Batch 6 item 3: a verbatim server->user line (a numeric reply, a
          * NOTICE...) reached the recipient's HOME: re-inject it through the
          * handler its token names, which delivers to the local client. */
-        crdt_line_reinject(m_text);
+        crdt_line_reinject(m_text, 0);
       } else if (tgt && MyConnect(tgt) && m_cmd[0] == 'I') {
         /* MR-5-1: a mesh-routed INVITE reached the target's HOME -> add the invite + notify
          * the local target (mirrors m_invite's MyConnect branch).  m_text = the channel. */
@@ -1775,7 +1815,7 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
              * Re-inject; do_numeric / the token's handler relay to the remote
              * user over our live legacy link (the source is rewritten to &me
              * for non-opers by FEAT_HIS_REWRITE as on the tree). */
-            crdt_line_reinject(m_text);
+            crdt_line_reinject(m_text, 0);
             crdt_cr_to_p10_bridged++;
           } else if (feature_bool(FEAT_CRDT_GATEWAY_BRIDGE) && srcc &&
               !crdt_user_is_mesh_only(srcc) &&
@@ -1963,7 +2003,7 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
                                           * tunnel armed around its dispatch */
         crdt_ch_tunnel_dispatch(srcyxx, bodybuf);
       else if (x_cmd == 'L')             /* batch 6 item 3: a hunted command, verbatim */
-        crdt_line_reinject(bodybuf);
+        crdt_line_reinject(bodybuf, 1);
       else
         crdt_services_reinject(x_cmd, bodybuf);
       log_write(LS_SYSTEM, L_INFO, 0, "Tier B CR-X: re-injected locally cmd=%c", x_cmd);

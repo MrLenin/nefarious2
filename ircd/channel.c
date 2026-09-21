@@ -546,6 +546,12 @@ struct Ban *find_ban(struct Client *cptr, struct Ban *banlist, int extbantype, i
     extbantype &= ~EBAN_EXCEPTLIST;
   }
 
+  /* Invariant 2: a server, a mesh anchor or &me has no user block and so no
+   * mask to match -- and this runs before the list walk, so an empty banlist
+   * crashed too.  Every caller reads NULL as "no ban". */
+  if (!cli_user(cptr))
+    return NULL;
+
   /* Build nick!user and alternate host names. */
   ircd_snprintf(0, nu, sizeof(nu), "%s!%s",
                 cli_name(cptr), cli_user(cptr)->username);
