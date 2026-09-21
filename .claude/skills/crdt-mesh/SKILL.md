@@ -124,14 +124,27 @@ All ride normal P10 framing as `:<src> CR <sub> …`. Gossiped to every `IsCrdtS
   target only); `*`-target broadcasts `W` WALLOPS (user- AND server-sourced) `U` WALLUSERS `O` SNO `M` SMO
   `D` DESYNCH `I` CI (target `*`; INVITE is `I` with a user target) `A` TK `S` PN `R` REDACT `E` METADATA
   (ephemeral) `G`/`g` masked PRIVMSG/NOTICE `J` GITSYNC `B` MULTILINE
-  announce `Z` SVSNOOP; user-target `Y` = a VERBATIM server-form line (numeric reply, NOTICE, any
-  server->user token) toward a user homed on a mesh stub -- minted by the `send_buffer` hook
-  (`crdt_reply_route_try`, the one point every send family reaches with the recipient known),
-  re-injected at the home through `do_numeric` / the token's SERVER handler (`crdt_line_reinject`,
-  cptr=&me, sptr=the line's own source); MODE excluded (umodes ride the user record). CR X letter
-  `L` is the request half: `hunt_server_cmd` toward a stub carries `[@Atags ]<src> <tok> <params>`
-  (the forwarded label rides inside), same re-inject at the destination; the gateway re-emits it
-  as real P10 for a legacy server it fronts. Pure helpers `crdt_p10.c` (cmocka'd). **Rules that every letter follows:** mint at the ORIGIN and once at the §17.7
+  announce `Z` SVSNOOP; user-target `Y` = a VERBATIM server-form line toward a user homed on a mesh
+  stub -- minted by the `send_buffer` hook (`crdt_reply_route_try`, the one point every send family
+  reaches with the recipient still known), re-injected at the home through `do_numeric` / the
+  token's SERVER handler (`crdt_line_reinject`). CR X letter `L` is the request half:
+  `hunt_server_cmd` toward a stub carries `[@Atags ]<src> <tok> <params>` (the forwarded label rides
+  inside, or the tag the request arrived with), same re-inject; the gateway re-emits it as real P10
+  for a legacy server it fronts. Pure helpers `crdt_p10.c` (cmocka'd).
+  **A stub is a SERVER destination.** `%C` and the seven `sendcmdto_*one*` formatters give an
+  `IsMeshStub` destination the SERVER branch -- token, numerics, compact tag -- or the re-inject
+  cannot resolve the line. A line built for a CLIENT destination renders a NAME source, which the
+  carrier's parser refuses; that plus the `cli_fd(cli_from(x)) < 0` skip already in every server-form
+  fan-out loop is what keeps channel and masked traffic off this carrier (no double delivery).
+  **The carriers move a BOUNDED token set** (`crdt_line_token_ok`): reply = every numeric + NOTICE
+  PRIVMSG PONG PRIVS ACCOUNT BX BS; hunt = VERSION TIME ADMIN INFO LUSERS MOTD RULES WHOIS PRIVS.
+  The re-inject runs a handler with `cptr = &me` and `sptr` = the line's own source -- a stub, or
+  `&me` when that numeric has no local Client. **`&me` is STAT_ME: it fails the EXACT `IsServer`
+  test exactly as a stub does** (the mirror of invariant 2), and asserts are COMPILED IN by default,
+  so `assert(IsServer(cptr))` is an abort. A handler gating on a privileged `cptr` also answers
+  ERR_NOPRIVILEGES when it is `&me` -- which is why oper ACTIONS (REHASH/CONNECT/UPING/SETTIME/
+  RPING) are deliberately not carried, only read-only queries. Widen the set only after reading that
+  handler for invariant 2 AND for authority it cannot be given here. **Rules that every letter follows:** mint at the ORIGIN and once at the §17.7
   gateway edge (`IsServer(cptr) && !IsCrdtAware(cptr)`); when minted keep the tree copy off CRDT-aware
   links (`sendcmdto_set_skip_crdt_servers()` / `sendcmdto_flag_serv_butone(..., FLAG_CRDT_AWARE)`) — a
   tree copy has no msgid to dedup on, so a P10-linked CRDT peer would deliver twice (F3 lesson); receivers
