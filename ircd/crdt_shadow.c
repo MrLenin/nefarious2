@@ -2306,10 +2306,18 @@ void crdt_shadow_convert_to_stub(struct Client *srv)
                                       * recv_ts), so seed THOSE — else a stub reusing a numeric
                                       * slot a prior partition left at miss_ticks>=3 is retired
                                       * on the very next tick, before its first post-split
-                                      * beacon lands, dropping its held users. */
+                                      * beacon lands, dropping its held users.  Do NOT touch
+                                      * recv_ts: crdt_shadow_server_beacon_fresh keys on it, and
+                                      * stamping "now" at the moment we watched the link die made
+                                      * a dead peer beacon-fresh for a full CRDT_BEACON_STALE --
+                                      * its chathistory store stayed "reachable" (no partial tag,
+                                      * queries tunnelled at a corpse), its held bouncer sessions
+                                      * unrevivable (holder_fresh), the orphan grace clock reset.
+                                      * The last real beacon (<= one tick old) already covers a
+                                      * peer that is merely re-routing; a dead one goes stale on
+                                      * schedule. */
     unsigned int n = (unsigned int)base64toint(cli_yxx(srv));
     if (n < CRDT_MAX_SERVERS) {
-      crdt_beacon[n].recv_ts          = CurrentTime;
       crdt_beacon[n].seen_since_tick  = 1;
       crdt_beacon[n].miss_ticks       = 0;
     }

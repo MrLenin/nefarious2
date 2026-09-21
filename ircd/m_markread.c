@@ -41,6 +41,7 @@
 #include "chathistory_presence.h"
 #include "client.h"
 #include "crdt_shadow.h" /* Tier C F2-a: mirror read-markers into the CRDT doc */
+#include "handlers.h"    /* crdt_gossip_message: PN gateway-edge mint */
 #include "hash.h"
 #include "history.h"
 #include "metadata.h"
@@ -485,6 +486,22 @@ int ms_presencesync(struct Client *cptr, struct Client *sptr, int parc,
 
   sendcmdto_serv_butone_v3(sptr, CMD_PRESENCE, cptr, "%s %s %s %s",
                            parv[1], parv[2], parv[3], parv[4]);
+  /* Gateway edge (CI / TK / MR precedent): an interval that arrived over
+   * a LEGACY link is minted into the mesh once here (letter 'S', the
+   * origin form in presence_broadcast_close); one from a CRDT peer
+   * already rode the mesh.  Without this a legacy-origin close never
+   * reached an overlay-only store, which then filtered those rows out of
+   * every strict-presence page.  Receivers apply locally only (the close
+   * is idempotent, so a P10-linked CRDT peer seeing both copies is
+   * harmless). */
+  if (IsServer(cptr) && !IsCrdtAware(cptr) && crdt_shadow_active()) {
+    char msgidbuf[64];
+    char body[ACCOUNTLEN + CHANNELLEN + 64];
+    generate_msgid(msgidbuf, sizeof msgidbuf);
+    ircd_snprintf(0, body, sizeof body, "%s %s %s %s",
+                  parv[1], parv[2], parv[3], parv[4]);
+    crdt_gossip_message(&me, 'S', "*", msgidbuf, body);
+  }
   return 0;
 }
 

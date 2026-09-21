@@ -878,6 +878,11 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
            * (CRDT_COLL_CH_STORAGE): re-derive evilnet/CHATHISTORYRETENTION
            * now, not on the 30s tick.  Cached compare -> no-op when unchanged. */
           chathistory_update_retention_isupport(1);
+          /* ... and advertise a doc-learned store to our legacy links now
+           * (CH A S synth, change-gated per store) instead of on the tick:
+           * a legacy peer's page fan-out otherwise excluded a store that
+           * appeared up to 30 s ago (the eager-publish sibling, 6204d08). */
+          crdt_shadow_ch_storage_synth_to(NULL);
           /* M6c-1 Increment 2: reconcile bouncer sessions EAGERLY on the delta that
            * carries the change, not on the 30s verify timer.  Without this the
            * gateway's HOLDING<->ACTIVE state-apply (and its BS A/D synth toward
