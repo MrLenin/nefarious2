@@ -9,6 +9,8 @@
 #include "config.h"
 
 #include "crdt_shadow.h"
+#include "webpush_keyring.h"   /* M3b: key id/text sizes */
+#include "webpush.h"           /* webpush_ring_adopt_from_doc */
 #include "crdt_state.h"
 #include "crdt_types.h"
 #include "crdt_wire.h"
@@ -3106,6 +3108,60 @@ void crdt_shadow_reconcile_webpush(void)
     log_write(LS_SYSTEM, L_INFO, 0,
               "CRDT F2-c: webpush reconcile applied %u, removed %d (doc->store)",
               sc.applied, removed);
+}
+
+/* ---- M3b: VAPID key ring over the mesh ------------------------------- */
+void crdt_shadow_webpush_key_set(const char *id, const char *text)
+{
+  const struct CrdtLWWValue *cur;
+  if (!shadow_on() || !id || !id[0] || !text || !text[0])
+    return;
+  cur = crdt_webpush_key_get(&g_crdt, id);
+  if (cur && cur->data && cur->data_len == strlen(text) &&
+      memcmp(cur->data, text, cur->data_len) == 0)
+    return;                                   /* identical: no op */
+  crdt_webpush_key_set(&g_crdt, id, text);
+  crdt_sync_push();
+}
+
+void crdt_shadow_webpush_key_remove(const char *id)
+{
+  if (!shadow_on() || !id || !id[0])
+    return;
+  if (!crdt_webpush_key_get(&g_crdt, id))
+    return;                                   /* absent or already tombstoned */
+  crdt_webpush_key_del(&g_crdt, id);
+  crdt_sync_push();
+}
+
+static void reconcile_webpush_key_cb(const char *key, uint32_t key_len,
+                                     const struct CrdtLWWValue *val, void *ctx)
+{
+  unsigned *applied = (unsigned *)ctx;
+  char id[WEBPUSH_KEY_ID_LEN + 1], text[WEBPUSH_KEY_TEXT_LEN];
+  if (!val || !val->data || !val->data_len || val->data_len >= sizeof text)
+    return;
+  if (key_len == 0 || key_len > WEBPUSH_KEY_ID_LEN)
+    return;
+  memcpy(id, key, key_len); id[key_len] = '\0';
+  memcpy(text, val->data, val->data_len); text[val->data_len] = '\0';
+  if (webpush_ring_adopt_from_doc(id, text) == 1)
+    (*applied)++;
+}
+
+/* Live doc keys we do not hold are adopted (m_webpush skips a key that
+ * would be pruned at once).  Tombstones drive nothing here: a key a peer
+ * still binds subscriptions to must stay until the local prune rule takes
+ * it (invariant 11 walk is unnecessary -- the ring is not a doc mirror). */
+void crdt_shadow_reconcile_webpush_keys(void)
+{
+  unsigned applied = 0;
+  if (!shadow_on())
+    return;
+  crdt_lwwmap_foreach(&g_crdt.webpush_keys, reconcile_webpush_key_cb, &applied);
+  if (applied)
+    log_write(LS_SYSTEM, L_INFO, 0,
+              "CRDT M3b: adopted %u VAPID key(s) from the doc", applied);
 }
 
 /* Drive the local readmarkers_cf from the doc (metadata_readmarker_set is newer-wins +
@@ -6342,6 +6398,7 @@ static void crdt_shadow_verify_cb(struct Event *ev)
   crdt_shadow_reconcile_metadata(); /* Tier C F2-b: drive account metadata from doc -> metadata_cf */
   crdt_shadow_reconcile_tempshuns(); /* Tier C F3: apply tempshun flips on the victim's home server */
   crdt_shadow_reconcile_webpush(); /* Tier C F2-c: drive webpush subs from doc -> LMDB */
+  crdt_shadow_reconcile_webpush_keys(); /* M3b: VAPID ring keys from the doc */
   crdt_shadow_reconcile_zlines();  /* ZLINE: drive global Z-lines from doc (+gateway) */
   crdt_shadow_reconcile_jupes();   /* JUPE: drive juped servers from doc (+gateway) */
   bounce_crdt_bsess_sweep();       /* 5-5e M2: mirror local-holder bouncer sessions -> doc (shadow) */

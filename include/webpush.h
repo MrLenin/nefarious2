@@ -293,4 +293,7 @@ void webpush_forget_account(const char *account);
 void webpush_notify_account(const char *account, const char *message,
                             size_t message_len);
 
+/* M3b: adopt a VAPID ring key learned from the CRDT doc (m_webpush.c). */
+int webpush_ring_adopt_from_doc(const char *id, const char *text);
+
 #endif /* INCLUDED_webpush_h */

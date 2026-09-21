@@ -1553,6 +1553,7 @@ static int burst_iter_cb(const char *account, const char *stored, void *data)
  * ------------------------------------------------------------------------- */
 
 static struct webpush_keyring wp_ring;
+#define WEBPUSH_KEY_GRACE 86400
 static int wp_ring_loaded = 0;          /* ring read from the store once */
 static char wp_last_error[200];         /* last setup problem, for STATS */
 static time_t wp_last_error_at = 0;
@@ -1702,8 +1703,14 @@ static const struct webpush_key *wp_mint(unsigned int generation, int manual,
     memset(&key, 0, sizeof(key));
     return NULL;
   }
-  if (rc == 1)
+  if (rc == 1) {
+    char dtext[WEBPUSH_KEY_TEXT_LEN];
     wp_send_key(NULL, NULL, &key);
+    /* M3b: into the doc too -- an overlay-only node never sees the WP K. */
+    if (webpush_key_format(&key, dtext, sizeof(dtext)) == 0)
+      crdt_shadow_webpush_key_set(key.id, dtext);
+    memset(dtext, 0, sizeof(dtext));
+  }
   memset(&key, 0, sizeof(key));
   wp_announce(why);
   return webpush_keyring_current(&wp_ring);
@@ -1951,6 +1958,43 @@ static int sweep_iter_cb(const char *account, const char *stored, void *data)
   return 0;
 }
 
+/** M3b: adopt a ring key learned from the CRDT doc (crdt_shadow reconcile).
+ * 1 adopted, 0 held already / not wanted, -1 rejected.  Not wanted = a key
+ * the local prune rule would take at once (older generation than our
+ * current key and past expire+grace since it was minted): a fresh node
+ * needs the current key to sign with, not the whole retired history.  A
+ * key we adopt here is also handed to our LEGACY links (skip CRDT-aware:
+ * they read the doc), so a legacy-only peer behind us learns it too. */
+int webpush_ring_adopt_from_doc(const char *id, const char *text)
+{
+  struct webpush_key key;
+  const struct webpush_key *cur;
+  int rc;
+  if (!webpush_store_available() || !wp_ring_loaded)
+    return 0;
+  if (webpush_keyring_find(&wp_ring, id))
+    return 0;
+  if (webpush_key_parse(id, text, &key) != 0)
+    return -1;
+  cur = webpush_keyring_current(&wp_ring);
+  if (cur && key.generation < cur->generation && key.created > 0) {
+    long long age = (long long)CurrentTime - key.created;
+    long long expire = (long long)feature_int(FEAT_WEBPUSH_EXPIRE);
+    if (expire > 0 && age > expire + WEBPUSH_KEY_GRACE) {
+      memset(&key, 0, sizeof(key));
+      return 0;
+    }
+  }
+  rc = wp_ring_adopt(&key, "doc");
+  if (rc == 1) {
+    sendcmdto_set_skip_crdt_servers();
+    wp_send_key(NULL, NULL, &key);
+    wp_announce("key from doc");
+  }
+  memset(&key, 0, sizeof(key));
+  return rc == 1 ? 1 : (rc < 0 ? -1 : 0);
+}
+
 /** Scheduled rotation: mint generation max+1 once the current key is
  * older than WEBPUSH_KEY_ROTATE.  Exactly one server does it in steady
  * state -- the key's origin -- so a linked network rotates once, not
@@ -1997,7 +2041,6 @@ static void wp_count_refs(void)
  * A day covers any burst or relink; a connection older than that which
  * registers for the first time binds to a key we may have dropped, and
  * delivery's 403 reaping plus the client's next login recover it. */
-#define WEBPUSH_KEY_GRACE 86400
 
 /** Drop retired keys nothing here references (past the grace) or past
  * the expiry window.  A peer still holding one re-sends it at the next
@@ -2016,6 +2059,10 @@ static void wp_prune(time_t now, long long expire)
                 id, k->generation, k->refs);
       webpush_store_key_del(id);
       webpush_key_unload(id);
+      /* M3b: the key's ORIGIN retires it in the doc (single-writer); peers
+       * that still bind subscriptions to it keep it until their own prune. */
+      if (0 == ircd_strcmp(k->origin, cli_name(&me)))
+        crdt_shadow_webpush_key_remove(id);
       webpush_keyring_remove(&wp_ring, id);   /* moves the last key into slot i */
       continue;
     }
@@ -2286,6 +2333,15 @@ int ms_webpush(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
     rc = wp_ring_adopt(&key, cli_name(sptr));
     if (rc == 1) {
       wp_send_key(NULL, cptr, &key);
+      /* M3b gateway edge: a key that arrived over a LEGACY link goes into
+       * the doc here (CI precedent); one from a CRDT peer is in the doc
+       * already (its origin, or the edge it crossed, put it there). */
+      if (IsServer(cptr) && !IsCrdtAware(cptr)) {
+        char dtext[WEBPUSH_KEY_TEXT_LEN];
+        if (webpush_key_format(&key, dtext, sizeof(dtext)) == 0)
+          crdt_shadow_webpush_key_set(key.id, dtext);
+        memset(dtext, 0, sizeof(dtext));
+      }
       wp_announce("key from peer");
       /* A local key this one displaces is retired, not dropped: the
        * maintenance prune takes it once nothing references it and the

@@ -408,6 +408,12 @@ void crdt_shadow_webpush_remove(const char *account, const char *endpoint);
 /** Tier C F2-c: drive the local webpush_store from the doc (SET-heal + reap).
  *  Part of the reconcile suite (eager + verify + materialize). */
 void crdt_shadow_reconcile_webpush(void);
+/* M3b: VAPID key ring over the mesh.  set = a key this node minted or learned
+ * at the legacy edge; remove = the key's ORIGIN pruned it; reconcile = adopt
+ * doc keys we do not hold (m_webpush decides, keeping referenced keys). */
+void crdt_shadow_webpush_key_set(const char *id, const char *text);
+void crdt_shadow_webpush_key_remove(const char *id);
+void crdt_shadow_reconcile_webpush_keys(void);
 
 /** Tier C F3: mint a TEMPSHUN flip into the doc at the ENTRY server (the oper's
  *  server for /TEMPSHUN, the §17.7 gateway edge for X3-sourced TS); the victim's

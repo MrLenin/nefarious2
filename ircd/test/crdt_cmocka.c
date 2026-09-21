@@ -2563,6 +2563,35 @@ static void test_crdt_beacon_tick_stale(void **state)
  * silently fails). Converge them over the doc, the F2-b metadata pattern:
  * key = account\0endpoint (opaque composite), value = the "endpoint|p256dh|auth"
  * stored blob, LWW (a re-register rotates keys -> newest wins). */
+/* M3b: a VAPID ring key replicates as (id -> record text); the origin's
+ * tombstone replicates too; digests agree at every step. */
+static void test_webpush_key_op_replicates(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s1, s2;
+  const struct CrdtLWWValue *v;
+  const char *id = "BIxYzPublicKeyBase64UrlNoPad";
+  const char *text = "3|1789960000|hub2.example|0|c2VjcmV0c2NhbGFy";
+  crdt_state_init(&s1, 3);
+  crdt_state_init(&s2, 8);
+  crdt_webpush_key_set(&s1, id, text);
+  crdt_state_sync(&s2, &s1);
+  v = crdt_webpush_key_get(&s2, id);
+  assert_non_null(v); assert_non_null(v->data);
+  assert_int_equal((int)strlen(text), (int)v->data_len);
+  assert_memory_equal(text, v->data, strlen(text));
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+  assert_int_equal(0, crdt_webpush_key_is_explicitly_removed(&s2, id));
+  /* the origin prunes it: tombstone replicates, get() is NULL, digests agree */
+  crdt_webpush_key_del(&s1, id);
+  crdt_state_sync(&s2, &s1);
+  assert_null(crdt_webpush_key_get(&s2, id));
+  assert_int_equal(1, crdt_webpush_key_is_explicitly_removed(&s2, id));
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+  crdt_state_clear(&s1);
+  crdt_state_clear(&s2);
+}
+
 static void test_webpush_op_replicates(void **state)
 {
   (void)state;
@@ -4080,6 +4109,7 @@ int main(void)
     cmocka_unit_test(test_accept_beyond_horizon_source),
     cmocka_unit_test(test_tempshun_replicates_and_reaps),
     cmocka_unit_test(test_webpush_op_replicates),
+    cmocka_unit_test(test_webpush_key_op_replicates),
     cmocka_unit_test(test_gline_doc_converges_same_lastmod),
     cmocka_unit_test(test_metadata_op_replicates),
     cmocka_unit_test(test_bsess_op_replicates),

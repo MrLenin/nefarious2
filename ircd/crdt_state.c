@@ -155,6 +155,7 @@ void crdt_state_init(struct CrdtNetworkState *st, uint16_t my_numeric)
   crdt_lwwmap_init(&st->metadata);
   crdt_lwwmap_init(&st->tempshuns);
   crdt_lwwmap_init(&st->webpush);
+  crdt_lwwmap_init(&st->webpush_keys);
   crdt_lwwmap_init(&st->decommissions);
   crdt_lwwmap_init(&st->ch_storage);
   crdt_orset_init(&st->silences);
@@ -183,6 +184,7 @@ void crdt_state_clear(struct CrdtNetworkState *st)
   crdt_lwwmap_clear(&st->metadata);
   crdt_lwwmap_clear(&st->tempshuns);
   crdt_lwwmap_clear(&st->webpush);
+  crdt_lwwmap_clear(&st->webpush_keys);
   crdt_lwwmap_clear(&st->decommissions);
   crdt_lwwmap_clear(&st->ch_storage);
   crdt_orset_clear(&st->silences);
@@ -1010,6 +1012,50 @@ int crdt_webpush_is_explicitly_removed(const struct CrdtNetworkState *st,
   return crdt_lwwmap_is_deleted(&st->webpush, key, klen);
 }
 
+void crdt_webpush_key_set(struct CrdtNetworkState *st, const char *id, const char *text)
+{
+  struct HLC ts = hlc_local_event(&st->clock);
+  uint32_t klen = (uint32_t)strlen(id), vlen = (uint32_t)strlen(text);
+  uint64_t seq;
+  struct CrdtOp *op;
+  crdt_lwwmap_set(&st->webpush_keys, id, klen, text, vlen, ts, st->my_numeric);
+  seq = st->next_seq++;
+  op = op_new(st->my_numeric, seq, CRDT_OP_SET, CRDT_COLL_WEBPUSH_KEYS);
+  op->key = memdup(id, klen);
+  op->key_len = klen;
+  op->val = memdup(text, vlen);
+  op->val_len = vlen;
+  op->ts = ts;
+  op->writer = st->my_numeric;
+  record(st, op);
+}
+
+void crdt_webpush_key_del(struct CrdtNetworkState *st, const char *id)
+{
+  struct HLC ts = hlc_local_event(&st->clock);
+  uint32_t klen = (uint32_t)strlen(id);
+  uint64_t seq;
+  struct CrdtOp *op;
+  crdt_lwwmap_delete(&st->webpush_keys, id, klen, ts, st->my_numeric);
+  seq = st->next_seq++;
+  op = op_new(st->my_numeric, seq, CRDT_OP_DELETE, CRDT_COLL_WEBPUSH_KEYS);
+  op->key = memdup(id, klen);
+  op->key_len = klen;
+  op->ts = ts;
+  op->writer = st->my_numeric;
+  record(st, op);
+}
+
+int crdt_webpush_key_is_explicitly_removed(const struct CrdtNetworkState *st, const char *id)
+{
+  return crdt_lwwmap_is_deleted(&st->webpush_keys, id, (uint32_t)strlen(id));
+}
+
+const struct CrdtLWWValue *crdt_webpush_key_get(const struct CrdtNetworkState *st, const char *id)
+{
+  return crdt_lwwmap_get(&st->webpush_keys, id, (uint32_t)strlen(id));
+}
+
 const struct CrdtLWWValue *crdt_webpush_get(const struct CrdtNetworkState *st,
                                             const char *key, uint32_t klen)
 {
@@ -1704,6 +1750,7 @@ static struct CrdtLWWMap *lww_for(struct CrdtNetworkState *st,
   case CRDT_COLL_METADATA:      return &st->metadata;
   case CRDT_COLL_TEMPSHUNS:     return &st->tempshuns;
   case CRDT_COLL_WEBPUSH:       return &st->webpush;
+  case CRDT_COLL_WEBPUSH_KEYS:  return &st->webpush_keys;
   case CRDT_COLL_DECOMMISSIONS: return &st->decommissions;
   case CRDT_COLL_CH_STORAGE: return &st->ch_storage;
   default:                return NULL;
@@ -2086,6 +2133,7 @@ uint64_t crdt_state_digest(const struct CrdtNetworkState *st)
   acc = digest_lww(acc, &st->metadata, 21);  /* salt 21: Tier C F2-b account metadata */
   acc = digest_lww(acc, &st->tempshuns, 22); /* salt 22: Tier C F3 tempshuns */
   acc = digest_lww(acc, &st->webpush, 23);   /* salt 23: Tier C F2-c webpush subs */
+  acc = digest_lww(acc, &st->webpush_keys, 26); /* salt 26: M3b VAPID key ring */
   acc = digest_lww(acc, &st->decommissions, 24); /* salt 24: decommission markers */
   acc = digest_lww(acc, &st->ch_storage, 25);    /* salt 25: 5-5f B2 CH storage capability */
   acc = digest_orset(acc, &st->silences, "", 0, 19);/* salt 19: Tier C F1-c silences */
@@ -2148,6 +2196,7 @@ uint64_t crdt_state_digest_materialized(const struct CrdtNetworkState *st)
   acc = digest_lww(acc, &st->metadata, 21);  /* salt 21: Tier C F2-b account metadata */
   acc = digest_lww(acc, &st->tempshuns, 22); /* salt 22: Tier C F3 tempshuns */
   acc = digest_lww(acc, &st->webpush, 23);   /* salt 23: Tier C F2-c webpush subs */
+  acc = digest_lww(acc, &st->webpush_keys, 26); /* salt 26: M3b VAPID key ring */
   acc = digest_lww(acc, &st->decommissions, 24); /* salt 24: decommission markers */
   acc = digest_lww(acc, &st->ch_storage, 25);    /* salt 25: 5-5f B2 CH storage capability */
   acc = digest_orset_present(acc, &st->silences, "", 0, 19);/* salt 19: Tier C F1-c silences */

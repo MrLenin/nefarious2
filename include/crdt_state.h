@@ -335,7 +335,9 @@ enum CrdtCollection {
   CRDT_COLL_TEMPSHUNS,     /**< victim numeric -> CrdtTempshun (LWW) — Tier C F3 */
   CRDT_COLL_WEBPUSH,       /**< account\0endpoint -> subscription blob (LWW) — Tier C F2-c */
   CRDT_COLL_DECOMMISSIONS, /**< 2-char server numeric -> CrdtDecommission (LWW) — operator-asserted permanent absence */
-  CRDT_COLL_CH_STORAGE     /**< 2-char server numeric -> CrdtChStorage (LWW) — 5-5f B2 chathistory storage capability */
+  CRDT_COLL_CH_STORAGE,    /**< 2-char server numeric -> CrdtChStorage (LWW) — 5-5f B2 chathistory storage capability */
+  CRDT_COLL_WEBPUSH_KEYS   /**< VAPID key id -> webpush_key_format() text (LWW; add-only on the wire, the
+                            *   origin tombstones a key it prunes) — M3b, 2026-09-21 */
 };
 
 struct CrdtOp {
@@ -422,6 +424,7 @@ struct CrdtNetworkState {
   struct CrdtLWWMap       metadata;     /**< account\0key -> metadata blob (LWW, Tier C F2-b) */
   struct CrdtLWWMap       tempshuns;    /**< victim numeric -> CrdtTempshun (LWW, Tier C F3) */
   struct CrdtLWWMap       webpush;      /**< account\0endpoint -> subscription blob (LWW, Tier C F2-c) */
+  struct CrdtLWWMap       webpush_keys; /**< VAPID key id -> key record text (LWW, M3b) */
   struct CrdtLWWMap       decommissions; /**< 2-char server numeric -> CrdtDecommission (LWW) */
   struct CrdtLWWMap       ch_storage;    /**< 2-char server numeric -> CrdtChStorage (LWW) — 5-5f B2 */
   struct CrdtORSet        silences;     /**< usernumeric\0mask -> per-user silence masks (Tier C F1-c) */
@@ -743,6 +746,15 @@ int  crdt_webpush_is_explicitly_removed(const struct CrdtNetworkState *st,
                                         const char *key, uint32_t klen);
 const struct CrdtLWWValue *crdt_webpush_get(const struct CrdtNetworkState *st,
                                             const char *key, uint32_t klen);
+/** M3b: VAPID key ring over the mesh — plain HLC-LWW on the key id, value =
+ *  the ring's own persisted record text (webpush_key_format).  Add-only in
+ *  practice; the key's ORIGIN tombstones it when it prunes it (peers keep a
+ *  key that still has local refs regardless: the tombstone only stops
+ *  re-adoption). */
+void crdt_webpush_key_set(struct CrdtNetworkState *st, const char *id, const char *text);
+void crdt_webpush_key_del(struct CrdtNetworkState *st, const char *id);
+int  crdt_webpush_key_is_explicitly_removed(const struct CrdtNetworkState *st, const char *id);
+const struct CrdtLWWValue *crdt_webpush_key_get(const struct CrdtNetworkState *st, const char *id);
 
 const struct CrdtLWWValue *crdt_metadata_get(const struct CrdtNetworkState *st,
                                              const char *key, uint32_t klen);
