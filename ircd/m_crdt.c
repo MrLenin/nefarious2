@@ -1196,6 +1196,26 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
             sendcmdto_serv_butone_v3(msrc, CMD_METADATA, NULL, "%s %s", ev[0], ev[1]);
         }
       }
+    } else if (m_cmd[0] == 'L' && target[0] == '*') {  /* SASL mechanism list (M5):
+                                            * the services announcement, applied
+                                            * locally so sasl= matches the network. */
+      set_sasl_mechanisms(m_text);
+      log_write(LS_SYSTEM, L_INFO, 0, "SASL mechanisms set to: %s (mesh)", m_text);
+    } else if (m_cmd[0] == 'V' && target[0] == '*') {  /* PRIVS (M8): "<numeric> <priv …>",
+                                            * applied as ms_privs does; real P10 to
+                                            * legacy links only when the origin has
+                                            * no tree presence here. */
+      const char *sp = strchr(m_text, ' ');
+      if (sp && sp > m_text && sp - m_text < 8 && sp[1]) {
+        char vn[8];
+        struct Client *vu;
+        ircd_strncpy(vn, m_text, (size_t)(sp - m_text) + 1);
+        vu = findNUser(vn);
+        if (vu) {
+          struct Client *vsrv = cli_user(vu)->server;
+          privs_apply_from_mesh(vn, sp + 1, !vsrv || IsMeshStub(vsrv));
+        }
+      }
     } else if (m_cmd[0] == 'Z' && target[0] == '*') {  /* SVSNOOP: "<servermask> <+|->",
                                             * every mesh node applies it against
                                             * itself (the P10 handler's logic); the

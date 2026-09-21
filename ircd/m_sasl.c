@@ -91,6 +91,7 @@
 #include "ircd_snprintf.h"     /* Tier B: build the CR-X reply body */
 #include "ircd_string.h"
 #include "handlers.h"          /* Tier B: crdt_route_services_reply_try (services-anchor bridge) */
+#include "crdt_shadow.h"        /* crdt_shadow_active: mech list over the mesh */
 #include "msg.h"
 #include "numeric.h"
 #include "numnicks.h"
@@ -127,13 +128,35 @@ int ms_sasl(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
     ext = parv[5];
 
   if (!strcmp(parv[1], "*")) {
+    int mesh = 0;
     /* Check for mechanism list broadcast: SASL * * M :PLAIN,EXTERNAL,... */
     if (!strcmp(token, "*") && reply[0] == 'M') {
       set_sasl_mechanisms(data);
       log_write(LS_SYSTEM, L_INFO, 0, "SASL mechanisms set to: %s", data);
+      /* Gateway edge (CI precedent): services announce the list over a
+       * LEGACY link; mint the mesh copy once here (CR M 'L') so an
+       * overlay-only node advertises the network's sasl= value instead of
+       * its FEAT_SASL_DEFAULT_MECHANISMS fallback.  One from a CRDT peer
+       * already rode the mesh.  Only the mechanism list is carried: the
+       * other "*" forms are agent-facing and the services bridge owns
+       * that leg. */
+      if (IsServer(cptr) && !IsCrdtAware(cptr) && crdt_shadow_active()) {
+        char body[BUFSIZE], msgidbuf[64];
+        ircd_snprintf(0, body, sizeof body, "%s", data);
+        generate_msgid(msgidbuf, sizeof msgidbuf);
+        crdt_gossip_message(&me, 'L', "*", msgidbuf, body);
+        mesh = 1;
+      }
     }
 
-    if (ext != NULL)
+    if (mesh) {
+      if (ext != NULL)
+        sendcmdto_flag_serv_butone(sptr, CMD_SASL, cptr, FLAG_LAST_FLAG, FLAG_CRDT_AWARE,
+                                   "* %s %s %s :%s", token, reply, data, ext);
+      else
+        sendcmdto_flag_serv_butone(sptr, CMD_SASL, cptr, FLAG_LAST_FLAG, FLAG_CRDT_AWARE,
+                                   "* %s %s :%s", token, reply, data);
+    } else if (ext != NULL)
       sendcmdto_serv_butone(sptr, CMD_SASL, cptr, "* %s %s %s :%s",
                                    token, reply, data, ext);
     else

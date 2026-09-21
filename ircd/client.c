@@ -37,6 +37,9 @@
 #include "s_conf.h"
 #include "s_debug.h"
 #include "send.h"
+#include "numnicks.h"
+#include "handlers.h"
+#include "crdt_shadow.h"
 #include "struct.h"
 
 /* #include <assert.h> -- Now using assert in ircd_log.h */
@@ -335,6 +338,21 @@ void client_check_privs(struct Client *client, struct Client *replyto)
   }
 }
 
+/* M8: the mesh copy of one PRIVS chunk (CR M 'V', target "*", body
+ * "<numeric> <priv …>" -- the P10 body).  Emits whenever the shadow is
+ * active; the caller keeps the tree copy off CRDT-aware links.  Without
+ * this HasPriv() on a mesh-only node was false for every remote oper. */
+int client_privs_mesh_mint(struct Client *client, const char *privlist)
+{
+  char body[BUFSIZE], msgidbuf[64];
+  if (!crdt_shadow_active() || !client || !privlist)
+    return 0;
+  ircd_snprintf(0, body, sizeof body, "%s%s %s", NumNick(client), privlist);
+  generate_msgid(msgidbuf, sizeof msgidbuf);
+  crdt_gossip_message(&me, 'V', "*", msgidbuf, body);
+  return 1;
+}
+
 void client_send_privs(struct Client *from, struct Client *to, struct Client *client)
 {
   int i, p;
@@ -375,6 +393,8 @@ void client_sendtoserv_privs(struct Client *client)
     if (HasPriv(client, privtab[i].priv)) {
       if ((p >= MAXPARA) || (strlen(privbuf) + strlen(privtab[i].name) + 1 > BUFSIZE - mlen)) {
         p = 1;
+        if (client_privs_mesh_mint(client, privbuf))
+          sendcmdto_set_skip_crdt_servers();
         sendcmdto_serv_butone(&me, CMD_PRIVS, client, "%C %s", client, privbuf);
         memset(&privbuf, 0, BUFSIZE);
       }
@@ -385,6 +405,8 @@ void client_sendtoserv_privs(struct Client *client)
   }
 
   if (strlen(privbuf) > 0) {
+    if (client_privs_mesh_mint(client, privbuf))
+      sendcmdto_set_skip_crdt_servers();
     sendcmdto_serv_butone(&me, CMD_PRIVS, client, "%C %s", client, privbuf);
   }
 }

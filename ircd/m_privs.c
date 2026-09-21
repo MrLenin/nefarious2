@@ -37,6 +37,8 @@
 #include "numeric.h"
 #include "numnicks.h"
 #include "send.h"
+#include "handlers.h"
+#include "crdt_shadow.h"
 
 /** Handle a local operator's privilege query.
  * @param[in] cptr Client that sent us the message.
@@ -77,6 +79,32 @@ int mo_privs(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
  * @param[in] parv Argument vector.
  * @see \ref m_functions
  */
+/* M8: 0 = normal P10 relay; 1 = apply only (mesh copy from a tree-present
+ * origin: legacy rides the origin's tree copy); 2 = apply + re-emit to
+ * legacy links only (mesh copy from a tree-absent origin). */
+static int privs_relay_mode = 0;
+
+void privs_apply_from_mesh(const char *numeric, const char *privlist, int relay_legacy)
+{
+  char buf[BUFSIZE];
+  char *pv[MAXPARA + 2];
+  char *q;
+  int pc = 0;
+  ircd_strncpy(buf, privlist, sizeof buf);
+  pv[pc++] = "PRIVS";
+  pv[pc++] = (char *)numeric;
+  for (q = buf; *q && pc < MAXPARA; ) {
+    while (*q == ' ') *q++ = '\0';
+    if (!*q) break;
+    pv[pc++] = q;
+    while (*q && *q != ' ') q++;
+  }
+  pv[pc] = NULL;
+  privs_relay_mode = relay_legacy ? 2 : 1;
+  ms_privs(&me, &me, pc, pv);
+  privs_relay_mode = 0;
+}
+
 int ms_privs(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
 {
   struct Client *acptr;
@@ -154,6 +182,15 @@ int ms_privs(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
              &cli_privs(acptr), sizeof(struct Privs));
     }
 
+    if (privs_relay_mode == 1)
+      return 0;                             /* mesh receiver: apply only */
+    /* Gateway edge (CI precedent): a PRIVS that arrived over a LEGACY link
+     * is minted into the mesh once here; the tree relay then goes to
+     * legacy links only.  privs_relay_mode 2 = the mesh receiver asked for
+     * a legacy re-emit (the origin has no tree presence here). */
+    if ((IsServer(cptr) && !IsCrdtAware(cptr) && client_privs_mesh_mint(acptr, buf))
+        || privs_relay_mode == 2)
+      sendcmdto_set_skip_crdt_servers();
     sendcmdto_serv_butone(sptr, CMD_PRIVS, cptr, "%C %s", acptr, buf);
   } else {
     if (parc < 2)

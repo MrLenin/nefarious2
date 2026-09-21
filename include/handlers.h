@@ -254,6 +254,11 @@ extern int ms_ping(struct Client*, struct Client*, int, char*[]);
 extern int ms_pong(struct Client*, struct Client*, int, char*[]);
 extern int ms_privmsg(struct Client*, struct Client*, int, char*[]);
 extern int ms_privs(struct Client*, struct Client*, int, char*[]);
+/* PRIVS over the CRDT mesh (M8): apply a "<numeric> <priv …>" line the way
+ * ms_privs does; relay real P10 to legacy links only when asked. */
+extern void privs_apply_from_mesh(const char *numeric, const char *privlist, int relay_legacy);
+/* SASL mechanism list over the mesh (M5): the receiver's apply. */
+extern void set_sasl_mechanisms(const char *mechs);
 extern int ms_quit(struct Client*, struct Client*, int, char*[]);
 extern int ms_rehash(struct Client*, struct Client*, int, char*[]);
 extern int ms_remove(struct Client*, struct Client*, int, char*[]);
