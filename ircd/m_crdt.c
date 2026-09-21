@@ -1103,6 +1103,43 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
           presence_apply_close(pv[0], /*is_session=*/0, pv[1], ps, pe);
         }
       }
+    } else if (m_cmd[0] == 'R' && target[0] == '*') {  /* REDACT (design B, live half):
+                                            * "<chan> <msgid> <redact_msgid> <time_ms>
+                                            * :<reason>" -- apply exactly as ms_redact
+                                            * (placeholder + ONE context row under the
+                                            * origin's redact msgid/time + member
+                                            * fan-out).  Re-emit real P10 to LEGACY links
+                                            * only when the origin has no tree presence
+                                            * here (overlay-only origin; TK precedent),
+                                            * else legacy rides the origin's tree copy. */
+      char rb[BUFSIZE];
+      char *rv[4];
+      char *q, *rreason = NULL;
+      int rc = 0;
+      ircd_strncpy(rb, m_text, sizeof rb);
+      for (q = rb; *q && rc < 4; ) {
+        while (*q == ' ') *q++ = '\0';
+        if (!*q) break;
+        rv[rc++] = q;
+        while (*q && *q != ' ') q++;
+      }
+      if (rc == 4) {
+        struct Client *rsrc = srcu ? srcu : (srcsrv ? srcsrv : &me);
+        struct Client *osrv = srcu ? cli_user(srcu)->server : srcsrv;
+        uint64_t rtime = (uint64_t)strtoull(rv[3], NULL, 10);
+        while (*q == ' ') q++;
+        if (*q == ':') q++;
+        rreason = *q ? q : NULL;
+        Debug((DEBUG_DEBUG, "CRDT RD: mesh redact %s %s from %s", rv[0], rv[1], srcyxx));
+        redact_apply_remote(rsrc, rv[0], rv[1], rv[2], rtime, rreason);
+        if (!osrv || IsMeshStub(osrv)) {
+          sendcmdto_set_s2s_tags(rtime, rv[2]);
+          sendcmdto_want_s2s_tags(1);
+          sendcmdto_set_skip_crdt_servers();
+          sendcmdto_serv_butone_v3(rsrc, CMD_REDACT, NULL, "%s %s :%s",
+                                   rv[0], rv[1], rreason ? rreason : "");
+        }
+      }
     } else if (m_cmd[0] == 'Z' && target[0] == '*') {  /* SVSNOOP: "<servermask> <+|->",
                                             * every mesh node applies it against
                                             * itself (the P10 handler's logic); the

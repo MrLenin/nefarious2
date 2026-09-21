@@ -322,6 +322,16 @@ extern void broadcast_channel_advertisement(const char*);
 extern void chathistory_init_callbacks(void);
 extern int m_redact(struct Client*, struct Client*, int, char*[]);
 extern int ms_redact(struct Client*, struct Client*, int, char*[]);
+/* REDACT on the CRDT mesh (design B, live half): apply a channel redaction the
+ * way ms_redact does (row placeholder + one REDACT context row + member
+ * fan-out), and mint the CR M 'R' copy (1 if minted; caller then keeps the
+ * tree relay off CRDT-aware links). */
+extern void redact_apply_remote(struct Client *src, const char *target,
+                                const char *msgid, const char *redact_msgid,
+                                uint64_t time_ms, const char *reason);
+extern int redact_mesh_mint(struct Client *from, const char *target,
+                            const char *msgid, const char *redact_msgid,
+                            uint64_t time_ms, const char *reason);
 extern int m_register(struct Client*, struct Client*, int, char*[]);
 extern int m_verify(struct Client*, struct Client*, int, char*[]);
 extern int m_markread(struct Client*, struct Client*, int, char*[]);

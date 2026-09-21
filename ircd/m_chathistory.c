@@ -49,6 +49,9 @@
 #include "metadata.h"
 #include "ircd_snprintf.h"
 #include "crdt_shadow.h"   /* 5-5f B2: doc-backed CH storage capability lookup */
+/* m_redact.c (handlers.h cannot be included here — forward_history_write prototype nit) */
+extern int redact_mesh_mint(struct Client *from, const char *target, const char *msgid,
+                            const char *redact_msgid, uint64_t time_ms, const char *reason);
 #include "ircd_string.h"
 #include "list.h"
 #include "msg.h"
@@ -5549,6 +5552,8 @@ static void complete_redact_fed(struct FedRequest *req)
      * and store the REDACT event with this same msgid via S2S tags). */
     sendcmdto_set_s2s_tags(time_ms, redact_msgid);
     sendcmdto_want_s2s_tags(1);
+    if (redact_mesh_mint(sptr, req->target, ctx->msgid, redact_msgid, time_ms, reason))
+      sendcmdto_set_skip_crdt_servers();   /* CRDT-aware peers got the mesh copy */
     sendcmdto_serv_butone_v3(sptr, CMD_REDACT, sptr, "%s %s :%s",
                           req->target, ctx->msgid, reason ? reason : "");
   }
