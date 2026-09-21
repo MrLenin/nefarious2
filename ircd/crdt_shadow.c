@@ -2289,11 +2289,21 @@ static void crdt_present_stub(struct Client *srv)
     SetIPv6(srv);
   if (!Protocol(srv))
     cli_serv(srv)->prot = 10;       /* Case-B anchor default (MAJOR_PROTOCOL "10") */
+  /* Present it with the SAME flag letters the canonical relayed intro carries
+   * (s_serv.c:310, m_server.c:1014).  Dropping them made the stub look like a
+   * bare P10 server to legacy: with no 'v' the legacy peer would not correlate
+   * a labelled forwarded command toward it (hunt_server_cmd gates the label
+   * save on IsIRCv3Aware of the DESTINATION), so a labelled reply that the
+   * mesh carrier now delivers correctly arrived untagged and its batch never
+   * closed. */
   sendcmdto_flag_serv_butone(&me, CMD_SERVER, NULL, FLAG_LAST_FLAG, FLAG_CRDT_AWARE,
-                             "%s 2 0 %Tu J%02u %s%s +%s%s :%s",
+                             "%s 2 0 %Tu J%02u %s%s +%s%s%s%s%s%s%s%s :%s",
                              cli_name(srv), cli_serv(srv)->timestamp, Protocol(srv),
                              NumServCap(srv), IsHub(srv) ? "h" : "",
-                             IsIPv6(srv) ? "6" : "", cli_info(srv));
+                             IsService(srv) ? "s" : "", IsIPv6(srv) ? "6" : "",
+                             IsOpLevels(srv) ? "o" : "", IsIRCv3Aware(srv) ? "v" : "",
+                             IsRenameCapable(srv) ? "r" : "", IsBxfAware(srv) ? "F" : "",
+                             IsCrdtAware(srv) ? "C" : "", cli_info(srv));
   log_write(LS_SYSTEM, L_NOTICE, 0,
             "CRDT mesh: presented stub %s to legacy as a P10 subtree (R6c)", cli_name(srv));
   /* Do NOT run the reconcile suite here: present() is called from make_anchor (Case B),
@@ -2413,6 +2423,12 @@ static struct Client *crdt_shadow_make_anchor(const char *srvnum)
   SetServerYXX(nc, nc, yxx);       /* server_list[srvnum]=nc + client_list; NO add_dlink */
   SetFlag(nc, FLAG_MAP);           /* keep its users visible in WHO */
   SetCrdtAware(nc);                /* its users are mesh-owned: from_crdt_peer self-skips */
+  SetIRCv3Aware(nc);               /* true by construction: a CRDT mesh peer speaks the
+                                    * IRCv3 S2S set (the CR tokens are a superset).  A
+                                    * CONVERTED stub keeps this from its own handshake;
+                                    * a synthetic anchor has no handshake to keep, and
+                                    * without it the anchor is presented to legacy as a
+                                    * bare P10 server (see crdt_present_stub). */
   add_client_to_list(nc);
   hAddClient(nc);
   log_write(LS_SYSTEM, L_NOTICE, 0,

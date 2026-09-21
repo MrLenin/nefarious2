@@ -2043,8 +2043,12 @@ doprintf(struct Client *dest, struct BufData *buf_p, const char *fmt,
       const char *str1 = 0, *str2 = 0, *str3 = 0;
       int slen1 = 0, slen2 = 0, slen3 = 0, elen = 0, plen = 0;
 
-      /* &me is used if it's not a definite server */
-      if (dest && (IsServer(dest) || IsMe(dest))) {
+      /* &me is used if it's not a definite server.  A STAT_MESH_SERVER stub
+       * is a server LINK (dead-sink, or the link the mesh reply carrier reads
+       * back): a line formatted toward it must be in server form -- numerics
+       * -- or the carrier's verbatim re-inject cannot resolve a thing
+       * (batch 6 item 3). */
+      if (dest && (IsServer(dest) || IsMe(dest) || IsMeshStub(dest))) {
 	/* Tier2: a STAT_MESH_SERVER stub IS a server (cli_serv set, cli_user==NULL);
 	 * IsServer is exact ==STAT_SERVER so guard it explicitly here, else the else
 	 * branch derefs cli_user(stub)->server (NULL) -> SIGSEGV. */

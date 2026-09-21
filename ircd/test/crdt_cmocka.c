@@ -4122,6 +4122,11 @@ static void test_p10_line_parse_rejects_junk(void **state)
   assert_int_equal(crdt_p10_line_parse("ABC 311 x", 9, &ln), 0);   /* 3-char source */
   assert_int_equal(crdt_p10_line_parse("AB 311", 6, &ln), 1);      /* empty rest is fine */
   assert_int_equal((int)ln.rest_len, 0);
+  /* a colon-prefixed prefix carries the same numeric */
+  assert_int_equal(crdt_p10_line_parse(":AB O ACAAB :hi", 15, &ln), 1);
+  assert_int_equal((int)ln.src_len, 2);
+  assert_memory_equal(ln.src, "AB", 2);
+  assert_int_equal(ln.tok[0], 'O');
 }
 
 static void test_p10_split_trailing_and_cap(void **state)

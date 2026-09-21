@@ -1363,14 +1363,20 @@ void sendcmdto_one(struct Client *from, const char *cmd, const char *tok,
   vd.vd_format = pattern; /* set up the struct VarData for %v */
   va_start(vd.vd_args, pattern);
 
-  /* For S2S messages, add compact tags.  Gate on FLAG_IRCV3AWARE so
+  /* A mesh stub/anchor is a SERVER link (its Connection is a dead sink, and
+   * under batch 6 item 3 the mesh reply carrier reads the formatted line back
+   * off it): format in SERVER form -- token, numerics, compact tags -- exactly
+   * as for a live peer, or the carrier's verbatim re-inject at the far end
+   * cannot resolve the source, the target or the command.
+   *
+   * For S2S messages, add compact tags.  Gate on FLAG_IRCV3AWARE so
    * legacy peers (which don't speak the @A compact format) don't pay
    * the prefix bytes against the 512-byte wire budget — they'd strip
    * the @-prefixed tags but the bytes still count, risking content
    * truncation on long messages.  Same gating discipline as 350769a
    * applied to the v3-only S2S tokens. */
-  if ((IsServer(to) || IsMe(to)) && feature_bool(FEAT_P10_MESSAGE_TAGS) &&
-      IsIRCv3Aware(to) &&
+  if ((IsServer(to) || IsMe(to) || IsMeshStub(to)) && feature_bool(FEAT_P10_MESSAGE_TAGS) &&
+      (IsIRCv3Aware(to) || IsMeshStub(to)) &&
       (s2s_msgid_override[0] || s2s_sessid_override[0] ||
        strcmp(tok, TOK_PRIVATE) == 0 || strcmp(tok, TOK_NOTICE) == 0 ||
        strcmp(tok, TOK_QUIT) == 0)) {
@@ -1403,7 +1409,7 @@ void sendcmdto_one(struct Client *from, const char *cmd, const char *tok,
     s2s_msgid_override[0] = '\0';  /* Clear even if not used */
     s2s_sessid_override[0] = '\0';  /* Clear even if not used */
     s2s_time_override = 0;
-    mb = msgq_make(to, "%:#C %s %v", from, IsServer(to) || IsMe(to) ? tok : cmd,
+    mb = msgq_make(to, "%:#C %s %v", from, IsServer(to) || IsMe(to) || IsMeshStub(to) ? tok : cmd,
                    &vd);
   }
 
@@ -1453,10 +1459,10 @@ void sendcmdto_one_tags(struct Client *from, const char *cmd, const char *tok,
   tags = format_message_tags_for_ex(tagbuf, sizeof(tagbuf), from, to, msgid);
 
   if (tags)
-    mb = msgq_make(to, "%s%:#C %s %v", tags, from, IsServer(to) || IsMe(to) ? tok : cmd,
+    mb = msgq_make(to, "%s%:#C %s %v", tags, from, IsServer(to) || IsMe(to) || IsMeshStub(to) ? tok : cmd,
 		   &vd);
   else
-    mb = msgq_make(to, "%:#C %s %v", from, IsServer(to) || IsMe(to) ? tok : cmd,
+    mb = msgq_make(to, "%:#C %s %v", from, IsServer(to) || IsMe(to) || IsMeshStub(to) ? tok : cmd,
 		   &vd);
 
   va_end(vd.vd_args);
@@ -1498,10 +1504,10 @@ void sendcmdto_one_tags_ext(struct Client *from, const char *cmd, const char *to
   tags = format_message_tags_for_ex(tagbuf, sizeof(tagbuf), from, to, ext_msgid);
 
   if (tags)
-    mb = msgq_make(to, "%s%:#C %s %v", tags, from, IsServer(to) || IsMe(to) ? tok : cmd,
+    mb = msgq_make(to, "%s%:#C %s %v", tags, from, IsServer(to) || IsMe(to) || IsMeshStub(to) ? tok : cmd,
 		   &vd);
   else
-    mb = msgq_make(to, "%:#C %s %v", from, IsServer(to) || IsMe(to) ? tok : cmd,
+    mb = msgq_make(to, "%:#C %s %v", from, IsServer(to) || IsMe(to) || IsMeshStub(to) ? tok : cmd,
 		   &vd);
 
   va_end(vd.vd_args);
@@ -1551,7 +1557,7 @@ void sendcmdto_one_tags_with_client(struct Client *from,
   vd.vd_format = pattern;
   va_start(vd.vd_args, pattern);
 
-  if (IsServer(to) || IsMe(to)) {
+  if (IsServer(to) || IsMe(to) || IsMeshStub(to)) {
     /* Server-link destination — use compact S2S tag prefix.
      * IRCV3AWARE peers get @A...,C<client_tags>; legacy peers get the
      * bare command (preserves pre-extension behaviour where direct
@@ -1567,7 +1573,7 @@ void sendcmdto_one_tags_with_client(struct Client *from,
      * cptr carries none. */
     struct Client *tag_cptr = s2s_cptr_override;
     s2s_cptr_override = NULL;
-    if (IsIRCv3Aware(to) &&
+    if ((IsIRCv3Aware(to) || IsMeshStub(to)) &&
         format_s2s_tags_with_client(s2s_tagbuf, sizeof(s2s_tagbuf), tag_cptr,
                                     has_ctags ? client_tags : NULL,
                                     NULL, 0)) {
@@ -1673,10 +1679,10 @@ void sendcmdto_one_tags_msgid(struct Client *from, const char *cmd, const char *
   tags = format_message_tags_for_ex(tagbuf, sizeof(tagbuf), from, to, msgid);
 
   if (tags)
-    mb = msgq_make(to, "%s%:#C %s %v", tags, from, IsServer(to) || IsMe(to) ? tok : cmd,
+    mb = msgq_make(to, "%s%:#C %s %v", tags, from, IsServer(to) || IsMe(to) || IsMeshStub(to) ? tok : cmd,
 		   &vd);
   else
-    mb = msgq_make(to, "%:#C %s %v", from, IsServer(to) || IsMe(to) ? tok : cmd,
+    mb = msgq_make(to, "%:#C %s %v", from, IsServer(to) || IsMe(to) || IsMeshStub(to) ? tok : cmd,
 		   &vd);
 
   va_end(vd.vd_args);
@@ -1753,7 +1759,7 @@ void sendcmdto_prio_one(struct Client *from, const char *cmd, const char *tok,
   vd.vd_format = pattern; /* set up the struct VarData for %v */
   va_start(vd.vd_args, pattern);
 
-  mb = msgq_make(to, "%:#C %s %v", from, IsServer(to) || IsMe(to) ? tok : cmd,
+  mb = msgq_make(to, "%:#C %s %v", from, IsServer(to) || IsMe(to) || IsMeshStub(to) ? tok : cmd,
 		 &vd);
 
   va_end(vd.vd_args);

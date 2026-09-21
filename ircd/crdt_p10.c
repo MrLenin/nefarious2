@@ -42,8 +42,8 @@ int crdt_p10_line_parse(const char *line, size_t len, struct CrdtP10Line *out)
   if (p >= end)
     return 0;
   e = find_space(p, end);                   /* source numeric */
-  out->src = p;
-  out->src_len = (size_t)(e - p);
+  out->src = (*p == ':') ? p + 1 : p;        /* a colon-prefixed prefix is the same numeric */
+  out->src_len = (size_t)(e - out->src);
   if (out->src_len != 2 && out->src_len != 5)
     return 0;
   p = skip_spaces(e, end);

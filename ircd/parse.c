@@ -1374,17 +1374,23 @@ msg_tree_parse(char *cmd, struct MessageTree *root)
   return NULL;
 }
 
-/** Look a P10 token up in the token trie (batch 6 item 3: the mesh
- * re-injects a verbatim server-form line through the handler its token
- * names).  @a tok is copied because the trie walk wants a mutable cursor.
+/** Look a P10 token up in the token trie, then -- for a line that was built
+ * for a client destination and so carries the long name -- in the command
+ * trie.  Batch 6 item 3: the mesh re-injects a verbatim line through the
+ * handler its token names.  @a tok is copied because the trie walk advances a
+ * mutable cursor.
  * @return The message, or NULL. */
 struct Message *msg_find_token(const char *tok)
 {
   char buf[16];
+  struct Message *m;
   if (!tok || !*tok || strlen(tok) >= sizeof buf)
     return NULL;
   strcpy(buf, tok);
-  return msg_tree_parse(buf, &tok_tree);
+  if ((m = msg_tree_parse(buf, &tok_tree)))
+    return m;
+  strcpy(buf, tok);
+  return msg_tree_parse(buf, &msg_tree);
 }
 
 /** Registers a service mapping to the pseudocommand handler.

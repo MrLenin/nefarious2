@@ -16,7 +16,7 @@ extern int parse_client(struct Client *cptr, char *buffer, char *bufend);
 extern int parse_server(struct Client *cptr, char *buffer, char *bufend);
 extern void initmsgtree(void);
 struct Message;
-extern struct Message *msg_find_token(const char *tok);
+extern struct Message *msg_find_token(const char *tok);  /* token, then command name */
 
 extern int register_mapping(struct s_map *map);
 extern int unregister_mapping(struct s_map *map);

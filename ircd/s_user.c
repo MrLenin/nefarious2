@@ -3225,7 +3225,12 @@ int is_silenced(struct Client *sptr, struct Client *acptr, int ischanmsg)
   if (ischanmsg && !feature_bool(FEAT_SILENCE_CHANMSGS))
     return 0;
 
-  if (IsServer(sptr) || IsMe(sptr) || !(user = cli_user(acptr))
+  /* Invariant 2: IsServer is EXACT, so a mesh stub/anchor source fell through
+   * to find_ban(), which formats the source's nick!user@host and derefs
+   * cli_user(stub) == NULL -> SIGSEGV.  Newly reachable since the mesh reply
+   * carrier re-injects server-sourced NOTICE/PRIVMSG at the recipient's home
+   * (batch 6 item 3); a server-ish source cannot be silenced either way. */
+  if (IsServer(sptr) || IsMeshStub(sptr) || IsMe(sptr) || !(user = cli_user(acptr))
       || !(found = find_ban(sptr, user->silence, EBAN_NONE, 0)))
     return 0;
   assert(!(found->flags & BAN_EXCEPTION));

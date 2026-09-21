@@ -624,6 +624,8 @@ static void crdt_line_reinject(const char *line)
     src = &me;
   memcpy(buf, ln.rest, ln.rest_len);
   buf[ln.rest_len] = '\0';
+  log_write(LS_SYSTEM, L_INFO, 0, "CRDT line re-inject: src=%.*s (%s) tok=%s",
+            (int)ln.src_len, ln.src, cli_name(src), tokbuf);
 
   crdt_line_tags_apply(&me, ln.tags, ln.tags_len);
   if (cli_user(src) && cli_from(src) && cli_from(src) != src && IsMeshStub(cli_from(src))) {
@@ -647,7 +649,12 @@ static void crdt_line_reinject(const char *line)
   } else {
     struct Message *mptr = msg_find_token(tokbuf);
     if (mptr && mptr->handlers[SERVER_HANDLER]) {
-      parc = 1 + crdt_p10_split(buf, parv + 1, MAXPARA + 1);
+      /* Same cap parse_server applies (parse.c:2178): split into at most
+       * mptr->parameters, the last of which keeps the rest of the line. */
+      int cap = (int)mptr->parameters;
+      if (cap < 1 || cap > MAXPARA + 1)
+        cap = MAXPARA + 1;
+      parc = 1 + crdt_p10_split(buf, parv + 1, cap);
       parv[parc] = NULL;
       (*mptr->handlers[SERVER_HANDLER])(&me, src, parc, parv);
     } else
@@ -717,6 +724,16 @@ int crdt_hunt_route_try(struct Client *from, struct Client *dstsrv, const char *
     char t[8];
     inttobase64_64(t, time_ms, 7);
     ircd_snprintf(0, tag, sizeof tag, "@A%s%s ", t, msgid);
+  } else if (!MyConnect(from) && cli_from(from) && feature_bool(FEAT_P10_MESSAGE_TAGS)
+             && cli_s2s_msgid(cli_from(from))[0]) {
+    /* A hunt we are FORWARDING: the requester is remote and its label rides the
+     * compact tag parse_server stored on the link the request arrived over.
+     * Carry it, or the responder has nothing to echo and the origin's labelled
+     * batch never closes (the tree preserves it the same way, via
+     * format_s2s_tags(cli_from(from))). */
+    char t[8];
+    inttobase64_64(t, cli_s2s_time_ms(cli_from(from)), 7);
+    ircd_snprintf(0, tag, sizeof tag, "@A%s%s ", t, cli_s2s_msgid(cli_from(from)));
   }
   crdt_m_source_token(from, srcfull, sizeof srcfull);   /* 5-char user / 2-char server */
   ircd_snprintf(0, line, sizeof line, "%s%s %s %s", tag, srcfull, tok, params);
