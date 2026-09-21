@@ -326,6 +326,18 @@ void crdt_gossip_message(struct Client *from, char cmd, const char *target,
                     mid, cmd, srcfull, target, CRDT_M_TTL_DEFAULT, text);
 }
 
+/* @time= value for a raw (Client-less source) local delivery: the origin
+ * event time the HLC-seeded msgid encodes, ISO-8601 with milliseconds. */
+static void crdt_m_time_tag(char *buf, size_t buflen, uint64_t ms)
+{
+  time_t secs = (time_t)(ms / 1000);
+  struct tm tmv;
+  gmtime_r(&secs, &tmv);
+  ircd_snprintf(0, buf, buflen, "%04d-%02d-%02dT%02d:%02d:%02d.%03uZ",
+                tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
+                tmv.tm_hour, tmv.tm_min, tmv.tm_sec, (unsigned)(ms % 1000));
+}
+
 /* MR-1: the direct CRDT peer (server link or overlay) whose numeric == @a num,
  * i.e. the link to forward a next-hop-routed frame on.  NULL if no such peer is
  * currently a sync target (its link dropped -> caller flood-falls-back). */
@@ -1190,10 +1202,55 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
        * the WALL* receiver lands. */
       struct Channel *ch = FindChannel(target);
       struct Membership *memb;
-      if (ch)
+      uint64_t ev_ms = 0;              /* the origin event time (one time per message) */
+      int unified = 0;
+      if (ch && !is_tag) {
+        ev_ms = msgid_decode_time_ms(m_msgid);
+        if (!ev_ms)
+          ev_ms = history_event_time_ms(NULL);
+      }
+      /* Deliver through the SAME send the tree relay uses whenever the source
+       * is a placeable user Client: local members get @msgid/@time exactly as
+       * for a tree-delivered message (the raw loop below gave them neither --
+       * a tagged client on a mesh node could not reply-quote or REDACT), and
+       * the server leg IS the R6b gateway copy, now carrying the origin msgid
+       * and event time as S2S tags (untagged, a legacy store minted its own
+       * msgid for the row -> the REDACT that named the origin's id never
+       * matched; one-msgid-per-event).  CRDT-aware servers are skipped (they
+       * got the flood); a mesh-only source never goes to legacy (its server
+       * was SQUIT there) so it takes the raw local-only path. */
+      if (ch && !is_tag && srcu && !crdt_user_is_mesh_only(srcu)
+          && m_msgid[0] && strcmp(m_msgid, "*") != 0) {
+        sendcmdto_set_client_event(m_msgid, ev_ms);
+        sendcmdto_set_s2s_tags(ev_ms, m_msgid);
+        sendcmdto_want_s2s_tags(1);
+        sendcmdto_set_s2s_cptr(&me);      /* no per-link S2S msgid to override ours */
+        sendcmdto_set_skip_crdt_servers();
+        sendcmdto_channel_butone(srcu, (m_cmd[0] == 'N') ? CMD_NOTICE : CMD_PRIVATE,
+                                 ch, NULL, SKIP_DEAF | SKIP_BURST, m_text[0],
+                                 "%H :%s", ch, m_text);
+        sendcmdto_set_client_msgid(NULL);
+        unified = 1;
+      }
+      if (ch && !unified)
         for (memb = ch->members; memb; memb = memb->next_member) {
+          char ttag[160];
           if (!MyConnect(memb->user))
             continue;
+          /* tags for the raw form: msgid for message-tags clients, time for
+           * server-time clients (the origin's event time) */
+          ttag[0] = '\0';
+          if (!is_tag && m_msgid[0] && strcmp(m_msgid, "*") != 0 &&
+              (CapActive(memb->user, CAP_MSGTAGS) || CapActive(memb->user, CAP_SERVERTIME))) {
+            char iso[40];
+            crdt_m_time_tag(iso, sizeof iso, ev_ms);
+            if (CapActive(memb->user, CAP_MSGTAGS) && CapActive(memb->user, CAP_SERVERTIME))
+              ircd_snprintf(0, ttag, sizeof ttag, "@msgid=%s;time=%s ", m_msgid, iso);
+            else if (CapActive(memb->user, CAP_MSGTAGS))
+              ircd_snprintf(0, ttag, sizeof ttag, "@msgid=%s ", m_msgid);
+            else
+              ircd_snprintf(0, ttag, sizeof ttag, "@time=%s ", iso);
+          }
           if (is_tag) {                /* TAGMSG: @tags prefix, no body, cap-gated */
             if (!CapActive(memb->user, CAP_MSGTAGS))
               continue;
@@ -1205,11 +1262,11 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
               sendrawto_one(memb->user, "@%s :%s TAGMSG %s", m_text,
                             srcsrv ? cli_name(srcsrv) : srcyxx, target);
           } else if (src && src->nick[0])
-            sendrawto_one(memb->user, ":%s!%s@%s %s %s :%s", src->nick,
+            sendrawto_one(memb->user, "%s:%s!%s@%s %s %s :%s", ttag, src->nick,
                           src->ident, src->host[0] ? src->host : "mesh",
                           cmdstr, target, m_text);
           else
-            sendrawto_one(memb->user, ":%s %s %s :%s",
+            sendrawto_one(memb->user, "%s:%s %s %s :%s", ttag,
                           srcsrv ? cli_name(srcsrv) : srcyxx, cmdstr, target,
                           m_text);
         }
@@ -1257,7 +1314,7 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
        * node with no legacy peers.  Skip a MESH-ONLY source: legacy SQUIT'd its server and
        * cannot place it (the partition case = R6c).  TAGMSG ('T') deferred (its @-tag legacy
        * form differs + its tree leg is not yet demoted). */
-      if (ch && !is_tag) {
+      if (ch && !is_tag && !unified) {   /* the unified send above already carried the legacy copy */
         struct Client *srcc = srcu;   /* USER sources only: legacy can't place a
                                        * server-form (2-char) source in a channel */
         if (srcc && !crdt_user_is_mesh_only(srcc))
