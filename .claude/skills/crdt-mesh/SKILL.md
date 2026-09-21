@@ -123,7 +123,7 @@ All ride normal P10 framing as `:<src> CR <sub> …`. Gossiped to every `IsCrdtS
   **Letters in use (2026-09-21):** channel/unicast `P N T K I` (+ `c h v` WALLCHOPS/HOPS/VOICES, channel
   target only); `*`-target broadcasts `W` WALLOPS (user- AND server-sourced) `U` WALLUSERS `O` SNO `M` SMO
   `D` DESYNCH `I` CI (target `*`; INVITE is `I` with a user target) `A` TK `S` PN `R` REDACT `E` METADATA
-  (ephemeral) `L` SASL mech list `V` PRIVS `G`/`g` masked PRIVMSG/NOTICE `J` GITSYNC `B` MULTILINE
+  (ephemeral) `G`/`g` masked PRIVMSG/NOTICE `J` GITSYNC `B` MULTILINE
   announce `Z` SVSNOOP. **Rules that every letter follows:** mint at the ORIGIN and once at the §17.7
   gateway edge (`IsServer(cptr) && !IsCrdtAware(cptr)`); when minted keep the tree copy off CRDT-aware
   links (`sendcmdto_set_skip_crdt_servers()` / `sendcmdto_flag_serv_butone(..., FLAG_CRDT_AWARE)`) — a

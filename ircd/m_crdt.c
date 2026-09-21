@@ -1197,11 +1197,6 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
             sendcmdto_serv_butone_v3(msrc, CMD_METADATA, NULL, "%s %s", ev[0], ev[1]);
         }
       }
-    } else if (m_cmd[0] == 'L' && target[0] == '*') {  /* SASL mechanism list (M5):
-                                            * the services announcement, applied
-                                            * locally so sasl= matches the network. */
-      set_sasl_mechanisms(m_text);
-      log_write(LS_SYSTEM, L_INFO, 0, "SASL mechanisms set to: %s (mesh)", m_text);
     } else if ((m_cmd[0] == 'G' || m_cmd[0] == 'g') && target[0] == '*') {  /* masked
                                             * PRIVMSG ('G') / NOTICE ('g'): "<mask>
                                             * :<text>".  Deliver to LOCAL matching

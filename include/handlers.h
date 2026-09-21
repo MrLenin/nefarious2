@@ -257,9 +257,6 @@ extern int ms_ping(struct Client*, struct Client*, int, char*[]);
 extern int ms_pong(struct Client*, struct Client*, int, char*[]);
 extern int ms_privmsg(struct Client*, struct Client*, int, char*[]);
 extern int ms_privs(struct Client*, struct Client*, int, char*[]);
-/* SASL mechanism list over the mesh (M5): the receiver's apply. */
-extern void set_sasl_mechanisms(const char *mechs);
-extern void sasl_mech_mesh_announce(void);   /* M5: at the legacy edge and at every CRDT link */
 extern int ms_quit(struct Client*, struct Client*, int, char*[]);
 extern int ms_rehash(struct Client*, struct Client*, int, char*[]);
 extern int ms_remove(struct Client*, struct Client*, int, char*[]);

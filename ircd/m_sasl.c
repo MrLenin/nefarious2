@@ -91,7 +91,6 @@
 #include "ircd_snprintf.h"     /* Tier B: build the CR-X reply body */
 #include "ircd_string.h"
 #include "handlers.h"          /* Tier B: crdt_route_services_reply_try (services-anchor bridge) */
-#include "crdt_shadow.h"        /* crdt_shadow_active: mech list over the mesh */
 #include "msg.h"
 #include "numeric.h"
 #include "numnicks.h"
@@ -106,20 +105,6 @@
 #include "sasl_auth.h"
 
 /* #include <assert.h> -- Now using assert in ircd_log.h */
-
-/* M5: tell the mesh the network's SASL mechanism list (CR M 'L').  Called
- * at the legacy edge when services announce it, and at every CRDT link so
- * a node that boots without a legacy path learns the list at once (the
- * services announcement only recurs when services relink). */
-void sasl_mech_mesh_announce(void)
-{
-  const char *mechs = get_sasl_mechanisms();
-  char msgidbuf[64];
-  if (!mechs || !crdt_shadow_active())
-    return;
-  generate_msgid(msgidbuf, sizeof msgidbuf);
-  crdt_gossip_message(&me, 'L', "*", msgidbuf, mechs);
-}
 
 int ms_sasl(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
 {
@@ -142,32 +127,12 @@ int ms_sasl(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
     ext = parv[5];
 
   if (!strcmp(parv[1], "*")) {
-    int mesh = 0;
-    /* Check for mechanism list broadcast: SASL * * M :PLAIN,EXTERNAL,... */
-    if (!strcmp(token, "*") && reply[0] == 'M') {
-      set_sasl_mechanisms(data);
-      log_write(LS_SYSTEM, L_INFO, 0, "SASL mechanisms set to: %s", data);
-      /* Gateway edge (CI precedent): services announce the list over a
-       * LEGACY link; mint the mesh copy once here (CR M 'L') so an
-       * overlay-only node advertises the network's sasl= value instead of
-       * its FEAT_SASL_DEFAULT_MECHANISMS fallback.  One from a CRDT peer
-       * already rode the mesh.  Only the mechanism list is carried: the
-       * other "*" forms are agent-facing and the services bridge owns
-       * that leg. */
-      if (IsServer(cptr) && !IsCrdtAware(cptr) && crdt_shadow_active()) {
-        sasl_mech_mesh_announce();
-        mesh = 1;
-      }
-    }
-
-    if (mesh) {
-      if (ext != NULL)
-        sendcmdto_flag_serv_butone(sptr, CMD_SASL, cptr, FLAG_LAST_FLAG, FLAG_CRDT_AWARE,
-                                   "* %s %s %s :%s", token, reply, data, ext);
-      else
-        sendcmdto_flag_serv_butone(sptr, CMD_SASL, cptr, FLAG_LAST_FLAG, FLAG_CRDT_AWARE,
-                                   "* %s %s :%s", token, reply, data);
-    } else if (ext != NULL)
+    /* Network-wide forms are relayed as-is over the tree.  (The old
+     * "SASL * * M :<mechanisms>" list broadcast was emitted only by an
+     * abandoned X3 branch; the advertised sasl= value is per-node config,
+     * see sasl_local_mechanisms() and the iauth mechanism cache.  The
+     * agent-facing "*" forms belong to the services bridge.) */
+    if (ext != NULL)
       sendcmdto_serv_butone(sptr, CMD_SASL, cptr, "* %s %s %s :%s",
                                    token, reply, data, ext);
     else
