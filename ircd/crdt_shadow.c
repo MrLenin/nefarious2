@@ -675,6 +675,10 @@ void crdt_shadow_user_add(struct Client *cptr)
   strncpy(rec.ident, cli_user(cptr)->username, sizeof rec.ident - 1);
   strncpy(rec.host, cli_user(cptr)->host, sizeof rec.host - 1);
   strncpy(rec.realhost, cli_user(cptr)->realhost, sizeof rec.realhost - 1);
+  if (IsFakeHost(cptr))
+    strncpy(rec.fakehost, cli_user(cptr)->fakehost, sizeof rec.fakehost - 1);
+  if (IsSetHost(cptr))
+    strncpy(rec.sethost, cli_user(cptr)->sethost, sizeof rec.sethost - 1);
   strncpy(rec.realname, cli_info(cptr), sizeof rec.realname - 1);
   strncpy(rec.account, cli_user(cptr)->account, sizeof rec.account - 1);
   strncpy(rec.swhois, cli_user(cptr)->swhois, sizeof rec.swhois - 1);
@@ -1077,6 +1081,8 @@ static void own_sweep_collect_cb(const char *key, uint32_t key_len,
   if (c->n >= OWN_SWEEP_MAX || !val->data ||
       val->data_len != sizeof(struct CrdtUserRecord))
     return;                                /* full, or foreign shape */
+  if (val->data_len != sizeof(struct CrdtUserRecord))
+    return;                         /* M4 schema guard: another record size = another schema */
   rec = (const struct CrdtUserRecord *)val->data;
   if (rec->server != c->me)
     return;                                /* not my origin — its owner sweeps it */
@@ -1472,6 +1478,8 @@ static void decomm_collect_user_cb(const char *key, uint32_t key_len,
   if (c->nu >= OWN_SWEEP_MAX || !val->data ||
       val->data_len != sizeof(struct CrdtUserRecord))
     return;
+  if (val->data_len != sizeof(struct CrdtUserRecord))
+    return;                         /* M4 schema guard: another record size = another schema */
   rec = (const struct CrdtUserRecord *)val->data;
   if (!decomm_srv_match(c, rec->server))
     return;
@@ -4422,6 +4430,8 @@ static void mat_user_cb(const char *key, uint32_t key_len,
   if (key_len >= sizeof numbuf ||
       val->data_len != sizeof(struct CrdtUserRecord)) { (*c->gaps)++; return; }
   memcpy(numbuf, key, key_len); numbuf[key_len] = '\0';
+  if (val->data_len != sizeof(struct CrdtUserRecord))
+    return;                         /* M4 schema guard: another record size = another schema */
   rec = (const struct CrdtUserRecord *)val->data;
   (*c->users)++;
   live = findNUser(numbuf);
@@ -4756,7 +4766,7 @@ static struct Client *crdt_materialize_one_user(const char *key, uint32_t key_le
   if (findNUser(numbuf))                  /* already live — idempotent + mandatory
                                              guard (SetRemoteNumNick kills on clash) */
     return NULL;
-  rec = (const struct CrdtUserRecord *)val->data;
+  rec = (const struct CrdtUserRecord *)val->data;   /* size checked above */
   srvnum[0] = numbuf[0]; srvnum[1] = numbuf[1]; srvnum[2] = '\0';
   srv = FindNServer(srvnum);
   if (!srv) {
@@ -5295,6 +5305,38 @@ static void crdt_reconcile_user_update(struct Client *live,
       SetCloakIP(live);
     c->attr++;
   }
+  /* M4: host OVERRIDES (FAKE / SETHOST) converge by value: copy the doc's
+   * override in (or drop ours when the doc has none) and let the derivation
+   * below re-run hide_hostmask, which honours the flags. */
+  {
+    int ovr = 0;
+    if (rec->fakehost[0]) {
+      if (!IsFakeHost(live) || ircd_strcmp(cli_user(live)->fakehost, rec->fakehost) != 0) {
+        ircd_strncpy(cli_user(live)->fakehost, rec->fakehost, HOSTLEN + 1);
+        SetFakeHost(live);
+        ovr = 1;
+      }
+    } else if (IsFakeHost(live)) {
+      ClearFakeHost(live);
+      cli_user(live)->fakehost[0] = '\0';
+      ovr = 1;
+    }
+    if (rec->sethost[0]) {
+      if (!IsSetHost(live) || ircd_strcmp(cli_user(live)->sethost, rec->sethost) != 0) {
+        ircd_strncpy(cli_user(live)->sethost, rec->sethost, HOSTLEN + 1);
+        SetSetHost(live);
+        ovr = 1;
+      }
+    } else if (IsSetHost(live)) {
+      ClearSetHost(live);
+      cli_user(live)->sethost[0] = '\0';
+      ovr = 1;
+    }
+    if (ovr) {
+      hide_hostmask(live);
+      c->attr++;
+    }
+  }
   if (IsHiddenHost(live) &&
       ircd_strcmp(cli_user(live)->host, rec->host) != 0) {
     char prevh[HOSTLEN + 1];
@@ -5372,6 +5414,8 @@ static void recon_user_cb(const char *key, uint32_t key_len,
   via = (srv && IsServer(srv)) ? cli_from(srv) : NULL;
   if (via && IsServer(via) && !IsCrdtAware(via) && IsBurstOrBurstAck(via))
     return;                       /* P10 intro may still be in flight on this legacy burst */
+  if (val->data_len != sizeof(struct CrdtUserRecord))
+    return;                         /* M4 schema guard: another record size = another schema */
   rec = (const struct CrdtUserRecord *)val->data;
   live = findNUser(nb);
   if (live) {                     /* 3n/3o: already live — reconcile nick + umode drift */

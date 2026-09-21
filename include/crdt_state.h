@@ -90,6 +90,13 @@ struct CrdtUserRecord {
   uint64_t nick_ts;                   /**< cli_lastnick (TS) */
   uint64_t acc_create;                /**< account timestamp */
   uint16_t server;        /**< owning server numeric (for SQUIT visibility) */
+  /* M4 (2026-09-21): the host OVERRIDES.  rec.host is the DISPLAYED host, but a
+   * copy re-derives its display host locally (hide_hostmask) and that
+   * derivation needs the override values, not just the +f/+h letters --
+   * without them a materialized copy showed the cloak, and the legacy render
+   * had to suppress the flag (C29 noval guard).  "" = not set. */
+  char     fakehost[CRDT_HOSTLEN];    /**< FAKE (services) host; "" if none */
+  char     sethost[CRDT_HOSTLEN];     /**< SETHOST (+h) host; "" if none */
   /* NB: hopcount is deliberately NOT stored — it is observer-relative (distance
    * from each server), so it can't be a shared CRDT value; 3c recomputes it
    * locally at materialize time. (The dry-run surfaced this.) */

@@ -2828,7 +2828,10 @@ const struct CrdtUserRecord *crdt_user_get(const struct CrdtNetworkState *st,
 {
   const struct CrdtLWWValue *v =
     crdt_lwwmap_get(&st->users, numeric, (uint32_t)strlen(numeric));
-  return v ? (const struct CrdtUserRecord *)v->data : NULL;
+  /* M4: the record is a whole struct on the wire; a blob of another size is
+   * another schema (mixed-version mesh) -- never misread it. */
+  return (v && v->data_len == sizeof(struct CrdtUserRecord))
+         ? (const struct CrdtUserRecord *)v->data : NULL;
 }
 
 int crdt_user_visible(const struct CrdtNetworkState *st, const char *numeric)
@@ -2907,7 +2910,7 @@ void crdt_nick_force_rename(struct CrdtNetworkState *st,
 
   /* rename the loser's user record nick -> its numeric (NOT a kill) */
   const struct CrdtLWWValue *v = crdt_lwwmap_get(&st->users, loser->numeric, nlen);
-  if (v && v->data) {
+  if (v && v->data && v->data_len == sizeof(struct CrdtUserRecord)) {   /* M4 schema guard */
     struct CrdtUserRecord r = *(const struct CrdtUserRecord *)v->data;
     memset(r.nick, 0, sizeof r.nick);
     strncpy(r.nick, loser->numeric, sizeof r.nick - 1);

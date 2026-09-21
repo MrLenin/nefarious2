@@ -2592,6 +2592,34 @@ static void test_webpush_key_op_replicates(void **state)
   crdt_state_clear(&s2);
 }
 
+/* M4: the host overrides ride the user record and an old-size blob is
+ * rejected by the schema guard instead of being misread. */
+static void test_user_record_host_overrides(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s1, s2;
+  struct CrdtUserRecord u;
+  const struct CrdtUserRecord *r;
+  memset(&u, 0, sizeof u);
+  strcpy(u.nick, "fh"); u.server = 3;
+  strcpy(u.host, "fake.example"); strcpy(u.realhost, "1.2.3.4.real");
+  strcpy(u.fakehost, "fake.example"); strcpy(u.sethost, "");
+  crdt_state_init(&s1, 3);
+  crdt_state_init(&s2, 8);
+  crdt_user_set(&s1, "ADAAB", &u);
+  crdt_state_sync(&s2, &s1);
+  r = crdt_user_get(&s2, "ADAAB");
+  assert_non_null(r);
+  assert_string_equal(r->fakehost, "fake.example");
+  assert_string_equal(r->sethost, "");
+  /* an old-schema blob (shorter) is not a record */
+  crdt_lwwmap_set(&s2.users, "ADAAC", 5, &u, (uint32_t)(sizeof u - 16),
+                  hlc_local_event(&s2.clock), 3);
+  assert_null(crdt_user_get(&s2, "ADAAC"));
+  crdt_state_clear(&s1);
+  crdt_state_clear(&s2);
+}
+
 static void test_webpush_op_replicates(void **state)
 {
   (void)state;
@@ -4110,6 +4138,7 @@ int main(void)
     cmocka_unit_test(test_tempshun_replicates_and_reaps),
     cmocka_unit_test(test_webpush_op_replicates),
     cmocka_unit_test(test_webpush_key_op_replicates),
+    cmocka_unit_test(test_user_record_host_overrides),
     cmocka_unit_test(test_gline_doc_converges_same_lastmod),
     cmocka_unit_test(test_metadata_op_replicates),
     cmocka_unit_test(test_bsess_op_replicates),

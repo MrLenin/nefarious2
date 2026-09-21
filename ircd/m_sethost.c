@@ -98,6 +98,7 @@
 #include "s_debug.h"
 #include "s_user.h"
 #include "send.h"
+#include "crdt_shadow.h"   /* M4: sethost into the doc */
 #include "bouncer_session.h"
 
 /* #include <assert.h> -- Now using assert in ircd_log.h */
@@ -133,7 +134,8 @@ static void apply_sethost_changes(struct Client *sptr, const char *hostmask,
   SetHiddenHost(sptr);
 
   hide_hostmask(sptr);
-  send_umode_out(sptr, sptr, setflags, 0, 0 /* 3o: sethost stays on P10 (host-param not reconciled) */);
+  send_umode_out(sptr, sptr, setflags, 0, 0 /* 3o: the umode letter stays on P10 */);
+  crdt_shadow_user_add(sptr);   /* M4: the host param rides the doc (rec.sethost) */
 
   /* Update bouncer aliases with new visible host */
   bounce_emit_alias_update(sptr, "host", cli_user(sptr)->host);
@@ -210,7 +212,8 @@ int m_sethost(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
     ClearSetHost(sptr);
     cli_user(sptr)->sethost[0] = '\0';
     hide_hostmask(sptr);
-    send_umode_out(cptr, sptr, &setflags, 0, 0 /* 3o: sethost stays on P10 (host-param not reconciled) */);
+    send_umode_out(cptr, sptr, &setflags, 0, 0 /* 3o: the umode letter stays on P10 */);
+  crdt_shadow_user_add(sptr);   /* M4: the host param rides the doc (rec.sethost) */
     return 0;
   }
 
@@ -303,7 +306,8 @@ int mo_sethost(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
     ClearSetHost(sptr);
     cli_user(sptr)->sethost[0] = '\0';
     hide_hostmask(sptr);
-    send_umode_out(cptr, sptr, &setflags, 0, 0 /* 3o: sethost stays on P10 (host-param not reconciled) */);
+    send_umode_out(cptr, sptr, &setflags, 0, 0 /* 3o: the umode letter stays on P10 */);
+  crdt_shadow_user_add(sptr);   /* M4: the host param rides the doc (rec.sethost) */
     return 0;
   }
 
@@ -325,7 +329,8 @@ int mo_sethost(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
     SetSetHost(sptr);
     SetHiddenHost(sptr);
     hide_hostmask(sptr);
-    send_umode_out(cptr, sptr, &setflags, 0, 0 /* 3o: sethost stays on P10 (host-param not reconciled) */);
+    send_umode_out(cptr, sptr, &setflags, 0, 0 /* 3o: the umode letter stays on P10 */);
+  crdt_shadow_user_add(sptr);   /* M4: the host param rides the doc (rec.sethost) */
     return 0;
   }
 
@@ -385,7 +390,8 @@ int mo_sethost(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
   SetHiddenHost(sptr);
 
   hide_hostmask(sptr);
-  send_umode_out(cptr, sptr, &setflags, 0, 0 /* 3o: sethost stays on P10 (host-param not reconciled) */);
+  send_umode_out(cptr, sptr, &setflags, 0, 0 /* 3o: the umode letter stays on P10 */);
+  crdt_shadow_user_add(sptr);   /* M4: the host param rides the doc (rec.sethost) */
 
   return 0;
 }

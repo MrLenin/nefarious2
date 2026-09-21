@@ -92,6 +92,7 @@
 #include "numnicks.h"
 #include "s_user.h"
 #include "send.h"
+#include "crdt_shadow.h"   /* M4: fakehost into the doc */
 #include "bouncer_session.h"
 #include "version.h"
 
@@ -135,6 +136,11 @@ int ms_fake(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
 
   sendcmdto_serv_butone(sptr, CMD_FAKE, cptr, "%C %s", target,
                         cli_user(target)->fakehost);
+
+  /* M4: push the fakehost into the CRDT doc so mesh copies converge (the
+   * P10 relay above islands under tree-retirement; every sibling handler
+   * mints here).  Self-skips on from_crdt_peer. */
+  crdt_shadow_user_add(target);
 
   /* Update bouncer aliases with new fakehost */
   bounce_emit_alias_update(target, "fakehost", cli_user(target)->fakehost);
