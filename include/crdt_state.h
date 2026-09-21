@@ -97,6 +97,12 @@ struct CrdtUserRecord {
    * had to suppress the flag (C29 noval guard).  "" = not set. */
   char     fakehost[CRDT_HOSTLEN];    /**< FAKE (services) host; "" if none */
   char     sethost[CRDT_HOSTLEN];     /**< SETHOST (+h) host; "" if none */
+  /* M8 (2026-09-21): an oper's PRIVILEGE set, the raw FLAGSET bits of struct
+   * Privs (client.h) copied by the shadow -- the engine stays Client-free.
+   * State, not a message: a letter raced the user's own record (a fresh
+   * copy has no user to apply it to) and a fresh node needs it from the
+   * snapshot.  All-zero = no privileges. */
+  uint64_t privbits[2];
   /* NB: hopcount is deliberately NOT stored — it is observer-relative (distance
    * from each server), so it can't be a shared CRDT value; 3c recomputes it
    * locally at materialize time. (The dry-run surfaced this.) */

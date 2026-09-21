@@ -1202,21 +1202,6 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
                                             * locally so sasl= matches the network. */
       set_sasl_mechanisms(m_text);
       log_write(LS_SYSTEM, L_INFO, 0, "SASL mechanisms set to: %s (mesh)", m_text);
-    } else if (m_cmd[0] == 'V' && target[0] == '*') {  /* PRIVS (M8): "<numeric> <priv …>",
-                                            * applied as ms_privs does; real P10 to
-                                            * legacy links only when the origin has
-                                            * no tree presence here. */
-      const char *sp = strchr(m_text, ' ');
-      if (sp && sp > m_text && sp - m_text < 8 && sp[1]) {
-        char vn[8];
-        struct Client *vu;
-        ircd_strncpy(vn, m_text, (size_t)(sp - m_text) + 1);
-        vu = findNUser(vn);
-        if (vu) {
-          struct Client *vsrv = cli_user(vu)->server;
-          privs_apply_from_mesh(vn, sp + 1, !vsrv || IsMeshStub(vsrv));
-        }
-      }
     } else if ((m_cmd[0] == 'G' || m_cmd[0] == 'g') && target[0] == '*') {  /* masked
                                             * PRIVMSG ('G') / NOTICE ('g'): "<mask>
                                             * :<text>".  Deliver to LOCAL matching
@@ -1241,16 +1226,17 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
          * "O" as the command). */
         const char *gcmd = (m_cmd[0] == 'g') ? MSG_NOTICE : MSG_PRIVATE;
         const char *gtok = (m_cmd[0] == 'g') ? TOK_NOTICE : TOK_PRIVATE;
-        sendcmdto_set_match_local_only();
+        /* ONE send: the matcher delivers locals in the same walk as the
+         * server leg, so relaying with a second call delivered locals
+         * twice.  Tree-absent origin: locals + legacy links (CRDT-aware
+         * skipped); else locals only. */
+        if (!osrv || IsMeshStub(osrv))
+          sendcmdto_set_skip_crdt_servers();
+        else
+          sendcmdto_set_match_local_only();
         sendcmdto_match_butone(srcu, gcmd, gtok,
                                mm, NULL, ghost ? MATCH_HOST : MATCH_SERVER,
                                "%s :%s", gb, gtext);
-        if (!osrv || IsMeshStub(osrv)) {
-          sendcmdto_set_skip_crdt_servers();
-          sendcmdto_match_butone(srcu, gcmd, gtok,
-                                 mm, NULL, ghost ? MATCH_HOST : MATCH_SERVER,
-                                 "%s :%s", gb, gtext);
-        }
       }
     } else if (m_cmd[0] == 'J' && target[0] == '*') {  /* GITSYNC "*" broadcast (M12):
                                             * "<action> [<subarg>]", run locally. */
@@ -1261,7 +1247,7 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
       if (jsp) *jsp++ = '\0';
       if (jb[0]) {
         Debug((DEBUG_DEBUG, "CRDT GS: mesh gitsync %s %s from %s", jb, jsp ? jsp : "", srcyxx));
-        gitsync_apply_from_mesh(jb, jsp);
+        gitsync_apply_from_mesh(srcu ? srcu : (srcsrv ? srcsrv : &me), jb, jsp);
       }
     } else if (m_cmd[0] == 'B' && target[0] == '*') {  /* MULTILINE announce (M9):
                                             * "<numeric> <bytes> <lines>". */

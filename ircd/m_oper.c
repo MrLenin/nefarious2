@@ -243,6 +243,7 @@ void do_oper(struct Client* cptr, struct Client* sptr, struct ConfItem* aconf, i
     crdt_shadow_user_add(sptr);
   } else {
     client_send_privs(&me, sptr, sptr);
+    crdt_shadow_user_add(sptr);        /* M8: the privilege set rides the user record */
 
     if (HasPriv(sptr, PRIV_PROPAGATE)) {
       modes = (HasPriv(sptr, PRIV_ADMIN) ? "aowsg" : "owsg");

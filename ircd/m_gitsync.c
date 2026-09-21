@@ -708,7 +708,7 @@ int mo_gitsync(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
  */
 static int gitsync_relay_mode = 0;   /* M12: 1 = mesh receiver (apply only) */
 
-void gitsync_apply_from_mesh(const char *action, const char *subarg)
+void gitsync_apply_from_mesh(struct Client *from, const char *action, const char *subarg)
 {
   char *pv[6];
   int pc = 0;
@@ -719,7 +719,7 @@ void gitsync_apply_from_mesh(const char *action, const char *subarg)
     pv[pc++] = (char *)subarg;
   pv[pc] = NULL;
   gitsync_relay_mode = 1;
-  ms_gitsync(&me, &me, pc, pv);
+  ms_gitsync(&me, from, pc, pv);      /* replies (status, disabled, ...) route back to the oper */
   gitsync_relay_mode = 0;
 }
 

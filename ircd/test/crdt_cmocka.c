@@ -2604,6 +2604,7 @@ static void test_user_record_host_overrides(void **state)
   strcpy(u.nick, "fh"); u.server = 3;
   strcpy(u.host, "fake.example"); strcpy(u.realhost, "1.2.3.4.real");
   strcpy(u.fakehost, "fake.example"); strcpy(u.sethost, "");
+  u.privbits[0] = 0x00000000deadbeefULL; u.privbits[1] = 0x1ULL;   /* M8 privilege bits */
   crdt_state_init(&s1, 3);
   crdt_state_init(&s2, 8);
   crdt_user_set(&s1, "ADAAB", &u);
@@ -2612,6 +2613,7 @@ static void test_user_record_host_overrides(void **state)
   assert_non_null(r);
   assert_string_equal(r->fakehost, "fake.example");
   assert_string_equal(r->sethost, "");
+  assert_true(r->privbits[0] == 0x00000000deadbeefULL && r->privbits[1] == 0x1ULL);
   /* an old-schema blob (shorter) is not a record */
   crdt_lwwmap_set(&s2.users, "ADAAC", 5, &u, (uint32_t)(sizeof u - 16),
                   hlc_local_event(&s2.clock), 3);

@@ -679,6 +679,10 @@ void crdt_shadow_user_add(struct Client *cptr)
     strncpy(rec.fakehost, cli_user(cptr)->fakehost, sizeof rec.fakehost - 1);
   if (IsSetHost(cptr))
     strncpy(rec.sethost, cli_user(cptr)->sethost, sizeof rec.sethost - 1);
+  {                                   /* M8: privilege bits, size-clamped both ways */
+    size_t pn = sizeof(struct Privs) < sizeof rec.privbits ? sizeof(struct Privs) : sizeof rec.privbits;
+    memcpy(rec.privbits, &cli_privs(cptr), pn);
+  }
   strncpy(rec.realname, cli_info(cptr), sizeof rec.realname - 1);
   strncpy(rec.account, cli_user(cptr)->account, sizeof rec.account - 1);
   strncpy(rec.swhois, cli_user(cptr)->swhois, sizeof rec.swhois - 1);
@@ -5304,6 +5308,20 @@ static void crdt_reconcile_user_update(struct Client *live,
     if (strchr(rec->umodes, 'c'))
       SetCloakIP(live);
     c->attr++;
+  }
+  /* M8: privileges converge by value (the FLAGSET bits); an alias mirrors
+   * its primary's set exactly as ms_privs does. */
+  {
+    struct Privs want;
+    size_t pn = sizeof(struct Privs) < sizeof rec->privbits ? sizeof(struct Privs) : sizeof rec->privbits;
+    memset(&want, 0, sizeof want);
+    memcpy(&want, rec->privbits, pn);
+    if (memcmp(&want, &cli_privs(live), sizeof want) != 0) {
+      memcpy(&cli_privs(live), &want, sizeof want);
+      if (IsBouncerAlias(live) && cli_user(live) && cli_user(live)->alias_primary)
+        memcpy(&cli_privs(cli_user(live)->alias_primary), &want, sizeof want);
+      c->attr++;
+    }
   }
   /* M4: host OVERRIDES (FAKE / SETHOST) converge by value: copy the doc's
    * override in (or drop ours when the doc has none) and let the derivation
