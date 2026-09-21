@@ -356,14 +356,15 @@ int m_redact(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
     sendcmdto_set_client_msgid(NULL);
 
     /* Set S2S tags for server relay */
-    sendcmdto_set_s2s_tags(time_ms, redact_msgid);
-    sendcmdto_want_s2s_tags(1);
-
     /* Propagate to other servers: CRDT-aware peers get the mesh copy
      * (an overlay-only store otherwise kept serving the row), legacy
-     * links the tree copy. */
+     * links the tree copy.  Mint BEFORE arming the one-shot S2S tags:
+     * the gossip's own sends would consume them and the tree copy would
+     * leave untagged -> legacy stores mint a second redact msgid. */
     if (redact_mesh_mint(sptr, target, msgid, redact_msgid, time_ms, reason))
       sendcmdto_set_skip_crdt_servers();
+    sendcmdto_set_s2s_tags(time_ms, redact_msgid);
+    sendcmdto_want_s2s_tags(1);
     sendcmdto_serv_butone_v3(sptr, CMD_REDACT, cptr, "%s %s :%s",
                           target, msgid, reason ? reason : "");
   }

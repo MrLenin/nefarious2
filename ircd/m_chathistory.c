@@ -5550,10 +5550,10 @@ static void complete_redact_fed(struct FedRequest *req)
 
     /* Propagate to other servers (ms_redact on storage servers will delete
      * and store the REDACT event with this same msgid via S2S tags). */
+    if (redact_mesh_mint(sptr, req->target, ctx->msgid, redact_msgid, time_ms, reason))
+      sendcmdto_set_skip_crdt_servers();   /* CRDT-aware peers got the mesh copy; mint BEFORE the one-shot tags */
     sendcmdto_set_s2s_tags(time_ms, redact_msgid);
     sendcmdto_want_s2s_tags(1);
-    if (redact_mesh_mint(sptr, req->target, ctx->msgid, redact_msgid, time_ms, reason))
-      sendcmdto_set_skip_crdt_servers();   /* CRDT-aware peers got the mesh copy */
     sendcmdto_serv_butone_v3(sptr, CMD_REDACT, sptr, "%s %s :%s",
                           req->target, ctx->msgid, reason ? reason : "");
   }
