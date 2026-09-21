@@ -2763,6 +2763,30 @@ deliver_s2s_multiline_batch(struct S2SMultilineBatch *batch, struct Client *cptr
  * parv[2] = target (or @client-tags on start, then target shifts to parv[3])
  * parv[3] = text (may be empty for end)
  */
+/* M9: the mesh copy of a server's MULTILINE capability announce. */
+int multiline_announce_mesh_mint(struct Client *srv)
+{
+  char body[128], msgidbuf[64];
+  if (!crdt_shadow_active() || !srv || !cli_serv(srv))
+    return 0;
+  ircd_snprintf(0, body, sizeof body, "%s %u %u", cli_yxx(srv),
+                cli_serv(srv)->ml_max_bytes, cli_serv(srv)->ml_max_lines);
+  generate_msgid(msgidbuf, sizeof msgidbuf);
+  crdt_gossip_message(&me, 'B', "*", msgidbuf, body);
+  return 1;
+}
+
+/* M9 receiver: mark @a numeric's server multiline-capable with its limits. */
+void multiline_announce_apply(const char *numeric, unsigned bytes, unsigned lines)
+{
+  struct Client *srv = FindNServer(numeric);
+  if (!srv || !cli_serv(srv) || srv == &me)
+    return;
+  SetMultiline(srv);
+  cli_serv(srv)->ml_max_bytes = bytes;
+  cli_serv(srv)->ml_max_lines = lines;
+}
+
 int ms_multiline(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
 {
   char *batch_ref;
@@ -2788,7 +2812,11 @@ int ms_multiline(struct Client* cptr, struct Client* sptr, int parc, char* parv[
       cli_serv(sptr)->ml_max_bytes = atoi(parv[1]);
     if (parc >= 3 && !EmptyString(parv[2]))
       cli_serv(sptr)->ml_max_lines = atoi(parv[2]);
-    /* Propagate with parameters */
+    /* Propagate with parameters.  M9: a CRDT peer beyond our tree only
+     * learns this over the mesh (letter 'B', "<numeric> <bytes> <lines>");
+     * minted once at the LEGACY edge (a CRDT origin minted its own). */
+    if (IsServer(cptr) && !IsCrdtAware(cptr) && multiline_announce_mesh_mint(sptr))
+      sendcmdto_set_skip_crdt_servers();
     sendcmdto_serv_butone_v3(sptr, CMD_MULTILINE, cptr, "%u %u",
                           cli_serv(sptr)->ml_max_bytes,
                           cli_serv(sptr)->ml_max_lines);

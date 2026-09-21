@@ -2023,6 +2023,24 @@ void server_relay_private_notice(struct Client* sptr, const char* name, const ch
  * @param[in] mask Target mask for the message.
  * @param[in] text %Message to relay.
  */
+/* M6: the mesh copy of a masked message ("$*.mask" / "$@host.mask" --
+ * NOTICE $*.domain is the network-announcement path).  sendcmdto_match_butone
+ * skips every user whose link is a dead sink (a mesh-only home), so without
+ * this nobody on an overlay-only node ever got one.  Letter 'G' = PRIVMSG,
+ * 'g' = NOTICE; body "<mask> :<text>".  Emits whenever the shadow is active;
+ * the caller then keeps the tree leg off CRDT-aware links. */
+static int masked_mesh_mint(struct Client *from, int is_notice,
+                            const char *mask, const char *text)
+{
+  char body[BUFSIZE], msgidbuf[64];
+  if (!crdt_shadow_active() || !from)
+    return 0;
+  ircd_snprintf(0, body, sizeof body, "%s :%s", mask, text);
+  generate_msgid(msgidbuf, sizeof msgidbuf);
+  crdt_gossip_message(from, is_notice ? 'g' : 'G', "*", msgidbuf, body);
+  return 1;
+}
+
 void relay_masked_message(struct Client* sptr, const char* mask, const char* text)
 {
   const char* s;
@@ -2052,6 +2070,8 @@ void relay_masked_message(struct Client* sptr, const char* mask, const char* tex
     ++s;
   }
 
+  if (masked_mesh_mint(sptr, 0, mask, text))
+    sendcmdto_set_skip_crdt_servers();   /* M6: CRDT-aware peers get the mesh copy */
   sendcmdto_match_butone(sptr, CMD_PRIVATE, s,
 			 IsServer(cli_from(sptr)) ? cli_from(sptr) : 0,
 			 host_mask ? MATCH_HOST : MATCH_SERVER,
@@ -2094,6 +2114,8 @@ void relay_masked_notice(struct Client* sptr, const char* mask, const char* text
     ++s;
   }
 
+  if (masked_mesh_mint(sptr, 1, mask, text))
+    sendcmdto_set_skip_crdt_servers();   /* M6: CRDT-aware peers get the mesh copy */
   sendcmdto_match_butone(sptr, CMD_NOTICE, s,
 			 IsServer(cli_from(sptr)) ? cli_from(sptr) : 0,
 			 host_mask ? MATCH_HOST : MATCH_SERVER,
@@ -2117,6 +2139,9 @@ void server_relay_masked_message(struct Client* sptr, const char* mask, const ch
     host_mask = 1;
     ++s;
   }
+  if ((!IsServer(cli_from(sptr)) || !IsCrdtAware(cli_from(sptr)))
+      && masked_mesh_mint(sptr, 0, mask, text))
+    sendcmdto_set_skip_crdt_servers();   /* M6: CRDT-aware peers get the mesh copy */
   sendcmdto_match_butone(sptr, CMD_PRIVATE, s,
 			 IsServer(cli_from(sptr)) ? cli_from(sptr) : 0,
 			 host_mask ? MATCH_HOST : MATCH_SERVER,
@@ -2140,6 +2165,9 @@ void server_relay_masked_notice(struct Client* sptr, const char* mask, const cha
     host_mask = 1;
     ++s;
   }
+  if ((!IsServer(cli_from(sptr)) || !IsCrdtAware(cli_from(sptr)))
+      && masked_mesh_mint(sptr, 1, mask, text))
+    sendcmdto_set_skip_crdt_servers();   /* M6: CRDT-aware peers get the mesh copy */
   sendcmdto_match_butone(sptr, CMD_NOTICE, s,
 			 IsServer(cli_from(sptr)) ? cli_from(sptr) : 0,
 			 host_mask ? MATCH_HOST : MATCH_SERVER,

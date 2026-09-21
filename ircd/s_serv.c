@@ -250,6 +250,7 @@ int server_estab(struct Client *cptr, struct ConfItem *aconf)
    */
   if (feature_bool(FEAT_CAP_draft_multiline) && IsIRCv3Aware(cptr)) {
     struct Client *srv;
+    multiline_announce_mesh_mint(&me);   /* M9: overlay-only peers learn our limits too */
     sendcmdto_one(&me, CMD_MULTILINE, cptr, "%d %d",
                   feature_int(FEAT_MULTILINE_MAX_BYTES),
                   feature_int(FEAT_MULTILINE_MAX_LINES));

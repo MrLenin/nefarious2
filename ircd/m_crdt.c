@@ -26,6 +26,7 @@
 #include "ircd_snprintf.h"  /* MR-1: ircd_snprintf (route target numeric) */
 #include "handlers.h"
 #include "metadata.h"      /* METADATA_VIS_*: CR M E receiver */
+#include "s_user.h"        /* MATCH_HOST/MATCH_SERVER: masked-message receiver */
 #include "msg.h"
 #include "numnicks.h"
 #include "send.h"
@@ -1216,6 +1217,52 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
           privs_apply_from_mesh(vn, sp + 1, !vsrv || IsMeshStub(vsrv));
         }
       }
+    } else if ((m_cmd[0] == 'G' || m_cmd[0] == 'g') && target[0] == '*') {  /* masked
+                                            * PRIVMSG ('G') / NOTICE ('g'): "<mask>
+                                            * :<text>".  Deliver to LOCAL matching
+                                            * users; real P10 to legacy links only
+                                            * when the origin has no tree presence
+                                            * here (the mask send routes per user). */
+      char gb[BUFSIZE];
+      char *gtext = NULL, *gs;
+      int ghost = 0;
+      ircd_strncpy(gb, m_text, sizeof gb);
+      gs = strstr(gb, " :");
+      if (gs && srcu) {
+        struct Client *osrv = cli_user(srcu)->server;
+        const char *mm;
+        *gs = '\0'; gtext = gs + 2;
+        mm = gb;                              /* "$*.mask" or "$@host.mask" */
+        if (*mm == '$') mm++;
+        if (*mm == '@') { ghost = 1; mm++; }
+        sendcmdto_set_match_local_only();
+        sendcmdto_match_butone(srcu, (m_cmd[0] == 'g') ? CMD_NOTICE : CMD_PRIVATE,
+                               mm, NULL, ghost ? MATCH_HOST : MATCH_SERVER,
+                               "%s :%s", gb, gtext);
+        if (!osrv || IsMeshStub(osrv)) {
+          sendcmdto_set_skip_crdt_servers();
+          sendcmdto_match_butone(srcu, (m_cmd[0] == 'g') ? CMD_NOTICE : CMD_PRIVATE,
+                                 mm, NULL, ghost ? MATCH_HOST : MATCH_SERVER,
+                                 "%s :%s", gb, gtext);
+        }
+      }
+    } else if (m_cmd[0] == 'J' && target[0] == '*') {  /* GITSYNC "*" broadcast (M12):
+                                            * "<action> [<subarg>]", run locally. */
+      char jb[BUFSIZE];
+      char *jsp;
+      ircd_strncpy(jb, m_text, sizeof jb);
+      jsp = strchr(jb, ' ');
+      if (jsp) *jsp++ = '\0';
+      if (jb[0]) {
+        Debug((DEBUG_DEBUG, "CRDT GS: mesh gitsync %s %s from %s", jb, jsp ? jsp : "", srcyxx));
+        gitsync_apply_from_mesh(jb, jsp);
+      }
+    } else if (m_cmd[0] == 'B' && target[0] == '*') {  /* MULTILINE announce (M9):
+                                            * "<numeric> <bytes> <lines>". */
+      char bn[4];
+      unsigned bb = 0, bl = 0;
+      if (sscanf(m_text, "%2s %u %u", bn, &bb, &bl) == 3)
+        multiline_announce_apply(bn, bb, bl);
     } else if (m_cmd[0] == 'Z' && target[0] == '*') {  /* SVSNOOP: "<servermask> <+|->",
                                             * every mesh node applies it against
                                             * itself (the P10 handler's logic); the

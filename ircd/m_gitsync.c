@@ -35,6 +35,8 @@
 #include "s_conf.h"
 #include "s_user.h"
 #include "send.h"
+#include "handlers.h"
+#include "crdt_shadow.h"
 
 #ifdef USE_LIBGIT2
 #include "gitsync.h"
@@ -340,6 +342,25 @@ cleanup:
  *   /GITSYNC * pubkey        - Show public keys from all servers
  *   /GITSYNC server.name hostkey reset - Reset fingerprint on specific server
  */
+/* M12: the mesh copy of a network-wide GITSYNC ("* <action> [<subarg>]"):
+ * the tree broadcast never reaches an overlay-only node, which then runs
+ * the old linesync config indefinitely.  Letter 'J'; receivers run the
+ * broadcast locally exactly as ms_gitsync does (no onward relay: the
+ * shared flood carries it).  Emits whenever the shadow is active. */
+static int gitsync_mesh_mint(struct Client *from, const char *action, const char *subarg)
+{
+  char body[BUFSIZE], msgidbuf[64];
+  if (!crdt_shadow_active() || !from || !action)
+    return 0;
+  if (subarg)
+    ircd_snprintf(0, body, sizeof body, "%s %s", action, subarg);
+  else
+    ircd_snprintf(0, body, sizeof body, "%s", action);
+  generate_msgid(msgidbuf, sizeof msgidbuf);
+  crdt_gossip_message(from, 'J', "*", msgidbuf, body);
+  return 1;
+}
+
 int mo_gitsync(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
 {
 #ifdef USE_LIBGIT2
@@ -406,7 +427,9 @@ int mo_gitsync(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
     }
 
     if (strcmp(target, "*") == 0) {
-      /* Broadcast to all servers */
+      /* Broadcast to all servers (CRDT-aware peers get the mesh copy) */
+      if (gitsync_mesh_mint(sptr, action, subarg))
+        sendcmdto_set_skip_crdt_servers();
       if (subarg)
         sendcmdto_serv_butone_v3(sptr, CMD_GITSYNC, cptr, "* %s %s", action, subarg);
       else
@@ -683,6 +706,23 @@ int mo_gitsync(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
  * parv[2] = action (force|status|pubkey|hostkey)
  * parv[3] = optional sub-argument (pem|reset)
  */
+static int gitsync_relay_mode = 0;   /* M12: 1 = mesh receiver (apply only) */
+
+void gitsync_apply_from_mesh(const char *action, const char *subarg)
+{
+  char *pv[6];
+  int pc = 0;
+  pv[pc++] = "GITSYNC";
+  pv[pc++] = "*";
+  pv[pc++] = (char *)action;
+  if (subarg && *subarg)
+    pv[pc++] = (char *)subarg;
+  pv[pc] = NULL;
+  gitsync_relay_mode = 1;
+  ms_gitsync(&me, &me, pc, pv);
+  gitsync_relay_mode = 0;
+}
+
 int ms_gitsync(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
 {
 #ifdef USE_LIBGIT2
@@ -701,11 +741,18 @@ int ms_gitsync(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
 
   /* Check if this is for us */
   if (strcmp(target, "*") == 0) {
-    /* Broadcast - forward to other servers and handle locally */
-    if (subarg)
-      sendcmdto_serv_butone_v3(sptr, CMD_GITSYNC, cptr, "* %s %s", action, subarg);
-    else
-      sendcmdto_serv_butone_v3(sptr, CMD_GITSYNC, cptr, "* %s", action);
+    /* Broadcast - forward to other servers and handle locally.  Gateway
+     * edge (CI precedent): one that arrived over a LEGACY link is minted
+     * into the mesh once here; the tree relay then skips CRDT-aware links.
+     * The mesh receiver (gitsync_relay_mode) applies only, no relay. */
+    if (gitsync_relay_mode == 0) {
+      if (IsServer(cptr) && !IsCrdtAware(cptr) && gitsync_mesh_mint(sptr, action, subarg))
+        sendcmdto_set_skip_crdt_servers();
+      if (subarg)
+        sendcmdto_serv_butone_v3(sptr, CMD_GITSYNC, cptr, "* %s %s", action, subarg);
+      else
+        sendcmdto_serv_butone_v3(sptr, CMD_GITSYNC, cptr, "* %s", action);
+    }
   } else {
     acptr = FindNServer(target);
     if (!acptr)

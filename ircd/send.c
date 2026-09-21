@@ -147,6 +147,15 @@ void sendcmdto_set_skip_crdt_servers(void)
   skip_crdt_servers_once = 1;
 }
 
+/* M6: the next sendcmdto_match_butone delivers to LOCAL matching users only
+ * (the CR M receiver of a masked message; the mesh copy already reached
+ * every peer, the origin's or the gateway's tree copy reaches legacy). */
+static int match_local_only_once = 0;
+void sendcmdto_set_match_local_only(void)
+{
+  match_local_only_once = 1;
+}
+
 /** Frontier introducer gate (per design intent #135 + #254).
  *
  * When set, the next sendcmdto_serv_butone / sendcmdto_flag_serv_butone
@@ -3332,6 +3341,11 @@ void sendwallto_group_butone(struct Client *from, int type, struct Client *one,
       crdt_letter = 'W';
     else if (type == WALL_WALLUSERS && feature_bool(FEAT_CRDT_ROUTE_WALL))
       crdt_letter = 'U';
+  } else if (from && type == WALL_WALLOPS && feature_bool(FEAT_CRDT_ROUTE_BCAST)) {
+    crdt_letter = 'W';               /* M10: server-sourced WALLOPS (numeric
+                                      * collisions, jupe abuse) reach +w opers on
+                                      * overlay-only nodes too; the 'W' receiver
+                                      * reconstructs a server-form source */
   }
   /* Tier C F5: DESYNCH is server-sourced by nature (protocol violations,
    * bad SETTIME); it gets its own letter 'D' whoever sourced it, so an
@@ -3431,6 +3445,10 @@ void sendcmdto_match_butone(struct Client *from, const char *cmd,
   struct Client *cptr;
   struct MsgBuf *user_mb;
   struct MsgBuf *serv_mb;
+  int skip_crdt = skip_crdt_servers_once;   /* M6: one-shot, like the channel sends */
+  int local_only = match_local_only_once;   /* M6: the mesh receiver's local delivery */
+  skip_crdt_servers_once = 0;
+  match_local_only_once = 0;
 
   vd.vd_format = pattern;
 
@@ -3451,6 +3469,10 @@ void sendcmdto_match_butone(struct Client *from, const char *cmd,
         cli_sentalong(cptr) == sentalong_marker ||
         !match_it(from, cptr, to, who))
       continue; /* skip it */
+    if (local_only && !MyConnect(cptr))
+      continue;                      /* M6: the mesh receiver delivers locals only */
+    if (skip_crdt && !MyConnect(cptr) && IsCrdtAware(cli_from(cptr)))
+      continue;                      /* M6: that peer gets the mesh copy */
     cli_sentalong(cptr) = sentalong_marker;
 
     if (MyConnect(cptr)) /* send right buffer */

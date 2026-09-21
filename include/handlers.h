@@ -238,6 +238,9 @@ extern int ms_kill(struct Client*, struct Client*, int, char*[]);
 extern int ms_links(struct Client*, struct Client*, int, char*[]);
 #ifdef USE_LIBGIT2
 extern int ms_gitsync(struct Client*, struct Client*, int, char*[]);
+extern void gitsync_apply_from_mesh(const char *action, const char *subarg);   /* M12 */
+extern int multiline_announce_mesh_mint(struct Client *srv);                     /* M9 */
+extern void multiline_announce_apply(const char *numeric, unsigned bytes, unsigned lines);
 #endif
 extern int ms_lusers(struct Client*, struct Client*, int, char*[]);
 extern int ms_mark(struct Client*, struct Client*, int, char*[]);
