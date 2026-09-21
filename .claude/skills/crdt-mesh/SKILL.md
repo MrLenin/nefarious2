@@ -124,7 +124,14 @@ All ride normal P10 framing as `:<src> CR <sub> …`. Gossiped to every `IsCrdtS
   target only); `*`-target broadcasts `W` WALLOPS (user- AND server-sourced) `U` WALLUSERS `O` SNO `M` SMO
   `D` DESYNCH `I` CI (target `*`; INVITE is `I` with a user target) `A` TK `S` PN `R` REDACT `E` METADATA
   (ephemeral) `G`/`g` masked PRIVMSG/NOTICE `J` GITSYNC `B` MULTILINE
-  announce `Z` SVSNOOP. **Rules that every letter follows:** mint at the ORIGIN and once at the §17.7
+  announce `Z` SVSNOOP; user-target `Y` = a VERBATIM server-form line (numeric reply, NOTICE, any
+  server->user token) toward a user homed on a mesh stub -- minted by the `send_buffer` hook
+  (`crdt_reply_route_try`, the one point every send family reaches with the recipient known),
+  re-injected at the home through `do_numeric` / the token's SERVER handler (`crdt_line_reinject`,
+  cptr=&me, sptr=the line's own source); MODE excluded (umodes ride the user record). CR X letter
+  `L` is the request half: `hunt_server_cmd` toward a stub carries `[@Atags ]<src> <tok> <params>`
+  (the forwarded label rides inside), same re-inject at the destination; the gateway re-emits it
+  as real P10 for a legacy server it fronts. Pure helpers `crdt_p10.c` (cmocka'd). **Rules that every letter follows:** mint at the ORIGIN and once at the §17.7
   gateway edge (`IsServer(cptr) && !IsCrdtAware(cptr)`); when minted keep the tree copy off CRDT-aware
   links (`sendcmdto_set_skip_crdt_servers()` / `sendcmdto_flag_serv_butone(..., FLAG_CRDT_AWARE)`) — a
   tree copy has no msgid to dedup on, so a P10-linked CRDT peer would deliver twice (F3 lesson); receivers

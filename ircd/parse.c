@@ -1374,6 +1374,19 @@ msg_tree_parse(char *cmd, struct MessageTree *root)
   return NULL;
 }
 
+/** Look a P10 token up in the token trie (batch 6 item 3: the mesh
+ * re-injects a verbatim server-form line through the handler its token
+ * names).  @a tok is copied because the trie walk wants a mutable cursor.
+ * @return The message, or NULL. */
+struct Message *msg_find_token(const char *tok)
+{
+  char buf[16];
+  if (!tok || !*tok || strlen(tok) >= sizeof buf)
+    return NULL;
+  strcpy(buf, tok);
+  return msg_tree_parse(buf, &tok_tree);
+}
+
 /** Registers a service mapping to the pseudocommand handler.
  * @param[in] map Service mapping to add.
  * @return Non-zero on success; zero if a command already used the name.

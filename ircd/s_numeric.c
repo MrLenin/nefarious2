@@ -64,8 +64,12 @@ int do_numeric(int numeric, int nnn, struct Client *cptr, struct Client *sptr,
   struct Channel *achptr = 0;
   char num[4];
 
-  /* Avoid trash, we need it to come from a server and have a target  */
-  if ((parc < 2) || !IsServer(sptr))
+  /* Avoid trash, we need it to come from a server and have a target.
+   * A mesh anchor/stub is a legitimate server source here (invariant 2,
+   * handler side): parse.c admits an anchor-prefixed numeric over a
+   * CRDT-aware link, and the mesh reply carrier re-injects with the origin
+   * anchor (or &me when it has none) as sptr. */
+  if ((parc < 2) || (!IsServer(sptr) && !IsMeshStub(sptr) && !IsMe(sptr)))
     return 0;
 
   /* Who should receive this message ? Will we do something with it ?

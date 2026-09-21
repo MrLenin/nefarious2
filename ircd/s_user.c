@@ -264,23 +264,41 @@ int hunt_server_cmd(struct Client *from, const char *cmd, const char *tok,
   }
 
   /* Save label and generate compact tag for forwarded labeled commands.
-   * Must happen before sendcmdto_one which picks up the s2s overrides.
+   * Must happen before the send, which picks up the s2s overrides.
    *
    * Only toward an IRCv3-aware destination: the label is correlated to
    * the reply by the compact msgid, which a legacy server neither
    * receives (send.c gates the @A prefix on IsIRCv3Aware) nor echoes.
    * With no possible correlation the honest outcome is the plain
-   * labeled ACK now and untagged numerics when they arrive. */
-  if (MyConnect(from) && cli_label(from)[0] &&
-      feature_bool(FEAT_CAP_labeled_response) &&
-      CapActive(from, CAP_LABELEDRESP) && CapActive(from, CAP_BATCH) &&
-      IsIRCv3Aware(acptr)) {
+   * labeled ACK now and untagged numerics when they arrive.  A mesh stub
+   * counts as aware (every mesh node is). */
+  {
     char msgid[S2S_MSGID_BUFSIZE];
-    uint64_t time_ms;
-    if (fwd_label_save(from, cmd, msgid, &time_ms)) {
-      if (feature_bool(FEAT_P10_MESSAGE_TAGS))
-        sendcmdto_set_s2s_tags(time_ms, msgid);
+    uint64_t time_ms = 0;
+    int have_label = 0;
+    if (MyConnect(from) && cli_label(from)[0] &&
+        feature_bool(FEAT_CAP_labeled_response) &&
+        CapActive(from, CAP_LABELEDRESP) && CapActive(from, CAP_BATCH) &&
+        (IsIRCv3Aware(acptr) || IsMeshStub(acptr)) &&
+        fwd_label_save(from, cmd, msgid, &time_ms))
+      have_label = feature_bool(FEAT_P10_MESSAGE_TAGS);
+
+    /* Batch 6 item 3 (request direction): the destination is a mesh stub --
+     * a P10 send would dead-sink.  Carry "<src> <tok> <params>" over CR X 'L'
+     * to be re-injected there; the replies come back over CR M 'Y'.  The
+     * label rides inside the frame, so the override is NOT armed on this
+     * path (it would leak into the next unrelated send). */
+    if (IsMeshStub(acptr)) {
+      char params[BUFSIZE];
+      ircd_snprintf(acptr, params, sizeof params, pattern, parv[1], parv[2], parv[3],
+                    parv[4], parv[5], parv[6], parv[7], parv[8]);
+      if (crdt_hunt_route_try(from, acptr, tok, params, have_label ? msgid : NULL, time_ms))
+        return (HUNTED_PASS);
+      send_reply(from, SND_EXPLICIT | ERR_NOSUCHSERVER, "* :Server is not reachable");
+      return (HUNTED_NOSUCH);
     }
+    if (have_label)
+      sendcmdto_set_s2s_tags(time_ms, msgid);
   }
 
   sendcmdto_one(from, cmd, tok, acptr, pattern, parv[1], parv[2], parv[3],
@@ -366,21 +384,45 @@ int hunt_server_prio_cmd(struct Client *from, const char *cmd, const char *tok,
   }
 
   /* Save label and generate compact tag for forwarded labeled commands.
-   * IRCv3-aware destinations only -- see hunt_server_cmd. */
-  if (MyConnect(from) && cli_label(from)[0] &&
-      feature_bool(FEAT_CAP_labeled_response) &&
-      CapActive(from, CAP_LABELEDRESP) && CapActive(from, CAP_BATCH) &&
-      IsIRCv3Aware(acptr)) {
+   * Must happen before the send, which picks up the s2s overrides.
+   *
+   * Only toward an IRCv3-aware destination: the label is correlated to
+   * the reply by the compact msgid, which a legacy server neither
+   * receives (send.c gates the @A prefix on IsIRCv3Aware) nor echoes.
+   * With no possible correlation the honest outcome is the plain
+   * labeled ACK now and untagged numerics when they arrive.  A mesh stub
+   * counts as aware (every mesh node is). */
+  {
     char msgid[S2S_MSGID_BUFSIZE];
-    uint64_t time_ms;
-    if (fwd_label_save(from, cmd, msgid, &time_ms)) {
-      if (feature_bool(FEAT_P10_MESSAGE_TAGS))
-        sendcmdto_set_s2s_tags(time_ms, msgid);
+    uint64_t time_ms = 0;
+    int have_label = 0;
+    if (MyConnect(from) && cli_label(from)[0] &&
+        feature_bool(FEAT_CAP_labeled_response) &&
+        CapActive(from, CAP_LABELEDRESP) && CapActive(from, CAP_BATCH) &&
+        (IsIRCv3Aware(acptr) || IsMeshStub(acptr)) &&
+        fwd_label_save(from, cmd, msgid, &time_ms))
+      have_label = feature_bool(FEAT_P10_MESSAGE_TAGS);
+
+    /* Batch 6 item 3 (request direction): the destination is a mesh stub --
+     * a P10 send would dead-sink.  Carry "<src> <tok> <params>" over CR X 'L'
+     * to be re-injected there; the replies come back over CR M 'Y'.  The
+     * label rides inside the frame, so the override is NOT armed on this
+     * path (it would leak into the next unrelated send). */
+    if (IsMeshStub(acptr)) {
+      char params[BUFSIZE];
+      ircd_snprintf(acptr, params, sizeof params, pattern, parv[1], parv[2], parv[3],
+                    parv[4], parv[5], parv[6], parv[7], parv[8]);
+      if (crdt_hunt_route_try(from, acptr, tok, params, have_label ? msgid : NULL, time_ms))
+        return (HUNTED_PASS);
+      send_reply(from, SND_EXPLICIT | ERR_NOSUCHSERVER, "* :Server is not reachable");
+      return (HUNTED_NOSUCH);
     }
+    if (have_label)
+      sendcmdto_set_s2s_tags(time_ms, msgid);
   }
 
   sendcmdto_prio_one(from, cmd, tok, acptr, pattern, parv[1], parv[2], parv[3],
-		     parv[4], parv[5], parv[6], parv[7], parv[8]);
+                parv[4], parv[5], parv[6], parv[7], parv[8]);
 
   return (HUNTED_PASS);
 }

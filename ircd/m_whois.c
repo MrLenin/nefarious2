@@ -98,6 +98,7 @@
 #include "msg.h"
 #include "numeric.h"
 #include "numnicks.h"
+#include "handlers.h"      /* crdt_hunt_avail (batch 6 item 3) */
 #include "s_user.h"
 #include "send.h"
 #include "whocmds.h"
@@ -534,7 +535,9 @@ int m_whois(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
       }
     }
 
-    if (!whois_dest_is_mesh_only(sptr, parv[1]) &&
+    /* Batch 6 item 3: a mesh-only destination is hunted over CR X 'L' (owner-
+     * exact idle) when the carrier is up; the local answer stays the fallback. */
+    if ((crdt_hunt_avail() || !whois_dest_is_mesh_only(sptr, parv[1])) &&
         hunt_server_cmd(sptr, CMD_WHOIS, cptr, 0, "%C :%s", 1, parc, parv) !=
        HUNTED_ISME)
     return 0;
@@ -616,7 +619,7 @@ int ms_whois(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
 
   if (parc > 2)
   {
-    if (!whois_dest_is_mesh_only(sptr, parv[1]) &&
+    if ((crdt_hunt_avail() || !whois_dest_is_mesh_only(sptr, parv[1])) &&
         hunt_server_cmd(sptr, CMD_WHOIS, cptr, 0, "%C :%s", 1, parc, parv) !=
         HUNTED_ISME)
       return 0;

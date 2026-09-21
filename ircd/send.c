@@ -1238,6 +1238,18 @@ void send_buffer(struct Client* to, struct MsgBuf* buf, int prio)
   assert(0 != to);
   assert(0 != buf);
 
+  /* Batch 6 item 3 (reply direction): a line for a REMOTE USER whose link is
+   * a mesh stub would be dropped by can_send below -- every numeric reply,
+   * NOTICE or other server->user line toward a user homed on a tree-absent
+   * server.  This is the one point every send family reaches with the
+   * recipient still known (send_reply, sendrawto_one and the seven
+   * sendcmdto_*one* formatters all end here), so the mesh carrier hooks
+   * here: the fully formatted server-form line rides CR M 'Y' to the
+   * user's home node and is re-injected there.  Returns 0 to fall through
+   * for every other recipient. */
+  if (crdt_reply_route_try(to, buf))
+    return;
+
   if (cli_from(to))
     to = cli_from(to);
 
@@ -1340,10 +1352,12 @@ void sendcmdto_one(struct Client *from, const char *cmd, const char *tok,
 {
   struct VarData vd;
   struct MsgBuf *mb;
+  struct Client *dest;
   struct Client *cptr;
   char s2s_tagbuf[128];
   int prio;
 
+  dest = to;                      /* the recipient itself, for send_buffer */
   to = cli_from(to);
 
   vd.vd_format = pattern; /* set up the struct VarData for %v */
@@ -1398,7 +1412,7 @@ void sendcmdto_one(struct Client *from, const char *cmd, const char *tok,
   /* Flush immediately for messages from U-lined servers (services) */
   prio = (feature_bool(FEAT_FLUSH_ULINE_IMMEDIATE) && is_from_uline(from)) ? 1 : 0;
 
-  send_buffer(to, mb, prio);
+  send_buffer(dest, mb, prio);
 
   msgq_clean(mb);
 }
@@ -1417,12 +1431,14 @@ void sendcmdto_one_tags(struct Client *from, const char *cmd, const char *tok,
 {
   struct VarData vd;
   struct MsgBuf *mb;
+  struct Client *dest;
   char tagbuf[512];
   char msgidbuf[64];
   char *tags;
   const char *msgid = NULL;
   int prio;
 
+  dest = to;                      /* the recipient itself, for send_buffer */
   to = cli_from(to);
 
   vd.vd_format = pattern; /* set up the struct VarData for %v */
@@ -1448,7 +1464,7 @@ void sendcmdto_one_tags(struct Client *from, const char *cmd, const char *tok,
   /* Flush immediately for messages from U-lined servers (services) */
   prio = (feature_bool(FEAT_FLUSH_ULINE_IMMEDIATE) && is_from_uline(from)) ? 1 : 0;
 
-  send_buffer(to, mb, prio);
+  send_buffer(dest, mb, prio);
 
   msgq_clean(mb);
 }
@@ -1468,10 +1484,12 @@ void sendcmdto_one_tags_ext(struct Client *from, const char *cmd, const char *to
 {
   struct VarData vd;
   struct MsgBuf *mb;
+  struct Client *dest;
   char tagbuf[512];
   char *tags;
   int prio;
 
+  dest = to;                      /* the recipient itself, for send_buffer */
   to = cli_from(to);
 
   vd.vd_format = pattern;
@@ -1491,7 +1509,7 @@ void sendcmdto_one_tags_ext(struct Client *from, const char *cmd, const char *to
   /* Flush immediately for messages from U-lined servers (services) */
   prio = (feature_bool(FEAT_FLUSH_ULINE_IMMEDIATE) && is_from_uline(from)) ? 1 : 0;
 
-  send_buffer(to, mb, prio);
+  send_buffer(dest, mb, prio);
 
   msgq_clean(mb);
 }
@@ -1520,12 +1538,14 @@ void sendcmdto_one_tags_with_client(struct Client *from,
 {
   struct VarData vd;
   struct MsgBuf *mb;
+  struct Client *dest;
   char tagbuf[4608];
   char s2s_tagbuf[4200];     /* fits @A prefix + ,C<4094-byte client_tags> */
   char *tags;
   int prio;
   int has_ctags = (client_tags && *client_tags);
 
+  dest = to;                      /* the recipient itself, for send_buffer */
   to = cli_from(to);
 
   vd.vd_format = pattern;
@@ -1579,7 +1599,7 @@ void sendcmdto_one_tags_with_client(struct Client *from,
   va_end(vd.vd_args);
 
   prio = (feature_bool(FEAT_FLUSH_ULINE_IMMEDIATE) && is_from_uline(from)) ? 1 : 0;
-  send_buffer(to, mb, prio);
+  send_buffer(dest, mb, prio);
   msgq_clean(mb);
 
   /* Consume any tag overrides the caller armed for this one send, so a
@@ -1609,6 +1629,7 @@ void sendcmdto_one_tags_msgid(struct Client *from, const char *cmd, const char *
 {
   struct VarData vd;
   struct MsgBuf *mb;
+  struct Client *dest;
   char tagbuf[512];
   char msgidbuf[64];
   char timebuf[32];
@@ -1618,6 +1639,7 @@ void sendcmdto_one_tags_msgid(struct Client *from, const char *cmd, const char *
   struct tm tm;
   int prio;
 
+  dest = to;                      /* the recipient itself, for send_buffer */
   to = cli_from(to);
 
   vd.vd_format = pattern;
@@ -1662,7 +1684,7 @@ void sendcmdto_one_tags_msgid(struct Client *from, const char *cmd, const char *
   /* Flush immediately for messages from U-lined servers (services) */
   prio = (feature_bool(FEAT_FLUSH_ULINE_IMMEDIATE) && is_from_uline(from)) ? 1 : 0;
 
-  send_buffer(to, mb, prio);
+  send_buffer(dest, mb, prio);
 
   msgq_clean(mb);
 }
@@ -1682,10 +1704,12 @@ void sendcmdto_one_client_tags(struct Client *from, const char *cmd,
 {
   struct VarData vd;
   struct MsgBuf *mb;
+  struct Client *dest;
   char tagbuf[4608];
   char *tags;
   int prio;
 
+  dest = to;                      /* the recipient itself, for send_buffer */
   to = cli_from(to);
 
   vd.vd_format = pattern;
@@ -1703,7 +1727,7 @@ void sendcmdto_one_client_tags(struct Client *from, const char *cmd,
   /* Flush immediately for messages from U-lined servers (services) */
   prio = (feature_bool(FEAT_FLUSH_ULINE_IMMEDIATE) && is_from_uline(from)) ? 1 : 0;
 
-  send_buffer(to, mb, prio);
+  send_buffer(dest, mb, prio);
 
   msgq_clean(mb);
 }
@@ -1721,7 +1745,9 @@ void sendcmdto_prio_one(struct Client *from, const char *cmd, const char *tok,
 {
   struct VarData vd;
   struct MsgBuf *mb;
+  struct Client *dest;
 
+  dest = to;                      /* the recipient itself, for send_buffer */
   to = cli_from(to);
 
   vd.vd_format = pattern; /* set up the struct VarData for %v */
@@ -1732,7 +1758,7 @@ void sendcmdto_prio_one(struct Client *from, const char *cmd, const char *tok,
 
   va_end(vd.vd_args);
 
-  send_buffer(to, mb, 1);
+  send_buffer(dest, mb, 1);
 
   msgq_clean(mb);
 }

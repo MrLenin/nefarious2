@@ -332,10 +332,16 @@ int abort_sasl(struct Client* cptr, int timeout) {
   else
     send_reply(cptr, ERR_SASLABORTED);
 
-  if (acptr)
-    sendcmdto_one(&me, CMD_SASL, acptr, "%C %C!%u.%u D A", acptr,
-                  &me, cli_fd(cptr), cli_saslcookie(cptr));
-  else
+  if (acptr) {
+    /* The agent may be a mesh anchor (admitted above): tunnel the abort like
+     * sasl_forward does, else the D A dead-sinks and the agent keeps the
+     * session open until its own timeout (batch 6 item 3). */
+    char abody[BUFSIZE];
+    ircd_snprintf(0, abody, sizeof abody, "%s %s!%u.%u D A", cli_yxx(acptr),
+                  cli_yxx(&me), cli_fd(cptr), cli_saslcookie(cptr));
+    if (!crdt_route_services_try(acptr, 'A', abody))
+      sendcmdto_one(&me, CMD_SASL, acptr, "%s", abody);
+  } else
     sendcmdto_serv_butone(&me, CMD_SASL, cptr, "* %C!%u.%u D A",
                           &me, cli_fd(cptr), cli_saslcookie(cptr));
 

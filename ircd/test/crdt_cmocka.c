@@ -29,6 +29,7 @@
 #include "crdt_types.h"
 #include "crdt_state.h"
 #include "crdt_wire.h"
+#include "crdt_p10.h"
 #include "s2s_chunk.h"
 #include "crdt_shadow.h"    /* M12: force_lastmod (static inline, pure) */
 
@@ -4079,6 +4080,70 @@ static void test_cross_entity_out_of_order_converges(void **state)
 
 /* ================================================================== */
 
+/* ===== crdt_p10: the verbatim-line helpers behind CR M 'Y' / CR X 'L' ===== */
+static void test_p10_line_parse_numeric_with_tags(void **state)
+{
+  struct CrdtP10Line ln;
+  const char *line = "@A1234567abcdefghijklmn AB 311 ACAAB nick user host * :real name\r\n";
+  (void)state;
+  assert_int_equal(crdt_p10_line_parse(line, strlen(line), &ln), 1);
+  assert_non_null(ln.tags);
+  assert_int_equal((int)ln.tags_len, 23);
+  assert_memory_equal(ln.tags, "@A1234567abcdefghijklmn", 23);
+  assert_int_equal((int)ln.src_len, 2);
+  assert_memory_equal(ln.src, "AB", 2);
+  assert_int_equal((int)ln.tok_len, 3);
+  assert_true(crdt_p10_tok_is_numeric(ln.tok, ln.tok_len));
+  assert_int_equal((int)ln.rest_len, (int)strlen("ACAAB nick user host * :real name"));
+  assert_memory_equal(ln.rest, "ACAAB nick user host * :real name", ln.rest_len);
+}
+
+static void test_p10_line_parse_user_source_no_tags(void **state)
+{
+  struct CrdtP10Line ln;
+  const char *line = "ABAAC O ACAAB :hello there";
+  (void)state;
+  assert_int_equal(crdt_p10_line_parse(line, strlen(line), &ln), 1);
+  assert_null(ln.tags);
+  assert_int_equal((int)ln.src_len, 5);
+  assert_memory_equal(ln.src, "ABAAC", 5);
+  assert_int_equal((int)ln.tok_len, 1);
+  assert_int_equal(ln.tok[0], 'O');
+  assert_false(crdt_p10_tok_is_numeric(ln.tok, ln.tok_len));
+  assert_int_equal((int)ln.rest_len, (int)strlen("ACAAB :hello there"));
+}
+
+static void test_p10_line_parse_rejects_junk(void **state)
+{
+  struct CrdtP10Line ln;
+  (void)state;
+  assert_int_equal(crdt_p10_line_parse("", 0, &ln), 0);
+  assert_int_equal(crdt_p10_line_parse("AB", 2, &ln), 0);          /* no token */
+  assert_int_equal(crdt_p10_line_parse("ABC 311 x", 9, &ln), 0);   /* 3-char source */
+  assert_int_equal(crdt_p10_line_parse("AB 311", 6, &ln), 1);      /* empty rest is fine */
+  assert_int_equal((int)ln.rest_len, 0);
+}
+
+static void test_p10_split_trailing_and_cap(void **state)
+{
+  char body[] = "ACAAB nick  user :the rest :of it";
+  char cap[] = "a b c d";
+  char *parv[8];
+  int n;
+  (void)state;
+  n = crdt_p10_split(body, parv, 8);
+  assert_int_equal(n, 4);
+  assert_string_equal(parv[0], "ACAAB");
+  assert_string_equal(parv[1], "nick");
+  assert_string_equal(parv[2], "user");
+  assert_string_equal(parv[3], "the rest :of it");
+  assert_null(parv[4]);
+  n = crdt_p10_split(cap, parv, 2);      /* cap: the last slot takes the rest (parse_server rule) */
+  assert_int_equal(n, 2);
+  assert_string_equal(parv[0], "a");
+  assert_string_equal(parv[1], "b c d");
+}
+
 int main(void)
 {
   const struct CMUnitTest tests[] = {
@@ -4188,6 +4253,11 @@ int main(void)
     /* Batch P3-5c Suite 2 — permuted-order merge commutativity/idempotence */
     cmocka_unit_test(test_permuted_merge_commutes_and_idempotent),
     cmocka_unit_test(test_cross_entity_out_of_order_converges),
+    /* batch 6 item 3: verbatim-line helpers */
+    cmocka_unit_test(test_p10_line_parse_numeric_with_tags),
+    cmocka_unit_test(test_p10_line_parse_user_source_no_tags),
+    cmocka_unit_test(test_p10_line_parse_rejects_junk),
+    cmocka_unit_test(test_p10_split_trailing_and_cap),
   };
   return cmocka_run_group_tests(tests, NULL, NULL);
 }

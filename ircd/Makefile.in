@@ -104,6 +104,7 @@ IRCD_SRC = \
 	crdt_types.c \
 	crdt_state.c \
 	crdt_wire.c \
+	crdt_p10.c \
 	crdt_shadow.c \
 	crdt_meshmap.c \
 	s2s_chunk.c \

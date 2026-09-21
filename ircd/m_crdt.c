@@ -28,6 +28,11 @@
 #include "metadata.h"      /* METADATA_VIS_*: CR M E receiver */
 #include "s_user.h"        /* MATCH_HOST/MATCH_SERVER: masked-message receiver */
 #include "msg.h"
+#include "msgq.h"
+#include "parse.h"
+#include "ircd_handler.h"
+#include "s_numeric.h"
+#include "crdt_p10.h"
 #include "numnicks.h"
 #include "send.h"
 #include "crdt_state.h"   /* Tier2 T2-b: struct CrdtUserRecord (CR M source prefix) */
@@ -556,6 +561,172 @@ int crdt_route_services_reply_by_num(const char *srvnum, char p10cmd, const char
   return 1;
 }
 
+/* ===== Batch 6 item 3: the reply direction (CR M 'Y') + the hunt request (CR X 'L') =====
+ * Both move a VERBATIM server-form P10 line "[@A<tags> ]<src> <tok> <params>" and re-inject
+ * it at the far end through the handler its token names (a numeric through do_numeric),
+ * with cptr = &me and sptr = the line's own source resolved locally.  Design:
+ * .claude/para/projects/crdt-mesh-reply-direction.md. */
+
+/* Compact-tag word -> the S2S correlation state parse_server would have set on the arriving
+ * link, applied to @a on (the re-inject reads it back through cli_s2s_msgid). */
+static void crdt_line_tags_apply(struct Client *on, const char *tags, size_t len)
+{
+  if (!on || !cli_connect(on))
+    return;
+  cli_s2s_time_ms(on) = 0;
+  cli_s2s_msgid(on)[0] = '\0';
+  if (tags && len >= 22 && tags[0] == '@' && tags[1] == 'A') {
+    char time_b64[8];
+    memcpy(time_b64, tags + 2, 7);
+    time_b64[7] = '\0';
+    cli_s2s_time_ms(on) = base64toint_64(time_b64);
+    memcpy(cli_s2s_msgid(on), tags + 9, 14);
+    cli_s2s_msgid(on)[14] = '\0';
+  }
+}
+
+static struct Client *crdt_line_source(const struct CrdtP10Line *ln)
+{
+  char tok[8];
+  struct Client *src;
+  memcpy(tok, ln->src, ln->src_len);
+  tok[ln->src_len] = '\0';
+  src = (ln->src_len == 5) ? findNUser(tok) : FindNServer(tok);
+  return src;
+}
+
+/* Re-inject a verbatim server-form line locally.  @a line is copied; the token's SERVER
+ * handler (or do_numeric) runs with cptr = &me and sptr = the resolved source (a server, a
+ * mesh anchor, a user known here) -- &me when the source has no Client here (the same rewrite
+ * FEAT_HIS_REWRITE applies to non-opers).  The compact tag, if any, is applied on &me (what
+ * do_numeric reads for a LOCAL recipient's forwarded-label batch) and, for a user source
+ * homed on a stub, on that stub's dead Connection (what send_reply reads, via cli_from(to),
+ * when the handler answers the requester). */
+static void crdt_line_reinject(const char *line)
+{
+  struct CrdtP10Line ln;
+  struct Client *src, *tagged = NULL;
+  char buf[BUFSIZE + 64];
+  char tokbuf[16];
+  char *parv[MAXPARA + 3];
+  int parc;
+
+  if (!line || !crdt_p10_line_parse(line, strlen(line), &ln))
+    return;
+  if (ln.tok_len >= sizeof tokbuf)
+    return;
+  memcpy(tokbuf, ln.tok, ln.tok_len);
+  tokbuf[ln.tok_len] = '\0';
+  if (!strcmp(tokbuf, TOK_CRDT_REPLICATION))
+    return;                                /* never nest the carrier */
+  src = crdt_line_source(&ln);
+  if (!src)
+    src = &me;
+  memcpy(buf, ln.rest, ln.rest_len);
+  buf[ln.rest_len] = '\0';
+
+  crdt_line_tags_apply(&me, ln.tags, ln.tags_len);
+  if (cli_user(src) && cli_from(src) && cli_from(src) != src && IsMeshStub(cli_from(src))) {
+    tagged = cli_from(src);
+    crdt_line_tags_apply(tagged, ln.tags, ln.tags_len);
+  }
+
+  parv[0] = cli_name(src);
+  if (crdt_p10_tok_is_numeric(tokbuf, 3)) {
+    /* parse_server keeps a numeric's tail as ONE parameter, colon preserved */
+    char *sp = strchr(buf, ' ');
+    parv[1] = buf;
+    if (sp) {
+      *sp = '\0';
+      parv[2] = sp + 1;
+      parc = 3;
+    } else
+      parc = 2;
+    parv[parc] = NULL;
+    do_numeric(atoi(tokbuf), 1, &me, src, parc, parv);
+  } else {
+    struct Message *mptr = msg_find_token(tokbuf);
+    if (mptr && mptr->handlers[SERVER_HANDLER]) {
+      parc = 1 + crdt_p10_split(buf, parv + 1, MAXPARA + 1);
+      parv[parc] = NULL;
+      (*mptr->handlers[SERVER_HANDLER])(&me, src, parc, parv);
+    } else
+      Debug((DEBUG_DEBUG, "CRDT line re-inject: no server handler for %s", tokbuf));
+  }
+
+  crdt_line_tags_apply(&me, NULL, 0);
+  if (tagged)
+    crdt_line_tags_apply(tagged, NULL, 0);
+}
+
+/* send_buffer hook: @a to is the ORIGINAL recipient, @a mb the formatted line.  A remote
+ * user whose link is a mesh stub cannot be reached over the tree; carry the line to its home
+ * over CR M 'Y' (user-routed: next-hop toward the owner, flood fallback, msgid dedup).
+ * Excluded by token: MODE -- umodes ride the user record, the home node would print the
+ * change twice.  Every other named carrier SKIPS its P10 send when the mesh takes the
+ * message, so a line that reaches here toward a stub is one the mesh did not carry. */
+int crdt_reply_route_try(struct Client *to, struct MsgBuf *mb)
+{
+  const char *data;
+  unsigned int len;
+  struct CrdtP10Line ln;
+  struct Client *from;
+  char text[BUFSIZE + 64];
+  char mid[64];
+  size_t n;
+
+  if (!to || !mb || !cli_user(to) || MyConnect(to) || !cli_from(to) ||
+      !IsMeshStub(cli_from(to)) || !crdt_shadow_active())
+    return 0;
+  msgq_buf_data(mb, &data, &len);
+  if (!crdt_p10_line_parse(data, len, &ln))
+    return 0;
+  if (ln.tok_len == 1 && ln.tok[0] == 'M')
+    return 0;                              /* MODE: the user record carries it */
+  if (ln.tok_len == 2 && !memcmp(ln.tok, TOK_CRDT_REPLICATION, 2))
+    return 0;
+  n = (size_t)((ln.rest + ln.rest_len) - data);   /* the line up to the CRLF */
+  if (n >= sizeof text)
+    n = sizeof text - 1;
+  memcpy(text, data, n);
+  text[n] = '\0';
+  from = crdt_line_source(&ln);
+  if (!from)
+    from = &me;
+  generate_msgid(mid, sizeof mid);
+  return crdt_route_unicast_try(from, 'Y', to, mid, text);
+}
+
+int crdt_hunt_avail(void)
+{
+  return crdt_shadow_active() && feature_bool(FEAT_CRDT_SERVICES_BRIDGE);
+}
+
+/* hunt_server_cmd hook: the destination server @a dstsrv is a mesh stub.  Carry the hunted
+ * command as a verbatim line over CR X 'L' (server-routed flood + dedup, like every other
+ * CR X letter); the destination re-injects it and its replies ride CR M 'Y' back.  The
+ * forwarded label, when the caller saved one, rides inside the line as the compact tag. */
+int crdt_hunt_route_try(struct Client *from, struct Client *dstsrv, const char *tok,
+                        const char *params, const char *msgid, uint64_t time_ms)
+{
+  char line[BUFSIZE + 64], tag[40] = "", srcfull[16], dstyxx[4], oyxx[4];
+  struct Client *osrv;
+  if (!crdt_hunt_avail() || !from || !dstsrv || !tok || !params)
+    return 0;
+  if (msgid && *msgid) {
+    char t[8];
+    inttobase64_64(t, time_ms, 7);
+    ircd_snprintf(0, tag, sizeof tag, "@A%s%s ", t, msgid);
+  }
+  crdt_m_source_token(from, srcfull, sizeof srcfull);   /* 5-char user / 2-char server */
+  ircd_snprintf(0, line, sizeof line, "%s%s %s %s", tag, srcfull, tok, params);
+  inttobase64(dstyxx, base64toint(cli_yxx(dstsrv)), 2);
+  osrv = cli_user(from) ? cli_user(from)->server : from;
+  inttobase64(oyxx, base64toint(cli_yxx(osrv ? osrv : &me)), 2);
+  crdt_services_emit(oyxx, dstyxx, 'L', line);
+  return 1;
+}
+
 /* Gateway: re-emit a tunneled services command as REAL P10 toward the live server @a dsrv
  * (x3).  The body is the verbatim P10 param tail; %s passes it literally (auth payloads have
  * no '%').  Dumb pipe — the auth handler on x3 parses it. */
@@ -587,6 +758,33 @@ static void crdt_services_reemit(struct Client *srcsrv, struct Client *dsrv, cha
      * sourced from the real owner, so the requester's find_fed_request()
      * matches exactly as if the two had been directly linked. */
     case 'H': sendcmdto_one(src, CMD_CHATHISTORY, dsrv, "%s", body); break;
+    /* Batch 6 item 3: a hunted command for a LEGACY server we front.  The
+     * line carries its own source; re-emit it as real P10 from that source
+     * unless the source is a mesh-only user legacy never saw (invariant 2). */
+    case 'L': {
+      struct CrdtP10Line ln;
+      struct Client *lsrc;
+      char tokbuf[16], rest[BUFSIZE];
+      if (!crdt_p10_line_parse(body, strlen(body), &ln) || ln.tok_len >= sizeof tokbuf)
+        break;
+      lsrc = crdt_line_source(&ln);
+      if (!lsrc || (cli_user(lsrc) && crdt_user_is_mesh_only(lsrc)))
+        break;
+      memcpy(tokbuf, ln.tok, ln.tok_len);
+      tokbuf[ln.tok_len] = '\0';
+      memcpy(rest, ln.rest, ln.rest_len);
+      rest[ln.rest_len] = '\0';
+      if (ln.tags && ln.tags_len >= 22 && feature_bool(FEAT_P10_MESSAGE_TAGS)) {
+        char t[8], mid[S2S_MSGID_BUFSIZE];
+        memcpy(t, ln.tags + 2, 7);
+        t[7] = '\0';
+        memcpy(mid, ln.tags + 9, 14);
+        mid[14] = '\0';
+        sendcmdto_set_s2s_tags(base64toint_64(t), mid);
+      }
+      sendcmdto_one(lsrc, tokbuf, tokbuf, dsrv, "%s", rest);
+      break;
+    }
     default: break;
   }
 }
@@ -985,7 +1183,8 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
       return 0;                        /* already handled via another mesh path */
     is_tag = (m_cmd[0] == 'T');
     cmdstr = (m_cmd[0] == 'N') ? "NOTICE" : (m_cmd[0] == 'K') ? "KILL"
-             : (m_cmd[0] == 'I') ? "INVITE" : (is_tag ? "TAGMSG" : "PRIVMSG");
+             : (m_cmd[0] == 'I') ? "INVITE" : (m_cmd[0] == 'Y') ? "LINE"
+             : (is_tag ? "TAGMSG" : "PRIVMSG");
     src = crdt_shadow_user_record(srcyxx);
     /* Source-form discrimination: a 2-char token is the SERVER-form source
      * (server / mesh stub / &me — a userless origin has no user YXX, see
@@ -1486,6 +1685,11 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
                                  : (srcsrv ? cli_name(srcsrv) : "mesh"));
         sendcmdto_one(ksh, CMD_KILL, tgt, "%C :%s %s", tgt, kn, m_text);
         exit_client_msg(cptr, tgt, ksh, "Killed (%s %s)", kn, m_text);
+      } else if (tgt && MyConnect(tgt) && m_cmd[0] == 'Y') {
+        /* Batch 6 item 3: a verbatim server->user line (a numeric reply, a
+         * NOTICE...) reached the recipient's HOME: re-inject it through the
+         * handler its token names, which delivers to the local client. */
+        crdt_line_reinject(m_text);
       } else if (tgt && MyConnect(tgt) && m_cmd[0] == 'I') {
         /* MR-5-1: a mesh-routed INVITE reached the target's HOME -> add the invite + notify
          * the local target (mirrors m_invite's MyConnect branch).  m_text = the channel. */
@@ -1549,7 +1753,14 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
           struct Client *srcc = srcu;
           int is_kill = (m_cmd[0] == 'K');                 /* MR-4c */
           int is_inv  = (m_cmd[0] == 'I');
-          if (feature_bool(FEAT_CRDT_GATEWAY_BRIDGE) && srcc &&
+          if (m_cmd[0] == 'Y' && feature_bool(FEAT_CRDT_GATEWAY_BRIDGE)) {
+            /* Batch 6 item 3: the recipient is a legacy user THIS node fronts.
+             * Re-inject; do_numeric / the token's handler relay to the remote
+             * user over our live legacy link (the source is rewritten to &me
+             * for non-opers by FEAT_HIS_REWRITE as on the tree). */
+            crdt_line_reinject(m_text);
+            crdt_cr_to_p10_bridged++;
+          } else if (feature_bool(FEAT_CRDT_GATEWAY_BRIDGE) && srcc &&
               !crdt_user_is_mesh_only(srcc) &&
               (m_cmd[0] == 'P' || m_cmd[0] == 'N' || is_kill || is_inv)) {
             if (is_kill)
@@ -1734,6 +1945,8 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
       if (x_cmd == 'H')                  /* 5-5f B3: chathistory needs the reply
                                           * tunnel armed around its dispatch */
         crdt_ch_tunnel_dispatch(srcyxx, bodybuf);
+      else if (x_cmd == 'L')             /* batch 6 item 3: a hunted command, verbatim */
+        crdt_line_reinject(bodybuf);
       else
         crdt_services_reinject(x_cmd, bodybuf);
       log_write(LS_SYSTEM, L_INFO, 0, "Tier B CR-X: re-injected locally cmd=%c", x_cmd);

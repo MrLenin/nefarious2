@@ -402,6 +402,20 @@ extern int crdt_route_services_try(struct Client* dstsrv, char p10cmd, const cha
 extern int crdt_route_services_reply_try(struct Client* tgt, char p10cmd, const char* body);
 extern int crdt_route_services_reply_by_num(const char* srvnum, char p10cmd, const char* body);
 
+/* Batch 6 item 3: the reply direction.  _reply_route_try: called from
+ * send_buffer with the ORIGINAL recipient and the formatted MsgBuf; tunnels a
+ * server-form line whose recipient is a user on a mesh-stub link over CR M 'Y'
+ * (1 = taken, the caller must not queue it).  _hunt_route_try: called from the
+ * hunt_server_cmd family when the destination server is a mesh stub; carries
+ * "<src> <tok> <params>" over CR X 'L' to be re-injected there (1 = taken).
+ * _hunt_avail: is that carrier usable (callers that would otherwise answer
+ * locally, m_whois, ask first). */
+struct MsgBuf;
+extern int crdt_reply_route_try(struct Client* to, struct MsgBuf* mb);
+extern int crdt_hunt_route_try(struct Client* from, struct Client* dstsrv, const char* tok,
+                               const char* params, const char* msgid, uint64_t time_ms);
+extern int crdt_hunt_avail(void);
+
 /* 5-5f B3 (gateway slice): chathistory federation over the CR-X carrier.
  * _try tunnels a frame toward a server numeric (0 = carrier unavailable, the
  * caller must then account for the request itself); _reply is the fire-and-
