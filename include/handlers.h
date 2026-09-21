@@ -330,6 +330,12 @@ extern int ms_redact(struct Client*, struct Client*, int, char*[]);
 extern void redact_apply_remote(struct Client *src, const char *target,
                                 const char *msgid, const char *redact_msgid,
                                 uint64_t time_ms, const char *reason);
+/* Same with the stored sender/account given explicitly (catch-up replay keeps
+ * the original redacter on the context row; NULL = derive from src). */
+extern void redact_apply_row(struct Client *src, const char *target,
+                             const char *msgid, const char *redact_msgid,
+                             uint64_t time_ms, const char *reason,
+                             const char *sender_str, const char *account_str);
 extern int redact_mesh_mint(struct Client *from, const char *target,
                             const char *msgid, const char *redact_msgid,
                             uint64_t time_ms, const char *reason);

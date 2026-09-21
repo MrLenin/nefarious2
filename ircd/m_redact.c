@@ -391,9 +391,10 @@ int m_redact(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
  * local members with the capability.  Idempotent: a repeat (two servers or
  * two users redacting the same message, or the catch-up query replaying one
  * we already applied) is still shown locally but stores no second row. */
-void redact_apply_remote(struct Client *src, const char *target,
-                         const char *msgid, const char *redact_msgid,
-                         uint64_t time_ms, const char *reason)
+void redact_apply_row(struct Client *src, const char *target,
+                      const char *msgid, const char *redact_msgid,
+                      uint64_t time_ms, const char *reason,
+                      const char *sender_str, const char *account_str)
 {
   struct Channel *chptr;
 
@@ -415,7 +416,9 @@ void redact_apply_remote(struct Client *src, const char *target,
                   (unsigned long long)(time_ms / 1000),
                   (unsigned long long)(time_ms % 1000));
 
-    if (cli_user(src))
+    if (sender_str && sender_str[0])
+      ircd_strncpy(sender, sender_str, sizeof(sender));
+    else if (cli_user(src))
       ircd_snprintf(0, sender, sizeof(sender), "%s!%s@%s",
                     cli_name(src), cli_user(src)->username,
                     cli_user(src)->host);
@@ -430,8 +433,9 @@ void redact_apply_remote(struct Client *src, const char *target,
                     "%s", msgid);
 
     history_store_message(redact_msgid, timestamp, target, NULL, sender,
-                          (cli_user(src) && cli_user(src)->account[0])
-                            ? cli_user(src)->account : "",
+                          account_str ? account_str
+                          : ((cli_user(src) && cli_user(src)->account[0])
+                             ? cli_user(src)->account : ""),
                           HISTORY_REDACT, redact_content, NULL);
   }
 
@@ -444,6 +448,13 @@ void redact_apply_remote(struct Client *src, const char *target,
 
   /* Clear msgid override so it doesn't leak into the next tagged send */
   sendcmdto_set_client_msgid(NULL);
+}
+
+void redact_apply_remote(struct Client *src, const char *target,
+                         const char *msgid, const char *redact_msgid,
+                         uint64_t time_ms, const char *reason)
+{
+  redact_apply_row(src, target, msgid, redact_msgid, time_ms, reason, NULL, NULL);
 }
 
 /* Mesh copy of a redaction (CR M 'R', target "*"): the P10 body plus the two
