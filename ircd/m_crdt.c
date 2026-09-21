@@ -1103,17 +1103,6 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
           presence_apply_close(pv[0], /*is_session=*/0, pv[1], ps, pe);
         }
       }
-    } else if (m_cmd[0] == 'Q' && target[0] == '*') {  /* QUIT reason: "<numeric>
-                                            * <text>", minted just before the user
-                                            * tombstone so the doc-driven exit here
-                                            * can say why instead of "Quit".  Park
-                                            * it (crdt_shadow.c); LOCAL only. */
-      const char *sp = strchr(m_text, ' ');
-      if (sp && sp > m_text && sp - m_text < 8) {
-        char qn[8];
-        ircd_strncpy(qn, m_text, (size_t)(sp - m_text) + 1);
-        crdt_shadow_quit_reason_note(qn, sp + 1);
-      }
     } else if (m_cmd[0] == 'Z' && target[0] == '*') {  /* SVSNOOP: "<servermask> <+|->",
                                             * every mesh node applies it against
                                             * itself (the P10 handler's logic); the

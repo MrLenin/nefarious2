@@ -229,7 +229,8 @@ void crdt_user_set(struct CrdtNetworkState *st, const char *numeric,
   record(st, op);
 }
 
-void crdt_user_remove(struct CrdtNetworkState *st, const char *numeric)
+void crdt_user_remove_reason(struct CrdtNetworkState *st, const char *numeric,
+                             const char *reason)
 {
   struct HLC ts = hlc_local_event(&st->clock);
   uint32_t klen = (uint32_t)strlen(numeric);
@@ -240,6 +241,12 @@ void crdt_user_remove(struct CrdtNetworkState *st, const char *numeric)
   op->key_len = klen;
   op->ts = ts;
   op->writer = st->my_numeric;
+  if (reason && *reason) {           /* rides the op only; the tombstone keeps no value */
+    size_t rl = strlen(reason);
+    if (rl > CRDT_QUITREASON_LEN - 1) rl = CRDT_QUITREASON_LEN - 1;
+    op->val = memdup(reason, rl);
+    op->val_len = (uint32_t)rl;
+  }
   record(st, op);
   /* M9: reap this user's SILENCE masks SYNCHRONOUSLY (not sweep-only) so the REMOVE
    * ops get seqs immediately after the user DELETE and before any numeric-reuse SET,
@@ -248,6 +255,39 @@ void crdt_user_remove(struct CrdtNetworkState *st, const char *numeric)
   /* Tier C F3: same reasoning for the tempshun register (numeric-reuse would
    * otherwise inherit the predecessor's shun). */
   crdt_state_reclaim_user_tempshun(st, numeric);
+}
+
+void crdt_user_remove(struct CrdtNetworkState *st, const char *numeric)
+{
+  crdt_user_remove_reason(st, numeric, NULL);
+}
+
+static void quit_ring_note(struct CrdtNetworkState *st, const char *key, uint32_t klen,
+                           const void *val, uint32_t vlen)
+{
+  unsigned i = st->quit_ring_head % CRDT_QUIT_RING;
+  if (klen >= CRDT_NUMERICLEN) return;
+  if (vlen > CRDT_QUITREASON_LEN - 1) vlen = CRDT_QUITREASON_LEN - 1;
+  memcpy(st->quit_ring[i].num, key, klen); st->quit_ring[i].num[klen] = '\0';
+  memcpy(st->quit_ring[i].reason, val, vlen); st->quit_ring[i].reason[vlen] = '\0';
+  st->quit_ring_head = i + 1;
+}
+
+int crdt_user_quit_reason_take(struct CrdtNetworkState *st, const char *numeric,
+                               char *buf, size_t buflen)
+{
+  unsigned i;
+  for (i = 0; i < CRDT_QUIT_RING; i++) {
+    if (!st->quit_ring[i].num[0] || strcmp(st->quit_ring[i].num, numeric))
+      continue;
+    if (buf && buflen) {
+      strncpy(buf, st->quit_ring[i].reason, buflen - 1);
+      buf[buflen - 1] = '\0';
+    }
+    st->quit_ring[i].num[0] = '\0';
+    return 1;
+  }
+  return 0;
 }
 
 /* Phase 3m: 1 iff this numeric has an explicit user delete-tombstone in the doc
@@ -1752,8 +1792,9 @@ void crdt_state_apply_op(struct CrdtNetworkState *st, const struct CrdtOp *op)
       if (op->type == CRDT_OP_SET)
         crdt_lwwmap_set(map, op->key, op->key_len, op->val, op->val_len,
                         op->ts, op->writer);
-      else
-        crdt_lwwmap_delete(map, op->key, op->key_len, op->ts, op->writer);
+      else if (crdt_lwwmap_delete(map, op->key, op->key_len, op->ts, op->writer)
+               && op->coll == CRDT_COLL_USERS && op->val && op->val_len)
+        quit_ring_note(st, op->key, op->key_len, op->val, op->val_len);  /* winning reason-carrying user delete */
     }
     hlc_receive(&st->clock, &op->ts);        /* advance our clock */
   }

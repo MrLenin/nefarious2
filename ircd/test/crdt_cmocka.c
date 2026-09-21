@@ -2434,6 +2434,44 @@ static void test_user_explicit_removal_gate(void **state)
   crdt_state_clear(&s2);
 }
 
+/* A user DELETE op carries the quit reason as its value; a peer that applies the
+ * winning delete parks (numeric, reason) for its doc-driven exit; a reason-less
+ * delete parks nothing; taking clears; the tombstone itself stays value-less so
+ * the doc digest is identical whether or not a reason travelled. */
+static void test_user_remove_reason_rides_delete(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s1, s2;
+  struct CrdtUserRecord u;
+  char why[CRDT_QUITREASON_LEN];
+  memset(&u, 0, sizeof u);
+  strcpy(u.nick, "bob"); u.server = 4;
+  crdt_state_init(&s1, 4);
+  crdt_state_init(&s2, 3);
+
+  crdt_user_set(&s1, "DAAAB", &u);
+  crdt_user_set(&s1, "DAAAC", &u);
+  assert_true(crdt_state_sync(&s2, &s1) >= 0);
+
+  crdt_user_remove_reason(&s1, "DAAAB", "Quit: gone fishing");
+  crdt_user_remove(&s1, "DAAAC");                       /* no reason */
+  assert_int_equal(0, crdt_user_quit_reason_take(&s1, "DAAAB", why, sizeof why)); /* origin parks nothing */
+  assert_true(crdt_state_sync(&s2, &s1) >= 0);
+  assert_int_equal(1, crdt_user_is_explicitly_removed(&s2, "DAAAB"));
+  assert_int_equal(1, crdt_user_is_explicitly_removed(&s2, "DAAAC"));
+  why[0] = '\0';
+  assert_int_equal(1, crdt_user_quit_reason_take(&s2, "DAAAB", why, sizeof why));
+  assert_string_equal(why, "Quit: gone fishing");
+  assert_int_equal(0, crdt_user_quit_reason_take(&s2, "DAAAB", why, sizeof why)); /* taken = cleared */
+  assert_int_equal(0, crdt_user_quit_reason_take(&s2, "DAAAC", why, sizeof why)); /* none carried */
+  /* value-less tombstones on both sides: the doc digests agree */
+  assert_int_equal(0, memcmp(&s1.users.entry_count, &s2.users.entry_count, sizeof s1.users.entry_count));
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+
+  crdt_state_clear(&s1);
+  crdt_state_clear(&s2);
+}
+
 /* LWW delete-tombstone GC: a user-remove tombstone is reclaimed only once its DELETE
  * op is causally stable (all peers saw it); kept while unstable (no resurrection). */
 static void test_lww_tombstone_gc(void **state)
@@ -4009,6 +4047,7 @@ int main(void)
     cmocka_unit_test(test_orphan_members_kept_while_user_tombstone),
     cmocka_unit_test(test_orphan_members_residue_converges),
     cmocka_unit_test(test_owner_remove_beats_snapshot_reimport),
+    cmocka_unit_test(test_user_remove_reason_rides_delete),
     cmocka_unit_test(test_digest_gc_invariant),
     cmocka_unit_test(test_decommission_replicates),
     cmocka_unit_test(test_decommission_reap_and_return),
