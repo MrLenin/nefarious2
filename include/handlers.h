@@ -84,6 +84,7 @@
  *                    non-NULL pointers.
  */
 
+#include <stdint.h>   /* uint64_t in the redact prototypes */
 #include <time.h>
 
 struct Channel;
