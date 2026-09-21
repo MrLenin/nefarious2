@@ -848,6 +848,15 @@ void crdt_shadow_retire_mesh_stub(struct Client *stub, const char *comment)
   for (i = 0; i <= cli_serv(stub)->nn_mask; ++acptrp, ++i)
     if (*acptrp)
       exit_one_client(*acptrp, comment);
+  /* Free whatever is still keyed on this Client BEFORE it goes: exit_one_client
+   * runs these only under IsServer, which a Case-B anchor (left STAT_MESH_SERVER
+   * below) never satisfies -- a BX M batch or deferred BX replayed against the
+   * anchor kept a dangling pointer into a freed Client (batch 6 T2).  Idempotent
+   * for Case A, where exit_one_client runs them again. */
+  s2s_multiline_cleanup_link(stub);
+  s2s_bxm_cleanup_link(stub);
+  pending_bx_cleanup_link(stub);
+  chathistory_fed_cleanup_link(stub);
   if (cli_serv(stub)->updown)      /* Case A: real tree DLink -> needs remove_dlink */
     SetServer(stub);               /* restore so exit_one_client does server teardown */
   /* Case B synthetic anchor (updown == NULL): leave STAT_MESH_SERVER -> exit_one_client

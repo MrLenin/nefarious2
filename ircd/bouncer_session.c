@@ -9788,11 +9788,16 @@ defer_bx_for_alias(const char *alias_numeric,
   memset(entry, 0, sizeof(*entry));
   ircd_strncpy(entry->alias_numeric, alias_numeric,
                sizeof(entry->alias_numeric));
-  /* Server numerics are 2 chars + null (3 bytes).  cptr is always a
-   * server for S2S BX traffic; sptr is too. */
-  if (cptr && IsServer(cptr))
+  /* Server numerics are 2 chars + null (3 bytes).  The source pair is a
+   * real link on the tree path, but a MESH STUB when a CRDT-aware peer
+   * relays a BX whose origin is a stub here, and &me (STAT_ME, not
+   * STAT_SERVER) for the CR X 'B' re-inject -- IsServer is exact, so an
+   * exact gate left the numeric empty and the drain discarded the entry
+   * as "source server gone" (batch 6 T1).  All three resolve back through
+   * FindNServer (me self-registers in server_list). */
+  if (cptr && (IsServer(cptr) || IsMeshStub(cptr) || IsMe(cptr)))
     ircd_strncpy(entry->cptr_yxx, cli_yxx(cptr), sizeof(entry->cptr_yxx));
-  if (sptr && IsServer(sptr))
+  if (sptr && (IsServer(sptr) || IsMeshStub(sptr) || IsMe(sptr)))
     ircd_strncpy(entry->sptr_yxx, cli_yxx(sptr), sizeof(entry->sptr_yxx));
   entry->parc = (parc > MAXPARA) ? MAXPARA : parc;
   for (i = 0; i < entry->parc; i++) {
@@ -9886,7 +9891,7 @@ void pending_bx_cleanup_link(struct Client *link)
 {
   int i;
   const char *yxx;
-  if (!link || !IsServer(link))
+  if (!link || (!IsServer(link) && !IsMeshStub(link)))   /* a retiring stub too (T2) */
     return;
   yxx = cli_yxx(link);
   if (!yxx || !*yxx)
@@ -9952,7 +9957,16 @@ find_s2s_bxm_batch(struct Client *link, const char *batch_id)
   return NULL;
 }
 
-/** Allocate a new BX M batch slot.  Returns NULL if no slot is free. */
+/** A BX M batch whose '-' end token never arrives (the link died and was
+ * converted to a stub, the alias vanished on a peer we cannot see) would
+ * otherwise pin its slot until the link Client is freed -- and a Case-B
+ * anchor's slot was never freed at all (batch 6 T2).  Same window as
+ * m_batch.c's S2S_ML_BATCH_TIMEOUT_S. */
+#define S2S_BXM_BATCH_TIMEOUT_S 60
+static void free_s2s_bxm_batch(struct S2SBxmBatch *b);
+
+/** Allocate a new BX M batch slot.  Returns NULL if no slot is free.
+ * Reaps timed-out batches first (F-MB3 shape). */
 static struct S2SBxmBatch *
 create_s2s_bxm_batch(struct Client *link, const char *batch_id,
                      const char *alias_num, const char *from_num,
@@ -9962,6 +9976,15 @@ create_s2s_bxm_batch(struct Client *link, const char *batch_id,
   int i;
   struct S2SBxmBatch *b;
 
+  for (i = 0; i < MAXCONNECTIONS; i++)
+    if (s2s_bxm_batches[i] &&
+        CurrentTime - s2s_bxm_batches[i]->start_time > S2S_BXM_BATCH_TIMEOUT_S) {
+      log_write(LS_SYSTEM, L_WARNING, 0,
+                "S2S BX M batch %s timed out (%ld s) -- reaping",
+                s2s_bxm_batches[i]->batch_id,
+                (long)(CurrentTime - s2s_bxm_batches[i]->start_time));
+      free_s2s_bxm_batch(s2s_bxm_batches[i]);
+    }
   for (i = 0; i < MAXCONNECTIONS; i++)
     if (!s2s_bxm_batches[i])
       break;
@@ -10363,7 +10386,11 @@ bounce_alias_multiline_echo(struct Client *cptr, struct Client *sptr,
 
     is_notice = (tok_str[0] == 'O');
 
-    /* Drop pre-existing batch with same id (collision) before opening. */
+    /* Drop pre-existing batch with same id (collision) before opening.
+     * Batches are keyed (link, bid); every mesh-tunnelled BX M is
+     * re-injected with cptr == &me (crdt_services_reinject), so all
+     * mesh origins share one key space and bid uniqueness (a generated
+     * msgid) is what separates them. */
     if ((batch = find_s2s_bxm_batch(cptr, bid)))
       free_s2s_bxm_batch(batch);
 
