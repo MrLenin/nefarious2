@@ -337,7 +337,7 @@ static void exit_one_client(struct Client* bcptr, const char* comment)
   if (IsUser(bcptr)) {
     /* Phase 1 CRDT shadow: mirror user removal while cli_user + numeric are
      * still valid (gated on FEAT_CRDT_ENABLED; skips bouncer aliases). */
-    crdt_shadow_user_remove(bcptr);
+    crdt_shadow_user_remove(bcptr, comment);
 
     /* Purge per-Client ephemeral session-scoped state before the rest
      * of the teardown sequence — cli_session_id is still valid here,

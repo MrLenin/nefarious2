@@ -164,7 +164,10 @@ void crdt_shadow_kick(struct Channel *chptr, struct Client *who,
 void crdt_shadow_user_add(struct Client *cptr);
 
 /** Mirror a user removal (called from exit_one_client for IsUser clients). */
-void crdt_shadow_user_remove(struct Client *cptr);
+void crdt_shadow_user_remove(struct Client *cptr, const char *comment);
+/* QUIT reason over the mesh (CR M 'Q'): note a departing user's reason so the
+ * doc-driven exit on this node can use it instead of the bare "Quit". */
+void crdt_shadow_quit_reason_note(const char *numeric, const char *reason);
 
 /** 5-5e M2 (doc-native bouncer, SHADOW): mirror/remove a bouncer-session record in the
  *  BSESSIONS doc collection.  Callers enforce single-writer (primary holder). */

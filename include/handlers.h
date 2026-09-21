@@ -276,6 +276,7 @@ extern int ms_svsjoin(struct Client*, struct Client*, int, char*[]);
 extern int ms_svsmode(struct Client*, struct Client*, int, char*[]);
 extern int ms_svsnick(struct Client*, struct Client*, int, char*[]);
 extern int ms_svsnoop(struct Client*, struct Client*, int, char*[]);
+extern void svsnoop_apply_local(const char *mask, const char *pm);
 extern int ms_svspart(struct Client*, struct Client*, int, char*[]);
 extern int ms_svsquit(struct Client*, struct Client*, int, char*[]);
 extern int ms_swhois(struct Client*, struct Client*, int, char*[]);

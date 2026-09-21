@@ -82,6 +82,9 @@
 #include "config.h"
 
 #include "client.h"
+#include "crdt_shadow.h"  /* crdt_shadow_active */
+#include "handlers.h"     /* crdt_gossip_message, svsnoop_apply_local */
+#include "ircd_snprintf.h"
 #include "hash.h"
 #include "ircd.h"
 #include "ircd_log.h"
@@ -104,41 +107,56 @@
  *
  *  Ported From Ultimate IRCd
  */
-int ms_svsnoop(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
+/* Apply an SVSNOOP aimed at @a mask on THIS server (no-op unless we match).
+ * Shared by the P10 handler and the CR M 'Z' receiver (mesh copy). */
+void svsnoop_apply_local(const char *mask, const char *pm)
 {
   struct ConfItem *aconf;
-  struct Client *server = 0;
-  char           c;
-  char*          cp;
+  struct Client *server;
+
+  /* this could be done with hunt_server_cmd but its a bucket of shit */
+  if (!string_has_wildcards(mask))
+    server = FindServer(mask);
+  else
+    server = find_match_server((char *)mask);
+  if (server != &me)
+    return;
+
+  if (*pm == '+') {
+    for(aconf = GlobalConfList; aconf; aconf = aconf->next) {
+      if (aconf->status & CONF_OPERATOR)
+        aconf->status |= CONF_ILLEGAL;
+    }
+    SetServerNoop(&me);
+  } else {
+    rehash (&me, 2);
+    ClearServerNoop(&me);
+  }
+}
+
+int ms_svsnoop(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
+{
+  int mesh;
 
   if (!IsServer(sptr) || parc < 3)
     return 0;
 
-  /* this could be done with hunt_server_cmd but its a bucket of shit */
-  if (!string_has_wildcards(parv[1]))
-    server = FindServer(parv[1]);
-  else
-    server = find_match_server(parv[1]);
+  svsnoop_apply_local(parv[1], parv[2]);
 
-  if (!server)
-    return 0;
-
-  if (server == &me) {
-    cp = parv[2];
-    c = *cp;
-    if (c == '+') {
-      for(aconf = GlobalConfList; aconf; aconf = aconf->next) {
-        if (aconf->status & CONF_OPERATOR)
-          aconf->status |= CONF_ILLEGAL;
-      }
-      SetServerNoop(&me);
-    } else {
-      rehash (&me, 2);
-      ClearServerNoop(&me);
-    }
-  }
-
-  sendcmdto_serv_butone(sptr, CMD_SVSNOOP, cptr, "%s %s", parv[1], parv[2]);
+  /* Services reach us over a legacy link; mint the mesh copy once at that
+   * edge (CR M 'Z', target "*", every mesh node applies it against itself)
+   * and keep the tree relay to legacy links -- a CRDT-aware downlink gets the
+   * mesh copy.  Mesh off / arrived from a CRDT peer: plain tree relay. */
+  mesh = IsServer(cptr) && !IsCrdtAware(cptr) && crdt_shadow_active();
+  if (mesh) {
+    char body[BUFSIZE], msgidbuf[64];
+    sendcmdto_flag_serv_butone(sptr, CMD_SVSNOOP, cptr, FLAG_LAST_FLAG,
+                               FLAG_CRDT_AWARE, "%s %s", parv[1], parv[2]);
+    ircd_snprintf(0, body, sizeof body, "%s %s", parv[1], parv[2]);
+    generate_msgid(msgidbuf, sizeof msgidbuf);
+    crdt_gossip_message(&me, 'Z', "*", msgidbuf, body);
+  } else
+    sendcmdto_serv_butone(sptr, CMD_SVSNOOP, cptr, "%s %s", parv[1], parv[2]);
   return 0;
 }
 

@@ -692,7 +692,60 @@ void crdt_shadow_user_add(struct Client *cptr)
   crdt_sync_push();                    /* eager-propagate to CRDT peers */
 }
 
-void crdt_shadow_user_remove(struct Client *cptr)
+/* QUIT reason over the mesh.  The user DELETE op carries no reason, so every
+ * doc-driven exit on a peer read "Quit" -- in every channel, on every mesh
+ * node, for every remote quit (not a partition edge once the tree is retired).
+ * The reason is not state: it rides an ephemeral CR M 'Q' ("<numeric> <text>")
+ * minted just BEFORE the tombstone so on each link it precedes the delta that
+ * triggers the exit; receivers park it here (bounded, short-lived) and
+ * crdt_shadow_reconcile_user_removes consumes it, falling back to "Quit" when
+ * it did not arrive first.  A netsplit cascade (owning server IsClosing) is
+ * exempt: one message per user for a whole leaf is not worth the burst. */
+#define CRDT_QUITREASON_SLOTS 64
+#define CRDT_QUITREASON_LEN   192
+#define CRDT_QUITREASON_TTL   120
+static struct {
+  char   num[CRDT_NUMERICLEN];
+  char   reason[CRDT_QUITREASON_LEN];
+  time_t at;
+} quit_reasons[CRDT_QUITREASON_SLOTS];
+
+void crdt_shadow_quit_reason_note(const char *numeric, const char *reason)
+{
+  int i, slot = 0;
+  time_t oldest = 0;
+  if (!numeric || !*numeric || !reason || !*reason)
+    return;
+  for (i = 0; i < CRDT_QUITREASON_SLOTS; i++) {
+    if (quit_reasons[i].at && !strcmp(quit_reasons[i].num, numeric)) { slot = i; break; }
+    if (!quit_reasons[i].at) { slot = i; break; }
+    if (!oldest || quit_reasons[i].at < oldest) { oldest = quit_reasons[i].at; slot = i; }
+  }
+  ircd_strncpy(quit_reasons[slot].num, numeric, sizeof quit_reasons[slot].num);
+  ircd_strncpy(quit_reasons[slot].reason, reason, sizeof quit_reasons[slot].reason);
+  quit_reasons[slot].at = CurrentTime;
+}
+
+/* Take (and clear) the parked reason for @a numeric, or NULL. */
+static const char *quit_reason_take(const char *numeric)
+{
+  static char out[CRDT_QUITREASON_LEN];
+  int i;
+  for (i = 0; i < CRDT_QUITREASON_SLOTS; i++) {
+    if (!quit_reasons[i].at || strcmp(quit_reasons[i].num, numeric))
+      continue;
+    if (CurrentTime - quit_reasons[i].at > CRDT_QUITREASON_TTL) {
+      quit_reasons[i].at = 0;
+      return NULL;
+    }
+    ircd_strncpy(out, quit_reasons[i].reason, sizeof out);
+    quit_reasons[i].at = 0;
+    return out;
+  }
+  return NULL;
+}
+
+void crdt_shadow_user_remove(struct Client *cptr, const char *comment)
 {
   char num[16];
   if (!shadow_on())
@@ -701,7 +754,16 @@ void crdt_shadow_user_remove(struct Client *cptr)
     return;
   if (from_crdt_peer(cli_from(cptr)))  /* single-writer: peer owns this op */
     return;
-  crdt_user_remove(&g_crdt, user_numeric(cptr, num, sizeof num));
+  user_numeric(cptr, num, sizeof num);
+  if (comment && *comment && cli_user(cptr)->server &&
+      !HasFlag(cli_user(cptr)->server, FLAG_CLOSING) && crdt_shadow_active()) {
+    char msgidbuf[64];
+    char body[CRDT_NUMERICLEN + CRDT_QUITREASON_LEN + 2];
+    generate_msgid(msgidbuf, sizeof msgidbuf);
+    ircd_snprintf(0, body, sizeof body, "%s %s", num, comment);
+    crdt_gossip_message(&me, 'Q', "*", msgidbuf, body);
+  }
+  crdt_user_remove(&g_crdt, num);
   crdt_sync_push();                    /* eager-propagate to CRDT peers */
 }
 
@@ -5384,8 +5446,10 @@ void crdt_shadow_reconcile_user_removes(void)
   }
   for (i = 0; i < nv; i++) {
     struct Client *v = findNUser(victims[i]);   /* re-find: a prior exit may have freed it */
-    if (v && IsUser(v) && !MyUser(v) && !IsBouncerAlias(v))
-      exit_client(cli_from(v), v, v, "Quit");   /* gateway via the now-legacy-only QUIT relay */
+    if (v && IsUser(v) && !MyUser(v) && !IsBouncerAlias(v)) {
+      const char *why = quit_reason_take(victims[i]);   /* CR M 'Q', if it got here first */
+      exit_client(cli_from(v), v, v, why ? why : "Quit");   /* gateway via the now-legacy-only QUIT relay */
+    }
   }
   if (nv)
     log_write(LS_SYSTEM, L_NOTICE, 0,

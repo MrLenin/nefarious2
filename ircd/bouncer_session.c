@@ -6892,7 +6892,7 @@ int bounce_demote_live_primary_to_alias(struct Client *acptr,
    * converge via the delta).  Reap skips MyUser + IsBouncerAlias, so leaf3's
    * own local alias is never exited by its own tombstone. */
   if (feature_bool(FEAT_CRDT_BOUNCER_DOC) && MyConnect(acptr))
-    crdt_shadow_user_remove(acptr);
+    crdt_shadow_user_remove(acptr, NULL);   /* internal move, no reason to carry */
 
   /* Promote the Client to alias: flag, NULL alias_primary (caller
    * patches via bounce_finish_live_primary_demote), drop from nick
