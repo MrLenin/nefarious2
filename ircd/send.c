@@ -31,6 +31,7 @@
 #include "crdt_hlc.h"
 #include "client.h"
 #include "handlers.h"     /* MR-2b: crdt_gossip_message (WALLOPS over the mesh) */
+#include "crdt_shadow.h"  /* crdt_shadow_active: tree copy vs mesh copy */
 #include "hash.h"
 #include "ircd.h"
 #include "ircd_features.h"
@@ -3476,6 +3477,14 @@ void sendto_opmask_butone_global(struct Client *one, unsigned int mask,
   struct MsgBuf *mb;
   struct DLink *lp;
 
+  /* Tier C F5: CRDT-aware peers get the mesh copy (letter 'O', target "*";
+   * the WALLOPS 'W' precedent) and MUST NOT also get the tree copy below --
+   * the tree copy carries no msgid, so a peer that holds both a P10 link
+   * and the mesh delivers the notice twice.  crdt_gossip_message emits
+   * whenever the shadow is active (FEAT_CRDT_ROUTE_BCAST only picks
+   * tree-forward vs flood), so that is the predicate for skipping the tree. */
+  int mesh = cli_serv(&me) && crdt_shadow_active();
+
   va_start(vl, pattern);
 
   if (cli_serv(&me) && (lp = cli_serv(&me)->down)) {
@@ -3486,17 +3495,15 @@ void sendto_opmask_butone_global(struct Client *one, unsigned int mask,
     for (lp = cli_serv(&me)->down; lp; lp = lp->next) {
       if (one && lp->value.cptr == cli_from(one))
         continue;
+      if (mesh && IsCrdtAware(lp->value.cptr))
+        continue;                  /* this peer gets the mesh copy */
       send_buffer(lp->value.cptr, mb, 0);
     }
 
     msgq_clean(mb);
   }
 
-  /* Tier C F5: the mesh copy (letter 'O', target "*"; the WALLOPS 'W'
-   * precedent).  The tree copy above never reaches an overlay-only CRDT
-   * node and is retired among CRDT peers.  crdt_gossip_message self-gates
-   * (shadow active + FEAT_CRDT_ROUTE_BCAST + bcast-stable). */
-  if (cli_serv(&me)) {
+  if (mesh) {
     char body[BUFSIZE], msgidbuf[64];
     size_t l;
     vd.vd_format = pattern;

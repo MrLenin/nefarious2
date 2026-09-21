@@ -36,6 +36,7 @@
 #include "ircd_snprintf.h"
 #include "ircd.h"          /* me */
 #include "handlers.h"   /* crdt_gossip_message */
+#include "crdt_shadow.h" /* crdt_shadow_active */
 
 #include <stdlib.h>
 
@@ -53,17 +54,23 @@ int ms_sno(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
   if (EmptyString(message) || !mask)
     return need_more_params(sptr, "SNO");
 
-  sendto_opmask_butone_from(sptr, sptr, mask, "%s", message);
-  sendcmdto_serv_butone(sptr, CMD_SNO, cptr, "%d :%s", mask, message);
   /* Gateway edge (CI precedent): a notice that arrived over a LEGACY link
    * is minted into the mesh once here (letter 'O'); one from a CRDT peer
-   * already rode the mesh. */
-  if (IsServer(cptr) && !IsCrdtAware(cptr)) {
+   * already rode the mesh.  When minted, the tree relay goes to legacy
+   * links only -- a CRDT-aware downlink would otherwise get both copies
+   * (the tree copy has no msgid to dedup on). */
+  int mesh = IsServer(cptr) && !IsCrdtAware(cptr) && crdt_shadow_active();
+
+  sendto_opmask_butone_from(sptr, sptr, mask, "%s", message);
+  if (mesh) {
     char body[BUFSIZE], msgidbuf[64];
+    sendcmdto_flag_serv_butone(sptr, CMD_SNO, cptr, FLAG_LAST_FLAG,
+                               FLAG_CRDT_AWARE, "%d :%s", mask, message);
     ircd_snprintf(0, body, sizeof body, "%d %s", mask, message);
     generate_msgid(msgidbuf, sizeof msgidbuf);
     crdt_gossip_message(&me, 'O', "*", msgidbuf, body);
-  }
+  } else
+    sendcmdto_serv_butone(sptr, CMD_SNO, cptr, "%d :%s", mask, message);
   return 0;
 }
 

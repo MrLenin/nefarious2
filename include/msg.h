@@ -601,7 +601,11 @@ struct Client;
 #define CMD_CRDT_REPLICATION	MSG_CRDT_REPLICATION, TOK_CRDT_REPLICATION
 
 #define MSG_CRDTMESH		"CRDTMESH"	/* CRDT mesh overlay-link handshake (Phase 4b) */
-#define TOK_CRDTMESH		"CM"
+#define TOK_CRDTMESH		"MH"   /* NOT "CM": that is TOK_CLEARMODE; a duplicate
+                                    * token makes the later msgtab row (this one,
+                                    * server slot m_ignore) shadow CLEARMODE in
+                                    * tok_tree and every S2S CLEARMODE is dropped.
+                                    * The handshake rides the long name anyway. */
 #define CMD_CRDTMESH		MSG_CRDTMESH, TOK_CRDTMESH
 
 #define MSG_STORE	"STORE"
