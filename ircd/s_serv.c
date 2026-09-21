@@ -368,6 +368,7 @@ int server_finish_burst(struct Client *cptr)
    * Fires for both the CR F snapshot path below and the cold-boot BURST fallback. */
   if (IsCrdtAware(cptr))
     crdt_shadow_beacon_burst(cptr);
+    sasl_mech_mesh_announce();          /* M5: the new peer learns the network sasl= list */
 
   /* Phase 3c cutover: a CRDT-aware peer with CRDT-primary mode gets the full
    * CRDT document (CR F snapshot) INSTEAD of the P10 user/session/channel BURST

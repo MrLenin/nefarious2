@@ -1235,13 +1235,19 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
         mm = gb;                              /* "$*.mask" or "$@host.mask" */
         if (*mm == '$') mm++;
         if (*mm == '@') { ghost = 1; mm++; }
+        /* NB: never `c ? CMD_NOTICE : CMD_PRIVATE` -- the two-token macros
+         * expand into a comma expression inside the ternary and the
+         * command/token arguments shift (clients then see the P10 token
+         * "O" as the command). */
+        const char *gcmd = (m_cmd[0] == 'g') ? MSG_NOTICE : MSG_PRIVATE;
+        const char *gtok = (m_cmd[0] == 'g') ? TOK_NOTICE : TOK_PRIVATE;
         sendcmdto_set_match_local_only();
-        sendcmdto_match_butone(srcu, (m_cmd[0] == 'g') ? CMD_NOTICE : CMD_PRIVATE,
+        sendcmdto_match_butone(srcu, gcmd, gtok,
                                mm, NULL, ghost ? MATCH_HOST : MATCH_SERVER,
                                "%s :%s", gb, gtext);
         if (!osrv || IsMeshStub(osrv)) {
           sendcmdto_set_skip_crdt_servers();
-          sendcmdto_match_butone(srcu, (m_cmd[0] == 'g') ? CMD_NOTICE : CMD_PRIVATE,
+          sendcmdto_match_butone(srcu, gcmd, gtok,
                                  mm, NULL, ghost ? MATCH_HOST : MATCH_SERVER,
                                  "%s :%s", gb, gtext);
         }
@@ -1337,9 +1343,10 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
         sendcmdto_want_s2s_tags(1);
         sendcmdto_set_s2s_cptr(&me);      /* no per-link S2S msgid to override ours */
         sendcmdto_set_skip_crdt_servers();
-        sendcmdto_channel_butone(srcu, (m_cmd[0] == 'N') ? CMD_NOTICE : CMD_PRIVATE,
+        sendcmdto_channel_butone(srcu, (m_cmd[0] == 'N') ? MSG_NOTICE : MSG_PRIVATE,
+                                 (m_cmd[0] == 'N') ? TOK_NOTICE : TOK_PRIVATE,
                                  ch, NULL, SKIP_DEAF | SKIP_BURST, m_text[0],
-                                 "%H :%s", ch, m_text);
+                                 "%H :%s", ch, m_text);   /* NOT `? CMD_NOTICE : CMD_PRIVATE` (comma-macro shift) */
         sendcmdto_set_client_msgid(NULL);
         unified = 1;
       }
@@ -1429,9 +1436,10 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
         struct Client *srcc = srcu;   /* USER sources only: legacy can't place a
                                        * server-form (2-char) source in a channel */
         if (srcc && !crdt_user_is_mesh_only(srcc))
-          sendcmdto_flag_serv_butone(srcc, (m_cmd[0] == 'N') ? CMD_NOTICE : CMD_PRIVATE,
+          sendcmdto_flag_serv_butone(srcc, (m_cmd[0] == 'N') ? MSG_NOTICE : MSG_PRIVATE,
+                                     (m_cmd[0] == 'N') ? TOK_NOTICE : TOK_PRIVATE,
                                      NULL, FLAG_LAST_FLAG, FLAG_CRDT_AWARE,
-                                     "%H :%s", ch, m_text);
+                                     "%H :%s", ch, m_text);   /* NOT `? CMD_NOTICE : CMD_PRIVATE` (comma-macro shift) */
       }
       /* R6b TAGMSG bridge: same gateway CR-M -> legacy bridge for TAGMSG.  The @tags v3 form
        * goes via sendcmdto_serv_butone_v3 (which targets IRCv3-aware downlinks); with skip_crdt
@@ -1585,7 +1593,8 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
               else
                 sendcmdto_one(srcc, CMD_INVITE, tgt, "%C :%s", tgt, m_text);
             } else
-              sendcmdto_one(srcc, (m_cmd[0] == 'N') ? CMD_NOTICE : CMD_PRIVATE, tgt,
+              sendcmdto_one(srcc, (m_cmd[0] == 'N') ? MSG_NOTICE : MSG_PRIVATE,
+                            (m_cmd[0] == 'N') ? TOK_NOTICE : TOK_PRIVATE, tgt,
                             "%C :%s", tgt, m_text);
             crdt_cr_to_p10_bridged++;
             log_write(LS_SYSTEM, L_INFO, 0, "MR-4 bridge: CR-M %s %s -> legacy user %s "

@@ -107,6 +107,20 @@
 
 /* #include <assert.h> -- Now using assert in ircd_log.h */
 
+/* M5: tell the mesh the network's SASL mechanism list (CR M 'L').  Called
+ * at the legacy edge when services announce it, and at every CRDT link so
+ * a node that boots without a legacy path learns the list at once (the
+ * services announcement only recurs when services relink). */
+void sasl_mech_mesh_announce(void)
+{
+  const char *mechs = get_sasl_mechanisms();
+  char msgidbuf[64];
+  if (!mechs || !crdt_shadow_active())
+    return;
+  generate_msgid(msgidbuf, sizeof msgidbuf);
+  crdt_gossip_message(&me, 'L', "*", msgidbuf, mechs);
+}
+
 int ms_sasl(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
 {
   struct Client* acptr;
@@ -141,10 +155,7 @@ int ms_sasl(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
        * other "*" forms are agent-facing and the services bridge owns
        * that leg. */
       if (IsServer(cptr) && !IsCrdtAware(cptr) && crdt_shadow_active()) {
-        char body[BUFSIZE], msgidbuf[64];
-        ircd_snprintf(0, body, sizeof body, "%s", data);
-        generate_msgid(msgidbuf, sizeof msgidbuf);
-        crdt_gossip_message(&me, 'L', "*", msgidbuf, body);
+        sasl_mech_mesh_announce();
         mesh = 1;
       }
     }

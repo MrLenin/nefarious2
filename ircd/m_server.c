@@ -842,6 +842,7 @@ int mr_crdtmesh(struct Client* cptr, struct Client* sptr, int parc, char* parv[]
    * the sync pull so the CR S reply's materializations already see fresh
    * beacons.  Both sides run this handler. */
   crdt_shadow_beacon_burst(cptr);
+  sasl_mech_mesh_announce();            /* M5: the new overlay peer learns the network sasl= list */
 
   /* Pull the peer's state immediately (CR S -> peer replies with delta/snapshot);
    * the 30s anti-entropy timer also covers this.  Convergence is bidirectional
