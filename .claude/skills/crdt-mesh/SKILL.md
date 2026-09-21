@@ -120,6 +120,19 @@ All ride normal P10 framing as `:<src> CR <sub> …`. Gossiped to every `IsCrdtS
   target = 5-char YXX or #chan). NEVER touches the doc. msgid-deduped; delivered to the local target/
   channel members with the source prefix reconstructed from the doc (`crdt_shadow_user_record`); then
   relayed onward. The Tier-2 live-traffic substrate.
+  **Letters in use (2026-09-21):** channel/unicast `P N T K I` (+ `c h v` WALLCHOPS/HOPS/VOICES, channel
+  target only); `*`-target broadcasts `W` WALLOPS (user- AND server-sourced) `U` WALLUSERS `O` SNO `M` SMO
+  `D` DESYNCH `I` CI (target `*`; INVITE is `I` with a user target) `A` TK `S` PN `R` REDACT `E` METADATA
+  (ephemeral) `L` SASL mech list `V` PRIVS `G`/`g` masked PRIVMSG/NOTICE `J` GITSYNC `B` MULTILINE
+  announce `Z` SVSNOOP. **Rules that every letter follows:** mint at the ORIGIN and once at the §17.7
+  gateway edge (`IsServer(cptr) && !IsCrdtAware(cptr)`); when minted keep the tree copy off CRDT-aware
+  links (`sendcmdto_set_skip_crdt_servers()` / `sendcmdto_flag_serv_butone(..., FLAG_CRDT_AWARE)`) — a
+  tree copy has no msgid to dedup on, so a P10-linked CRDT peer would deliver twice (F3 lesson); receivers
+  apply LOCALLY and re-emit real P10 to legacy links only when the origin has no tree presence here
+  (`!osrv || IsMeshStub(osrv)`, the TK rule); mint BEFORE arming one-shot S2S tags (the gossip's own sends
+  consume them — REDACT lesson); a value that must be present WHEN a state change applies travels ON the
+  op, never beside it as a letter (the QUIT-reason lesson: two-hop path race). Gate a broadcast letter
+  with a watcher on a P10-LINKED CRDT peer and COUNT matches, not on the overlay-only node.
 - **CR H** `<yxx> <emit_ts>` — **ephemeral** liveness beacon, emitted UNCONDITIONALLY every verify
   cycle by every CRDT-primary server; receivers track last-beacon per server (`crdt_beacon[]`); a mesh
   stub whose beacon goes stale (>90s = unreachable via every CRDT path) is retired.
@@ -206,6 +219,10 @@ On a CRDT-server SQUIT, instead of cascade-tombstoning, the departed server is K
 9. **The beacon emits UNCONDITIONALLY every cycle.** Liveness must be traffic-independent — an idle-but-
    reachable server still beacons → stays fresh → not retired. (Avoids the SV-staleness false-positive
    that sank the replicated servers-map.)
+9b. **`CrdtUserRecord` travels as a WHOLE struct (memdup): every reader checks `data_len == sizeof` (M4
+    schema guard) — a blob of another size is another schema, never misread; append fields only and rebuild
+    ALL FIVE bed images together.** The record carries the host OVERRIDES (fakehost/sethost): a copy
+    re-derives its display host locally, so the letters alone were not enough.
 10. **The replicated `servers`-map / per-viewpoint reachability is ABANDONED** (4a). Reachability is a
     LOCAL determination (`FindNServer` + the beacon), never replicated CRDT state ("no amount of
     patching makes a per-viewpoint value robust as shared state"). Don't resurrect it — path-vector
@@ -267,6 +284,8 @@ On a CRDT-server SQUIT, instead of cascade-tombstoning, the departed server is K
 | `ircd/ircd_relay.c` / `m_tagmsg.c` | CR M live-delivery hooks (relay_*/server_relay_*; mesh_delivered flag) |
 | `include/client.h` | `STAT_MESH_SERVER`/`IsMeshStub`/`FLAG_CRDT_OVERLAY`/`IsCrdtAware`/`IsCrdtSyncTarget` |
 | `ircd/test/crdt_cmocka.c` | the engine test suite (the image gate) |
+| `ircd/redact_index.c/.h` | REDACT catch-up index (design B): pure key/value/reply codec, history_cmocka-gated; store side in history.c (CF `redact_index`, scan, watermark), query `CH Q * D` + reply `CH D` + trigger on store_reachable in m_chathistory.c |
+| `webpush_keys` collection | VAPID ring over the mesh (M3b): id → ring record text; publish-at-load + mint + gateway edge; origin tombstones on prune; reconcile adopts via webpush_ring_adopt_from_doc |
 
 Keep this skill and the submodule copy (`nefarious-crdt/.claude/skills/crdt-mesh/`) in sync when editing.
 
