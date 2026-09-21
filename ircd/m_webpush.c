@@ -2166,6 +2166,7 @@ int webpush_setup(void)
 
   if (!wp_ring_loaded) {
     wp_ring_loaded = 1;
+    wp_ring_load();
     /* M3b: publish the held ring into the doc (idempotent: an identical
      * record mints nothing).  Keys loaded from the store were never
      * minted here, so without this the doc only ever carried keys minted
@@ -2181,7 +2182,6 @@ int webpush_setup(void)
         memset(dtext, 0, sizeof(dtext));
       }
     }
-    wp_ring_load();
     if (!kc_transport_ready)
       wp_error("HTTP transport (libkc) not initialised: keys are advertised "
                "but no push can be delivered");
