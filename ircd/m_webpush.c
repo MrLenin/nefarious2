@@ -543,6 +543,10 @@ static void webpush_forbidden(const char *account, const char *endpoint)
     webpush_store_remove(account, endpoint);
   }
   sendcmdto_serv_butone_v3(&me, CMD_WEBPUSH, NULL, "U %s %s", account, endpoint);
+  /* Doc tombstone too (hard invariant 5): without it the reconciler
+   * re-adds the live doc entry on the next tick and mesh peers never
+   * dropped it -- a 403'd endpoint was pushed to forever. */
+  crdt_shadow_webpush_remove(account, endpoint);
 }
 
 /** Iterator callback for webpush_notify_account — sends push to each subscription. */
@@ -1270,6 +1274,7 @@ static int forget_iter_cb(const char *stored, void *data)
   endpoint[len] = '\0';
   sendcmdto_serv_butone_v3(&me, CMD_WEBPUSH, NULL, "U %s %s",
                            ctx->account, endpoint);
+  crdt_shadow_webpush_remove(ctx->account, endpoint);   /* doc tombstone (invariant 5) */
   return 0;
 }
 
@@ -1939,6 +1944,7 @@ static int sweep_iter_cb(const char *account, const char *stored, void *data)
   /* Peers hold their own copy; without this they keep it and burst it
    * back at the next link. */
   sendcmdto_serv_butone_v3(&me, CMD_WEBPUSH, NULL, "U %s %s", account, endpoint);
+  crdt_shadow_webpush_remove(account, endpoint);        /* doc tombstone (invariant 5) */
   log_write(LS_SYSTEM, L_DEBUG, 0,
             "WebPush: swept stale subscription for %s (armed %lld)",
             account, armed);
