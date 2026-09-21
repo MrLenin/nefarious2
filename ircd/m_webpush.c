@@ -2166,6 +2166,21 @@ int webpush_setup(void)
 
   if (!wp_ring_loaded) {
     wp_ring_loaded = 1;
+    /* M3b: publish the held ring into the doc (idempotent: an identical
+     * record mints nothing).  Keys loaded from the store were never
+     * minted here, so without this the doc only ever carried keys minted
+     * AFTER the mesh learned to carry them -- an overlay-only node would
+     * keep minting a competing key at boot instead of adopting the
+     * network's current one. */
+    {
+      int ki;
+      for (ki = 0; ki < wp_ring.count; ki++) {
+        char dtext[WEBPUSH_KEY_TEXT_LEN];
+        if (webpush_key_format(&wp_ring.keys[ki], dtext, sizeof(dtext)) == 0)
+          crdt_shadow_webpush_key_set(wp_ring.keys[ki].id, dtext);
+        memset(dtext, 0, sizeof(dtext));
+      }
+    }
     wp_ring_load();
     if (!kc_transport_ready)
       wp_error("HTTP transport (libkc) not initialised: keys are advertised "
