@@ -51,6 +51,7 @@
 #include "s_bsd.h"
 #include "s_user.h"
 #include "send.h"
+#include "handlers.h"   /* crdt_gossip_message: METADATA over the mesh */
 
 #include <string.h>
 #include <stdlib.h>
@@ -842,6 +843,12 @@ static int metadata_cmd_set(struct Client *sptr, int parc, char *parv[])
        * Broadcast for the online-local case too: metadata_set_client never
        * emits S2S itself, so before this the *account write was node-local
        * in BOTH branches. */
+      {
+        char star_target[ACCOUNTLEN + 2];
+        ircd_snprintf(0, star_target, sizeof star_target, "*%s", account_name);
+        if (metadata_mesh_mint(sptr, star_target, key, visibility, value))
+          sendcmdto_set_skip_crdt_servers();   /* CRDT-aware peers get the mesh copy */
+      }
       if (value)
         sendcmdto_serv_butone_v3(sptr, CMD_METADATA, NULL, "*%s %s %s :%s",
                                  account_name, key,
@@ -1434,15 +1441,33 @@ int m_metadata(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
  * @param[in] parc Number of arguments.
  * @param[in] parv Argument vector.
  */
+/* Mesh copy of a metadata change (CR M 'E', target "*"): the P10 MD body
+ * verbatim ("<target> <key> <P|*> :<value>" / "<target> <key>" to unset).
+ * Emits whenever the shadow is active; the caller then keeps the tree
+ * relay off CRDT-aware links (they get this). */
+int metadata_mesh_mint(struct Client *from, const char *target,
+                       const char *key, int visibility, const char *value)
+{
+  char body[BUFSIZE], msgidbuf[64];
+  if (!crdt_shadow_active() || !from || !target || !key)
+    return 0;
+  if (value)
+    ircd_snprintf(0, body, sizeof body, "%s %s %s :%s", target, key,
+                  visibility == METADATA_VIS_PRIVATE ? "P" : "*", value);
+  else
+    ircd_snprintf(0, body, sizeof body, "%s %s", target, key);
+  generate_msgid(msgidbuf, sizeof msgidbuf);
+  crdt_gossip_message(from, 'E', "*", msgidbuf, body);
+  return 1;
+}
+
 int ms_metadata(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
 {
   const char *target;
   const char *key;
   const char *value = NULL;
   int visibility = METADATA_VIS_PUBLIC;
-  int is_channel = 0;
-  struct Client *target_client = NULL;
-  struct Channel *target_channel = NULL;
+  int mesh = 0;
 
   if (parc < 3)
     return 0;
@@ -1467,6 +1492,39 @@ int ms_metadata(struct Client *cptr, struct Client *sptr, int parc, char *parv[]
       value = parv[3];
     }
   }
+
+  if (!metadata_apply_relayed(sptr, target, key, visibility, value))
+    return 0;
+
+  /* Gateway edge (CI precedent): a change that arrived over a LEGACY link
+   * is minted into the mesh once here; one from a CRDT peer already rode
+   * the mesh.  When minted, the tree relay goes to legacy links only. */
+  if (IsServer(cptr) && !IsCrdtAware(cptr))
+    mesh = metadata_mesh_mint(sptr, target, key, visibility, value);
+  if (mesh)
+    sendcmdto_set_skip_crdt_servers();
+  if (value)
+    sendcmdto_serv_butone_v3(sptr, CMD_METADATA, cptr, "%s %s %s :%s",
+                             target, key,
+                             visibility == METADATA_VIS_PRIVATE ? "P" : "*",
+                             value);
+  else
+    sendcmdto_serv_butone_v3(sptr, CMD_METADATA, cptr, "%s %s",
+                             target, key);
+  return 0;
+}
+
+/* Apply a metadata change that reached us from elsewhere (P10 MD or the
+ * CR M 'E' mesh copy) exactly as ms_metadata always did: the account form
+ * ("*account") and the nick/channel form, each under the Tier C F2-b
+ * doc-mirror suspend (the ORIGIN mirrored it; single-writer).  1 applied
+ * (relay it), 0 dropped (unknown target / invalid key / over limits). */
+int metadata_apply_relayed(struct Client *sptr, const char *target,
+                           const char *key, int visibility, const char *value)
+{
+  int is_channel = 0;
+  struct Client *target_client = NULL;
+  struct Channel *target_channel = NULL;
 
   if (!is_valid_key(key))
     return 0;
@@ -1511,16 +1569,7 @@ int ms_metadata(struct Client *cptr, struct Client *sptr, int parc, char *parv[]
     if (!found_online && metadata_lmdb_is_available())
       metadata_account_set_permanent(account_name, key, value, visibility);
     crdt_shadow_metadata_suspend(0);
-
-    if (value)
-      sendcmdto_serv_butone_v3(sptr, CMD_METADATA, cptr, "%s %s %s :%s",
-                               target, key,
-                               visibility == METADATA_VIS_PRIVATE ? "P" : "*",
-                               value);
-    else
-      sendcmdto_serv_butone_v3(sptr, CMD_METADATA, cptr, "%s %s",
-                               target, key);
-    return 0;
+    return 1;
   }
 
   /* Find target */
@@ -1579,17 +1628,5 @@ int ms_metadata(struct Client *cptr, struct Client *sptr, int parc, char *parv[]
 
   /* Notify local subscribers (vis-aware — see metadata_notify_subscribers). */
   metadata_notify_subscribers(target, key, value, visibility);
-
-  /* Propagate to other servers */
-  if (value) {
-    sendcmdto_serv_butone_v3(sptr, CMD_METADATA, cptr, "%s %s %s :%s",
-                          target, key,
-                          visibility == METADATA_VIS_PRIVATE ? "P" : "*",
-                          value);
-  } else {
-    sendcmdto_serv_butone_v3(sptr, CMD_METADATA, cptr, "%s %s",
-                          target, key);
-  }
-
-  return 0;
+  return 1;
 }

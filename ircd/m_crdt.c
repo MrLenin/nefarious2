@@ -25,6 +25,7 @@
 #include "ircd_log.h"
 #include "ircd_snprintf.h"  /* MR-1: ircd_snprintf (route target numeric) */
 #include "handlers.h"
+#include "metadata.h"      /* METADATA_VIS_*: CR M E receiver */
 #include "msg.h"
 #include "numnicks.h"
 #include "send.h"
@@ -1151,6 +1152,48 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
           sendcmdto_set_skip_crdt_servers();
           sendcmdto_serv_butone_v3(rsrc, CMD_REDACT, NULL, "%s %s :%s",
                                    rv[0], rv[1], rreason ? rreason : "");
+        }
+      }
+    } else if (m_cmd[0] == 'E' && target[0] == '*') {  /* METADATA (ephemeral by spec):
+                                            * the P10 MD body verbatim, "<target>
+                                            * <key> [<P|*>] [:<value>]".  Apply as
+                                            * ms_metadata does (doc mirror suspended:
+                                            * the origin owns any permanent row).
+                                            * Re-emit real P10 to LEGACY links only
+                                            * when the origin has no tree presence
+                                            * here (TK precedent). */
+      char eb[BUFSIZE];
+      char *ev[3];
+      char *q, *evalue = NULL;
+      int ec = 0, evis = METADATA_VIS_PUBLIC;
+      ircd_strncpy(eb, m_text, sizeof eb);
+      for (q = eb; *q && ec < 3; ) {
+        while (*q == ' ') *q++ = '\0';
+        if (!*q || *q == ':') break;
+        ev[ec++] = q;
+        while (*q && *q != ' ') q++;
+      }
+      while (*q == ' ') q++;
+      if (ec == 3 && ((ev[2][0] == 'P' || ev[2][0] == '*') && !ev[2][1])) {
+        evis = (ev[2][0] == 'P') ? METADATA_VIS_PRIVATE : METADATA_VIS_PUBLIC;
+        if (*q == ':') evalue = q + 1;
+      } else if (ec == 3) {
+        evalue = ev[2];                    /* old form: third token is the value */
+      } else if (ec == 2 && *q == ':') {
+        evalue = q + 1;
+      }
+      if (ec >= 2) {
+        struct Client *msrc = srcu ? srcu : (srcsrv ? srcsrv : &me);
+        struct Client *osrv = srcu ? cli_user(srcu)->server : srcsrv;
+        Debug((DEBUG_DEBUG, "CRDT MD: mesh %s %s from %s", ev[0], ev[1], srcyxx));
+        if (metadata_apply_relayed(msrc, ev[0], ev[1], evis, evalue)
+            && (!osrv || IsMeshStub(osrv))) {
+          sendcmdto_set_skip_crdt_servers();
+          if (evalue)
+            sendcmdto_serv_butone_v3(msrc, CMD_METADATA, NULL, "%s %s %s :%s", ev[0], ev[1],
+                                     evis == METADATA_VIS_PRIVATE ? "P" : "*", evalue);
+          else
+            sendcmdto_serv_butone_v3(msrc, CMD_METADATA, NULL, "%s %s", ev[0], ev[1]);
         }
       }
     } else if (m_cmd[0] == 'Z' && target[0] == '*') {  /* SVSNOOP: "<servermask> <+|->",

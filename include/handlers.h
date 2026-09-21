@@ -349,6 +349,15 @@ extern int m_rename(struct Client*, struct Client*, int, char*[]);
 extern int ms_rename(struct Client*, struct Client*, int, char*[]);
 extern int m_metadata(struct Client*, struct Client*, int, char*[]);
 extern int ms_metadata(struct Client*, struct Client*, int, char*[]);
+/* METADATA over the CRDT mesh (ephemeral by spec: memory + S2S only for
+ * unauthed users / unregistered channels, so CR M is its carrier).  Apply
+ * a relayed MD the way ms_metadata does (1 applied, 0 dropped); mint the
+ * CR M 'E' copy (1 if minted; the caller keeps the tree relay off
+ * CRDT-aware links). */
+extern int metadata_apply_relayed(struct Client *sptr, const char *target,
+                                  const char *key, int visibility, const char *value);
+extern int metadata_mesh_mint(struct Client *from, const char *target,
+                              const char *key, int visibility, const char *value);
 extern int m_webpush(struct Client*, struct Client*, int, char*[]);
 extern int ms_webpush(struct Client*, struct Client*, int, char*[]);
 extern int m_bouncer(struct Client*, struct Client*, int, char*[]);
