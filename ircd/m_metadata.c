@@ -938,7 +938,11 @@ static int metadata_cmd_set(struct Client *sptr, int parc, char *parv[])
    * metadata_notify_subscribers. */
   metadata_notify_subscribers(wire_target, key, value, visibility);
 
-  /* Propagate to other servers with visibility */
+  /* Propagate to other servers with visibility: CRDT-aware peers get the
+   * mesh copy (an unauthed user's / unregistered channel's metadata has
+   * no doc and died at the tree horizon), legacy links the tree copy. */
+  if (metadata_mesh_mint(sptr, wire_target, key, visibility, value))
+    sendcmdto_set_skip_crdt_servers();
   if (value) {
     sendcmdto_serv_butone_v3(sptr, CMD_METADATA, NULL, "%s %s %s :%s",
                           wire_target, key,
@@ -1063,9 +1067,12 @@ static int metadata_cmd_clear(struct Client *sptr, int parc, char *parv[])
     struct MetadataEntry *entry = is_channel
                                     ? metadata_list_channel(target_channel)
                                     : metadata_list_client(target_client);
-    for (; entry; entry = entry->next)
+    for (; entry; entry = entry->next) {
+      if (metadata_mesh_mint(sptr, wire_target, entry->key, METADATA_VIS_PUBLIC, NULL))
+        sendcmdto_set_skip_crdt_servers();
       sendcmdto_serv_butone_v3(sptr, CMD_METADATA, NULL, "%s %s",
                                wire_target, entry->key);
+    }
   }
 
   /* #605: the requester gets a `metadata` batch with one RPL_KEYNOTSET
