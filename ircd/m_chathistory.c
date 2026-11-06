@@ -39,11 +39,6 @@
 #include "hash.h"
 #include "history.h"
 #include "redact_index.h"   /* redaction catch-up query (design B) */
-/* m_redact.c (handlers.h cannot be included here -- forward_history_write prototype nit) */
-extern void redact_apply_row(struct Client *src, const char *target, const char *msgid,
-                             const char *redact_msgid, uint64_t time_ms, const char *reason,
-                             const char *sender_str, const char *account_str);
-static void redact_catchup_kick(unsigned int store_num);   /* design B trigger (defined with the catch-up) */
 #include "ircd.h"
 #include "ircd_alloc.h"
 #include "ircd_compress.h"

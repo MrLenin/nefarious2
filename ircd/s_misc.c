@@ -364,6 +364,11 @@ int64_t exit_face_departs(struct Client *c, const char *comment)
 
     if (!link || !IsServer(link) || IsBurstGated(link))
       continue;
+    /* Phase 3m (CRDT-mesh): on a CRDT primary the leave rides the doc to
+     * CRDT-aware peers (the caller's crdt_shadow_user_remove tombstone), as
+     * exit_client()'s QUIT loop keeps its Q off them. */
+    if (feature_bool(FEAT_CRDT_PRIMARY) && IsCrdtAware(link))
+      continue;
     /* Armed per link: a send toward a legacy link consumes the override
      * without a tag region (as exit_client() arms its QUIT). */
     if (msgid[0])
@@ -763,6 +768,7 @@ static void exit_one_client(struct Client* bcptr, const char* comment)
           Debug((DEBUG_INFO, "Bouncer: destroy@exit-holding-killed sess=%s "
                  "client=%s aliases=%d",
                  bsess->hs_sessid, cli_name(bcptr), bsess->hs_alias_count));
+          bounce_crdt_tombstone_owned(bsess);   /* doc tombstones while bcptr still proves ownership */
           bsess->hs_client = NULL;
           if (bsess->hs_alias_count > 0) {
             int i;
@@ -794,11 +800,15 @@ static void exit_one_client(struct Client* bcptr, const char* comment)
           Debug((DEBUG_INFO, "Bouncer: destroy@exit-holding-no-aliases sess=%s "
                  "client=%s aliases=%d",
                  bsess->hs_sessid, cli_name(bcptr), bsess->hs_alias_count));
+          bounce_crdt_tombstone_owned(bsess);   /* doc tombstones while bcptr still proves ownership */
           bsess->hs_client = NULL;
           bounce_broadcast(bsess, 'X', NULL);
           bounce_destroy(bsess);
         }
       } else if (bsess->hs_state == BOUNCE_ACTIVE) {
+        /* Ownership read before the slot is cleared: only the branches
+         * below that end the session tombstone its doc records. */
+        struct Client *owner = bsess->hs_client;
         bsess->hs_client = NULL;
         if (HasFlag(bcptr, FLAG_KILLED)) {
           /* KILL: force-destroy session regardless of aliases */
@@ -816,6 +826,9 @@ static void exit_one_client(struct Client* bcptr, const char* comment)
                             comment && *comment ? comment : "Session killed");
             }
           }
+          bsess->hs_client = owner;            /* doc tombstones while it */
+          bounce_crdt_tombstone_owned(bsess);  /* still proves ownership */
+          bsess->hs_client = NULL;
           bounce_broadcast(bsess, 'X', NULL);
           bounce_destroy(bsess);
         } else if (MyUser(bcptr) && bounce_enabled_for(bcptr)
@@ -824,6 +837,9 @@ static void exit_one_client(struct Client* bcptr, const char* comment)
           Debug((DEBUG_INFO, "Bouncer: destroy@exit-active-orphan sess=%s "
                  "client=%s",
                  bsess->hs_sessid, cli_name(bcptr)));
+          bsess->hs_client = owner;            /* doc tombstones while it */
+          bounce_crdt_tombstone_owned(bsess);  /* still proves ownership */
+          bsess->hs_client = NULL;
           bounce_broadcast(bsess, 'X', NULL);
           bounce_destroy(bsess);
         }

@@ -930,6 +930,9 @@ static void bounce_hold_expire(struct Event *ev)
    * in exit_one_client (s_misc.c) won't try to destroy it again.
    * The actual free is deferred to the ET_DESTROY handler above. */
   bounce_broadcast(session, 'X', NULL);
+  /* The doc tombstones while the ghost still proves ownership (CRDT peers
+   * skip the BS X); the free stays deferred. */
+  bounce_crdt_tombstone_owned(session);
   session->hs_state = BOUNCE_DESTROYING;
   session->hs_client = NULL;
   if (ghost && IsBouncerHold(ghost)) {
@@ -1560,16 +1563,24 @@ static int bounce_crdt_lease_resume(struct Client *cptr, const char *account,
      * doc transfers the lease (the heal demote on the old holder keys off this).
      * Claimed only once the attach took: a refused attach (Keycloak or account
      * mismatch, +Z) must not leave the doc naming a holder with no primary. */
+    /* The lease points into the doc's LWW map, and the claim replaces (frees)
+     * that value: copy what the log needs first. */
+    uint16_t old_host = lease->host;
+    unsigned int new_gen = (unsigned int)(lease->generation + 1);
+    /* The nick check the chooser's orphan reclaim makes: a held nick would
+     * 433 the login after the attach, the 'A' and the claim. */
+    if (bounce_login_nick_held_elsewhere(cptr))
+      return BOUNCE_RESUME_NICK_HELD;
     if (bounce_attach(session, cptr, 0) == 0) {
       crdt_shadow_blease_claim(account, session->hs_sessid, myn,
-                               lease->generation + 1, (uint64_t)CurrentTime);
+                               new_gen, (uint64_t)CurrentTime);
+      lease = NULL;   /* freed by the claim */
       bounce_broadcast(session, 'A', cli_yxx(cptr));
       *out_session = session;
       log_write(LS_SYSTEM, L_NOTICE, 0,
                 "Bouncer M6d: REVIVE_LOCAL took over session %s for %s "
                 "(stale doc-holder %u -> claimed gen %u)",
-                session->hs_sessid, account, lease->host,
-                (unsigned)(lease->generation + 1));
+                session->hs_sessid, account, (unsigned)old_host, new_gen);
       return BOUNCE_RESUME_HELD;
     }
     return -1;   /* attach failed -> the chooser decides */
@@ -3419,7 +3430,7 @@ time_t bounce_compute_hold_time_ext(struct BouncerSession *session)
  * bsess/blease doc records never tombstoned and orphaned network-wide (the
  * M3 election-divergence noise found via ORESET/SET-HOLD-off, 2026-07-29;
  * five call sites swept). */
-void bounce_destroy_owned(struct BouncerSession *session)
+void bounce_crdt_tombstone_owned(struct BouncerSession *session)
 {
   assert(0 != session);
   if (feature_bool(FEAT_CRDT_PRIMARY) && session->hs_client
@@ -3427,6 +3438,12 @@ void bounce_destroy_owned(struct BouncerSession *session)
     crdt_shadow_bsess_remove(session->hs_account, session->hs_sessid);
     crdt_shadow_blease_remove(session->hs_account, session->hs_sessid);  /* M5 */
   }
+}
+
+void bounce_destroy_owned(struct BouncerSession *session)
+{
+  assert(0 != session);
+  bounce_crdt_tombstone_owned(session);
   session->hs_client = NULL;   /* unanchor: later exit passes skip session cleanup */
   bounce_destroy(session);     /* its own gate no-ops now (hs_client NULL) */
 }
@@ -11423,6 +11440,15 @@ static void bounce_live_join(struct BouncerSession *s, struct Client *j,
   presence_set_event_time(quit_time);
   remove_user_from_all_channels(j);
   presence_set_event_time(0);
+
+  /* M6d ghost-freedom (as the live-primary demote): tombstone the face's
+   * CRDT user record while it is still a non-alias primary, so CRDT peers
+   * exit their copy (the Q above skips them) and never re-materialize it as
+   * a plain user.  Single writer: only the owning server.  PRIMARY alone
+   * must also tombstone, since exit_face_departs skips the Q on it. */
+  if ((feature_bool(FEAT_CRDT_PRIMARY) || feature_bool(FEAT_CRDT_BOUNCER_DOC))
+      && MyConnect(j))
+    crdt_shadow_user_remove(j, reason);
 
   /* 3. An alias of ours from here on: still a socket and a registered
    * user, no longer announced (the network learns it by BX C). */

@@ -1312,6 +1312,10 @@ extern void bounce_destroy(struct BouncerSession *session);
  * doc tombstones while hs_client still proves ownership, then NULLs it and
  * destroys).  Replaces the "hs_client = NULL; bounce_destroy()" pattern, which
  * silently skipped the tombstones (orphan doc records, 2026-07-29). */
+/** Mint the doc tombstones (bsessions + bleases) of a session this server
+ * holds, while its hs_client still proves ownership; no-op otherwise.  For a
+ * caller that must clear hs_client itself before the record goes. */
+extern void bounce_crdt_tombstone_owned(struct BouncerSession *session);
 extern void bounce_destroy_owned(struct BouncerSession *session);
 
 /** A member (or an oper) ends @a session (enum bounce_member_end):

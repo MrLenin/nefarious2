@@ -411,6 +411,7 @@ int server_finish_burst(struct Client *cptr)
     crdt_send_snapshot(cptr);
     sendcmdto_one(&me, CMD_END_OF_BURST, cptr, "");
     sendcmdto_one(&me, CMD_END_OF_BURST_ACK, cptr, "");
+    sendcmdto_set_inbound_link(inbound);   /* as the normal end of the burst does */
     return 0;
   }
 

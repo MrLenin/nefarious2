@@ -217,7 +217,6 @@ void sasl_webhook_link_catchup(struct Client *cptr)
 #include <jansson.h>
 #include <kc/kc_webhook.h>
 
-static struct sasl_webhook_stats wh_stats;
 static int webhook_initialized = 0;
 
 /* ---- Session deauth/kill helpers ---- */
