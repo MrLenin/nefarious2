@@ -1561,7 +1561,12 @@ static int bounce_crdt_lease_resume(struct Client *cptr, const char *account,
             account, session->hs_sessid, lease ? "yes" : "none",
             lease ? lease->host : 0, holder_fresh,
             (void*)session->hs_client, (int)act);
-  if (act == CRDT_BLEASE_REVIVE_LOCAL) {
+  /* Only with no live primary here: bounce_attach's own precondition.  The
+   * lease can name a stale holder H while the session already moved to a live
+   * primary elsewhere (a cross-server promote; the new holder's sweep stands
+   * down while H is fresh).  Reviving then would 433 the login on that very
+   * primary's nick; the chooser aliases it instead. */
+  if (act == CRDT_BLEASE_REVIVE_LOCAL && !session->hs_client) {
     /* stale/dead holder -> become primary; record us as the gen+1 host so the
      * doc transfers the lease (the heal demote on the old holder keys off this).
      * Claimed only once the attach took: a refused attach (Keycloak or account
@@ -11034,6 +11039,11 @@ int bounce_yield_held_ghost(struct BouncerSession *session, struct Client *ghost
                     session->hs_aliases[i].ba_numeric, session->hs_sessid);
       }
       session->hs_alias_count = 0;
+      /* The merged-away id leaves the doc while hs_client still proves we
+       * hold it: bounce_destroy below runs with the slot empty, and its
+       * single-writer gate would mint nothing, so the bsess and blease
+       * would have no writer left to retire them. */
+      bounce_crdt_tombstone_owned(session);
       bounce_hs_client_assign_checked(session, NULL, "yield");
       /* Ours ends (BS X, destroy) once its devices are announced in the
        * record they join (below): a peer then re-files them before the
@@ -13209,6 +13219,13 @@ static int bounce_alias_promote(struct Client *cptr, struct Client *sptr,
     cli_user(new_client)->alias_primary = NULL;
     /* C1: Add promoted alias to nick hash (aliases aren't in nick hash) */
     hAddClient(new_client);
+    /* CRDT: another server promoted our alias.  A live join or demote
+     * tombstoned this numeric's user record while it was an alias; as a
+     * primary it needs the record back, or the peers' reconcile exits it
+     * (a QUIT, gatewayed to legacy too).  The same re-mint as
+     * bounce_promote_alias; single writer: only the owning server. */
+    if (MyConnect(new_client))
+      crdt_shadow_user_add(new_client);
     /* Reconcile opers/inv counting: ClearBouncerAlias made new_client an eligible
      * primary.  Flag-keyed + idempotent — a remote alias (was uncounted) is bumped
      * now (without this it exits +o uncounted -> opers underflow assert), the
