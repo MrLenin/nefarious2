@@ -630,26 +630,6 @@ static int metadata_write_versioned(const char *account, const char *key,
   return (rc == DB_OK) ? 0 : -1;
 }
 
-void metadata_doc_mirror_account(const char *account, const char *key,
-                                 const char *value, int visibility,
-                                 const struct md_stamp *st)
-{
-  char prefixed[METADATA_VALUE_LEN + 8];
-  const char *stored_value = value;
-
-  /* The permanent-row prefix rule of metadata_write_versioned, so the doc
-   * value reads back the same way (metadata_decode_visibility). */
-  if (value && !metadata_key_is_server_managed(key)) {
-    size_t vlen_raw = strlen(value);
-
-    if (vlen_raw + 2 >= sizeof(prefixed))
-      return;
-    memcpy(prefixed, (visibility == METADATA_VIS_PRIVATE) ? "P:" : "*:", 2);
-    memcpy(prefixed + 2, value, vlen_raw + 1);
-    stored_value = prefixed;
-  }
-  crdt_shadow_metadata_set(account, key, stored_value, 1, st);
-}
 
 /** Internal helper for metadata_account_set with explicit timestamp.
  * Pass timestamp=0 for permanent values (no TTL expiry).  Stamp-now
@@ -1657,6 +1637,29 @@ int metadata_readmarker_foreach(const char *account, int (*cb)(const char *targe
 int metadata_sync(void) { return -1; }
 
 #endif /* USE_ROCKSDB */
+
+/* Storage-independent: a no-store build and a store-less server both reach it
+ * (metadata_account_write). */
+void metadata_doc_mirror_account(const char *account, const char *key,
+                                 const char *value, int visibility,
+                                 const struct md_stamp *st)
+{
+  char prefixed[METADATA_VALUE_LEN + 8];
+  const char *stored_value = value;
+
+  /* The permanent-row prefix rule of metadata_write_versioned, so the doc
+   * value reads back the same way (metadata_decode_visibility). */
+  if (value && !metadata_key_is_server_managed(key)) {
+    size_t vlen_raw = strlen(value);
+
+    if (vlen_raw + 2 >= sizeof(prefixed))
+      return;
+    memcpy(prefixed, (visibility == METADATA_VIS_PRIVATE) ? "P:" : "*:", 2);
+    memcpy(prefixed + 2, value, vlen_raw + 1);
+    stored_value = prefixed;
+  }
+  crdt_shadow_metadata_set(account, key, stored_value, 1, st);
+}
 
 /** Decode the visibility prefix from a just-decoded (post-TTL-strip) store row
  * value OR a CRDT doc value (both share this encoding), per the class rule that

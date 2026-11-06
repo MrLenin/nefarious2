@@ -941,7 +941,11 @@ static struct HLC metadata_op_ts(struct CrdtNetworkState *st, const struct HLC *
 {
   if (!at)
     return hlc_local_event(&st->clock);
-  hlc_receive(&st->clock, at);
+  /* Bounded, as every peer clock is (W4): a stamp too far ahead keeps its
+   * place in the entry but does not drag the doc clock, which orders every
+   * other collection's local ops too.  The callers refuse such stamps. */
+  hlc_receive_bounded(&st->clock, at, hlc_wall_clock_ms(), hlc_max_forward_ms(),
+                      NULL);
   return *at;
 }
 

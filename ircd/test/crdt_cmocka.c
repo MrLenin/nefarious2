@@ -705,8 +705,10 @@ static void test_metadata_set_at_keeps_row_stamp(void **state)
   struct CrdtNetworkState s1, s2;
   char key[32];
   const struct CrdtLWWValue *v;
-  struct HLC newer = { 5000000000000ULL, 3, 7 };
-  struct HLC older = { 4000000000000ULL, 0, 9 };
+  uint64_t now = hlc_wall_clock_ms();
+  struct HLC newer = { now + 1000, 3, 7 };   /* inside the 60 s forward bound */
+  struct HLC older = { now - 1000, 0, 9 };
+  struct HLC far = { now + 3600000ULL, 0, 7 };  /* an hour ahead: beyond it */
   struct HLC dts;
   uint32_t klen;
   (void)state;
@@ -734,9 +736,13 @@ static void test_metadata_set_at_keeps_row_stamp(void **state)
   assert_memory_equal("P:1", v->data, 3);
 
   /* A stamped delete keeps its stamp, readable for the store heal. */
-  crdt_metadata_del_at(&s1, key, klen, &(struct HLC){ 6000000000000ULL, 0, 7 });
+  crdt_metadata_del_at(&s1, key, klen, &(struct HLC){ now + 2000, 0, 7 });
   assert_int_equal(1, crdt_lwwmap_deleted_ts(&s1.metadata, key, klen, &dts));
-  assert_int_equal(6000000000000ULL, dts.physical_ms);
+  assert_int_equal(now + 2000, dts.physical_ms);
+
+  /* A stamp beyond the forward bound does not drag the doc clock. */
+  crdt_metadata_set_at(&s2, key, klen, "P:2", 3, &far);
+  assert_true(s2.clock.physical_ms < far.physical_ms);
 
   crdt_state_clear(&s1);
   crdt_state_clear(&s2);

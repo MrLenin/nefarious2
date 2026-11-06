@@ -3308,6 +3308,10 @@ void crdt_shadow_metadata_set(const char *account, const char *key,
   klen = metadata_doc_key(account, key, dk, sizeof dk);
   if (!klen)
     return;
+  /* A stamp too far ahead stays out of the doc (its merge was the bounded
+   * hlc_global_receive's to refuse; the doc clock must not jump with it). */
+  if (st && md_stamp_ahead(st, hlc_wall_clock_ms(), hlc_max_forward_ms()))
+    return;
   if (value) {
     if (!permanent)
       return;                              /* TTL cache — not shared truth, skip */
@@ -3407,7 +3411,7 @@ static void reconcile_metadata_set_cb(const char *key, uint32_t key_len,
   char account[CHANNELLEN + 1], mkey[METADATA_KEY_LEN + 1];
   char cur[METADATA_VALUE_LEN + 1], docval[METADATA_VALUE_LEN + 1];
   uint32_t al, kl;
-  int docvis, curvis;
+  int docvis, curvis, same;
   if (!val || !val->data || !val->data_len || val->data_len > METADATA_VALUE_LEN)
     return;
   nul = memchr(key, '\0', key_len);          /* key = account\0metakey (opaque split) */
@@ -3430,9 +3434,8 @@ static void reconcile_metadata_set_cb(const char *key, uint32_t key_len,
    * vis; compare BOTH against the split doc value.  The pre-A2 guard compared the
    * stripped store value against the still-prefixed docval, which mismatches every
    * private row and re-writes it each 30s tick — split first, then compare. */
-  if (metadata_account_get_vis(account, mkey, cur, sizeof cur, &curvis) == 0 &&
-      curvis == docvis && strcmp(cur, docraw) == 0)
-    return;
+  same = metadata_account_get_vis(account, mkey, cur, sizeof cur, &curvis) == 0 &&
+         curvis == docvis && strcmp(cur, docraw) == 0;
   /* Heal the store with the decoded (raw, vis); set_ts re-encodes the prefix and
    * self-skips its doc mirror (g_metadata_reconciling).  On a REAL store change
    * ONLY (we are past the echo guard), materialize the converged value into every
@@ -3455,8 +3458,24 @@ static void reconcile_metadata_set_cb(const char *key, uint32_t key_len,
     in.vis = docvis;
     in.value = docraw;
     in.vlen = strlen(docraw);
+    /* A row stamped too far ahead (a skewed writer) is refused, as
+     * ms_metadata_stamped refuses it on the wire, so the doc-fed store and
+     * the P10-fed store agree on what they hold. */
+    if (md_stamp_ahead(&in.st, hlc_wall_clock_ms(), hlc_max_forward_ms()))
+      return;
+    /* Always the version merge, even when the content matches (stage-2 fix
+     * review): the doc may hold the same value under a newer stamp, which the
+     * store must take so it refuses an older row in flight.  The merge is a
+     * point read when the store already has this stamp. */
     if (metadata_account_merge(account, mkey, &in) != 1)
-      return;                 /* the store's row is newer (or a store error) */
+      return;                 /* the store's row is as new or newer (or a store error) */
+    if (same) {
+      /* Only the stamp moved: memory and subscribers already have the value;
+       * the links that never see the doc still need the version. */
+      if (!IsChannelName(account))
+        metadata_emit_versioned_skip_crdt(&me, account, mkey, &in);
+      return;
+    }
     c->applied++;
     if (IsChannelName(account)) {
       /* Memory + notify only (the doc-only delivery half of the M8 class). */
@@ -3490,6 +3509,34 @@ static void reconcile_metadata_del_collect(const void *key, size_t klen, void *a
     return;
   if (!crdt_metadata_is_explicitly_removed(&g_crdt, key, (uint32_t)klen))
     return;
+  /* A store row newer than the doc's tombstone stands (the stamped merge below
+   * would keep it): skip it here, or every tick re-collects it and enough of
+   * them starve the real deletes out of the capped slots. */
+  {
+    struct HLC dts;
+    const char *nul = memchr(key, '\0', klen);
+    char account[CHANNELLEN + 1], mkey[METADATA_KEY_LEN + 1];
+    size_t al = nul ? (size_t)(nul - (const char *)key) : 0;
+    size_t kl = nul ? klen - al - 1 : 0;
+    struct md_version local;
+    char valbuf[METADATA_VALUE_LEN];
+    struct md_stamp tst;
+
+    if (!nul || al == 0 || al > CHANNELLEN || kl == 0 || kl > METADATA_KEY_LEN)
+      return;
+    memcpy(account, key, al); account[al] = '\0';
+    memcpy(mkey, nul + 1, kl); mkey[kl] = '\0';
+    if (crdt_lwwmap_deleted_ts(&g_crdt.metadata, key, (uint32_t)klen, &dts)
+        && metadata_account_get_version(account, mkey, &local, valbuf,
+                                        sizeof valbuf) == 0
+        && !local.tombstone) {
+      tst.ms = dts.physical_ms;
+      tst.logical = dts.logical;
+      tst.node = dts.node_id;
+      if (md_stamp_cmp(&local.st, &tst) > 0)
+        return;
+    }
+  }
   if (d->nr >= CRDT_METADATA_REMOVE_MAX) { d->capped = 1; return; }
   memcpy(d->keys[d->nr], key, klen);
   d->klens[d->nr] = (uint32_t)klen;
@@ -3508,6 +3555,10 @@ void crdt_shadow_reconcile_metadata(void)
   unsigned int removed = 0;
   int i;
   if (!shadow_on())
+    return;
+  /* Without a store there is nothing to heal (the stamped merge refuses every
+   * row), and every entry would cost a refused merge each tick. */
+  if (!metadata_lmdb_is_available())
     return;
   g_metadata_reconciling = 1;
   crdt_lwwmap_foreach(&g_crdt.metadata, reconcile_metadata_set_cb, &c);
@@ -3556,7 +3607,8 @@ void crdt_shadow_reconcile_metadata(void)
         in.vis = oldvis;
         in.value = NULL;
         in.vlen = 0;
-        if (metadata_account_merge(account, mkey, &in) != 1)
+        if (md_stamp_ahead(&in.st, hlc_wall_clock_ms(), hlc_max_forward_ms())
+            || metadata_account_merge(account, mkey, &in) != 1)
           continue;
         if (!IsChannelName(account)) {
           removed++;
