@@ -10981,6 +10981,7 @@ int bounce_yield_held_ghost(struct BouncerSession *session, struct Client *ghost
   struct BouncerSession *merged = NULL;
   char merged_account[ACCOUNTLEN + 1] = "";
   char merged_sessid[BOUNCER_SESSID_LEN] = "";
+  int merged_owned = 0;   /* we held the merged-away id: we retire its doc records */
   char new_full[6];
   int i, installed;
 
@@ -11039,11 +11040,14 @@ int bounce_yield_held_ghost(struct BouncerSession *session, struct Client *ghost
                     session->hs_aliases[i].ba_numeric, session->hs_sessid);
       }
       session->hs_alias_count = 0;
-      /* The merged-away id leaves the doc while hs_client still proves we
-       * hold it: bounce_destroy below runs with the slot empty, and its
-       * single-writer gate would mint nothing, so the bsess and blease
-       * would have no writer left to retire them. */
-      bounce_crdt_tombstone_owned(session);
+      /* Note ownership while hs_client still proves it: bounce_destroy below
+       * runs with the slot empty, so its single-writer gate would mint no
+       * tombstone and the bsess and blease would have no writer left.  The
+       * tombstones themselves wait until the devices are re-filed (below):
+       * on a CRDT peer they are the BS X, and an early one would reap the
+       * replica before our BX C reaches it. */
+      merged_owned = feature_bool(FEAT_CRDT_PRIMARY) && session->hs_client
+                     && MyConnect(session->hs_client);
       bounce_hs_client_assign_checked(session, NULL, "yield");
       /* Ours ends (BS X, destroy) once its devices are announced in the
        * record they join (below): a peer then re-files them before the
@@ -11111,6 +11115,13 @@ int bounce_yield_held_ghost(struct BouncerSession *session, struct Client *ghost
   if (merged_sessid[0]) {
     struct BouncerSession *m = bounce_session_listed(merged_account, merged,
                                                      merged_sessid);
+
+    /* Its doc records go now, after the BX C above and whether or not the
+     * account still lists the record (the doc names the id either way). */
+    if (merged_owned) {
+      crdt_shadow_bsess_remove(merged_account, merged_sessid);
+      crdt_shadow_blease_remove(merged_account, merged_sessid);
+    }
 
     if (m) {
       log_write(LS_USER, L_INFO, 0, "Bouncer yield: session %s of %s merged "
