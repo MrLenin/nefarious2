@@ -584,6 +584,13 @@ extern int metadata_account_get_version(const char *account, const char *key,
                                         struct md_version *out,
                                         char *valbuf, size_t vlen);
 
+/** Is the live store row for (@a account, @a key) permanent, as opposed to
+ * a TTL cache row (metadata_account_set)?  Only a permanent row is shared
+ * truth that may enter the CRDT doc.
+ * @return 1 (live and permanent), 0 (a TTL row, or no live row), -1 (error).
+ */
+extern int metadata_account_row_permanent(const char *account, const char *key);
+
 /** Merge an incoming stamped version against the stored one by the pure
  * LWW rule (metadata_lww.h's md_lww_take).  On take: folds the incoming
  * stamp into this server's global HLC (hlc_global_receive, so our clock

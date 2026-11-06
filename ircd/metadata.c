@@ -415,8 +415,34 @@ int metadata_lmdb_is_available(void)
  * @param[out] visibility Decoded visibility, or NULL if not needed.
  * @return 0 on success, 1 if not found or expired, -1 on error.
  */
+static int account_get_vis_ttl(const char *account, const char *key,
+                               char *value, size_t value_len, int *visibility,
+                               time_t *cached_at);
+
 int metadata_account_get_vis(const char *account, const char *key,
                              char *value, size_t value_len, int *visibility)
+{
+  return account_get_vis_ttl(account, key, value, value_len, visibility, NULL);
+}
+
+/** See include/metadata.h. */
+int metadata_account_row_permanent(const char *account, const char *key)
+{
+  char value[METADATA_VALUE_LEN];
+  time_t cached_at = 0;
+  int rc = account_get_vis_ttl(account, key, value, sizeof value, NULL,
+                               &cached_at);
+
+  if (rc != 0)
+    return rc < 0 ? -1 : 0;
+  return cached_at == 0;
+}
+
+/** metadata_account_get_vis, also giving the TTL cache time of the row
+ * (0 for a permanent row) in @a cached_at when it is not NULL. */
+static int account_get_vis_ttl(const char *account, const char *key,
+                               char *value, size_t value_len, int *visibility,
+                               time_t *cached_at)
 {
   struct db_val val = { NULL, 0 };
   /* @a account is an account name (<=ACCOUNTLEN) OR, since B1/B2's opaque
@@ -483,6 +509,8 @@ int metadata_account_get_vis(const char *account, const char *key,
   strcpy(value, stripped);
   if (visibility)
     *visibility = vis;
+  if (cached_at)
+    *cached_at = timestamp;
   return 0;
 }
 
@@ -1619,6 +1647,7 @@ void metadata_lmdb_shutdown(void) { }
 int metadata_lmdb_is_available(void) { return 0; }
 int metadata_account_get(const char *account, const char *key, char *value) { return -1; }
 int metadata_account_get_vis(const char *account, const char *key, char *value, size_t value_len, int *visibility) { (void)account; (void)key; (void)value; (void)value_len; (void)visibility; return -1; }
+int metadata_account_row_permanent(const char *account, const char *key) { (void)account; (void)key; return -1; }
 int metadata_account_set(const char *account, const char *key, const char *value, int visibility) { (void)visibility; return -1; }
 int metadata_account_set_permanent(const char *account, const char *key, const char *value, int visibility) { (void)visibility; return -1; }
 struct MetadataEntry *metadata_account_list(const char *account) { return NULL; }

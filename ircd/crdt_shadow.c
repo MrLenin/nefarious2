@@ -3355,6 +3355,29 @@ static const struct HLC *md_stamp_hlc(const struct md_stamp *st, struct HLC *out
   return out;
 }
 
+/* Does the doc already hold @a st, or a newer version, for this key (live
+ * or tombstoned)?  Then minting @a st again changes nothing: a stamped row
+ * enters the doc only where it lacks that stamp or a newer one, so it is
+ * idempotent whichever hop mints it (#12). */
+static int md_doc_has_stamp(const char *dk, uint32_t klen, const struct md_stamp *st)
+{
+  const struct CrdtLWWValue *v;
+  struct HLC ts;
+  struct md_stamp have;
+
+  if (!st)
+    return 0;
+  v = crdt_metadata_get(&g_crdt, dk, klen);
+  if (v && v->data)
+    ts = v->ts;
+  else if (!crdt_lwwmap_deleted_ts(&g_crdt.metadata, dk, klen, &ts))
+    return 0;
+  have.ms = ts.physical_ms;
+  have.logical = ts.logical;
+  have.node = ts.node_id;
+  return md_stamp_cmp(&have, st) >= 0;
+}
+
 void crdt_shadow_metadata_set(const char *account, const char *key,
                               const char *value, int permanent,
                               const struct md_stamp *st)
@@ -3370,6 +3393,8 @@ void crdt_shadow_metadata_set(const char *account, const char *key,
   /* A stamp too far ahead stays out of the doc (its merge was the bounded
    * hlc_global_receive's to refuse; the doc clock must not jump with it). */
   if (md_stamp_refused(st))
+    return;
+  if (md_doc_has_stamp(dk, klen, st))
     return;
   if (value) {
     if (!permanent)
@@ -3463,7 +3488,52 @@ void crdt_shadow_diag_metadata_entry(struct Client *sptr, const char *account,
  * permanent value if the store copy is missing or differs (echo-guarded so a
  * P10-delivered value isn't bounced back + no write churn). Runs under
  * g_metadata_reconciling so metadata_account_set_permanent's mirror self-skips. */
-struct reconcile_metadata_ctx { unsigned int applied; };
+/* Store rows strictly newer than the doc's entry for their key, to write
+ * back into the doc once the reconcile walks are done: without it nothing
+ * writes such a row into the doc (its mirror was suspended, or the store
+ * merged it from a link while the doc missed it) and the two stay
+ * different for good.  Collected during the walks (the doc map must not
+ * change under crdt_lwwmap_foreach), written after them. */
+struct md_writeback {
+  char keys[CRDT_METADATA_REMOVE_MAX][CHANNELLEN + METADATA_KEY_LEN + 4];
+  uint32_t klens[CRDT_METADATA_REMOVE_MAX];
+  int n;
+};
+static void md_writeback_add(struct md_writeback *wb, const void *key, uint32_t klen)
+{
+  if (!wb || wb->n >= CRDT_METADATA_REMOVE_MAX || klen == 0
+      || klen > sizeof wb->keys[0])
+    return;                     /* the rest wait for the next tick */
+  memcpy(wb->keys[wb->n], key, klen);
+  wb->klens[wb->n] = klen;
+  wb->n++;
+}
+/* Is the store's row for (@a account, @a mkey) strictly newer than @a than,
+ * and takeable (not too far ahead)? */
+static int md_store_strictly_newer(const char *account, const char *mkey,
+                                   const struct md_stamp *than)
+{
+  struct md_version local;
+  char valbuf[METADATA_VALUE_LEN];
+
+  /* A live row must be permanent: a TTL cache row is no shared truth and
+   * never enters the doc (crdt_shadow_metadata_set skips it too).  The row
+   * must carry another server's stamp.  A newer row stamped by us is
+   * usually an unstamped relayed change stored under our receive-time
+   * stamp (the mirror suspended, its origin minted it), and publishing it
+   * would let every receiver outrank the origin, even a newer write,
+   * network-wide.  The cost: a local write of ours whose mirror did not
+   * happen (the shadow off, or the doc losing the entry) is not repaired
+   * here either; the two can tell apart only with a provenance mark on the
+   * store row. */
+  return metadata_account_get_version(account, mkey, &local, valbuf,
+                                      sizeof valbuf) == 0
+         && local.st.node != g_crdt.my_numeric
+         && md_stamp_cmp(&local.st, than) > 0 && !md_stamp_refused(&local.st)
+         && (local.tombstone || metadata_account_row_permanent(account, mkey) == 1);
+}
+
+struct reconcile_metadata_ctx { unsigned int applied; struct md_writeback *wb; };
 static void reconcile_metadata_set_cb(const char *key, uint32_t key_len,
                                       const struct CrdtLWWValue *val, void *ctx)
 {
@@ -3529,8 +3599,14 @@ static void reconcile_metadata_set_cb(const char *key, uint32_t key_len,
      * review): the doc may hold the same value under a newer stamp, which the
      * store must take so it refuses an older row in flight.  The merge is a
      * point read when the store already has this stamp. */
-    if (metadata_account_merge(account, mkey, &in) != 1)
-      return;                 /* the store's row is as new or newer (or a store error) */
+    {
+      int mrc = metadata_account_merge(account, mkey, &in);
+
+      if (mrc == 0 && md_store_strictly_newer(account, mkey, &in.st))
+        md_writeback_add(c->wb, key, key_len);
+      if (mrc != 1)
+        return;               /* the store's row is as new or newer (or a store error) */
+    }
     if (same) {
       /* Only the stamp moved: memory and subscribers already have the value;
        * the links that never see the doc still need the version. */
@@ -3563,6 +3639,7 @@ struct reconcile_metadata_del_ctx {
   uint32_t klens[CRDT_METADATA_REMOVE_MAX];
   int nr;
   int capped;
+  struct md_writeback *wb;
 };
 static void reconcile_metadata_del_collect(const void *key, size_t klen, void *arg)
 {
@@ -3598,8 +3675,15 @@ static void reconcile_metadata_del_collect(const void *key, size_t klen, void *a
       /* md_lww_take keeps a live row against an equal-stamp tombstone too,
        * and a refused (far-ahead) tombstone is never applied: neither can
        * ever be reaped, so neither takes a slot. */
-      if (md_stamp_cmp(&local.st, &tst) >= 0 || md_stamp_refused(&tst))
+      if (md_stamp_cmp(&local.st, &tst) >= 0 || md_stamp_refused(&tst)) {
+        /* A live row strictly newer than the tombstone goes back into the
+         * doc, or the doc keeps the delete for good. */
+        if (md_stamp_cmp(&local.st, &tst) > 0 && !md_stamp_refused(&local.st)
+            && local.st.node != g_crdt.my_numeric
+            && metadata_account_row_permanent(account, mkey) == 1)
+          md_writeback_add(d->wb, key, (uint32_t)klen);
         return;
+      }
     }
   }
   if (d->nr >= CRDT_METADATA_REMOVE_MAX) { d->capped = 1; return; }
@@ -3617,7 +3701,8 @@ void crdt_shadow_reconcile_metadata(void)
 {
   struct reconcile_metadata_ctx c = { 0 };
   struct reconcile_metadata_del_ctx *d;
-  unsigned int removed = 0;
+  struct md_writeback *wb;
+  unsigned int removed = 0, written_back = 0;
   int i;
   if (!shadow_on())
     return;
@@ -3625,12 +3710,15 @@ void crdt_shadow_reconcile_metadata(void)
    * row), and every entry would cost a refused merge each tick. */
   if (!metadata_lmdb_is_available())
     return;
+  wb = (struct md_writeback *)MyCalloc(1, sizeof *wb);
+  c.wb = wb;
   g_metadata_reconciling = 1;
   crdt_lwwmap_foreach(&g_crdt.metadata, reconcile_metadata_set_cb, &c);
 
   /* DELETE pass — heap-alloc the collector (large arrays; off the stack). */
   d = (struct reconcile_metadata_del_ctx *)MyCalloc(1, sizeof *d);
   if (d) {
+    d->wb = wb;
     metadata_account_foreach_key(reconcile_metadata_del_collect, d);
     for (i = 0; i < d->nr; i++) {
       const char *k = d->keys[i];
@@ -3702,10 +3790,46 @@ void crdt_shadow_reconcile_metadata(void)
   }
   g_metadata_reconciling = 0;
 
-  if (c.applied || removed)
+  /* Write back the store rows strictly newer than the doc, under their own
+   * stamps (the mirror's usual path, now that the walks are done and the
+   * reconcile guard is down).  Re-read: a row may have changed since. */
+  if (wb) {
+    for (i = 0; i < wb->n; i++) {
+      const char *k = wb->keys[i];
+      const char *nul = memchr(k, '\0', wb->klens[i]);
+      char account[CHANNELLEN + 1], mkey[METADATA_KEY_LEN + 1];
+      char valbuf[METADATA_VALUE_LEN + 1];
+      struct md_version local;
+      uint32_t al, kl;
+
+      if (!nul)
+        continue;
+      al = (uint32_t)(nul - k);
+      kl = wb->klens[i] - al - 1;
+      if (al == 0 || al > CHANNELLEN || kl == 0 || kl > METADATA_KEY_LEN)
+        continue;
+      memcpy(account, k, al); account[al] = '\0';
+      memcpy(mkey, nul + 1, kl); mkey[kl] = '\0';
+      if (metadata_account_get_version(account, mkey, &local, valbuf,
+                                       sizeof valbuf) != 0
+          || md_stamp_refused(&local.st) || local.st.node == g_crdt.my_numeric)
+        continue;
+      if (local.tombstone)
+        crdt_shadow_metadata_set(account, mkey, NULL, 1, &local.st);
+      else if (metadata_account_row_permanent(account, mkey) == 1)
+        metadata_doc_mirror_account(account, mkey, local.value, local.vis,
+                                    &local.st);
+      else
+        continue;                         /* became a TTL row since */
+      written_back++;
+    }
+    MyFree(wb);
+  }
+
+  if (c.applied || removed || written_back)
     log_write(LS_SYSTEM, L_INFO, 0,
-              "CRDT metadata-reconcile: %u set, %u removed from doc",
-              c.applied, removed);
+              "CRDT metadata-reconcile: %u set, %u removed from doc, %u written back",
+              c.applied, removed, written_back);
 }
 
 /* ---- Global-state track: GLINEs as CRDT-native doc state (step 2 shadow-write) ---- */

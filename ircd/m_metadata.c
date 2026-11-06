@@ -1951,15 +1951,13 @@ static int ms_metadata_stamped(struct Client *cptr, struct Client *sptr,
     }
   }
 
-  /* Tier C F2-b single-writer: a row that came over a CRDT-aware link was
-   * mirrored into the doc by the server that wrote it, so this merge must
-   * not mint it again.  One from any other link is minted here, the
-   * gateway edge, so peers reached only over the mesh get it. */
-  if (IsCrdtAware(cptr))
-    crdt_shadow_metadata_suspend(1);
+  /* The merge's doc mirror mints this row under its own stamp only where
+   * the doc lacks that stamp or a newer one (crdt_shadow_metadata_set), so
+   * it is idempotent whichever hop mints it and trusts no link: a row its
+   * CRDT origin already put in the doc is skipped, and one from a legacy
+   * link enters the doc here, at the gateway edge (#12).  Equal stamps
+   * mint the same entry (the writer is the stamp's node, C1). */
   merge_rc = metadata_account_merge(account_name, wire_key, &in);
-  if (IsCrdtAware(cptr))
-    crdt_shadow_metadata_suspend(0);
   /* Kept the local version (0): not relayed, even one with this very stamp
    * that came first by the doc -- the doc reconcile that healed it sent it on
    * to the links that never see the doc (crdt_shadow.c), and a second relay
