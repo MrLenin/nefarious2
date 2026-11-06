@@ -8643,6 +8643,13 @@ int bounce_promote_alias(struct BouncerSession *session, int local_only)
   /* Add to nick hash (aliases aren't in nick hash) */
   hAddClient(alias);
 
+  /* CRDT: a live join or demote tombstoned this client's user record while
+   * it became an alias; as a primary again it needs the record back, or the
+   * peers' reconcile pass exits it.  LWW, so this SET beats the earlier
+   * delete.  Single writer: only the owning server. */
+  if (MyConnect(alias))
+    crdt_shadow_user_add(alias);
+
   /* opers / inv_clients: ClearBouncerAlias above made @a alias a real primary,
    * so reconcile its counting.  Flag-keyed + idempotent: a LOCAL alias was
    * already counted when created (no-op here); a REMOTE alias was never counted
@@ -11444,10 +11451,10 @@ static void bounce_live_join(struct BouncerSession *s, struct Client *j,
   /* M6d ghost-freedom (as the live-primary demote): tombstone the face's
    * CRDT user record while it is still a non-alias primary, so CRDT peers
    * exit their copy (the Q above skips them) and never re-materialize it as
-   * a plain user.  Single writer: only the owning server.  PRIMARY alone
-   * must also tombstone, since exit_face_departs skips the Q on it. */
-  if ((feature_bool(FEAT_CRDT_PRIMARY) || feature_bool(FEAT_CRDT_BOUNCER_DOC))
-      && MyConnect(j))
+   * a plain user, as exit_one_client does for any departure.  Single
+   * writer: only the owning server.  bounce_promote_alias writes the record
+   * back if this face is promoted later. */
+  if (MyConnect(j))   /* crdt_shadow_user_remove checks the features */
     crdt_shadow_user_remove(j, reason);
 
   /* 3. An alias of ours from here on: still a socket and a registered
