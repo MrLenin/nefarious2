@@ -23,8 +23,9 @@ TESTPROGS = \
 # #ifdef USE_LIBKC.  Their build rules stay defined below either way; they
 # are simply never requested.
 #
-# @EPOLL_CMOCKA_TESTPROGS@ is ircd_events_cmocka when the epoll engine is
-# built, and empty otherwise: it links ../engine_epoll.o.
+# The EPOLL_CMOCKA_TESTPROGS substitution (configure.in) is
+# ircd_events_cmocka and paste_listener_cmocka when the epoll engine is
+# built, and empty otherwise: they link ../engine_epoll.o.
 CMOCKA_TESTPROGS = \
 	@KC_CMOCKA_TESTPROGS@ \
 	@EPOLL_CMOCKA_TESTPROGS@ \
@@ -39,6 +40,8 @@ CMOCKA_TESTPROGS = \
 	ircd_crypt_cmocka \
 	crule_cmocka \
 	history_cmocka \
+	history_trim_codec_cmocka \
+	history_trim_cmocka \
 	chathistory_presence_cmocka \
 	recv_classify_cmocka \
 	crdt_cmocka \
@@ -47,6 +50,7 @@ CMOCKA_TESTPROGS = \
 	crdt_wire_hardening_cmocka \
 	register_throttle_cmocka \
 	ipcheck_refund_cmocka \
+	ipcheck_cmocka \
 	fakelag_cmocka \
 	webpush_mute_cmocka \
 	webpush_expiry_cmocka \
@@ -58,20 +62,25 @@ CMOCKA_TESTPROGS = \
 	bouncer_rebind_auth_cmocka \
 	exit_reason_cmocka \
 	bouncer_deauth_cmocka \
+	bouncer_transplant_cmocka \
 	sessid_index_cmocka \
 	metadata_lww_cmocka \
+	bouncer_record_cmocka \
 	webpush_line_cmocka \
 	websocket_cmocka \
 	db_casefold_cmocka \
 	account_id_cmocka \
 	webhook_eventlog_cmocka \
-	crdt_hlc_bound_cmocka
+	crdt_hlc_bound_cmocka \
+	db_api_fake_cmocka \
+	db_api_rocksdb_cmocka
 
 CMOCKA_LIBS = -lcmocka
 ZSTD_LIBS = -lzstd
 CURL_LIBS = -lcurl
 JANSSON_LIBS = -ljansson
 SSL_LIBS = -lssl -lcrypto
+ROCKSDB_LIBS = -lrocksdb -lstdc++ -lpthread
 
 DEP_SRC = \
 	ircd_chattr_t.c \
@@ -89,6 +98,8 @@ DEP_SRC = \
 	ircd_crypt_cmocka.c \
 	crule_cmocka.c \
 	history_cmocka.c \
+	history_trim_codec_cmocka.c \
+	history_trim_cmocka.c \
 	chathistory_presence_cmocka.c \
 	recv_classify_cmocka.c \
 	crdt_cmocka.c \
@@ -97,6 +108,7 @@ DEP_SRC = \
 	crdt_wire_hardening_cmocka.c \
 	register_throttle_cmocka.c \
 	ipcheck_refund_cmocka.c \
+	ipcheck_cmocka.c \
 	fakelag_cmocka.c \
 	webpush_mute_cmocka.c \
 	webpush_expiry_cmocka.c \
@@ -108,8 +120,10 @@ DEP_SRC = \
 	bouncer_rebind_auth_cmocka.c \
 	exit_reason_cmocka.c \
 	bouncer_deauth_cmocka.c \
+	bouncer_transplant_cmocka.c \
 	sessid_index_cmocka.c \
 	metadata_lww_cmocka.c \
+	bouncer_record_cmocka.c \
 	webhook_eventlog_cmocka.c \
 	webpush_line_cmocka.c \
 	kc_url_cmocka.c \
@@ -126,6 +140,9 @@ DEP_SRC = \
 	kc_webhook_sig_cmocka.c \
 	ircd_events_cmocka.c \
 	crdt_hlc_bound_cmocka.c \
+	paste_listener_cmocka.c \
+	db_api_cmocka.c \
+	fake_db.c \
 	test_stub.c
 
 all: ${TESTPROGS}
@@ -211,10 +228,35 @@ CRULE_CMOCKA_OBJS = crule_cmocka.o test_stub.o ../ircd_string.o
 crule_cmocka: $(CRULE_CMOCKA_OBJS)
 	${CC} -o $@ $(LDFLAGS) $(CRULE_CMOCKA_OBJS) $(CMOCKA_LIBS)
 
-# history tests - serialization functions (no LMDB required)
-HISTORY_CMOCKA_OBJS = history_cmocka.o test_stub.o ../ircd_string.o ../redact_index.o
+# history tests - links the REAL record codec (history_record.o: serialize,
+# deserialize, sentinel escaping, CH W forward encode/split); no database.
+HISTORY_CMOCKA_OBJS = history_cmocka.o test_stub.o ../history_record.o ../ircd_snprintf.o ../ircd_alloc.o ../ircd_compress.o ../ircd_string.o ../redact_index.o
 history_cmocka: $(HISTORY_CMOCKA_OBJS)
-	${CC} -o $@ $(LDFLAGS) $(HISTORY_CMOCKA_OBJS) $(CMOCKA_LIBS)
+	${CC} -o $@ $(LDFLAGS) $(HISTORY_CMOCKA_OBJS) $(CMOCKA_LIBS) $(ZSTD_LIBS)
+
+# history_trim_codec tests - the pure key/record/owner-key codec for the
+# chathistory trim project's by_time/by_owner indexes.  Links the real
+# ../history_trim_codec.o plus ../db_casefold.o for db_casefold_bytes
+# (fold helper) and ../ircd_string.o for the casemapping table db_casefold.o
+# uses; fake_db.o satisfies only db_casefold.o's storage symbols (db_get,
+# db_iter_*, db_writebatch_*, ...) that db_casefold_migrate references --
+# no RocksDB, and this suite never calls that path.
+HISTORY_TRIM_CODEC_CMOCKA_OBJS = history_trim_codec_cmocka.o test_stub.o ../history_trim_codec.o ../db_casefold.o ../ircd_string.o fake_db.o
+history_trim_codec_cmocka: $(HISTORY_TRIM_CODEC_CMOCKA_OBJS)
+	${CC} -o $@ $(LDFLAGS) $(HISTORY_TRIM_CODEC_CMOCKA_OBJS) $(CMOCKA_LIBS)
+
+# history_trim tests - the trim engine (index staging, the sliced boot
+# accounting scan, budgeted slices, the one delete function, touched-target
+# cleanup) against the in-memory storage fake: fake_db.o is the whole db_*
+# backend here.  Links the real ../history_trim.o and its codec
+# (../history_trim_codec.o, ../redact_index.o for the redact_index key,
+# ../db_casefold.o + ../ircd_string.o for name folding, ../ircd_alloc.o
+# for MyMalloc); test_stub.o supplies log_write.  No RocksDB.
+HISTORY_TRIM_CMOCKA_OBJS = history_trim_cmocka.o test_stub.o ../history_trim.o \
+	../history_trim_codec.o ../redact_index.o ../db_casefold.o ../ircd_string.o \
+	../ircd_alloc.o fake_db.o
+history_trim_cmocka: $(HISTORY_TRIM_CMOCKA_OBJS)
+	${CC} -o $@ $(LDFLAGS) $(HISTORY_TRIM_CMOCKA_OBJS) $(CMOCKA_LIBS)
 
 # chathistory_presence tests - links the REAL chathistory_presence.o (built
 # by the top-level `make` before this runs, same as ../ircd_string.o et al)
@@ -269,6 +311,20 @@ register_throttle_cmocka: $(REGISTER_THROTTLE_CMOCKA_OBJS)
 # No test_stub.o: the module is pure by design (no log_write, no ircd deps).
 ipcheck_refund_test.o: ../ipcheck_refund.c ../../include/ipcheck_refund.h
 	${CC} ${CFLAGS} ${CPPFLAGS} -DIPCHECK_REFUND_TABLE_BITS=0 -DIPCHECK_REFUND_BUCKET_DEPTH=2 -c -o $@ ../ipcheck_refund.c
+
+# IPcheck tests - the real IPcheck.c, with assert() routed to CMocka's
+# mock_assert() (mock_assert.h) so a test can see an assert fire; the ircd
+# services it calls (features, timers, the clock, the log, the registration
+# NOTICE) are stubbed in ipcheck_cmocka.c itself, test_stub.o's debug()
+# included, which would print every Debug() line.
+ipcheck_test.o: ../IPcheck.c ../../include/IPcheck.h mock_assert.h
+	${CC} ${CFLAGS} ${CPPFLAGS} -include ${srcdir}/mock_assert.h -c -o $@ ../IPcheck.c
+
+IPCHECK_CMOCKA_OBJS = ipcheck_cmocka.o ipcheck_test.o \
+	../ipcheck_refund.o ../ircd_alloc.o ../ircd_snprintf.o ../ircd_string.o \
+	../match.o
+ipcheck_cmocka: $(IPCHECK_CMOCKA_OBJS)
+	${CC} -o $@ $(LDFLAGS) $(IPCHECK_CMOCKA_OBJS) $(CMOCKA_LIBS)
 
 IPCHECK_REFUND_CMOCKA_OBJS = ipcheck_refund_cmocka.o ipcheck_refund_test.o
 ipcheck_refund_cmocka: $(IPCHECK_REFUND_CMOCKA_OBJS)
@@ -363,10 +419,34 @@ kc_webhook_sig_cmocka: $(KC_WEBHOOK_SIG_CMOCKA_OBJS)
 # ircd_events tests - an engine error never runs a socket's callback
 # inside the socket_add/socket_events/socket_state call that caused it.
 # Links the real event core and epoll engine, and makes real epoll calls
-# fail; the few ircd symbols around them are stubbed in the test.
-IRCD_EVENTS_CMOCKA_OBJS = ircd_events_cmocka.o test_stub.o ../ircd_events.o ../engine_epoll.o ../crdt_hlc.o
+# fail; the few ircd symbols around them are stubbed in the test.  The
+# event core is compiled with its assert() routed to the test
+# (events_assert.h), so a case can see an assert fire, or run past it as a
+# release build does.
+ircd_events_test.o: ../ircd_events.c ../../include/ircd_events.h events_assert.h
+	${CC} ${CFLAGS} ${CPPFLAGS} -include ${srcdir}/events_assert.h -c -o $@ ../ircd_events.c
+
+IRCD_EVENTS_CMOCKA_OBJS = ircd_events_cmocka.o test_stub.o ircd_events_test.o ../engine_epoll.o ../crdt_hlc.o
 ircd_events_cmocka: $(IRCD_EVENTS_CMOCKA_OBJS)
 	${CC} -o $@ $(LDFLAGS) $(IRCD_EVENTS_CMOCKA_OBJS) $(CMOCKA_LIBS)
+
+# paste_listener tests - a paste connection is freed only by the last
+# ET_DESTROY of the two event generators inside it (its socket and its
+# request timer), never while one is still in use: a request timeout, a
+# failed handshake, a hangup, a refused registration, shutdown, a served
+# request and a WebSocket promote; and it holds a reference on its Listener
+# until it closes, across a rehash that drops the port.  Includes
+# ../paste_listener.c (so the test sees the conn when it is freed) and
+# links the real event core (ircd_events_test.o, as above) and epoll
+# engine; the TLS cases run a real handshake over a socketpair, hence
+# libssl.
+paste_listener_cmocka.o: ${srcdir}/paste_listener_cmocka.c ../paste_listener.c
+	${CC} ${CFLAGS} ${CPPFLAGS} -c -o $@ ${srcdir}/paste_listener_cmocka.c
+
+PASTE_LISTENER_CMOCKA_OBJS = paste_listener_cmocka.o ircd_events_test.o \
+	../engine_epoll.o ../ircd_string.o ../crdt_hlc.o
+paste_listener_cmocka: $(PASTE_LISTENER_CMOCKA_OBJS)
+	${CC} -o $@ $(LDFLAGS) $(PASTE_LISTENER_CMOCKA_OBJS) $(CMOCKA_LIBS) $(SSL_LIBS)
 
 .c.o:
 	${CC} ${CFLAGS} ${CPPFLAGS} -c $< -o $@
@@ -507,6 +587,18 @@ BOUNCER_DEAUTH_CMOCKA_OBJS = bouncer_deauth_cmocka.o bouncer_deauth_test.o
 bouncer_deauth_cmocka: $(BOUNCER_DEAUTH_CMOCKA_OBJS)
 	${CC} -o $@ $(LDFLAGS) $(BOUNCER_DEAUTH_CMOCKA_OBJS) $(CMOCKA_LIBS)
 
+# bouncer_transplant tests - the revive's one fallible step, linked with
+# the real event core (../ircd_events.o) and a fake engine defined in the
+# test under whichever engine names the build configured.
+bouncer_transplant_test.o: ../bouncer_transplant.c \
+		../../include/bouncer_transplant.h ../../include/ircd_events.h
+	${CC} ${CFLAGS} ${CPPFLAGS} -c -o $@ ../bouncer_transplant.c
+
+BOUNCER_TRANSPLANT_CMOCKA_OBJS = bouncer_transplant_cmocka.o \
+	bouncer_transplant_test.o test_stub.o ../ircd_events.o
+bouncer_transplant_cmocka: $(BOUNCER_TRANSPLANT_CMOCKA_OBJS)
+	${CC} -o $@ $(LDFLAGS) $(BOUNCER_TRANSPLANT_CMOCKA_OBJS) $(CMOCKA_LIBS)
+
 # sessid_index tests - the module is pure (no ircd deps)
 sessid_index_test.o: ../sessid_index.c ../../include/sessid_index.h
 	${CC} ${CFLAGS} ${CPPFLAGS} -c -o $@ ../sessid_index.c
@@ -522,6 +614,14 @@ metadata_lww_test.o: ../metadata_lww.c ../../include/metadata_lww.h
 METADATA_LWW_CMOCKA_OBJS = metadata_lww_cmocka.o metadata_lww_test.o
 metadata_lww_cmocka: $(METADATA_LWW_CMOCKA_OBJS)
 	${CC} -o $@ $(LDFLAGS) $(METADATA_LWW_CMOCKA_OBJS) $(CMOCKA_LIBS)
+
+# bouncer_record tests - the record decoder calls nothing in the ircd
+bouncer_record_test.o: ../bouncer_record.c ../../include/bouncer_record.h ../../include/bouncer_session.h
+	${CC} ${CFLAGS} ${CPPFLAGS} -c -o $@ ../bouncer_record.c
+
+BOUNCER_RECORD_CMOCKA_OBJS = bouncer_record_cmocka.o bouncer_record_test.o
+bouncer_record_cmocka: $(BOUNCER_RECORD_CMOCKA_OBJS)
+	${CC} -o $@ $(LDFLAGS) $(BOUNCER_RECORD_CMOCKA_OBJS) $(CMOCKA_LIBS)
 
 # webhook_eventlog tests - the applied-events log is pure (no ircd deps, no jansson)
 webhook_eventlog_test.o: ../webhook_eventlog.c ../../include/webhook_eventlog.h
@@ -561,3 +661,26 @@ webpush_line_cmocka: $(WEBPUSH_LINE_CMOCKA_OBJS)
 CRDT_HLC_BOUND_CMOCKA_OBJS = crdt_hlc_bound_cmocka.o test_stub.o ../crdt_hlc.o
 crdt_hlc_bound_cmocka: $(CRDT_HLC_BOUND_CMOCKA_OBJS)
 	${CC} -o $@ $(LDFLAGS) $(CRDT_HLC_BOUND_CMOCKA_OBJS) $(CMOCKA_LIBS)
+
+# db_api tests - storage API spec (bounded iterators, range delete, a
+# compaction hint), run against two backends from the SAME test source
+# (db_api_cmocka.c) so the fake cannot drift from RocksDB:
+#   db_api_fake_cmocka    - the plain compile, links the in-memory fake
+#                           (fake_db.o, ircd/test/fake_db.h); no RocksDB.
+#   db_api_rocksdb_cmocka - the -DDB_API_REAL compile (its own .o, since
+#                           the flag changes the binary), links the real
+#                           RocksDB backend (../db_rocksdb.o) against a
+#                           mkdtemp()'d env; test_stub.o supplies
+#                           log_write, and ../ircd_snprintf.o/../ircd_alloc.o/
+#                           ../ircd_string.o are the real backend's own deps.
+DB_API_FAKE_CMOCKA_OBJS = db_api_cmocka.o fake_db.o
+db_api_fake_cmocka: $(DB_API_FAKE_CMOCKA_OBJS)
+	${CC} -o $@ $(LDFLAGS) $(DB_API_FAKE_CMOCKA_OBJS) $(CMOCKA_LIBS)
+
+db_api_cmocka_real.o: ${srcdir}/db_api_cmocka.c
+	${CC} ${CFLAGS} ${CPPFLAGS} -DDB_API_REAL -c -o $@ ${srcdir}/db_api_cmocka.c
+
+DB_API_ROCKSDB_CMOCKA_OBJS = db_api_cmocka_real.o test_stub.o ../db_rocksdb.o \
+	../ircd_alloc.o ../ircd_string.o ../ircd_snprintf.o
+db_api_rocksdb_cmocka: $(DB_API_ROCKSDB_CMOCKA_OBJS)
+	${CC} -o $@ $(LDFLAGS) $(DB_API_ROCKSDB_CMOCKA_OBJS) $(CMOCKA_LIBS) $(ROCKSDB_LIBS)

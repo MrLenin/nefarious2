@@ -562,12 +562,14 @@ int websocket_handshake_feed(struct Client *cptr, const char *data,
  * @param[out] opcode The frame opcode.
  * @param[out] is_fin Set to 1 if FIN bit is set (final fragment), 0 otherwise.
  * @return Number of bytes consumed from frame, 0 if incomplete, -1 on
- *   error, WS_DECODE_TOOBIG if the payload exceeds WS_MAX_PAYLOAD.
+ *   a protocol error (the caller answers Close 1002), WS_DECODE_TOOBIG if
+ *   the payload exceeds WS_MAX_PAYLOAD (Close 1009).
  *
  * RFC 6455 Compliance:
  * - §5.2: RSV1-3 bits MUST be 0 unless extension negotiated (we negotiate none)
  * - §5.1: Client-to-server frames MUST be masked
  * - §5.2: Reserved opcodes (0x03-0x07, 0x0B-0x0F) MUST cause connection failure
+ * - §5.5: Control frames MUST NOT be fragmented
  * - §5.5: Control frames MUST have payload length <= 125 bytes
  */
 int websocket_decode_frame(const unsigned char *frame, int frame_len,
@@ -611,6 +613,12 @@ int websocket_decode_frame(const unsigned char *frame, int frame_len,
   }
 
   is_control = (*opcode >= 0x08);
+
+  /* RFC 6455 §5.5: control frames MUST NOT be fragmented */
+  if (is_control && !fin) {
+    Debug((DEBUG_DEBUG, "WebSocket: Control frame 0x%x without FIN - protocol error", *opcode));
+    return -1;
+  }
 
   /* Parse second byte: MASK + payload length */
   masked = (frame[1] & WS_MASK) ? 1 : 0;
@@ -807,29 +815,85 @@ static int ws_send_raw(struct Client *cptr, const unsigned char *data, int len)
   }
 }
 
-/** Send a WebSocket Close frame (RFC 6455 §5.5.1) with a status code.
- * Best effort, no error reporting: this is used immediately before the
- * connection is dropped so the client can tell a policy close (e.g.
- * 1009 Message Too Big) apart from a network failure (1006).
+/** Set the Close frame this connection ends with (RFC 6455 §5.5.1: one
+ * per connection, and no data frame after it).  The first call decides
+ * it: a refusal's status, or the answer to the client's own Close; the
+ * farewell 1000 that exit_client() and a bouncer hold set on the way out
+ * then changes nothing.  Nothing goes on the wire here:
+ * websocket_close_flush() sends it when close_connection() closes the
+ * socket, after the lines queued before it.  Sent at once, a refusal's
+ * Close went ahead of exit_client()'s "ERROR :Closing Link", a data frame
+ * after the Close (§5.5.1) that web IRC clients read the quit reason
+ * from.
+ *
+ * The reason must be UTF-8 (§5.5.1), or the client fails the connection
+ * (§8.1) and reports 1006 instead of the status.  A farewell's reason is
+ * the exit comment, which for a QUIT or a KILL carries the user's text,
+ * UTF-8 or not: invalid bytes become U+FFFD.  A control frame carries at
+ * most 125 bytes (§5.5), so the reason is then cut to
+ * WS_CLOSE_REASON_MAX bytes at a character boundary.
  * @param[in] cptr Client connection.
- * @param[in] code Status code.
- * @param[in] reason Optional reason text (truncated to fit a control frame).
+ * @param[in] code Status code, or WS_CLOSE_NO_STATUS (an empty Close).
+ * @param[in] reason Optional reason text.
  */
-void websocket_send_close(struct Client *cptr, int code, const char *reason)
+void websocket_set_close(struct Client *cptr, int code, const char *reason)
 {
-  unsigned char frame[2 + 125];
-  int rlen = reason ? (int)strlen(reason) : 0;
+  struct Connection *con = cli_connect(cptr);
+  char text[BUFSIZE];
 
-  if (rlen > 123)
-    rlen = 123;  /* control frame payload <= 125 incl. 2-byte code */
+  if (con_ws_close_code(con))
+    return;
+  con_ws_close_code(con) = code;
+  con_ws_close_reason(con)[0] = '\0';
+  if (code == WS_CLOSE_NO_STATUS || EmptyString(reason))
+    return;
+  /* string_sanitize_utf8() works in a BUFSIZE buffer and its result, up
+   * to well past WS_CLOSE_REASON_MAX bytes, is whole UTF-8 sequences:
+   * ircd_utf8_clamp() then cuts it at a character boundary. */
+  ircd_strncpy(text, reason, sizeof(text));
+  string_sanitize_utf8(text);
+  ircd_utf8_clamp(text, WS_CLOSE_REASON_MAX);
+  ircd_strncpy(con_ws_close_reason(con), text, sizeof(con_ws_close_reason(con)));
+}
+
+/** Flush a WebSocket connection that is being closed: the lines queued
+ * on it, then the one Close frame websocket_set_close() set (RFC 6455
+ * §5.5.1).  Best effort, no error reporting: the client can then tell a
+ * policy close (e.g. 1009 Message Too Big) apart from a network failure
+ * (1006).  Nothing is sent on a dead socket: its Close stays unsent, and
+ * its fd is closed next.  On a live one the Close is marked sent before
+ * the write, so one that ws_send_raw() could not send (a blocked socket,
+ * a partial frame pending) is not tried again.
+ * @param[in] cptr Client connection.
+ */
+void websocket_close_flush(struct Client *cptr)
+{
+  struct Connection *con = cli_connect(cptr);
+  unsigned char frame[2 + 2 + WS_CLOSE_REASON_MAX];
+  int code = con_ws_close_code(con);
+  int len;
+
+  /* exit_client()'s ERROR line is queued last: it goes first */
+  send_queued(cptr);
+  if (!code || con_ws_close_sent(con) || IsDead(cptr) || cli_fd(cptr) < 0)
+    return;
+  con_ws_close_sent(con) = 1;
   frame[0] = WS_FIN | WS_OPCODE_CLOSE;
-  frame[1] = (unsigned char)(2 + rlen);
-  frame[2] = (code >> 8) & 0xFF;
-  frame[3] = code & 0xFF;
-  if (rlen > 0)
-    memcpy(frame + 4, reason, rlen);
-  Debug((DEBUG_DEBUG, "WebSocket: sending Close %d (%s)", code, reason ? reason : ""));
-  ws_send_raw(cptr, frame, 4 + rlen);
+  if (code == WS_CLOSE_NO_STATUS) {
+    frame[1] = 0;
+    len = 2;
+  } else {
+    int rlen = (int)strlen(con_ws_close_reason(con));
+
+    frame[1] = (unsigned char)(2 + rlen);
+    frame[2] = (code >> 8) & 0xFF;
+    frame[3] = code & 0xFF;
+    memcpy(frame + 4, con_ws_close_reason(con), rlen);
+    len = 4 + rlen;
+  }
+  Debug((DEBUG_DEBUG, "WebSocket: sending Close %d (%s)", code,
+         con_ws_close_reason(con)));
+  ws_send_raw(cptr, frame, len);
 }
 
 /** Send an empty WS protocol-level PING (RFC 6455 5.5.2).  Browsers
@@ -876,6 +940,21 @@ void websocket_ping_timer_init(void)
   timer_add(timer_init(&ws_ping_timer), ws_ping_callback, 0, TT_PERIODIC, iv);
 }
 
+/** Whether a Close frame may carry \a code on the wire (RFC 6455 §7.4):
+ * a status §7.4.1 defines for an endpoint to send or IANA has registered
+ * since (1000-1003, 1007-1014), or one of the library and application
+ * ranges (3000-4999, §7.4.2).  Not 1004 (reserved), not 1005, 1006 and
+ * 1015 (never on the wire), not 0-999, 1016-2999 (unassigned) or anything
+ * over 4999.
+ * @param[in] code Status code.
+ * @return Non-zero if a Close may carry it. */
+static int ws_close_code_valid(int code)
+{
+  if (code >= 3000 && code <= 4999)
+    return 1;
+  return (code >= 1000 && code <= 1003) || (code >= 1007 && code <= 1014);
+}
+
 int websocket_handle_control(struct Client *cptr, int opcode,
                              const char *payload, int payload_len)
 {
@@ -903,22 +982,85 @@ int websocket_handle_control(struct Client *cptr, int opcode,
       return 1;
 
     case WS_OPCODE_CLOSE:
-      /* Client initiated close - send close response */
-      response[0] = WS_FIN | WS_OPCODE_CLOSE;
-      if (payload_len >= 2) {
-        /* Echo back the status code */
-        response[1] = 2;
-        response[2] = payload[0];
-        response[3] = payload[1];
-        resp_len = 4;
-      } else {
-        response[1] = 0;
-        resp_len = 2;
+      /* Client initiated close.  The answer echoes its status (§5.5.1),
+       * and an empty Close answers one without a body.  A body too short
+       * for a status, or a status no Close may carry (§7.4; among them 0
+       * and 1005, which websocket_set_close() reads as "none" and "an
+       * empty Close"), is a protocol error: 1002, never the forbidden
+       * code echoed back.  A reason that is not UTF-8 (§5.5.1, §8.1) is
+       * 1007.  The answer is this connection's Close unless one of ours
+       * is already set, and goes out when the caller closes the
+       * connection. */
+      if (payload_len == 0)
+        websocket_set_close(cptr, WS_CLOSE_NO_STATUS, NULL);
+      else {
+        int code = payload_len >= 2
+                   ? ((unsigned char)payload[0] << 8) | (unsigned char)payload[1]
+                   : 0;
+
+        if (payload_len < 2 || !ws_close_code_valid(code))
+          websocket_set_close(cptr, 1002, "Invalid Close status");
+        else if (!string_is_valid_utf8_len(payload + 2, payload_len - 2))
+          websocket_set_close(cptr, 1007, "Invalid UTF-8");
+        else
+          websocket_set_close(cptr, code, NULL);
       }
-      ws_send_raw(cptr, response, resp_len);
       return 0; /* Signal to close connection */
 
     default:
       return 1;
   }
+}
+
+int websocket_frag_feed(struct Client *cptr, int opcode, int is_fin,
+                        const char *payload, int len,
+                        char **msg, int *msg_len)
+{
+  char *buf = cli_ws_frag_buf(cptr);
+
+  if (opcode == WS_OPCODE_CONTINUATION) {
+    /* RFC 6455 §5.4: a continuation only continues a started message */
+    if (cli_ws_frag_opcode(cptr) == 0) {
+      websocket_set_close(cptr, 1002, "Continuation without a message");
+      return WS_FRAG_ORPHAN;
+    }
+  } else if (cli_ws_frag_opcode(cptr) != 0) {
+    /* RFC 6455 §5.4: a message's fragments are not interleaved with
+     * another message (only control frames may come between them) */
+    websocket_set_close(cptr, 1002, "Data frame inside a fragmented message");
+    return WS_FRAG_INTERLEAVED;
+  } else {
+    cli_ws_frag_opcode(cptr) = opcode;
+    cli_ws_frag_len(cptr) = 0;
+  }
+
+  if (len > WS_MAX_PAYLOAD - cli_ws_frag_len(cptr)) {
+    /* The same answer as a single frame over the limit */
+    websocket_set_close(cptr, 1009, "Message too big");
+    return WS_FRAG_OVERFLOW;
+  }
+  memcpy(buf + cli_ws_frag_len(cptr), payload, len);
+  cli_ws_frag_len(cptr) += len;
+
+  if (!is_fin)
+    return WS_FRAG_MORE;
+
+  *msg = buf;
+  *msg_len = cli_ws_frag_len(cptr);
+  /* con_ws_frag_buf has room past WS_MAX_PAYLOAD for this NUL and
+   * the line ending the caller may add. */
+  buf[*msg_len] = '\0';
+  opcode = cli_ws_frag_opcode(cptr);
+  cli_ws_frag_len(cptr) = 0;
+  cli_ws_frag_opcode(cptr) = 0;
+
+  /* RFC 6455 Section 8.1: text frames must be valid UTF-8; §7.4.1 names
+   * the Close status for data that does not match its type.  The whole
+   * message: a U+0000 in it is a character, and a check of the C string
+   * stopped there. */
+  if (opcode == WS_OPCODE_TEXT && !string_is_valid_utf8_len(buf, *msg_len)) {
+    websocket_set_close(cptr, 1007, "Invalid UTF-8");
+    return WS_FRAG_BADUTF8;
+  }
+  return WS_FRAG_DONE;
 }

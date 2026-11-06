@@ -177,6 +177,8 @@ enum IAuthFlag
 {
   IAUTH_BLOCKED,                        /**< socket buffer full */
   IAUTH_CLOSING,                        /**< candidate to be disposed */
+  IAUTH_SPAWN_UNDO,                     /**< a failed spawn is deleting its
+                                         * sockets: no automatic respawn */
   /* The following flags are controlled by iauth's "O" options command. */
   IAUTH_ADDLINFO,                       /**< Send additional info
                                          * (password and username). */
@@ -1452,6 +1454,10 @@ static void start_auth_query(struct AuthRequest* auth)
     if (IsUserPort(auth->client))
       sendheader(auth->client, REPORT_FAIL_ID);
     close(fd);
+    /* Nothing is registered (a refused socket_add() leaves the socket
+     * inactive): the teardown must neither close this number again nor
+     * socket_del() it. */
+    s_fd(&auth->socket) = -1;
     return;
   }
 
@@ -1962,9 +1968,10 @@ int auth_send_sasl_abort(struct Client *cptr)
 int iauth_do_spawn(struct IAuth *iauth, int automatic)
 {
   pid_t cpid;
-  int s_io[2];
-  int s_err[2];
+  int s_io[2] = { -1, -1 };
+  int s_err[2] = { -1, -1 };
   int res;
+  const char *step;
 
   if (automatic && CurrentTime - iauth->started < 5)
   {
@@ -1976,70 +1983,49 @@ int iauth_do_spawn(struct IAuth *iauth, int automatic)
   iauth->started = CurrentTime;
 
   /* Attempt to allocate a pair of sockets. */
-  res = os_socketpair(s_io);
-  if (res) {
+  if (os_socketpair(s_io)) {
     res = errno;
-    Debug((DEBUG_INFO, "Unable to create IAuth socketpair: %s", strerror(res)));
-    return res;
+    step = "create IAuth socketpair";
+    s_io[0] = s_io[1] = -1;
+    goto failed;
   }
 
   /* Mark the parent's side of the pair (element 0) as non-blocking. */
-  res = os_set_nonblocking(s_io[0]);
-  if (!res) {
+  if (!os_set_nonblocking(s_io[0])) {
     res = errno;
-    Debug((DEBUG_INFO, "Unable to make IAuth socket non-blocking: %s", strerror(res)));
-    close(s_io[1]);
-    close(s_io[0]);
-    return res;
+    step = "make IAuth socket non-blocking";
+    goto failed;
   }
 
   /* Initialize the socket structure to talk to the child. */
-  res = socket_add(i_socket(iauth), iauth_sock_callback, iauth,
-                   SS_CONNECTED, SOCK_EVENT_READABLE, s_io[0]);
-  if (!res) {
+  if (!socket_add(i_socket(iauth), iauth_sock_callback, iauth,
+                  SS_CONNECTED, SOCK_EVENT_READABLE, s_io[0])) {
     res = errno;
-    Debug((DEBUG_INFO, "Unable to register IAuth socket: %s", strerror(res)));
-    close(s_io[1]);
-    close(s_io[0]);
-    return res;
+    step = "register IAuth socket";
+    goto failed;
   }
 
   /* Allocate another pair for stderr. */
-  res = os_socketpair(s_err);
-  if (res) {
+  if (os_socketpair(s_err)) {
     res = errno;
-    Debug((DEBUG_INFO, "Unable to create IAuth stderr: %s", strerror(res)));
-    socket_del(i_socket(iauth));
-    close(s_io[1]);
-    close(s_io[0]);
-    return res;
+    step = "create IAuth stderr";
+    s_err[0] = s_err[1] = -1;
+    goto failed;
   }
 
   /* Mark parent side of this pair non-blocking, too. */
-  res = os_set_nonblocking(s_err[0]);
-  if (!res) {
+  if (!os_set_nonblocking(s_err[0])) {
     res = errno;
-    Debug((DEBUG_INFO, "Unable to make IAuth stderr non-blocking: %s", strerror(res)));
-    close(s_err[1]);
-    close(s_err[0]);
-    socket_del(i_socket(iauth));
-    close(s_io[1]);
-    close(s_io[0]);
-    return res;
+    step = "make IAuth stderr non-blocking";
+    goto failed;
   }
 
   /* And set up i_stderr(iauth). */
-  res = socket_add(i_stderr(iauth), iauth_stderr_callback, iauth,
-                   SS_CONNECTED, SOCK_EVENT_READABLE, s_err[0]);
-  if (!res) {
+  if (!socket_add(i_stderr(iauth), iauth_stderr_callback, iauth,
+                  SS_CONNECTED, SOCK_EVENT_READABLE, s_err[0])) {
     res = errno;
-    Debug((DEBUG_INFO, "Unable to register IAuth stderr: %s", strerror(res)));
-    close(s_err[1]);
-    close(s_err[0]);
-    socket_del(i_socket(iauth));
-    close(s_io[1]);
-    close(s_io[0]);
-    return res;
+    step = "register IAuth stderr";
+    goto failed;
   }
 
   /* Attempt to fork a child process. */
@@ -2047,14 +2033,8 @@ int iauth_do_spawn(struct IAuth *iauth, int automatic)
   if (cpid < 0) {
     /* Error forking the child, still in parent. */
     res = errno;
-    Debug((DEBUG_INFO, "Unable to fork IAuth child: %s", strerror(res)));
-    socket_del(i_stderr(iauth));
-    close(s_err[1]);
-    close(s_err[0]);
-    socket_del(i_socket(iauth));
-    close(s_io[1]);
-    close(s_io[0]);
-    return res;
+    step = "fork IAuth child";
+    goto failed;
   }
 
   if (cpid > 0) {
@@ -2084,6 +2064,44 @@ int iauth_do_spawn(struct IAuth *iauth, int automatic)
 
   /* If we got here, something was seriously wrong. */
   exit(EXIT_FAILURE);
+
+failed:
+  /* Say so: IAuth stays down (clients register without it) until a rehash
+   * spawns it again.  An engine other than epoll may refuse a registration
+   * without setting errno. */
+  log_write(LS_IAUTH, L_ERROR, 0, "IAuth spawn failed: unable to %s: %s",
+            step, res ? strerror(res) : "no error code");
+  sendto_opmask_butone(NULL, SNO_AUTH, "IAuth spawn failed: unable to %s: %s; "
+                       "IAuth is down until a rehash",
+                       step, res ? strerror(res) : "no error code");
+
+  /* A spawn that fails part-way leaves nothing behind.  Each socket
+   * registered so far is deleted while its descriptor is still open, so
+   * the engine unregisters that descriptor and not a later owner of the
+   * number.  Then the ends that exist are closed, and neither socket keeps
+   * a number: i_GetConnected() is false, a rehash spawns afresh, and
+   * iauth_disconnect() finds nothing to close.  A refused socket is not
+   * active and is not deleted.  The deletes run the sockets' ET_DESTROY
+   * callbacks, whose automatic respawn must not run for this failure (the
+   * 5-second guard would only refuse it, as "IAuth crashed fast"):
+   * IAUTH_SPAWN_UNDO keeps them from it. */
+  IAuthSet(iauth, IAUTH_SPAWN_UNDO);
+  if (s_active(i_stderr(iauth)))
+    socket_del(i_stderr(iauth));
+  if (s_active(i_socket(iauth)))
+    socket_del(i_socket(iauth));
+  IAuthClr(iauth, IAUTH_SPAWN_UNDO);
+  if (s_err[1] >= 0)
+    close(s_err[1]);
+  if (s_err[0] >= 0)
+    close(s_err[0]);
+  if (s_io[1] >= 0)
+    close(s_io[1]);
+  if (s_io[0] >= 0)
+    close(s_io[0]);
+  s_fd(i_stderr(iauth)) = -1;
+  s_fd(i_socket(iauth)) = -1;
+  return res ? res : -1;          /* a failure, even without an errno */
 }
 
 /** Restart an %IAuth program.
@@ -2100,6 +2118,10 @@ int auth_restart(void)
   /* Need to initialize a new connection. */
   iauthnew = MyCalloc(1, sizeof(*iauthnew));
   msgq_init(i_sendQ(iauthnew));
+  /* No descriptors yet (0 is someone else's): until a spawn registers
+   * them, i_GetConnected() is false and iauth_disconnect() leaves them. */
+  s_fd(i_socket(iauthnew)) = -1;
+  s_fd(i_stderr(iauthnew)) = -1;
   /* Populate iauth's argv array. */
   iauthnew->i_argv = MyCalloc(iauth->i_argc + 1, sizeof(iauthnew->i_argv[0]));
   for (ii = 0; ii < iauth->i_argc; ++ii)
@@ -2151,6 +2173,8 @@ int auth_spawn(int argc, char *argv[])
   /* Need to initialize a new connection. */
   iauth = MyCalloc(1, sizeof(*iauth));
   msgq_init(i_sendQ(iauth));
+  s_fd(i_socket(iauth)) = -1;   /* no descriptors yet: as in auth_restart() */
+  s_fd(i_stderr(iauth)) = -1;
   /* Populate iauth's argv array. */
   iauth->i_argv = MyCalloc(argc + 1, sizeof(iauth->i_argv[0]));
   for (ii = 0; ii < argc; ++ii)
@@ -2184,18 +2208,26 @@ static void iauth_disconnect(struct IAuth *iauth)
   if (iauth == NULL)
     return;
 
-  /* Close error socket. */
+  /* Close both sockets.  A socket_del() can respawn IAuth: when the other
+   * socket is no longer active and we are not closing, the ET_DESTROY
+   * callback calls iauth_do_spawn(), which registers this same Socket
+   * again, with the new child's descriptor, before socket_del() returns
+   * (outside the socket's own callbacks the destroy is not deferred).  So
+   * clear s_fd only if the socket still reads as deleted (GEN_DESTROY).
+   * Comparing numbers cannot tell: socketpair() reuses the number just
+   * closed. */
   if (s_fd(i_stderr(iauth)) != -1) {
     close(s_fd(i_stderr(iauth)));
     socket_del(i_stderr(iauth));
-    s_fd(i_stderr(iauth)) = -1;
+    if (i_stderr(iauth)->s_header.gh_flags & GEN_DESTROY)
+      s_fd(i_stderr(iauth)) = -1;
   }
 
-  /* Close main socket. */
   if (s_fd(i_socket(iauth)) != -1) {
     close(s_fd(i_socket(iauth)));
     socket_del(i_socket(iauth));
-    s_fd(i_socket(iauth)) = -1;
+    if (i_socket(iauth)->s_header.gh_flags & GEN_DESTROY)
+      s_fd(i_socket(iauth)) = -1;
   }
 
   /* Release any clients stuck waiting for IAuth response. */
@@ -3446,7 +3478,8 @@ static void iauth_sock_callback(struct Event *ev)
 
   switch (ev_type(ev)) {
   case ET_DESTROY:
-    if (!IAuthHas(iauth, IAUTH_CLOSING) && !s_active(i_stderr(iauth)))
+    if (!IAuthHas(iauth, IAUTH_CLOSING) && !IAuthHas(iauth, IAUTH_SPAWN_UNDO)
+        && !s_active(i_stderr(iauth)))
       iauth_do_spawn(iauth, 1);
     break;
   case ET_READ:
@@ -3526,7 +3559,8 @@ static void iauth_stderr_callback(struct Event *ev)
 
   switch (ev_type(ev)) {
   case ET_DESTROY:
-    if (!IAuthHas(iauth, IAUTH_CLOSING) && !s_active(i_socket(iauth)))
+    if (!IAuthHas(iauth, IAUTH_CLOSING) && !IAuthHas(iauth, IAUTH_SPAWN_UNDO)
+        && !s_active(i_socket(iauth)))
       iauth_do_spawn(iauth, 1);
     break;
   case ET_READ:

@@ -835,16 +835,17 @@ static void check_pings(struct Event* ev) {
   timer_add(&ping_timer, check_pings, 0, TT_ABSOLUTE, next_check);
 }
 
-/** Periodic callback to purge old history messages.
- * Runs every hour to enforce CHATHISTORY_RETENTION policy.
- * @param[in] ev Timer event (ignored).
+/** The chathistory maintenance tick (CHATHISTORY_MAINTENANCE_INTERVAL,
+ * floor 60 s): starts a trim pass -- retention age-out runs from there in
+ * budgeted slices on the trimmer's own 1 s timer (history_trim_tick) --
+ * and prunes expired presence intervals.
+ * @param[in] ev Timer event: only its expiry runs a tick (the ET_DESTROY
+ * of a timer_del, e.g. history_purge_restart_timer's, is not a tick).
  */
 static void history_purge_callback(struct Event* ev)
 {
-  int retention_days;
-  unsigned long max_age_seconds;
-
-  (void)ev; /* unused */
+  if (ev_type(ev) != ET_EXPIRE)
+    return;
 
   /* Only run if chathistory storage is enabled */
   if (!feature_bool(FEAT_CHATHISTORY_STORE))
@@ -853,21 +854,18 @@ static void history_purge_callback(struct Event* ev)
   if (!history_is_available())
     return;
 
-  /* Run storage management maintenance (eviction if needed)
-   * This has its own internal interval check. */
-  history_maintenance_tick();
+  /* A trim pass starts on every maintenance tick, retention or not:
+   * age-out simply has no work at retention 0 (the slice timer carries
+   * any backlog on at 1 s). */
+  history_trim_tick(1);
 
-  retention_days = feature_int(FEAT_CHATHISTORY_RETENTION);
-  if (retention_days <= 0)
+  if (feature_int(FEAT_CHATHISTORY_RETENTION) <= 0)
     return; /* Retention disabled */
-
-  max_age_seconds = (unsigned long)retention_days * 24 * 60 * 60;
-  history_purge_old(max_age_seconds);
 
   /* Strict-presence chathistory: prune intervals fully older than the
    * retention horizon.  Cheap (in-memory walk + a single CF scan of a
-   * small CF) and bounded — happens once per retention pass alongside
-   * the existing chathistory purge. */
+   * small CF) and bounded — happens once per maintenance tick, as the
+   * trim pass starts. */
   presence_retention_sweep();
 }
 
@@ -1365,11 +1363,11 @@ int main(int argc, char **argv) {
     struct db_init_arg web_arg  = { NULL, 0 };
     pthread_t hist_th, meta_th, web_th;
     int hist_started = 0, meta_started = 0, web_started = 0;
+    uint64_t newest_row_ms = 0;   /* 0 = no history store */
 
     if (feature_bool(FEAT_CHATHISTORY_STORE)) {
-      /* Map size and zstd compression must be configured before
-       * history_init() runs. */
-      history_set_map_size((size_t)feature_int(FEAT_HISTORY_MAP_SIZE_MB));
+      /* zstd compression must be configured before history_init() runs
+       * (HISTORY_MAP_SIZE_MB is the trimmer's logical cap, read live). */
 #ifdef USE_ZSTD
       compress_init((size_t)feature_int(FEAT_COMPRESS_THRESHOLD),
                     feature_int(FEAT_COMPRESS_LEVEL));
@@ -1405,8 +1403,13 @@ int main(int argc, char **argv) {
       if (hist_arg.rc != 0)
         log_write(LS_SYSTEM, L_WARNING, 0,
                   "Failed to initialize chathistory database, feature disabled");
-      else
+      else {
         chathistory_init_callbacks();
+        /* One walk of the targets CF serves the trimmer's start (its
+         * index-gap check) and the presence boot-close below (the newest
+         * stored row). */
+        newest_row_ms = history_trim_start();
+      }
     }
     if (feature_bool(FEAT_CAP_draft_metadata_2) && meta_arg.rc != 0)
       log_write(LS_SYSTEM, L_WARNING, 0,
@@ -1420,7 +1423,7 @@ int main(int argc, char **argv) {
      * completes.  Also runs the boot-close sweep for stale open
      * intervals.  Non-fatal: without the env, session-anchored
      * presence remains usable in-memory. */
-    presence_set_boot_alive_hint(history_newest_activity_ms());
+    presence_set_boot_alive_hint(newest_row_ms);
     if (presence_init() != 0 && feature_bool(FEAT_CHATHISTORY_STRICT_PRESENCE)) {
       /* Strict presence with no account store hides every authenticated
        * user's history behind a zero record.  Fail loud and fail open. */

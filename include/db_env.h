@@ -14,6 +14,10 @@
 #ifndef INCLUDED_db_types_h
 #include "db_types.h"
 #endif
+#ifndef INCLUDED_stdint_h
+#include <stdint.h>
+#define INCLUDED_stdint_h
+#endif
 
 /** Per-env tuning hints.  Not every backend respects every field; the
  * libmdbx backend uses size_floor/size_max for mdbx_env_set_geometry,
@@ -30,6 +34,18 @@ struct db_env_opts {
                                     (RocksDB only — libmdbx ignores) */
   int random_access;          /**< nonzero: random-access workload hint
                                     (libmdbx MDBX_NORDAHEAD; RocksDB advise_random_on_open) */
+  /** RocksDB: NULL-terminated names of the CFs whose rows are deleted as
+   * a matter of course (a trimmer deletes every row it once wrote).  Each
+   * SST file written for one of them -- flush or compaction output -- is
+   * marked for compaction when any @a deletion_window consecutive entries
+   * hold at least @a deletion_trigger tombstones (RocksDB's
+   * CompactOnDeletionCollector), so a run of tombstones is compacted
+   * down to the data it deletes instead of being walked by every seek
+   * that crosses it.  Applies when the CF is created and every time the
+   * env is opened.  NULL = none; libmdbx ignores it. */
+  const char *const *deletion_heavy_cfs;
+  size_t deletion_window;     /**< N (0 = 4096; RocksDB rounds up to 128s) */
+  size_t deletion_trigger;    /**< D (0 = half of N) */
 };
 
 /** Per-CF tuning at open time.  RocksDB uses these for column-family
@@ -95,6 +111,39 @@ extern int db_env_sync(struct db_env *env);
  *            CFs in @a env. */
 extern int db_env_compact(struct db_env *env, struct db_cf *cf);
 
+/** Delete every key in the half-open range [@a start, @a end) from
+ * @a cf in one operation, using the env's normal (non-durable) write
+ * options.  Bounds follow the same inclusive-lower/exclusive-upper
+ * convention as db_iter_open_bounded.  RocksDB: rocksdb_delete_range_cf
+ * (a single tombstone covering the range, not a per-key delete loop).
+ * Returns DB_OK or DB_ERR_*. */
+extern int db_delete_range(struct db_env *env, struct db_cf *cf,
+                           const void *start, size_t slen,
+                           const void *end, size_t elen);
+
+/** Flush @a cf's memtable to an SST file; @a wait 0 does not wait for the
+ * flush itself (it runs in the background) -- but RocksDB still switches
+ * the memtable on the calling thread, and blocks the call while the
+ * flush would stall writes (FlushOptions.allow_write_stall is false and
+ * has no C setter): one more immutable memtable reaching
+ * max_write_buffer_number (a flush of @a cf already in flight), or one
+ * more L0 file reaching level0_slowdown_writes_trigger.  db_cf_stats
+ * reports both (imm_memtables, l0_files and the two options) so a caller
+ * on a latency budget can skip a flush that would wait.  A compaction hint
+ * marks SST files only, so the tombstones still in a memtable need this
+ * first.  RocksDB: rocksdb_flush_cf.  Returns DB_OK or DB_ERR_*. */
+extern int db_flush_cf(struct db_env *env, struct db_cf *cf, int wait);
+
+/** Hint the backend to background-compact [@a start, @a end) in @a cf.
+ * NULL for either bound means an open end on that side (NULL for both
+ * hints "the whole CF", same as db_env_compact's cf-only form).
+ * Returns at once -- this only marks files for background compaction,
+ * it does not wait for it to finish.  RocksDB: rocksdb_suggest_compact_range_cf.
+ * Returns DB_OK or DB_ERR_*. */
+extern int db_suggest_compact(struct db_env *env, struct db_cf *cf,
+                              const void *start, size_t slen,
+                              const void *end, size_t elen);
+
 /** Backend-agnostic stats record returned by db_env_stats.  Numbers
  * are approximate on RocksDB (estimate-num-keys is not exact) and
  * exact on libmdbx (B-tree leaf count).  Empty fields are zero. */
@@ -112,9 +161,30 @@ struct db_cf_stats {
   size_t   on_disk_bytes;
   size_t   approx_keys;
   unsigned int depth;            /**< libmdbx B-tree depth; RocksDB: max LSM level */
+  size_t   mem_deletes;          /**< RocksDB: deletes in the active memtable */
+  size_t   imm_deletes;          /**< RocksDB: deletes in immutable memtables */
+  /* What decides whether a flush of the CF would block its caller
+   * (RocksDB waits in FlushMemTable while the flush would stall writes:
+   * imm_memtables + 1 >= max_write_buffers, or l0_files + 1 >=
+   * l0_slowdown_trigger).  0 = unknown (libmdbx). */
+  unsigned int imm_memtables;    /**< rocksdb.num-immutable-mem-table */
+  unsigned int l0_files;         /**< rocksdb.num-files-at-level0 */
+  unsigned int max_write_buffers;    /**< the CF's max_write_buffer_number */
+  unsigned int l0_slowdown_trigger;  /**< its level0_slowdown_writes_trigger */
 };
 extern int db_cf_stats(struct db_env *env, struct db_cf *cf,
                        struct db_cf_stats *out);
+
+/** Read the numeric backend property @a name of @a cf into *@a out;
+ * @a cf NULL reads it on the env's default CF.  RocksDB keeps its
+ * DB-wide counters there -- "rocksdb.background-errors", the failed
+ * background flushes and compactions since the env opened (a store
+ * stuck after one fails every write), is bumped on the default CF's
+ * stats only -- so read those with @a cf NULL.  RocksDB:
+ * rocksdb_property_int / rocksdb_property_int_cf.
+ * Returns DB_OK, DB_NOTFOUND (no such numeric property), or DB_ERR_*. */
+extern int db_property_u64(struct db_env *env, struct db_cf *cf,
+                           const char *name, uint64_t *out);
 
 /** Reap stale reader-table slots after an unclean shutdown.  libmdbx-
  * specific; RocksDB no-op.  Called from history.c startup recovery. */

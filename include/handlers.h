@@ -316,6 +316,7 @@ extern void chathistory_store_unreachable(unsigned int num, time_t since);
 extern void chathistory_store_reachable(unsigned int num);
 extern void chathistory_legacy_ads_foreach(void (*fn)(const char *srvnum, unsigned int retention, void *ctx),
                                            void *ctx);
+extern void chathistory_coverage_changed(void);
 extern int server_retention_covers(struct Client*, time_t);
 extern void clear_server_ad(struct Client*);
 extern void chathistory_report_ads(struct Client*, const struct StatDesc*, char*);

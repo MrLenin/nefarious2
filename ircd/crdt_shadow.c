@@ -1184,7 +1184,14 @@ void crdt_shadow_ch_storage_publish(void)
   num[2] = '\0';
 
   stores    = feature_bool(FEAT_CHATHISTORY_STORE) ? 1u : 0u;
-  retention = (uint32_t)feature_int(FEAT_CHATHISTORY_RETENTION);
+  /* The effective coverage, as CH A S/R advertise it (upstream fdea6814):
+   * once the trim engine's oldest-overall eviction moves the store's real
+   * cutoff, the configured retention overstates what a query can find.
+   * A negative value has no doc meaning; it reads as unlimited (0). */
+  {
+    int days = history_coverage_days();
+    retention = days < 0 ? 0u : (uint32_t)days;
+  }
   cur       = crdt_chstore_get(&g_crdt, num);
 
   if (!stores) {

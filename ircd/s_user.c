@@ -32,6 +32,7 @@
 #include "bouncer_session.h"
 #include "bouncer_rebind_auth.h"
 #include "history.h"
+#include "history_trim_codec.h"
 #include "capab.h"
 #include "IPcheck.h"
 #include "channel.h"
@@ -777,7 +778,26 @@ int register_user(struct Client *cptr, struct Client *sptr)
         revive_target = NULL;
       }
 
-      if (revive_target && bounce_revive(revive_target, sptr) == 0) {
+      int revived = revive_target ? bounce_revive(revive_target, sptr) : -1;
+
+      /* The event engine would not take this connection's socket for the
+       * ghost (bounce_revive() -2): the session was left as it was, but
+       * the socket is off the engine and cannot go back on, so this
+       * connection cannot register by any route.  It closes as the
+       * unregistered connection it was before the prologue above
+       * (register_user_unwind(): no WHOWAS entry, no MONITOR offline for
+       * the nick the ghost still holds, the counts it took given back);
+       * its exit sends the ERROR line, the TLS close_notify, the FIN, and
+       * releases its IPcheck entry, confs and listener.  The reconnect
+       * revives the session. */
+      if (revived == -2) {
+        register_user_unwind(sptr, pre_status, pre_handler, 0);
+        ++ServerStats->is_ref;
+        return exit_client(cptr, sptr, &me,
+                           "Could not resume your session; please reconnect");
+      }
+
+      if (revived == 0) {
         /* Success! Ghost is now alive with our socket.
          * sptr is now a husk with fd=-1. Free it silently. */
         struct Client *ghost = revive_target->hs_client;
@@ -1192,26 +1212,13 @@ int register_user(struct Client *cptr, struct Client *sptr)
     else if (HasFlag(acptr, FLAG_TS8))
       SetFlag(sptr, FLAG_TS8);
 
-    /*
-     * Check to see if this user is being propagated
-     * as part of a net.burst, or is using protocol 9.
-     * FIXME: This can be sped up - its stupid to check it for
-     * every NICK message in a burst again  --Run.
-     */
-    for (; acptr != &me; acptr = cli_serv(acptr)->up)
-    {
-      if (IsBurst(acptr) || Protocol(acptr) < 10)
-        break;
-    }
-    if (IsIPChecked(sptr) && !IPcheck_remote_connect(sptr, (acptr != &me)))
-    {
-      /*
-       * We ran out of bits to count this
-       */
-      sendcmdto_one(&me, CMD_KILL, sptr, "%C :%s (Too many connections from your host -- Ghost)",
-                    sptr, cli_name(&me));
-      return exit_client(cptr, sptr, &me,"Too many connections from your host -- throttled");
-    }
+    /* Remote users are not counted in IPcheck: the registry is per
+     * server.  (A check here used to read IsIPChecked(sptr) &&
+     * !IPcheck_remote_connect(sptr, is_burst), but nothing sets that flag
+     * on a remote client before this point and IPcheck_remote_connect()
+     * asserts it is clear, so it never ran -- not since upstream 57aad727
+     * made it test the flag instead of an except lookup.  The burst walk
+     * that fed it its is_burst went with it.) */
     SetUser(sptr);
   }
 
@@ -1674,8 +1681,12 @@ int set_nick_name(struct Client* cptr, struct Client* sptr,
           struct Membership *chan;
           char timestamp[32];
           char old_sender[HISTORY_SENDER_LEN];
+          char owner[HTC_OWNER_MAX];
           const char *account = (cli_user(sptr) && cli_user(sptr)->account[0])
                                 ? cli_user(sptr)->account : NULL;
+
+          /* The rows' trim owner: the client whose account they carry. */
+          history_owner_of(owner, sizeof(owner), sptr);
 
           ircd_snprintf(0, old_sender, sizeof(old_sender), "%s!%s@%s",
                         cli_name(sptr), cli_user(sptr)->username, cli_user(sptr)->host);
@@ -1688,7 +1699,7 @@ int set_nick_name(struct Client* cptr, struct Client* sptr,
               continue;
             history_store_message(nick_msgid, timestamp, chan->channel->chname,
                                   NULL, old_sender, account, HISTORY_NICK,
-                                  nick, NULL);
+                                  nick, NULL, owner);
           }
         }
 #endif

@@ -25,10 +25,12 @@
 #include "config.h"
 
 #include "bouncer_session.h"
+#include "bouncer_record.h"
 #include "bouncer_converge.h"
 #include "bouncer_wire.h"
 #include "bouncer_count.h"
 #include "bouncer_rebind_auth.h"
+#include "bouncer_transplant.h"
 #include "account_id.h"
 #include "exit_reason.h"
 #include "websocket.h"
@@ -5636,6 +5638,7 @@ int bounce_db_restore(void)
   int expired = 0;
   int migrated_v7 = 0;
   int migrated = 0;   /* v8..v11 records read through a frozen layout */
+  int rejected = 0;   /* wrong size for their version, or unknown version */
   time_t max_hold;
 
   if (!feature_bool(FEAT_BOUNCER_PERSIST) || !metadata_lmdb_is_available())
@@ -5684,224 +5687,43 @@ int bounce_db_restore(void)
     time_t remaining;
     uint32_t version;
 
-    /* Records start with a uint32 version field at offset 0 in every
-     * schema version.  Read it without struct overlay to dispatch on
-     * version regardless of total record size. */
-    if (vlen < sizeof(uint32_t))
-      continue;
-    memcpy(&version, vbuf, sizeof(version));
-
-    if (version == BOUNCER_DB_VERSION) {
-      /* v12: current schema, parse directly from on-disk bytes. */
-      if (vlen != sizeof(struct BounceSessionRecord))
-        continue;
-      rec = (struct BounceSessionRecord *)vbuf;
-    } else if (version == 11) {
-      /* v11: v12 without the trailing bsr_kc_id, which stays empty (the
-       * revive adopts the login's id). */
-      (void)sizeof(char[(sizeof(struct BounceSessionRecord_v11)
-                         == offsetof(struct BounceSessionRecord, bsr_kc_id))
-                        ? 1 : -1]);
-      if (vlen != sizeof(struct BounceSessionRecord_v11))
-        continue;
-      memset(&rec_buf, 0, sizeof(rec_buf));
-      memcpy(&rec_buf, vbuf, sizeof(struct BounceSessionRecord_v11));
-      rec_buf.bsr_version = BOUNCER_DB_VERSION;
-      rec = &rec_buf;
+    switch (bounce_record_decode(vbuf, vlen, &rec_buf, &version)) {
+    case BOUNCE_REC_CURRENT:
+      break;
+    case BOUNCE_REC_MIGRATED:
       migrated++;
       log_write(LS_SYSTEM, L_INFO, 0,
-                "bouncer_persist: migrated v11 record (account=%s) → v%d",
-                rec->bsr_account, BOUNCER_DB_VERSION);
-    } else if (version == 10) {
-      /* v10: v12 without the trailing snomask and id fields, which stay zero
-       * (no mask recorded: the oper grant falls back to the O:line's). */
-      /* Compile-time check: a v10 record is a prefix of a v11 one. */
-      (void)sizeof(char[(sizeof(struct BounceSessionRecord_v10)
-                         == offsetof(struct BounceSessionRecord, bsr_snomask))
-                        ? 1 : -1]);
-      if (vlen != sizeof(struct BounceSessionRecord_v10))
-        continue;
-      memset(&rec_buf, 0, sizeof(rec_buf));
-      memcpy(&rec_buf, vbuf, sizeof(struct BounceSessionRecord_v10));
-      rec_buf.bsr_version = BOUNCER_DB_VERSION;
-      rec = &rec_buf;
-      migrated++;
-      log_write(LS_SYSTEM, L_INFO, 0,
-                "bouncer_persist: migrated v10 record (account=%s) → v%d",
-                rec->bsr_account, BOUNCER_DB_VERSION);
-    } else if (version == 9) {
-      /* v9: identical to v10 except bsr_aliases[] was sized 4.  Read
-       * with the frozen v9 struct and copy field-by-field; the alias
-       * roster copies up to the old array size, the rest of the
-       * (larger) v10 array stays zero. */
-      const struct BounceSessionRecord_v9 *v9;
-      unsigned int ai;
-      if (vlen != sizeof(struct BounceSessionRecord_v9))
-        continue;
-      v9 = (const struct BounceSessionRecord_v9 *)vbuf;
-      memset(&rec_buf, 0, sizeof(rec_buf));
-      rec_buf.bsr_version = BOUNCER_DB_VERSION;
-      ircd_strncpy(rec_buf.bsr_account, v9->bsr_account, ACCOUNTLEN + 1);
-      ircd_strncpy(rec_buf.bsr_sessid, v9->bsr_sessid, BOUNCER_SESSID_LEN);
-      ircd_strncpy(rec_buf.bsr_token, v9->bsr_token, BOUNCER_TOKEN_LEN + 1);
-      ircd_strncpy(rec_buf.bsr_name, v9->bsr_name, BOUNCER_NAME_LEN);
-      ircd_strncpy(rec_buf.bsr_origin, v9->bsr_origin, NICKLEN + 1);
-      rec_buf.bsr_hold_override = v9->bsr_hold_override;
-      rec_buf.bsr_created = v9->bsr_created;
-      rec_buf.bsr_disconnect_time = v9->bsr_disconnect_time;
-      rec_buf.bsr_last_active = v9->bsr_last_active;
-      rec_buf.bsr_last_msg_time = v9->bsr_last_msg_time;
-      rec_buf.bsr_total_active = v9->bsr_total_active;
-      rec_buf.bsr_attach_count = v9->bsr_attach_count;
-      rec_buf.bsr_connect_count = v9->bsr_connect_count;
-      ircd_strncpy(rec_buf.bsr_nick, v9->bsr_nick, NICKLEN + 1);
-      ircd_strncpy(rec_buf.bsr_username, v9->bsr_username, USERLEN + 1);
-      ircd_strncpy(rec_buf.bsr_realhost, v9->bsr_realhost, HOSTLEN + 1);
-      ircd_strncpy(rec_buf.bsr_host, v9->bsr_host, HOSTLEN + 1);
-      ircd_strncpy(rec_buf.bsr_realname, v9->bsr_realname, REALLEN + 1);
-      ircd_strncpy(rec_buf.bsr_account_name, v9->bsr_account_name,
-                   ACCOUNTLEN + 1);
-      rec_buf.bsr_acc_create = v9->bsr_acc_create;
-      memcpy(&rec_buf.bsr_ip, &v9->bsr_ip, sizeof(rec_buf.bsr_ip));
-      ircd_strncpy(rec_buf.bsr_sock_ip, v9->bsr_sock_ip, SOCKIPLEN + 1);
-      ircd_strncpy(rec_buf.bsr_sockhost, v9->bsr_sockhost, HOSTLEN + 1);
-      rec_buf.bsr_listener_port = v9->bsr_listener_port;
-      rec_buf.bsr_agg_sendB = v9->bsr_agg_sendB;
-      rec_buf.bsr_agg_receiveB = v9->bsr_agg_receiveB;
-      rec_buf.bsr_agg_sendM = v9->bsr_agg_sendM;
-      rec_buf.bsr_agg_receiveM = v9->bsr_agg_receiveM;
-      rec_buf.bsr_histcount = v9->bsr_histcount;
-      memcpy(rec_buf.bsr_history, v9->bsr_history, sizeof(rec_buf.bsr_history));
-      rec_buf.bsr_chancount = v9->bsr_chancount;
-      memcpy(rec_buf.bsr_channels, v9->bsr_channels,
-             sizeof(rec_buf.bsr_channels));
-      rec_buf.bsr_aliascount = v9->bsr_aliascount;
-      if (rec_buf.bsr_aliascount > 4)
-        rec_buf.bsr_aliascount = 4;
-      for (ai = 0; ai < rec_buf.bsr_aliascount; ai++)
-        rec_buf.bsr_aliases[ai] = v9->bsr_aliases[ai];
-      ircd_strncpy(rec_buf.bsr_oper_name, v9->bsr_oper_name, NICKLEN + 1);
-      rec_buf.bsr_oper_granted_at = v9->bsr_oper_granted_at;
-      rec = &rec_buf;
-      migrated++;
-      log_write(LS_SYSTEM, L_INFO, 0,
-                "bouncer_persist: migrated v9 record (account=%s) → v%d",
-                rec->bsr_account, BOUNCER_DB_VERSION);
-    } else if (version == 8) {
-      /* v8: legacy schema.  Read with the frozen v8 struct, then build
-       * a v9 record in-place; v9 only adds oper-grant fields (left
-       * zero — pre-v9 sessions weren't opered as far as we know). */
-      const struct BounceSessionRecord_v8 *v8;
-      if (vlen != sizeof(struct BounceSessionRecord_v8))
-        continue;
-      v8 = (const struct BounceSessionRecord_v8 *)vbuf;
-      memset(&rec_buf, 0, sizeof(rec_buf));
-      /* All v8 fields appear in v9 with the same names/types — copy
-       * field-by-field rather than a struct-overlay memcpy because the
-       * outer struct's layout has the oper fields appended after
-       * bsr_aliases. */
-      rec_buf.bsr_version = BOUNCER_DB_VERSION;
-      ircd_strncpy(rec_buf.bsr_account, v8->bsr_account, ACCOUNTLEN + 1);
-      ircd_strncpy(rec_buf.bsr_sessid, v8->bsr_sessid, BOUNCER_SESSID_LEN);
-      ircd_strncpy(rec_buf.bsr_token, v8->bsr_token, BOUNCER_TOKEN_LEN + 1);
-      ircd_strncpy(rec_buf.bsr_name, v8->bsr_name, BOUNCER_NAME_LEN);
-      ircd_strncpy(rec_buf.bsr_origin, v8->bsr_origin, NICKLEN + 1);
-      rec_buf.bsr_hold_override = v8->bsr_hold_override;
-      rec_buf.bsr_created = v8->bsr_created;
-      rec_buf.bsr_disconnect_time = v8->bsr_disconnect_time;
-      rec_buf.bsr_last_active = v8->bsr_last_active;
-      rec_buf.bsr_last_msg_time = v8->bsr_last_msg_time;
-      rec_buf.bsr_total_active = v8->bsr_total_active;
-      rec_buf.bsr_attach_count = v8->bsr_attach_count;
-      rec_buf.bsr_connect_count = v8->bsr_connect_count;
-      ircd_strncpy(rec_buf.bsr_nick, v8->bsr_nick, NICKLEN + 1);
-      ircd_strncpy(rec_buf.bsr_username, v8->bsr_username, USERLEN + 1);
-      ircd_strncpy(rec_buf.bsr_realhost, v8->bsr_realhost, HOSTLEN + 1);
-      ircd_strncpy(rec_buf.bsr_host, v8->bsr_host, HOSTLEN + 1);
-      ircd_strncpy(rec_buf.bsr_realname, v8->bsr_realname, REALLEN + 1);
-      ircd_strncpy(rec_buf.bsr_account_name, v8->bsr_account_name,
-                   ACCOUNTLEN + 1);
-      rec_buf.bsr_acc_create = v8->bsr_acc_create;
-      memcpy(&rec_buf.bsr_ip, &v8->bsr_ip, sizeof(rec_buf.bsr_ip));
-      ircd_strncpy(rec_buf.bsr_sock_ip, v8->bsr_sock_ip, SOCKIPLEN + 1);
-      ircd_strncpy(rec_buf.bsr_sockhost, v8->bsr_sockhost, HOSTLEN + 1);
-      rec_buf.bsr_listener_port = v8->bsr_listener_port;
-      rec_buf.bsr_agg_sendB = v8->bsr_agg_sendB;
-      rec_buf.bsr_agg_receiveB = v8->bsr_agg_receiveB;
-      rec_buf.bsr_agg_sendM = v8->bsr_agg_sendM;
-      rec_buf.bsr_agg_receiveM = v8->bsr_agg_receiveM;
-      rec_buf.bsr_histcount = v8->bsr_histcount;
-      memcpy(rec_buf.bsr_history, v8->bsr_history, sizeof(rec_buf.bsr_history));
-      rec_buf.bsr_chancount = v8->bsr_chancount;
-      memcpy(rec_buf.bsr_channels, v8->bsr_channels,
-             sizeof(rec_buf.bsr_channels));
-      rec_buf.bsr_aliascount = v8->bsr_aliascount;
-      memcpy(rec_buf.bsr_aliases, v8->bsr_aliases,
-             sizeof(rec_buf.bsr_aliases));
-      /* bsr_oper_name + bsr_oper_granted_at left zero — pre-v9 sessions
-       * had no session-level oper grant. */
-      rec = &rec_buf;
-      migrated++;
-      log_write(LS_SYSTEM, L_INFO, 0,
-                "bouncer_persist: migrated v8 record (account=%s) → current",
-                rec->bsr_account);
-    } else if (version == 7) {
-      /* v7: legacy schema.  Read with the frozen v7 struct, then
-       * construct a v8 record in-place by copying matching fields and
-       * minting a UUID v7 for the new sessid format (per redesign
-       * A.1).  New v8-only fields (alias roster) default to empty —
-       * peers' BS A bursts repopulate them on next link. */
-      const struct BounceSessionRecord_v7 *v7;
-      if (vlen != sizeof(struct BounceSessionRecord_v7))
-        continue;
-      v7 = (const struct BounceSessionRecord_v7 *)vbuf;
-      memset(&rec_buf, 0, sizeof(rec_buf));
-      rec_buf.bsr_version = BOUNCER_DB_VERSION;
-      ircd_strncpy(rec_buf.bsr_account, v7->bsr_account, ACCOUNTLEN + 1);
+                "bouncer_persist: migrated v%u record (account=%s) → v%d",
+                version, rec_buf.bsr_account, BOUNCER_DB_VERSION);
+      break;
+    case BOUNCE_REC_MIGRATED_V7:
       /* Mint a fresh UUID v7 for the v7→v8 sessid migration (per G.1). */
       generate_sessid(rec_buf.bsr_sessid);
-      ircd_strncpy(rec_buf.bsr_token, v7->bsr_token, BOUNCER_TOKEN_LEN + 1);
-      ircd_strncpy(rec_buf.bsr_name, v7->bsr_name, BOUNCER_NAME_LEN);
-      ircd_strncpy(rec_buf.bsr_origin, v7->bsr_origin, NICKLEN + 1);
-      rec_buf.bsr_hold_override = v7->bsr_hold_override;
-      rec_buf.bsr_created = v7->bsr_created;
-      rec_buf.bsr_disconnect_time = v7->bsr_disconnect_time;
-      rec_buf.bsr_last_active = v7->bsr_last_active;
-      rec_buf.bsr_last_msg_time = v7->bsr_last_msg_time;
-      rec_buf.bsr_total_active = v7->bsr_total_active;
-      rec_buf.bsr_attach_count = v7->bsr_attach_count;
-      rec_buf.bsr_connect_count = v7->bsr_connect_count;
-      ircd_strncpy(rec_buf.bsr_nick, v7->bsr_nick, NICKLEN + 1);
-      ircd_strncpy(rec_buf.bsr_username, v7->bsr_username, USERLEN + 1);
-      ircd_strncpy(rec_buf.bsr_realhost, v7->bsr_realhost, HOSTLEN + 1);
-      ircd_strncpy(rec_buf.bsr_host, v7->bsr_host, HOSTLEN + 1);
-      ircd_strncpy(rec_buf.bsr_realname, v7->bsr_realname, REALLEN + 1);
-      ircd_strncpy(rec_buf.bsr_account_name, v7->bsr_account_name,
-                   ACCOUNTLEN + 1);
-      rec_buf.bsr_acc_create = v7->bsr_acc_create;
-      memcpy(&rec_buf.bsr_ip, &v7->bsr_ip, sizeof(rec_buf.bsr_ip));
-      ircd_strncpy(rec_buf.bsr_sock_ip, v7->bsr_sock_ip, SOCKIPLEN + 1);
-      ircd_strncpy(rec_buf.bsr_sockhost, v7->bsr_sockhost, HOSTLEN + 1);
-      rec_buf.bsr_listener_port = v7->bsr_listener_port;
-      rec_buf.bsr_agg_sendB = v7->bsr_agg_sendB;
-      rec_buf.bsr_agg_receiveB = v7->bsr_agg_receiveB;
-      rec_buf.bsr_agg_sendM = v7->bsr_agg_sendM;
-      rec_buf.bsr_agg_receiveM = v7->bsr_agg_receiveM;
-      rec_buf.bsr_histcount = v7->bsr_histcount;
-      memcpy(rec_buf.bsr_history, v7->bsr_history, sizeof(rec_buf.bsr_history));
-      rec_buf.bsr_chancount = v7->bsr_chancount;
-      memcpy(rec_buf.bsr_channels, v7->bsr_channels,
-             sizeof(rec_buf.bsr_channels));
-      /* bsr_aliascount + bsr_aliases[] left zeroed — peers refill. */
-      rec = &rec_buf;
       migrated_v7++;
       log_write(LS_SYSTEM, L_INFO, 0,
                 "bouncer_persist: migrated v7 record (account=%s) → "
                 "v%d sessid=%s",
-                rec->bsr_account, BOUNCER_DB_VERSION, rec->bsr_sessid);
-    } else {
-      continue; /* unknown version, skip */
+                rec_buf.bsr_account, BOUNCER_DB_VERSION, rec_buf.bsr_sessid);
+      break;
+    case BOUNCE_REC_BAD_SIZE:
+      /* A known version whose length is not that version's size: the
+       * frozen layout and what the version's build wrote disagree, or the
+       * record is torn.  Not restored, and the eviction pass below deletes
+       * it whenever that pass runs, so say so. */
+      rejected++;
+      log_write(LS_SYSTEM, L_WARNING, 0,
+                "bouncer_persist: skipping v%u record of %zu bytes "
+                "(v%u records are %zu)", version, vlen, version,
+                bounce_record_size(version));
+      continue;
+    case BOUNCE_REC_UNKNOWN:
+      rejected++;
+      log_write(LS_SYSTEM, L_WARNING, 0,
+                "bouncer_persist: skipping record of %zu bytes with "
+                "unknown version %u", vlen, version);
+      continue;
     }
+    rec = &rec_buf;
 
     /* Check expiry */
     elapsed = CurrentTime - (time_t)rec->bsr_disconnect_time;
@@ -6137,7 +5959,9 @@ int bounce_db_restore(void)
             if (CurrentTime - (time_t)r->bsr_disconnect_time > max_hold)
               should_delete = 1;
           } else {
-            /* Unknown version or wrong size — evict. */
+            /* Unknown version or wrong size — evict.  v8..v11 records
+             * also land here; they were migrated and are re-put below.
+             * The restore loop logged each one it skipped. */
             should_delete = 1;
           }
         }
@@ -6175,7 +5999,8 @@ int bounce_db_restore(void)
 
   log_write(LS_SYSTEM, L_INFO, 0,
             "bouncer_persist: restored %d sessions (%d migrated from v7, "
-            "%d from v8-v11)", restored, migrated_v7, migrated);
+            "%d from v8-v11, %d unreadable)", restored, migrated_v7, migrated,
+            rejected);
   return restored;
 }
 
@@ -9188,10 +9013,12 @@ static int bounce_hold_session(struct Client *cptr,
 
   /* WebSocket farewell (best effort): tell the client WHY before the
    * socket drops, so browsers see a labeled close instead of a bare
-   * 1006 indistinguishable from a network cut.  Dead sockets (write
-   * errors, EOF) can't be written to -- skip. */
+   * 1006 indistinguishable from a network cut -- unless a refusal or the
+   * client's own Close already set the status.  close_connection() below
+   * sends it, after what is queued.  Dead sockets (write errors, EOF)
+   * can't be written to -- skip. */
   if (IsWebSocket(cptr) && !IsDead(cptr) && cli_fd(cptr) >= 0)
-    websocket_send_close(cptr, 1000, comment ? comment : "held");
+    websocket_set_close(cptr, 1000, comment ? comment : "held");
 
   /* close_connection() below zeroes the server notice mask and leaves
    * the modes, +s included, on the ghost.  Keep the mask with the
@@ -9403,10 +9230,24 @@ int bounce_forced_exit(struct Client *cptr, struct Client *victim,
  *    remote aliases provide connectivity. A local client connecting
  *    to the managing server becomes the primary via socket transplant.
  *
+ * One step can fail: registering the temp's descriptor with the event
+ * engine for the ghost's socket (epoll: ENOMEM or ENOSPC).  It runs before
+ * anything else changes -- the session, its timers, the burst gates, the
+ * ghost's TLS object and the LocalClientArray slot -- so a refusal leaves
+ * all of them as they were and puts nothing on the wire (#138's F6).
+ *
  * @param[in] session The HOLDING or ACTIVE relay-only session.
  * @param[in] temp The temporary client whose socket will be transplanted.
- *                 This client will be freed (locally, no network messages).
- * @return 0 on success, -1 on error.
+ *                 The caller disposes of it (see the return values); this
+ *                 function frees nothing.
+ * @return 0 on success: the caller frees @a temp (bounce_free_temp_client).
+ *         -1 when this is not a revive (a gate refused it): nothing was
+ *         changed or taken, and @a temp may register by another route.
+ *         -2 when the engine refused the descriptor: the session is
+ *         untouched, but @a temp's socket is off the engine for good (its
+ *         descriptor and TLS object are handed back to it, for its exit to
+ *         close).  @a temp cannot register by any route; the caller exits
+ *         it.
  */
 int bounce_revive(struct BouncerSession *session, struct Client *temp)
 {
@@ -9416,18 +9257,13 @@ int bounce_revive(struct BouncerSession *session, struct Client *temp)
   struct Membership *member;
   int fd;
   int was_holding;
+  int fresh;            /* the ghost's socket is registered afresh */
+#ifdef USE_SSL
+  SSL *temp_ssl;
+#endif
 
   if (!session)
     return -1;
-
-  /* Active client is taking over the session — it's no longer a
-   * tentative restore.  Clear the reconcile-pending flag so any
-   * incoming BX R for this session treats us as firm. */
-  session->hs_restore_pending = 0;
-
-  /* Convergence-completion event: any peer that was waiting on a
-   * pending-restore session can release its gate now. */
-  bounce_release_idle_gates();
 
   ghost = session->hs_client;
   if (!ghost || !MyUser(ghost))
@@ -9449,6 +9285,13 @@ int bounce_revive(struct BouncerSession *session, struct Client *temp)
   }
 
   if (!temp || !MyConnect(temp))
+    return -1;
+  /* A connection with no fd has no socket to move (and the take below
+   * would unregister a socket already off the engine).  No route gives a
+   * revive one -- a refused take is exited at once (-2) -- and none ever
+   * may: before -2 a refused revive left its login socketless, and a
+   * deferred registration then retried it here with fd -1 (F6-d). */
+  if (cli_fd(temp) < 0)
     return -1;
 
   ghost_con = cli_connect(ghost);
@@ -9481,6 +9324,134 @@ int bounce_revive(struct BouncerSession *session, struct Client *temp)
   Debug((DEBUG_INFO, "Bouncer: reviving ghost %s with socket from temp %s (fd %d)",
          cli_name(ghost), cli_name(temp), cli_fd(temp)));
 
+  /* Step 1: Take the temp client's fd and SSL.
+   * The socket keeps its data (the temp's Connection): its ET_DESTROY,
+   * run here or at the end of the temp's own running callback, is what
+   * clears FREEFLAG_SOCKET.  The Connection then goes the way any client's
+   * does: free_client() deallocates it at once when no flag is left (no
+   * proc or SASL timer pending), else the last destroy to clear its flag
+   * (the socket's, a timer's) frees it once free_client() has let go of
+   * it.  Clearing s_data first (as this did before) sent the destroy down
+   * its "already claimed" branch, FREEFLAG_SOCKET stayed set, and the
+   * temp's Connection was never freed: one leaked per revive.
+   * IMPORTANT: Save and NULL the SSL pointer BEFORE socket_del,
+   * because socket_del triggers ET_DESTROY which calls ssl_free().
+   * If we don't NULL it first, the SSL context gets freed before we
+   * can transfer it to the ghost.
+   * EQUALLY CRITICAL: use socket_del_keepfd so the engine unregisters
+   * fd (epoll_ctl DEL runs while s_fd is still valid) but ET_DESTROY's
+   * close() is skipped (s_fd is zeroed between eng_closing and the
+   * destroy event in the synchronous event model).  Clearing s_fd
+   * before socket_del (as a plain socket_del variant) breaks eng_closing,
+   * leaving the fd registered in epoll — the ghost's registration below
+   * then fails with EEXIST.
+   * From here on the temp's socket is off the engine for good: it cannot
+   * be registered again (socket_add() would reset the gh_ref its own
+   * running read callback may hold).  So a refusal below cannot fall
+   * back to registering the temp by another route (-1); it returns -2. */
+  fd = cli_fd(temp);
+#ifdef USE_SSL
+  temp_ssl = con_socket(temp_con).ssl;
+  con_socket(temp_con).ssl = NULL;  /* Prevent ssl_free from freeing it */
+#endif
+  socket_del_keepfd(&cli_socket(temp));
+  cli_fd(temp) = -1;
+
+  /* Step 2: Ghost's old fd should be -1 from close_connection() during hold.
+   * Just verify and update LocalClientArray if somehow it wasn't. */
+  if (cli_fd(ghost) >= 0) {
+    LocalClientArray[cli_fd(ghost)] = 0;
+    close(cli_fd(ghost));
+    cli_fd(ghost) = -1;
+  }
+
+  /* Step 3: Register the fd for the ghost's socket -- the one step that
+   * can fail, so it runs before anything else changes.
+   * For persisted ghosts (restored from MDBX on startup), socket_add was
+   * never called, so the socket lacks s_data/s_func/GEN_ACTIVE; a ghost
+   * held through close_connection() is inactive too (its ET_DESTROY ran).
+   * bounce_transplant_register() uses socket_add for an inactive socket,
+   * socket_reattach for an active one, and on a refusal leaves the
+   * ghost's socket as it was: its fd (-1) and its flags.  A refused
+   * socket_add() leaves the socket inactive and unlinked itself, but with
+   * its flags reset and the refused fd in s_fd; the restore puts back
+   * what the hold left, and the next revive again takes socket_add(), not
+   * socket_reattach() of a socket on no list with no FREEFLAG_SOCKET
+   * (#138's F6-b).
+   *
+   * Nothing is queued in this synchronous event model: a socket's
+   * ET_DESTROY runs inside socket_del*(), or as the socket's own running
+   * callback returns.  A held ghost's socket was unregistered in
+   * close_connection(), in a callback of the ghost's own or outside any,
+   * so its ET_DESTROY has run by the time another connection's
+   * registration revives it: the socket is GEN_DESTROY and not GEN_ACTIVE,
+   * and that destroy claimed its s_data (client_sock_callback). */
+  Debug((DEBUG_INFO, "Bouncer: ghost %s socket gh_flags=0x%x GEN_ACTIVE=%d s_data=%p",
+         cli_name(ghost), cli_socket(ghost).s_header.gh_flags,
+         !!(cli_socket(ghost).s_header.gh_flags & GEN_ACTIVE),
+         s_data(&cli_socket(ghost))));
+  if (!bounce_transplant_register(&cli_socket(ghost), client_sock_callback,
+                                  (void *)ghost_con, fd, &fresh)) {
+    int err = errno;
+
+    /* Refused (#138's F6).  The ghost's socket is as it was (above).  The
+     * connection goes back to the temp, fd and TLS object, for its exit
+     * to close: the ERROR line, the TLS close_notify, the FIN, the one
+     * close (close_connection(), which knows the socket is already off
+     * the engine).  LocalClientArray[fd] is still the temp's: it was never
+     * touched.  The session, its timers and the burst gates were never
+     * touched either, and nothing went on the wire: the session stays as
+     * it was for the reconnect. */
+    cli_fd(temp) = fd;
+#ifdef USE_SSL
+    con_socket(temp_con).ssl = temp_ssl;
+#endif
+    log_write(LS_USER, L_WARNING, 0,
+              "Bouncer: could not move %s's connection onto %s (session %s "
+              "of %s): the event engine refused it (%s); the session is "
+              "left as it was and the connection is closed",
+              cli_name(temp), cli_name(ghost), session->hs_sessid,
+              session->hs_account, strerror(err));
+    return -2;
+  }
+  Debug((DEBUG_INFO, "Bouncer: %s for the ghost's socket",
+         fresh ? "socket_add" : "socket_reattach"));
+
+  /* Commit: nothing below can fail. */
+
+  /* Step 4: Update LocalClientArray */
+  LocalClientArray[fd] = ghost;
+
+#ifdef USE_SSL
+  /* Free ghost's old SSL object (should be NULL from close_connection) */
+  if (con_socket(ghost_con).ssl) {
+    SSL_free(con_socket(ghost_con).ssl);
+    con_socket(ghost_con).ssl = NULL;
+  }
+  /* Transfer temp's SSL object to ghost */
+  con_socket(ghost_con).ssl = temp_ssl;
+#endif
+
+  /* CRITICAL: the Connection holds a registered socket again, so it has
+   * FREEFLAG_SOCKET: free_client() then socket_del()s the socket and leaves
+   * the Connection to the socket's ET_DESTROY, rather than deallocating it
+   * under a socket still on the engine.  The held socket's own ET_DESTROY
+   * cleared the flag, and a reattached socket cannot be counted on to
+   * still have it.  Set on every registration (it is idempotent), not only
+   * a fresh one. */
+  con_freeflag(ghost_con) |= FREEFLAG_SOCKET;
+
+  /* Active client is taking over the session — it's no longer a
+   * tentative restore.  Clear the reconcile-pending flag so any
+   * incoming BX R for this session treats us as firm. */
+  session->hs_restore_pending = 0;
+
+  /* Convergence-completion event: any peer that was waiting on a
+   * pending-restore session can release its gate now.  Before any other
+   * emit of the revive, as it always was: a released burst describes the
+   * session as held, and the attach (BX U, BS A) follows it. */
+  bounce_release_idle_gates();
+
   if (was_holding) {
     /* Mark session as ACTIVE before canceling timer.
      * This prevents a race where an already-queued ET_EXPIRE event
@@ -9496,117 +9467,6 @@ int bounce_revive(struct BouncerSession *session, struct Client *temp)
      * (a new client attached), so the promote is no longer wanted. */
     if (t_active(&session->hs_promote_timer))
       timer_del(&session->hs_promote_timer);
-  }
-
-  /* Step 1: Steal the temp client's fd and SSL.
-   * Clear s_data BEFORE socket_del to prevent stale callbacks.
-   * IMPORTANT: Also save and NULL the SSL pointer BEFORE socket_del,
-   * because socket_del triggers ET_DESTROY which calls ssl_free().
-   * If we don't NULL it first, the SSL context gets freed before we
-   * can transfer it to the ghost.
-   * EQUALLY CRITICAL: use socket_del_keepfd so the engine unregisters
-   * fd (epoll_ctl DEL runs while s_fd is still valid) but ET_DESTROY's
-   * close() is skipped (s_fd is zeroed between eng_closing and the
-   * destroy event in the synchronous event model).  Clearing s_fd
-   * before socket_del (as a plain socket_del variant) breaks eng_closing,
-   * leaving the fd registered in epoll — subsequent socket_add on the
-   * ghost fails with EEXIST, revive returns -1, and register_user falls
-   * back to bounce_attach which silently kills the ghost and introduces
-   * a new NICK, colliding with the ghost that's still alive on remote
-   * servers (user@host kill from upstream hub). */
-  fd = cli_fd(temp);
-  s_data(&cli_socket(temp)) = NULL;
-#ifdef USE_SSL
-  {
-    SSL *temp_ssl = con_socket(temp_con).ssl;
-    con_socket(temp_con).ssl = NULL;  /* Prevent ssl_free from freeing it */
-    socket_del_keepfd(&cli_socket(temp));
-    cli_fd(temp) = -1;
-
-    /* Step 2: Ghost's old fd should be -1 from close_connection() during hold.
-     * Just verify and update LocalClientArray if somehow it wasn't. */
-    if (cli_fd(ghost) >= 0) {
-      LocalClientArray[cli_fd(ghost)] = 0;
-      close(cli_fd(ghost));
-      cli_fd(ghost) = -1;
-    }
-
-    /* Free ghost's old SSL object (should be NULL from close_connection) */
-    if (con_socket(ghost_con).ssl) {
-      SSL_free(con_socket(ghost_con).ssl);
-      con_socket(ghost_con).ssl = NULL;
-    }
-    /* Transfer temp's SSL object to ghost */
-    con_socket(ghost_con).ssl = temp_ssl;
-  }
-#else
-  socket_del_keepfd(&cli_socket(temp));
-  cli_fd(temp) = -1;
-
-  /* Step 2: Ghost's old fd should be -1 from close_connection() during hold.
-   * Just verify and update LocalClientArray if somehow it wasn't. */
-  if (cli_fd(ghost) >= 0) {
-    LocalClientArray[cli_fd(ghost)] = 0;
-    close(cli_fd(ghost));
-    cli_fd(ghost) = -1;
-  }
-#endif
-
-  /* Step 3: Transplant the fd into the ghost's Connection */
-  s_fd(&con_socket(ghost_con)) = fd;
-
-  /* Step 4: Update LocalClientArray */
-  LocalClientArray[fd] = ghost;
-
-  /* Step 5: Initialize ghost socket if not already active.
-   * For persisted ghosts (restored from MDBX on startup), socket_add was
-   * never called, so the socket lacks s_data/s_func/GEN_ACTIVE.
-   * For normal ghosts that went into holding, the socket is already
-   * initialized from when they originally connected.
-   * Use socket_add for uninitialized sockets, socket_reattach for active ones.
-   *
-   * NOTE: If GEN_DESTROY is set, there may be pending ET_DESTROY event(s)
-   * queued from previous socket_del calls (e.g., from prior revival cycles
-   * where the user disconnected and re-entered HOLD mode). These stale events
-   * are safely handled by atomic s_data claiming in client_sock_callback -
-   * the first ET_DESTROY atomically claims s_data, subsequent events see NULL
-   * and return early, preventing double-free. */
-  Debug((DEBUG_INFO, "Bouncer: ghost %s socket gh_flags=0x%x GEN_ACTIVE=%d s_data=%p",
-         cli_name(ghost), cli_socket(ghost).s_header.gh_flags,
-         !!(cli_socket(ghost).s_header.gh_flags & GEN_ACTIVE),
-         s_data(&cli_socket(ghost))));
-  if (!(cli_socket(ghost).s_header.gh_flags & GEN_ACTIVE)) {
-    /* Persisted or re-held ghost: socket not active, use socket_add.
-     * Note: Any pending stale ET_DESTROY events from previous socket_del
-     * calls are handled by the atomic s_data claiming in client_sock_callback. */
-    Debug((DEBUG_INFO, "Bouncer: using socket_add for uninitialized ghost socket"));
-    if (!socket_add(&cli_socket(ghost), client_sock_callback,
-                    (void *)ghost_con, SS_CONNECTED, SOCK_EVENT_READABLE, fd)) {
-      Debug((DEBUG_ERROR, "Bouncer: socket_add failed during ghost revival for %s",
-             cli_name(ghost)));
-      close(fd);
-      s_fd(&con_socket(ghost_con)) = -1;
-      LocalClientArray[fd] = 0;
-      return -1;
-    }
-    /* CRITICAL: Restore FREEFLAG_SOCKET on the connection.  A previous stale
-     * ET_DESTROY may have cleared it.  Without this flag, free_client will go
-     * the immediate deallocation path and free the connection, but there could
-     * still be pending stale ET_DESTROY events that will then access freed
-     * memory.  With FREEFLAG_SOCKET set, free_client properly queues socket_del
-     * and waits for ET_DESTROY to free the connection. */
-    con_freeflag(ghost_con) |= FREEFLAG_SOCKET;
-  } else {
-    /* Normal ghost: socket was active, just reattach fd */
-    Debug((DEBUG_INFO, "Bouncer: using socket_reattach for active ghost socket"));
-    if (!socket_reattach(&cli_socket(ghost), fd)) {
-      Debug((DEBUG_ERROR, "Bouncer: socket_reattach failed during ghost revival for %s",
-             cli_name(ghost)));
-      close(fd);
-      s_fd(&con_socket(ghost_con)) = -1;
-      LocalClientArray[fd] = 0;
-      return -1;
-    }
   }
 
   /* Step 6: Reset socket interest and clear stale flags.
@@ -9755,6 +9615,17 @@ int bounce_revive(struct BouncerSession *session, struct Client *temp)
   con_ws_txrem_pos(ghost_con) = con_ws_txrem_pos(temp_con);
   con_ws_txrem(temp_con) = NULL;
   con_ws_txrem_len(temp_con) = con_ws_txrem_pos(temp_con) = 0;
+  /* So does the Close: the ghost's is its old socket's (the hold's
+   * farewell, set and sent), and with it kept the new socket could never
+   * send its own (websocket_set_close() keeps the first status set, and
+   * one Close goes out per connection). */
+  con_ws_close_code(ghost_con) = con_ws_close_code(temp_con);
+  memcpy(con_ws_close_reason(ghost_con), con_ws_close_reason(temp_con),
+         sizeof(con_ws_close_reason(ghost_con)));
+  con_ws_close_sent(ghost_con) = con_ws_close_sent(temp_con);
+  con_ws_close_code(temp_con) = 0;
+  con_ws_close_reason(temp_con)[0] = '\0';
+  con_ws_close_sent(temp_con) = 0;
 
   /* Step 8: Copy CAP state from temp to ghost */
   memcpy(con_capab(ghost_con), con_capab(temp_con), sizeof(struct CapSet));
@@ -15143,11 +15014,12 @@ static int bounce_alias_destroy(struct Client *cptr, struct Client *sptr,
   if (MyConnect(target)) {
     /* A device of ours whose session ended elsewhere: its socket is told
      * why before it closes, as exit_client() tells every local client.
-     * BX X carries no reason; the session's end is the one there is. */
+     * BX X carries no reason; the session's end is the one there is.
+     * close_connection() sends a WebSocket's Close after the ERROR. */
     if ((IsUser(target) || IsUserPort(target)) && !IsDead(target)
         && cli_fd(target) >= 0) {
       if (IsWebSocket(target))
-        websocket_send_close(target, 1000, "Bouncer session ended");
+        websocket_set_close(target, 1000, "Bouncer session ended");
       sendrawto_one(target, MSG_ERROR " :Closing Link: %s by %s (%s)",
                     cli_name(target), cli_name(&his), "Bouncer session ended");
     }

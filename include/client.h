@@ -548,7 +548,7 @@ struct Connection
   /* WebSocket state for RFC 6455 compliance */
   unsigned char       con_ws_frame_buf[WS_MAX_FRAME]; /**< Partial WebSocket frame buffer (holds one max-size frame) */
   int                 con_ws_frame_len;   /**< Length of data in frame buffer */
-  char                con_ws_frag_buf[16384]; /**< Fragment reassembly buffer */
+  char                con_ws_frag_buf[WS_MAX_PAYLOAD + 2]; /**< Fragment reassembly buffer (+ NUL and line ending) */
   int                 con_ws_frag_len;    /**< Length of data in fragment buffer */
   int                 con_ws_frag_opcode; /**< Opcode of first fragment */
   time_t              con_ws_ctl_since;   /**< Control-frame meter: debt clock (same shape as con_since, own budget) */
@@ -557,6 +557,9 @@ struct Connection
   char*               con_ws_txrem;       /**< Unsent tail of a partially-written outbound WS frame (heap, on demand; plaintext sockets) */
   int                 con_ws_txrem_len;   /**< Total bytes in con_ws_txrem */
   int                 con_ws_txrem_pos;   /**< Bytes of con_ws_txrem already written */
+  int                 con_ws_close_code;  /**< Status of the one Close frame this socket ends with (RFC 6455 §5.5.1), set by websocket_set_close(); 0 = none yet, WS_CLOSE_NO_STATUS = an empty Close */
+  char                con_ws_close_reason[WS_CLOSE_REASON_MAX + 1]; /**< Its reason text */
+  int                 con_ws_close_sent;  /**< That Close has gone out (websocket_close_flush()) */
   time_t              con_burst_gate_deadline; /**< Deadline at which to force-release a
                                                   burst gate held on a non-BXF-aware (legacy)
                                                   peer.  Only meaningful while IsBurstGated().
@@ -1178,6 +1181,12 @@ struct Client {
 #define con_ws_txrem(con)	((con)->con_ws_txrem)
 #define con_ws_txrem_len(con)	((con)->con_ws_txrem_len)
 #define con_ws_txrem_pos(con)	((con)->con_ws_txrem_pos)
+/** Status of the WebSocket Close this socket ends with (0 = none set). */
+#define con_ws_close_code(con)	((con)->con_ws_close_code)
+/** Reason text of the WebSocket Close this socket ends with. */
+#define con_ws_close_reason(con)	((con)->con_ws_close_reason)
+/** Non-zero once the WebSocket Close frame has gone out on this socket. */
+#define con_ws_close_sent(con)	((con)->con_ws_close_sent)
 /** Get per-class recv classifier state. */
 #define con_recv_state(con)     ((con)->con_recv_state)
 /** Get tag-region byte count for the in-flight wire line. */
