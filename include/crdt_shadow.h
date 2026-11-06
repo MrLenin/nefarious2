@@ -132,6 +132,10 @@ static inline int crdt_accept_beyond_horizon(int from_is_mesh_stub,
 /** Initialise the shadow CRDT document for this server and arm the periodic
  *  verify timer. Idempotent; safe to call once at startup. */
 void crdt_shadow_init(uint16_t my_numeric);
+/** CRDT_ENABLED as latched at boot: what the 'C' flag advertises. */
+int crdt_shadow_boot_enabled(void);
+/** CRDT_ENABLED's feature notify: warns that a change waits for restart. */
+void crdt_shadow_enabled_changed(void);
 
 /** Mirror a channel join (called from add_user_to_channel). @a flags are the
  *  membership flags so the bridge can skip bouncer aliases. */

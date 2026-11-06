@@ -754,11 +754,12 @@ static int completed_connection(struct Client* cptr)
    * stamped and relayed (only while P10_MESSAGE_TAGS is on: the mark
    * rides the compact tags).
    * Legacy peers ignore unknown flag chars. */
-  sendrawto_one(cptr, MSG_SERVER " %s 1 %Tu %Tu J%s %s%s +%s6%svFC%s :%s",
+  sendrawto_one(cptr, MSG_SERVER " %s 1 %Tu %Tu J%s %s%s +%s6%svF%s%s :%s",
                 cli_name(&me), cli_serv(&me)->timestamp, newts,
 		MAJOR_PROTOCOL, NumServCap(&me),
 		feature_bool(FEAT_HUB) ? "h" : "",
                 feature_bool(FEAT_OPLEVELS) ? "o" : "",
+                IsCrdtAware(&me) ? "C" : "",
                 feature_bool(FEAT_P10_MESSAGE_TAGS) ? "H" : "",
                 cli_info(&me));
   if (feature_bool(FEAT_P10_MESSAGE_TAGS))

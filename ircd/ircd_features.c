@@ -1535,7 +1535,7 @@ static struct FeatureDesc {
    * Booleans: master switch + per-phase gates. Ints: GC / batching tuning.
    * Order here must mirror the enum tail in ircd_features.h (features[] is
    * indexed by enum ordinal). */
-  F_B(CRDT_ENABLED, 0, 0, 0),
+  F_B(CRDT_ENABLED, 0, 0, crdt_shadow_enabled_changed),
   F_B(CRDT_SYNC, 0, 0, 0),
   F_B(CRDT_MESH, 0, 0, 0),
   F_B(CRDT_PRIMARY, 0, 0, 0),

@@ -1384,7 +1384,11 @@ int main(int argc, char **argv) {
    * flag will set FLAG_IRCV3AWARE on us and gate fork-only emissions
    * accordingly. Legacy peers ignore the unknown flag char. */
   SetIRCv3Aware(&me);
-  SetCrdtAware(&me);   /* this binary speaks the CR (CRDT sync) token */
+  /* 'C' means this server's shadow writes the doc, not just that the binary
+   * speaks CR: peers skip the tree path for C peers.  Latched at boot with
+   * the shadow (crdt_shadow_boot_enabled). */
+  if (crdt_shadow_boot_enabled())
+    SetCrdtAware(&me);
   /* Deliberately do NOT SetRenameCapable(&me): 'r' (FLAG_RENAME_CAPABLE)
    * exists so this fork can recognize and propagate rename-capable
    * non-v3 peers (X3, which advertises 'r'), not to advertise it on our

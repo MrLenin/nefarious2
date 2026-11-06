@@ -408,10 +408,35 @@ int crdt_shadow_chan_local_check_add(const char *msgid)
                               CRDT_CHAN_LOCAL_WINDOW);
 }
 
-/** Shadow is active only once initialised AND the feature is enabled. */
+/* CRDT_ENABLED as read at boot.  The 'C' SERVER flag says this server's
+ * shadow writes the doc (peers skip the tree path for C peers: KICK, NICK,
+ * modes, glines, metadata), so the shadow and the flag must agree for the
+ * life of every link: both follow the boot value, and a REHASH that changes
+ * the feature takes effect at the next restart. */
+static int g_boot_enabled;
+
+/** Shadow is active only once initialised AND the feature was on at boot. */
 static int shadow_on(void)
 {
-  return g_inited && feature_bool(FEAT_CRDT_ENABLED);
+  return g_inited && g_boot_enabled;
+}
+
+int crdt_shadow_boot_enabled(void)
+{
+  return g_inited && g_boot_enabled;
+}
+
+void crdt_shadow_enabled_changed(void)
+{
+  if (!g_inited || feature_bool(FEAT_CRDT_ENABLED) == g_boot_enabled)
+    return;
+  log_write(LS_SYSTEM, L_WARNING, 0,
+            "CRDT_ENABLED is now %s but stays %s until restart (the C server "
+            "flag and the shadow follow the boot value)",
+            feature_bool(FEAT_CRDT_ENABLED) ? "TRUE" : "FALSE",
+            g_boot_enabled ? "on" : "off");
+  sendto_opmask_butone(0, SNO_OLDSNO,
+                       "CRDT_ENABLED changes take effect at the next restart");
 }
 
 /** Single-writer gate (Phase 3a). Returns true if a state event reached us via
@@ -6700,6 +6725,7 @@ void crdt_shadow_init(uint16_t my_numeric)
   if (g_inited)
     return;
   crdt_state_init(&g_crdt, my_numeric);
+  g_boot_enabled = feature_bool(FEAT_CRDT_ENABLED) ? 1 : 0;
   /* Restart-epoch defense: seed next_seq from the wall clock (ms) so a restarted
    * server's freshly-reset op sequence never reuses seqs from a previous
    * incarnation that peers still remember in their state vectors (which would

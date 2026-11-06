@@ -147,11 +147,12 @@ int server_estab(struct Client *cptr, struct ConfItem *aconf)
      *  Legacy peers ignore unknown flag chars (set_server_flags has no
      *  default in its switch).
      */
-    sendrawto_one(cptr, MSG_SERVER " %s 1 %Tu %Tu J%s %s%s +%s6%svFC%s :%s",
+    sendrawto_one(cptr, MSG_SERVER " %s 1 %Tu %Tu J%s %s%s +%s6%svF%s%s :%s",
 		  cli_name(&me), cli_serv(&me)->timestamp,
 		  cli_serv(cptr)->timestamp, MAJOR_PROTOCOL, NumServCap(&me),
 		  feature_bool(FEAT_HUB) ? "h" : "",
                   feature_bool(FEAT_OPLEVELS) ? "o" : "",
+                  IsCrdtAware(&me) ? "C" : "",
                   holdmark ? "H" : "",
 		  *(cli_info(&me)) ? cli_info(&me) : "IRCers United");
     if (holdmark)

@@ -714,7 +714,7 @@ int mr_crdtmesh(struct Client* cptr, struct Client* sptr, int parc, char* parv[]
   if (IsUserPort(cptr))
     return exit_client_msg(cptr, cptr, &me,
                            "Cannot connect a CRDT mesh link to a user port");
-  if (!feature_bool(FEAT_CRDT_ENABLED))
+  if (!crdt_shadow_boot_enabled())
     return exit_client(cptr, cptr, &me, "CRDT not enabled here");
   if (parc < 3)
     return exit_client(cptr, cptr, &me, "Need more parameters");
