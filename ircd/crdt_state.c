@@ -929,7 +929,26 @@ int crdt_gline_is_explicitly_removed(const struct CrdtNetworkState *st,
 void crdt_metadata_set(struct CrdtNetworkState *st, const char *key, uint32_t klen,
                        const void *val, uint32_t vlen)
 {
-  struct HLC ts = hlc_local_event(&st->clock);
+  crdt_metadata_set_at(st, key, klen, val, vlen, NULL);
+}
+
+/* The metadata writes with an explicit timestamp: the stamped account row's own
+ * HLC (metadata_lww's md_stamp), so the doc's LWW and the store's LWW order one
+ * row's writes the same way and a doc->store heal keeps the row's stamp.  The doc
+ * clock moves past it (hlc_receive), as for any remote op.  @a at NULL: a fresh
+ * local event, as before. */
+static struct HLC metadata_op_ts(struct CrdtNetworkState *st, const struct HLC *at)
+{
+  if (!at)
+    return hlc_local_event(&st->clock);
+  hlc_receive(&st->clock, at);
+  return *at;
+}
+
+void crdt_metadata_set_at(struct CrdtNetworkState *st, const char *key, uint32_t klen,
+                          const void *val, uint32_t vlen, const struct HLC *at)
+{
+  struct HLC ts = metadata_op_ts(st, at);
   uint64_t seq;
   struct CrdtOp *op;
   crdt_lwwmap_set(&st->metadata, key, klen, val, vlen, ts, st->my_numeric);
@@ -946,7 +965,13 @@ void crdt_metadata_set(struct CrdtNetworkState *st, const char *key, uint32_t kl
 
 void crdt_metadata_del(struct CrdtNetworkState *st, const char *key, uint32_t klen)
 {
-  struct HLC ts = hlc_local_event(&st->clock);
+  crdt_metadata_del_at(st, key, klen, NULL);
+}
+
+void crdt_metadata_del_at(struct CrdtNetworkState *st, const char *key, uint32_t klen,
+                          const struct HLC *at)
+{
+  struct HLC ts = metadata_op_ts(st, at);
   uint64_t seq;
   struct CrdtOp *op;
   crdt_lwwmap_delete(&st->metadata, key, klen, ts, st->my_numeric);

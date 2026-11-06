@@ -431,13 +431,19 @@ void crdt_shadow_reconcile_tempshuns(void);
  *  DELETE store-walk). crdt_shadow_metadata_suspend toggles the single-writer guard so
  *  a P10-relayed apply (ms_metadata) does NOT re-mirror. Additive (P10 MD not
  *  suppressed). */
+struct md_stamp;
+/** @a st: the stamped row's own stamp (metadata_write_versioned's), carried as the
+ *  doc entry's HLC so the doc and the store order the row's writes alike; NULL = a
+ *  fresh doc event. */
 void crdt_shadow_metadata_set(const char *account, const char *key,
-                              const char *value, int permanent);
+                              const char *value, int permanent,
+                              const struct md_stamp *st);
 /** Mint a doc metadata tombstone for a pre-formed storage key (account\0key). Raw-key
  *  variant of crdt_shadow_metadata_set's delete branch, for metadata_account_clear's
  *  bulk store-delete (which bypasses the (account,key) chokepoint). Same gates; skips
  *  keys not doc-present. */
-void crdt_shadow_metadata_remove_key(const void *key, uint32_t klen);
+void crdt_shadow_metadata_remove_key(const void *key, uint32_t klen,
+                                     const struct md_stamp *st);
 void crdt_shadow_reconcile_metadata(void);
 void crdt_shadow_metadata_suspend(int on);
 /** Oper diagnostic (/CRDT key): print the raw doc metadata entry for

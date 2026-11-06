@@ -595,6 +595,13 @@ extern int metadata_account_get_version(const char *account, const char *key,
  * @param[in] in Incoming version to merge.
  * @return 1 (taken), 0 (kept the local version), -1 (error).
  */
+/** The doc mirror of an account row written without a store
+ * (metadata_account_write with storage unconfigured): what
+ * metadata_write_versioned mirrors after a store write, under the row's
+ * stamp @a st. */
+extern void metadata_doc_mirror_account(const char *account, const char *key,
+                                        const char *value, int visibility,
+                                        const struct md_stamp *st);
 extern int metadata_account_merge(const char *account, const char *key,
                                   const struct md_version *in);
 

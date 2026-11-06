@@ -696,6 +696,53 @@ static void test_gline_op_replicates(void **state)
   crdt_state_clear(&s2);
 }
 
+/* Stage-2 review: a stamped account row's own HLC rides the doc entry, so the doc
+ * and the store order one row's writes alike.  set_at keeps the given stamp
+ * (not a fresh local event), replicates it, moves the doc clock past it, and an
+ * older stamp loses to a newer one whichever arrives last. */
+static void test_metadata_set_at_keeps_row_stamp(void **state)
+{
+  struct CrdtNetworkState s1, s2;
+  char key[32];
+  const struct CrdtLWWValue *v;
+  struct HLC newer = { 5000000000000ULL, 3, 7 };
+  struct HLC older = { 4000000000000ULL, 0, 9 };
+  struct HLC dts;
+  uint32_t klen;
+  (void)state;
+
+  memcpy(key, "bob", 3); key[3] = '\0'; memcpy(key + 4, "umode.invisible", 15);
+  klen = 3 + 1 + 15;
+  crdt_state_init(&s1, 1);
+  crdt_state_init(&s2, 2);
+
+  crdt_metadata_set_at(&s1, key, klen, "P:1", 3, &newer);
+  v = crdt_metadata_get(&s1, key, klen);
+  assert_non_null(v);
+  assert_int_equal(0, hlc_compare(&v->ts, &newer));
+  assert_true(hlc_compare(&s1.clock, &newer) >= 0);   /* the doc clock moved past it */
+
+  crdt_state_sync(&s2, &s1);
+  v = crdt_metadata_get(&s2, key, klen);
+  assert_non_null(v);
+  assert_int_equal(0, hlc_compare(&v->ts, &newer));
+
+  /* An older row arriving later (a delayed gateway import) does not win. */
+  crdt_metadata_set_at(&s2, key, klen, "P:0", 3, &older);
+  v = crdt_metadata_get(&s2, key, klen);
+  assert_non_null(v);
+  assert_memory_equal("P:1", v->data, 3);
+
+  /* A stamped delete keeps its stamp, readable for the store heal. */
+  crdt_metadata_del_at(&s1, key, klen, &(struct HLC){ 6000000000000ULL, 0, 7 });
+  assert_int_equal(1, crdt_lwwmap_deleted_ts(&s1.metadata, key, klen, &dts));
+  assert_int_equal(6000000000000ULL, dts.physical_ms);
+
+  crdt_state_clear(&s1);
+  crdt_state_clear(&s2);
+}
+
+
 /* ================================================================== */
 /* Tier C F2-b: account metadata as a plain HLC-LWW doc collection keyed by the
  * opaque account\0key composite (variable-length blob value). SET replicates via
@@ -4222,6 +4269,7 @@ int main(void)
     cmocka_unit_test(test_user_record_host_overrides),
     cmocka_unit_test(test_gline_doc_converges_same_lastmod),
     cmocka_unit_test(test_metadata_op_replicates),
+    cmocka_unit_test(test_metadata_set_at_keeps_row_stamp),
     cmocka_unit_test(test_bsess_op_replicates),
     cmocka_unit_test(test_bsess_winner),
     cmocka_unit_test(test_bconn_roster),

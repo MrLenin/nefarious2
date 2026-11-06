@@ -1960,8 +1960,23 @@ static int ms_metadata_stamped(struct Client *cptr, struct Client *sptr,
   merge_rc = metadata_account_merge(account_name, wire_key, &in);
   if (IsCrdtAware(cptr))
     crdt_shadow_metadata_suspend(0);
+  if (merge_rc == 0) {
+    /* Kept the local version.  One with this very stamp may have come first
+     * by the doc (the reconcile heals under the row's own stamp): the row is
+     * applied here already, but the links behind us still need it, so relay
+     * it as if taken.  An older incoming row is not relayed. */
+    struct md_version local;
+    char valbuf[METADATA_VALUE_LEN];
+
+    if (metadata_account_get_version(account_name, wire_key, &local, valbuf,
+                                     sizeof(valbuf)) == 0
+        && md_stamp_cmp(&local.st, &in.st) == 0
+        && local.tombstone == in.tombstone)
+      metadata_emit_versioned(sptr, NULL, cptr, account_name, wire_key, &in);
+    return 0;
+  }
   if (merge_rc != 1)
-    return 0;   /* kept the local version (0), or a store error (-1): no relay */
+    return 0;   /* a store error (-1): no relay */
 
   metadata_account_apply_memory(account_name, wire_key,
                                 tombstone ? NULL : chunk->value, vis);
@@ -2066,6 +2081,9 @@ int metadata_apply_relayed(struct Client *link, struct Client *sptr,
   struct Client *target_client = NULL;
   struct Channel *target_channel = NULL;
   int limit_rc = METADATA_LIMIT_OK;
+  /* From a CRDT peer or the CR M 'E' mesh copy (@a link NULL): its origin
+   * already mirrored any doc entry, so this server must not mint one. */
+  int relayed_from_doc = !link || IsCrdtAware(link);
 
   if (!is_valid_key(key))
     return 0;
@@ -2090,17 +2108,20 @@ int metadata_apply_relayed(struct Client *link, struct Client *sptr,
         mdsync_limit_notice(link, target, key, metadata_limit_why(limit_rc));
       return 1;
     }
-    /* Tier C F2-b single-writer: the ORIGIN already mirrored this write
-     * into the CRDT doc; suspend the storage-layer mirror across the
-     * store write so this server does not re-mint the op. */
-    crdt_shadow_metadata_suspend(1);
+    /* Tier C F2-b single-writer: a change from a CRDT peer (or its mesh
+     * copy) was mirrored into the doc by its origin, so suspend the
+     * storage-layer mirror.  One from a link that is not CRDT-aware has no
+     * doc entry anywhere: this gateway mints it (stage-2 review). */
+    if (relayed_from_doc)
+      crdt_shadow_metadata_suspend(1);
     if (metadata_lmdb_is_available()) {
       struct md_stamp st = metadata_stamp_now();
 
       (void)metadata_account_put_versioned(account_name, key, value,
                                            visibility, &st);
     }
-    crdt_shadow_metadata_suspend(0);
+    if (relayed_from_doc)
+      crdt_shadow_metadata_suspend(0);
     metadata_account_apply_memory(account_name, key, value, visibility);
     return 1;
   }
@@ -2144,11 +2165,14 @@ int metadata_apply_relayed(struct Client *link, struct Client *sptr,
     return 1;
   }
 
-  /* Tier C F2-b: the ORIGIN server already mirrored this into the CRDT
-   * doc.  Suspend the storage-layer mirror across the apply so this server
-   * does NOT re-enter the doc (single-writer); no early return until the
-   * resume below. */
-  crdt_shadow_metadata_suspend(1);
+  /* Tier C F2-b: a change from a CRDT peer (or its mesh copy) was
+   * mirrored into the CRDT doc by its ORIGIN.  Suspend the storage-layer
+   * mirror across the apply so this server does NOT re-enter the doc
+   * (single-writer); no early return until the resume below.  One from a
+   * link that is not CRDT-aware has no doc entry: this gateway mints it,
+   * or the doc reconcile would put the old value back (stage-2 review). */
+  if (relayed_from_doc)
+    crdt_shadow_metadata_suspend(1);
   if (is_channel)
     metadata_set_channel(target_channel, key, value, visibility);
   else if (target_client)
@@ -2157,7 +2181,8 @@ int metadata_apply_relayed(struct Client *link, struct Client *sptr,
    * persists PERMANENTLY for authed users; for a +R channel
    * metadata_set_channel() does the same (B1, gated on MODE_REGISTERED).
    * An unregistered channel is memory+relay only by design (spec §C3). */
-  crdt_shadow_metadata_suspend(0);
+  if (relayed_from_doc)
+    crdt_shadow_metadata_suspend(0);
 
   /* Notify local subscribers (vis-aware -- see metadata_notify_subscribers). */
   metadata_notify_subscribers(target, key, value, visibility);

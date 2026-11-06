@@ -626,8 +626,29 @@ static int metadata_write_versioned(const char *account, const char *key,
      * all gates (eligibility / re-entrancy / single-writer). value==NULL => delete.
      * stored_value (not value) so the doc mirror captures the SAME vis-prefixed buffer
      * that was just written to the store — visibility round-trips the mesh. */
-    crdt_shadow_metadata_set(account, key, stored_value, timestamp == 0);
+    crdt_shadow_metadata_set(account, key, stored_value, timestamp == 0, st);
   return (rc == DB_OK) ? 0 : -1;
+}
+
+void metadata_doc_mirror_account(const char *account, const char *key,
+                                 const char *value, int visibility,
+                                 const struct md_stamp *st)
+{
+  char prefixed[METADATA_VALUE_LEN + 8];
+  const char *stored_value = value;
+
+  /* The permanent-row prefix rule of metadata_write_versioned, so the doc
+   * value reads back the same way (metadata_decode_visibility). */
+  if (value && !metadata_key_is_server_managed(key)) {
+    size_t vlen_raw = strlen(value);
+
+    if (vlen_raw + 2 >= sizeof(prefixed))
+      return;
+    memcpy(prefixed, (visibility == METADATA_VIS_PRIVATE) ? "P:" : "*:", 2);
+    memcpy(prefixed + 2, value, vlen_raw + 1);
+    stored_value = prefixed;
+  }
+  crdt_shadow_metadata_set(account, key, stored_value, 1, st);
 }
 
 /** Internal helper for metadata_account_set with explicit timestamp.
@@ -1306,7 +1327,7 @@ int metadata_account_clear(const char *account)
      * (account\0metakey). CLEAR is a user action, not a reconcile, so the wrapper's
      * re-entrancy guards pass and the mint fires; the store del and the doc tombstone
      * stay in lockstep. */
-    crdt_shadow_metadata_remove_key(kbuf, (uint32_t)klen);
+    crdt_shadow_metadata_remove_key(kbuf, (uint32_t)klen, &st);
     /* Same key, metadata_clock_cf: a tombstone for every key this
      * batch deletes, so a later merge from a stale peer sees a clock
      * row to compare against instead of silently resurrecting the row. */

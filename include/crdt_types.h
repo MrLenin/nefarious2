@@ -225,6 +225,10 @@ const struct CrdtLWWValue *crdt_lwwmap_get(const struct CrdtLWWMap *map,
  *  (never on get()==NULL) so sync-lag absence never triggers a wrongful remove. */
 int crdt_lwwmap_is_deleted(const struct CrdtLWWMap *map,
                            const char *key, uint32_t key_len);
+/** The delete-tombstone's HLC: 1 and *@a out filled iff the key's last write was a
+ *  delete, else 0. */
+int crdt_lwwmap_deleted_ts(const struct CrdtLWWMap *map, const char *key,
+                           uint32_t key_len, struct HLC *out);
 
 /** Reclaim a delete-tombstone whose causally-stable DELETE op is being GC'd: frees
  *  the entry iff it is a tombstone written at exactly @a ts (no newer write

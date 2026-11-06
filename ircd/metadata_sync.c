@@ -88,11 +88,18 @@ void mdsync_link_free(struct Client *server)
 /** Send one already-formatted MD =account line to its destination(s):
  * a single client/link when @a one is non-NULL, else every IRCv3-aware
  * server except @a butone. */
+/** Set by metadata_emit_versioned_skip_crdt around its emit: every broadcast
+ * line skips CRDT-aware links (the one-shot is armed per line, since a long
+ * row goes out in several pieces). */
+static int mdsync_skip_crdt;
+
 static void mdsync_send_line(struct Client *src, struct Client *one,
                              struct Client *butone, const char *account,
                              const char *stamp_text, const char *key,
                              const char *flags, const char *piece)
 {
+  if (!one && mdsync_skip_crdt)
+    sendcmdto_set_skip_crdt_servers();
   if (one) {
     /* metadata_emit_versioned has already refused a @a one that is not
      * IRCv3-aware; checked again here so this helper is safe alone. */
@@ -179,6 +186,14 @@ void metadata_emit_versioned(struct Client *src, struct Client *one,
   }
 }
 
+void metadata_emit_versioned_skip_crdt(struct Client *src, const char *account,
+                                       const char *key, const struct md_version *v)
+{
+  mdsync_skip_crdt = 1;
+  metadata_emit_versioned(src, NULL, NULL, account, key, v);
+  mdsync_skip_crdt = 0;
+}
+
 int metadata_account_write(struct Client *src, const char *account,
                            const char *key, const char *value, int vis)
 {
@@ -202,6 +217,12 @@ int metadata_account_write(struct Client *src, const char *account,
               "not sent", account, key);
     return -1;
   }
+
+  /* Without a store, metadata_write_versioned never ran, so nothing put
+   * the row in the CRDT doc: mirror it here, so peers reached only over
+   * the mesh still get it (stage-2 review). */
+  if (!metadata_lmdb_is_available())
+    metadata_doc_mirror_account(account, key, value, vis, &st);
 
   metadata_account_apply_memory(account, key, value, vis);
 

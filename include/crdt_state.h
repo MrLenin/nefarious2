@@ -746,6 +746,13 @@ int crdt_marker_get(const struct CrdtNetworkState *st, const char *key, uint32_t
 void crdt_metadata_set(struct CrdtNetworkState *st, const char *key, uint32_t klen,
                        const void *val, uint32_t vlen);
 void crdt_metadata_del(struct CrdtNetworkState *st, const char *key, uint32_t klen);
+/** The same writes stamped with @a at (the stamped account row's own HLC) instead
+ *  of a fresh local event; NULL @a at = a local event.  The doc clock moves past
+ *  @a at. */
+void crdt_metadata_set_at(struct CrdtNetworkState *st, const char *key, uint32_t klen,
+                          const void *val, uint32_t vlen, const struct HLC *at);
+void crdt_metadata_del_at(struct CrdtNetworkState *st, const char *key, uint32_t klen,
+                          const struct HLC *at);
 int crdt_metadata_is_explicitly_removed(const struct CrdtNetworkState *st,
                                         const char *key, uint32_t klen);
 /** Return the current metadata LWW value (NULL if absent/tombstoned) — for the

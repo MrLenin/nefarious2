@@ -107,6 +107,13 @@ extern void metadata_emit_versioned(struct Client *src, struct Client *one,
  * @param[in] vis METADATA_VIS_PUBLIC or METADATA_VIS_PRIVATE.
  * @return 0 on success, -1 when nothing was applied.
  */
+/** metadata_emit_versioned's broadcast to every IRCv3 link that is not
+ * CRDT-aware: the doc reconcile's heal of a stamped row (crdt_shadow.c), for
+ * the links that never see the doc. */
+extern void metadata_emit_versioned_skip_crdt(struct Client *src,
+                                              const char *account,
+                                              const char *key,
+                                              const struct md_version *v);
 extern int metadata_account_write(struct Client *src, const char *account,
                                   const char *key, const char *value, int vis);
 

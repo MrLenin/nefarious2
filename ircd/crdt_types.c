@@ -438,6 +438,19 @@ int crdt_lwwmap_is_deleted(const struct CrdtLWWMap *map,
   return (e && e->deleted) ? 1 : 0;
 }
 
+/* The delete-tombstone's HLC: 1 and *@a out filled iff @a key's last write was a
+ * delete (crdt_lwwmap_is_deleted), else 0. */
+int crdt_lwwmap_deleted_ts(const struct CrdtLWWMap *map, const char *key,
+                           uint32_t key_len, struct HLC *out)
+{
+  struct CrdtLWWEntry *e = lww_find(map, key, key_len);
+  if (!e || !e->deleted)
+    return 0;
+  if (out)
+    *out = e->val.ts;
+  return 1;
+}
+
 int crdt_lwwmap_delete(struct CrdtLWWMap *map, const char *key,
                        uint32_t key_len, struct HLC ts, uint16_t writer)
 {
