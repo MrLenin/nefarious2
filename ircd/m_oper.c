@@ -515,12 +515,22 @@ int m_oper(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
     else
       srv = find_match_server(parv[1]);
 
+    if (!srv && !string_has_wildcards(parv[1]) && (srv = FindClient(parv[1]))
+        && !IsMeshStub(srv))
+      srv = NULL;                /* FindServer is IsServer-exact: keep only a stub */
+
     if (!srv)
       return send_reply(sptr, ERR_NOOPERHOST);
 
     if (IsMe(srv)) {
       parv[1] = parv[2];
       parv[2] = parv[3];
+    } else if (IsMeshStub(srv)) {
+      /* Reachable only over the CRDT mesh: a P10 send would dead-sink, and
+       * no mesh carrier moves an oper password (nor should one).  Refuse,
+       * as hunt_server_cmd does for a stub it cannot carry to. */
+      return send_reply(sptr, SND_EXPLICIT | ERR_NOSUCHSERVER,
+                        "%s :Server is not reachable", cli_name(srv));
     } else {
       sendcmdto_one(sptr, CMD_OPER, srv, "%C %s %s", srv, parv[2], parv[3]);
       SetOperedRemote(sptr);
@@ -577,6 +587,9 @@ int ms_oper(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
 
     if (!(acptr = FindNServer(parv[1])))
       return send_reply(sptr, ERR_NOOPERHOST);
+    else if (IsMeshStub(acptr))      /* see m_oper: never carried */
+      return send_reply(sptr, SND_EXPLICIT | ERR_NOSUCHSERVER,
+                        "%s :Server is not reachable", cli_name(acptr));
     else if (!IsMe(acptr)) {
       sendcmdto_one(sptr, CMD_OPER, acptr, "%C %s %s", acptr, parv[2],
                     parv[3]);
