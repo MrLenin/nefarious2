@@ -749,6 +749,20 @@ static void test_metadata_set_at_keeps_row_stamp(void **state)
 }
 
 
+/* The tombstone (or live) entry for a key, read straight from the map:
+ * crdt_lwwmap_get hides deleted entries and the digest skips them. */
+static const struct CrdtLWWEntry *lww_entry(const struct CrdtLWWMap *m,
+                                            const char *key, uint32_t klen)
+{
+  uint32_t b;
+  const struct CrdtLWWEntry *e;
+  for (b = 0; b < m->nbuckets; b++)
+    for (e = m->buckets[b]; e; e = e->ht_next)
+      if (e->key_len == klen && 0 == memcmp(e->key, key, klen))
+        return e;
+  return NULL;
+}
+
 /* Two servers that each mint the same stamped row (each took it over its own
  * W4 link) must end with one entry and equal digests.  The writer comes from
  * the stamp, not the minting server, so the copies are bit-identical; with
@@ -756,41 +770,77 @@ static void test_metadata_set_at_keeps_row_stamp(void **state)
  * would differ for good (anti-entropy re-sending CR F every tick). */
 static void test_metadata_same_stamp_mints_converge(void **state)
 {
-  struct CrdtNetworkState s1, s2;
+  struct CrdtNetworkState s1, s2, s3, s4;
   char key[32];
-  const struct CrdtLWWValue *v1, *v2;
+  const struct CrdtLWWEntry *e;
+  unsigned char *buf = malloc(1 << 16);
   uint64_t now = hlc_wall_clock_ms();
   struct HLC row = { now - 500, 2, 9 };       /* stamped by server 9 */
   struct HLC gone = { now - 100, 0, 9 };
   uint32_t klen;
+  int n;
   (void)state;
 
+  assert_non_null(buf);
   memcpy(key, "bob", 3); key[3] = '\0'; memcpy(key + 4, "avatar", 6);
   klen = 3 + 1 + 6;
   crdt_state_init(&s1, 1);
   crdt_state_init(&s2, 2);
+  crdt_state_init(&s3, 3);
+  crdt_state_init(&s4, 4);
 
+  /* Both mint the same stamped row, then sync both ways. */
   crdt_metadata_set_at(&s1, key, klen, "P:x", 3, &row, now, 60000);
   crdt_metadata_set_at(&s2, key, klen, "P:x", 3, &row, now, 60000);
   crdt_state_sync(&s2, &s1);
   crdt_state_sync(&s1, &s2);
-  v1 = crdt_metadata_get(&s1, key, klen);
-  v2 = crdt_metadata_get(&s2, key, klen);
-  assert_non_null(v1);
-  assert_non_null(v2);
-  assert_int_equal(9, v1->writer);
-  assert_int_equal(9, v2->writer);
+  e = lww_entry(&s1.metadata, key, klen);
+  assert_non_null(e); assert_int_equal(9, e->val.writer);
+  e = lww_entry(&s2.metadata, key, klen);
+  assert_non_null(e); assert_int_equal(9, e->val.writer);
   assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
 
-  /* The same holds for a stamped delete minted on both. */
+  /* The op carries the stamp's writer too: a third server that learns the
+   * row only by delta replay records 9, not 1. */
+  crdt_state_sync(&s3, &s1);
+  e = lww_entry(&s3.metadata, key, klen);
+  assert_non_null(e); assert_int_equal(9, e->val.writer);
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s3));
+
+  /* A stamped delete minted on both: the tombstones match in ts and writer,
+   * through delta replay (twice, as duplicates arrive) and a snapshot. */
   crdt_metadata_del_at(&s1, key, klen, &gone, now, 60000);
   crdt_metadata_del_at(&s2, key, klen, &gone, now, 60000);
   crdt_state_sync(&s2, &s1);
   crdt_state_sync(&s1, &s2);
+  crdt_state_sync(&s2, &s1);
+  crdt_state_sync(&s3, &s2);
+  {
+    struct CrdtNetworkState *all[3] = { &s1, &s2, &s3 };
+    int i;
+    for (i = 0; i < 3; i++) {
+      e = lww_entry(&all[i]->metadata, key, klen);
+      assert_non_null(e);
+      assert_int_equal(1, e->deleted);
+      assert_int_equal(0, hlc_compare(&e->val.ts, &gone));
+      assert_int_equal(9, e->val.writer);
+    }
+  }
+  n = crdt_snapshot_encode(&s1, buf, 1 << 16);
+  assert_true(n > 0);
+  assert_true(crdt_snapshot_apply(&s4, buf, (size_t)n) >= 0);
+  assert_true(crdt_snapshot_apply(&s4, buf, (size_t)n) >= 0);   /* a duplicate */
+  e = lww_entry(&s4.metadata, key, klen);
+  assert_non_null(e);
+  assert_int_equal(1, e->deleted);
+  assert_int_equal(9, e->val.writer);
   assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
 
+  free(buf);
   crdt_state_clear(&s1);
   crdt_state_clear(&s2);
+  crdt_state_clear(&s3);
+  crdt_state_clear(&s4);
 }
 
 /* ================================================================== */
