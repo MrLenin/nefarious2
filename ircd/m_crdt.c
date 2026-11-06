@@ -1429,6 +1429,8 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
         if (!*q || *q == ':') break;
         ev[ec++] = q;
         while (*q && *q != ' ') q++;
+        if (*q)                /* end the token here: the third one is */
+          *q++ = '\0';         /* not followed by another pass of the loop */
       }
       while (*q == ' ') q++;
       if (ec == 3 && ((ev[2][0] == 'P' || ev[2][0] == '*') && !ev[2][1])) {
