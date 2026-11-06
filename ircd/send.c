@@ -476,6 +476,11 @@ void sendcmdto_reset_s2s_overrides(void)
   s2s_client_tags_override = NULL;
   s2s_raw_tags[0] = '\0';
   s2s_want_tags = 0;
+  /* The crdt-mesh one-shots too: one left armed would make the next
+   * unrelated broadcast skip the CRDT peers or the local members. */
+  skip_crdt_servers_once = 0;
+  skip_local_members_once = 0;
+  match_local_only_once = 0;
 }
 
 /** Mint a fresh msgid into \a link's S2S stash for an event that

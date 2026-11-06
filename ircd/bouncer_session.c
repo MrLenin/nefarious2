@@ -1498,6 +1498,20 @@ int bounce_login_nick_held_elsewhere(struct Client *cptr)
  * @param[out] out_session Set to the session if resumed or created.
  * @return 1 if resumed a held session, 2 if attached as alias, 0 otherwise.
  */
+/** 5-5e M6d: does the doc lease say a live holder elsewhere owns @a s?  Such a
+ * record is a doc replica, not garbage: the chooser must not discard it. */
+static int bounce_crdt_lease_held_elsewhere(const char *account,
+                                            const struct BouncerSession *s)
+{
+  const struct CrdtBouncerLease *lease;
+
+  if (!feature_bool(FEAT_CRDT_BOUNCER_DOC) || !feature_bool(FEAT_CRDT_PRIMARY))
+    return 0;
+  lease = crdt_shadow_blease_get(account, s->hs_sessid);
+  return lease && lease->host != (uint16_t)base64toint(cli_yxx(&me))
+         && crdt_shadow_server_beacon_fresh(lease->host);
+}
+
 /** 5-5e M6d (CRDT doc bouncer): the doc liveness-lease makes the alias-vs-
  * reclaim decision for an ACTIVE session whose primary is not ours
  * AUTHORITATIVE.  A doc-materialized replica has hs_client==NULL even when the
@@ -1514,9 +1528,9 @@ int bounce_login_nick_held_elsewhere(struct Client *cptr)
  *         the sessions again); -1 to let the chooser decide (lease mine or none,
  *         or the doc bouncer is off). */
 static int bounce_crdt_lease_resume(struct Client *cptr, const char *account,
+                                    struct BouncerSession *session,
                                     struct BouncerSession **out_session)
 {
-  struct BouncerSession *session;
   const struct CrdtBouncerLease *lease;
   uint16_t myn;
   int holder_fresh;
@@ -1524,7 +1538,8 @@ static int bounce_crdt_lease_resume(struct Client *cptr, const char *account,
 
   if (!feature_bool(FEAT_CRDT_BOUNCER_DOC) || !feature_bool(FEAT_CRDT_PRIMARY))
     return -1;
-  session = bounce_find_any_session(account);
+  if (!session)
+    session = bounce_find_any_session(account);
   if (!session || session->hs_state != BOUNCE_ACTIVE
       || (session->hs_client && MyConnect(session->hs_client)))
     return -1;
@@ -1542,10 +1557,12 @@ static int bounce_crdt_lease_resume(struct Client *cptr, const char *account,
             (void*)session->hs_client, (int)act);
   if (act == CRDT_BLEASE_REVIVE_LOCAL) {
     /* stale/dead holder -> become primary; record us as the gen+1 host so the
-     * doc transfers the lease (the heal demote on the old holder keys off this). */
-    crdt_shadow_blease_claim(account, session->hs_sessid, myn,
-                             lease->generation + 1, (uint64_t)CurrentTime);
+     * doc transfers the lease (the heal demote on the old holder keys off this).
+     * Claimed only once the attach took: a refused attach (Keycloak or account
+     * mismatch, +Z) must not leave the doc naming a holder with no primary. */
     if (bounce_attach(session, cptr, 0) == 0) {
+      crdt_shadow_blease_claim(account, session->hs_sessid, myn,
+                               lease->generation + 1, (uint64_t)CurrentTime);
       bounce_broadcast(session, 'A', cli_yxx(cptr));
       *out_session = session;
       log_write(LS_SYSTEM, L_NOTICE, 0,
@@ -1675,18 +1692,6 @@ int bounce_auto_resume(struct Client *cptr, struct BouncerSession **out_session,
                   "Session ended: its Keycloak account was replaced");
       goto rechoose;   /* the session list changed */
     }
-    /* The CRDT doc lease decides an ACTIVE session whose primary is not
-     * ours before the chooser may discard or reclaim a doc replica (M6d).
-     * After the Keycloak ends, so a replaced login never revives. */
-    if (!lease_checked) {
-      int lrc;
-      lease_checked = 1;
-      lrc = bounce_crdt_lease_resume(cptr, account, out_session);
-      if (lrc == -2)
-        goto rechoose;
-      if (lrc >= 0)
-        return lrc;
-    }
     /* Nothing anywhere we can reach holds this record: no local holder,
      * no client, no ghost numeric to resolve.  It is garbage (a replica
      * that outlived its holder), and leaving it would block this login
@@ -1696,6 +1701,10 @@ int bounce_auto_resume(struct Client *cptr, struct BouncerSession **out_session,
      * by state. */
     for (i = 0; i < n && ch.discard; i++) {
       if (!(ch.discard & (1UL << i)))
+        continue;
+      /* A doc replica whose lease names a live holder elsewhere is not
+       * garbage: the M6d step below aliases onto that holder (or refuses). */
+      if (bounce_crdt_lease_held_elsewhere(account, sessions[i]))
         continue;
       log_write(LS_USER, L_INFO, 0,
                 "Bouncer: discarding unattachable replica %s for %s",
@@ -1794,6 +1803,21 @@ int bounce_auto_resume(struct Client *cptr, struct BouncerSession **out_session,
     }
     default:
       break;
+    }
+
+    /* The CRDT doc lease decides an ACTIVE session whose primary is not ours
+     * (M6d) -- only where the chooser itself would alias onto, reclaim, or
+     * pass over it; its refusals, holds and waits above stand. */
+    if (!lease_checked
+        && (kind == BOUNCE_CHOOSE_ACTIVE_REMOTE || kind == BOUNCE_CHOOSE_ORPHAN
+            || kind == BOUNCE_CHOOSE_NONE)) {
+      int lrc;
+      lease_checked = 1;
+      lrc = bounce_crdt_lease_resume(cptr, account, session, out_session);
+      if (lrc == -2)
+        goto rechoose;   /* the replica now names the holder's live primary */
+      if (lrc >= 0)
+        return lrc;
     }
 
     /* The live-session check: the first session of the account.  Per

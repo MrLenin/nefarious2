@@ -2909,10 +2909,11 @@ int set_user_mode(struct Client *cptr, struct Client *sptr, int parc,
           hold_on_tell = bounce_hold_on_tells(asker_device, MyUser(acptr),
                                               IsUser(acptr), 1);
           SetBncHoldPref(acptr);
-          /* Home node (or the asking device's server) owns the write: see the
-           * 'Y' comment -- a remote copy re-asserting it would mint a fresh
-           * HLC into the doc and clobber the home's value. */
-          if (MyUser(acptr) || asker_device)
+          /* On a CRDT primary the home node (or the asking device's server)
+           * owns the write: see the 'Y' comment -- a remote copy re-asserting
+           * it would mint a fresh HLC into the doc and clobber the home's
+           * value.  Without the doc every server keeps its own copy. */
+          if (!feature_bool(FEAT_CRDT_PRIMARY) || MyUser(acptr) || asker_device)
             metadata_set_client(acptr, "draft/persistence/hold", "1", METADATA_VIS_PRIVATE);
         } else {
           struct BouncerSession *session = NULL;
@@ -3149,10 +3150,11 @@ int set_user_mode(struct Client *cptr, struct Client *sptr, int parc,
   /* A -b that stands (no +b after it in this command): the hold
    * preference, before the mode line goes out and before the end. */
   if (hold_off) {
-    /* Only the home node or the asking device's server writes it (see the
-     * 'Y' comment): a remote copy taking a relayed or doc-reconciled -b
-     * would mint hold=0 with a fresh HLC and clobber the home's value. */
-    if (MyUser(acptr) || hold_off_tell)
+    /* On a CRDT primary only the home node or the asking device's server
+     * writes it (see the 'Y' comment): a remote copy taking a relayed or
+     * doc-reconciled -b would mint hold=0 with a fresh HLC and clobber the
+     * home's value.  Without the doc every server keeps its own copy. */
+    if (!feature_bool(FEAT_CRDT_PRIMARY) || MyUser(acptr) || hold_off_tell)
       metadata_set_client(acptr, "draft/persistence/hold", "0", METADATA_VIS_PRIVATE);
     if (hold_off_tell)
       sendcmdto_serv_butone_v3(&me, CMD_METADATA, NULL, "%s %s P :0",

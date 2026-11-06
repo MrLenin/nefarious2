@@ -110,16 +110,35 @@ static void eventlog_ensure(void)
  * storm fresh msgids).  crdt_gossip_message self-gates (shadow active +
  * FEAT_CRDT_ROUTE_BCAST + bcast-stable), so mesh off -> tree-only behavior.
  *
- * The mesh copy carries the name only: a mesh-only node purges by name, not by
- * Keycloak id, and does not run the event's deauth (see the merge notes). */
+ * The mesh copy carries names only, one per copy: a mesh-only node purges by
+ * name, not by Keycloak id (an id-only event mints nothing), and does not run
+ * the event's deauth (see the merge notes). */
 static void ci_mesh_mint(const char *username)
 {
   char msgidbuf[64];
+  char one[ACCOUNTLEN + 1];
+  const char *p, *comma;
+  size_t len;
 
-  if (!username || !username[0] || 0 == strcmp(username, "*"))
+  if (!username)
     return;
-  generate_msgid(msgidbuf, sizeof msgidbuf);
-  crdt_gossip_message(&me, 'I', "*", msgidbuf, username);
+  /* A Keycloak id that resolved to several names relays them joined by
+   * ',' (names_join); the mesh receiver purges one name per copy. */
+  for (p = username; *p; p = comma ? comma + 1 : p + len) {
+    comma = strchr(p, ',');
+    len = comma ? (size_t)(comma - p) : strlen(p);
+    if (len == 0 || len > ACCOUNTLEN || (len == 1 && *p == '*')) {
+      if (!comma)
+        break;
+      continue;
+    }
+    memcpy(one, p, len);
+    one[len] = '\0';
+    generate_msgid(msgidbuf, sizeof msgidbuf);
+    crdt_gossip_message(&me, 'I', "*", msgidbuf, one);
+    if (!comma)
+      break;
+  }
 }
 
 /** One relay per event to every IRCv3-aware server: the five-parameter CI
