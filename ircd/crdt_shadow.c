@@ -3285,6 +3285,15 @@ static uint32_t metadata_doc_key(const char *account, const char *key,
  * cache (last_present / ms_metadata remote cache) and is NOT converged. Self-skips while
  * a doc-driven reconcile or a P10-relayed apply is in flight (single-writer + loop
  * prevention). Called from metadata_account_set_ts (the storage chokepoint). */
+/* Is @a st too far ahead to take?  The bound's zero means unbounded, as
+ * hlc_receive_bounded reads it (md_stamp_ahead alone would refuse every
+ * future stamp under a zero bound). */
+static int md_stamp_refused(const struct md_stamp *st)
+{
+  uint64_t max = hlc_max_forward_ms();
+  return st && max && md_stamp_ahead(st, hlc_wall_clock_ms(), max);
+}
+
 /* An md_stamp as the doc's HLC (the same three fields). */
 static const struct HLC *md_stamp_hlc(const struct md_stamp *st, struct HLC *out)
 {
@@ -3310,7 +3319,7 @@ void crdt_shadow_metadata_set(const char *account, const char *key,
     return;
   /* A stamp too far ahead stays out of the doc (its merge was the bounded
    * hlc_global_receive's to refuse; the doc clock must not jump with it). */
-  if (st && md_stamp_ahead(st, hlc_wall_clock_ms(), hlc_max_forward_ms()))
+  if (md_stamp_refused(st))
     return;
   if (value) {
     if (!permanent)
@@ -3345,7 +3354,7 @@ void crdt_shadow_metadata_remove_key(const void *key, uint32_t klen,
   struct HLC at;
   if (!shadow_on() || g_metadata_reconciling || g_metadata_remote_applying)
     return;
-  if (!key || !klen)
+  if (!key || !klen || md_stamp_refused(st))
     return;
   v = crdt_metadata_get(&g_crdt, (const char *)key, klen);
   if (!v || !v->data)
@@ -3461,7 +3470,7 @@ static void reconcile_metadata_set_cb(const char *key, uint32_t key_len,
     /* A row stamped too far ahead (a skewed writer) is refused, as
      * ms_metadata_stamped refuses it on the wire, so the doc-fed store and
      * the P10-fed store agree on what they hold. */
-    if (md_stamp_ahead(&in.st, hlc_wall_clock_ms(), hlc_max_forward_ms()))
+    if (md_stamp_refused(&in.st))
       return;
     /* Always the version merge, even when the content matches (stage-2 fix
      * review): the doc may hold the same value under a newer stamp, which the
@@ -3533,7 +3542,10 @@ static void reconcile_metadata_del_collect(const void *key, size_t klen, void *a
       tst.ms = dts.physical_ms;
       tst.logical = dts.logical;
       tst.node = dts.node_id;
-      if (md_stamp_cmp(&local.st, &tst) > 0)
+      /* md_lww_take keeps a live row against an equal-stamp tombstone too,
+       * and a refused (far-ahead) tombstone is never applied: neither can
+       * ever be reaped, so neither takes a slot. */
+      if (md_stamp_cmp(&local.st, &tst) >= 0 || md_stamp_refused(&tst))
         return;
     }
   }
@@ -3607,7 +3619,7 @@ void crdt_shadow_reconcile_metadata(void)
         in.vis = oldvis;
         in.value = NULL;
         in.vlen = 0;
-        if (md_stamp_ahead(&in.st, hlc_wall_clock_ms(), hlc_max_forward_ms())
+        if (md_stamp_refused(&in.st)
             || metadata_account_merge(account, mkey, &in) != 1)
           continue;
         if (!IsChannelName(account)) {
