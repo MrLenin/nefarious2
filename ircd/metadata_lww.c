@@ -108,6 +108,11 @@ int md_stamp_parse(const char *text, struct md_stamp *out)
 
   if (!text || !out)
     return -1;
+  /* A text that does not fit MD_STAMP_BUFSIZE (only a 20-digit ms with
+   * long 16-bit fields gets there) could not be formatted back, kept as
+   * a chunk identity or clock-encoded: refuse it here, once. */
+  if (strlen(text) >= MD_STAMP_BUFSIZE)
+    return -1;
 
   dot1 = strchr(text, '.');
   if (!dot1)
@@ -429,16 +434,75 @@ int md_flags_parse(const char *tok, int *vis, int *tombstone, int *more)
 /* Chunk reassembly                                                     */
 /* ------------------------------------------------------------------ */
 
-/** Whether @a c's pending accumulation (if any) was filed under the
- * same (account, stamp, key, vis) as this feed call. */
-static int md_chunk_identity_matches(const struct md_chunk *c,
-                                      const char *account, const char *stamp,
-                                      const char *key, int vis)
+/** Whether @a s (NULL taken as "") fits a buffer of @a size bytes with
+ * its NUL. */
+static int md_fits(const char *s, size_t size)
 {
-  return c->vis == vis &&
-         0 == strcmp(c->account, account ? account : "") &&
-         0 == strcmp(c->stamp, stamp ? stamp : "") &&
-         0 == strcmp(c->key, key ? key : "");
+  return strlen(s ? s : "") < size;
+}
+
+/** Whether (@a account, @a stamp, @a key) names the same row as the
+ * identity fields @a a / @a s / @a k (vis is not part of a row's
+ * identity: see md_chunk_feed). */
+static int md_row_eq(const char *a, const char *s, const char *k,
+                     const char *account, const char *stamp, const char *key)
+{
+  return 0 == strcmp(a, account ? account : "") &&
+         0 == strcmp(s, stamp ? stamp : "") &&
+         0 == strcmp(k, key ? key : "");
+}
+
+/** The poison slot naming row (@a account, @a stamp, @a key), or NULL. */
+static struct md_chunk_poison *md_chunk_poison_find(struct md_chunk *c,
+                                                    const char *account,
+                                                    const char *stamp,
+                                                    const char *key)
+{
+  int i;
+
+  for (i = 0; i < MD_CHUNK_POISON_SLOTS; i++)
+    if (c->poison[i].used &&
+        md_row_eq(c->poison[i].account, c->poison[i].stamp, c->poison[i].key,
+                  account, stamp, key))
+      return &c->poison[i];
+  return NULL;
+}
+
+/** Discard the rest of row (@a account, @a stamp, @a key): its later
+ * pieces, up to and including its more=0 one, are swallowed.  Each row
+ * takes its own slot (a free one, else the slots in turn), so poisoning
+ * one row never forgets another's while a slot is free (N3(a)). */
+static void md_chunk_poison(struct md_chunk *c, const char *account,
+                            const char *stamp, const char *key)
+{
+  struct md_chunk_poison *p = md_chunk_poison_find(c, account, stamp, key);
+  int i;
+
+  if (!p) {
+    for (i = 0; i < MD_CHUNK_POISON_SLOTS; i++)
+      if (!c->poison[i].used) {
+        p = &c->poison[i];
+        break;
+      }
+  }
+  if (!p) {
+    if (c->poison_next < 0 || c->poison_next >= MD_CHUNK_POISON_SLOTS)
+      c->poison_next = 0;
+    p = &c->poison[c->poison_next];
+    c->poison_next = (c->poison_next + 1) % MD_CHUNK_POISON_SLOTS;
+  }
+  md_bounded_copy(p->account, sizeof(p->account), account);
+  md_bounded_copy(p->stamp, sizeof(p->stamp), stamp);
+  md_bounded_copy(p->key, sizeof(p->key), key);
+  p->used = 1;
+}
+
+/** Forget the pending value, if any. */
+static void md_chunk_reset(struct md_chunk *c)
+{
+  c->active = 0;
+  c->len = 0;
+  c->value[0] = '\0';
 }
 
 int md_chunk_feed(struct md_chunk *c, const char *account, const char *stamp,
@@ -451,10 +515,41 @@ int md_chunk_feed(struct md_chunk *c, const char *account, const char *stamp,
 
   c->dropped = 0;
 
-  if (c->active && !md_chunk_identity_matches(c, account, stamp, key, vis)) {
-    c->active = 0;
-    c->len = 0;
-    c->dropped = 1;
+  /* Never truncate an identity field: a cut name could match another
+   * row's (final review M2).  Refused before anything changes. */
+  if (!md_fits(account, sizeof(c->account)) ||
+      !md_fits(stamp, sizeof(c->stamp)) ||
+      !md_fits(key, sizeof(c->key)))
+    return MD_CHUNK_ERROR;
+
+  /* The rest of a row already given up on (final review M1): swallow
+   * it, so no tail of it is ever handed back as the whole value. */
+  {
+    struct md_chunk_poison *p = md_chunk_poison_find(c, account, stamp, key);
+
+    if (p) {
+      if (!more)
+        p->used = 0;
+      return MD_CHUNK_ERROR;
+    }
+  }
+
+  if (c->active) {
+    if (md_row_eq(c->account, c->stamp, c->key, account, stamp, key)) {
+      if (c->vis != vis) {
+        /* The same row arriving inconsistent: none of it is trusted. */
+        md_chunk_reset(c);
+        if (more)
+          md_chunk_poison(c, account, stamp, key);
+        return MD_CHUNK_ERROR;
+      }
+    } else {
+      /* Another row's line interrupted this one: drop what we have and
+       * the rest of it, then start the new row fresh. */
+      md_chunk_poison(c, c->account, c->stamp, c->key);
+      md_chunk_reset(c);
+      c->dropped = 1;
+    }
   }
 
   if (!c->active) {
@@ -468,9 +563,9 @@ int md_chunk_feed(struct md_chunk *c, const char *account, const char *stamp,
 
   plen = strlen(piece);
   if (c->len + plen >= sizeof(c->value)) {
-    c->active = 0;
-    c->len = 0;
-    c->value[0] = '\0';
+    md_chunk_reset(c);
+    if (more)
+      md_chunk_poison(c, account, stamp, key);
     return MD_CHUNK_ERROR;
   }
 
@@ -483,6 +578,24 @@ int md_chunk_feed(struct md_chunk *c, const char *account, const char *stamp,
 
   c->active = 0;
   return MD_CHUNK_DONE;
+}
+
+void md_chunk_abandon(struct md_chunk *c, const char *account,
+                      const char *stamp, const char *key, int more)
+{
+  if (!c)
+    return;
+  if (!md_fits(account, sizeof(c->account)) ||
+      !md_fits(stamp, sizeof(c->stamp)) ||
+      !md_fits(key, sizeof(c->key)))
+    return;
+  if (c->active && md_row_eq(c->account, c->stamp, c->key, account, stamp, key))
+    md_chunk_reset(c);
+  /* Only when pieces follow: a refused last (or only) piece leaves
+   * nothing to discard, and a poison would swallow the row's next
+   * delivery instead (N3(b)). */
+  if (more)
+    md_chunk_poison(c, account, stamp, key);
 }
 
 /* ------------------------------------------------------------------ */
@@ -552,4 +665,89 @@ int md_pull_parse(int parc, char *parv[], unsigned long *seq, char *scope,
   *seq = (unsigned long)useq;
   *scope = parv[3][0];
   return count;
+}
+
+/* ------------------------------------------------------------------ */
+/* Bounded top-N-by-stamp selection (fix round 1)                      */
+/* ------------------------------------------------------------------ */
+
+int md_topn_place(const struct md_stamp *kept, int count, int cap,
+                  const struct md_stamp *incoming)
+{
+  int i;
+
+  if (!kept || !incoming || cap <= 0 || count < 0 || count > cap)
+    return -1;
+
+  if (count < cap) {
+    /* Room to spare: find incoming's place among the ascending kept
+     * stamps (linear scan from the newest end -- cap is small, at
+     * most a couple hundred, so this is not performance-sensitive). */
+    i = count;
+    while (i > 0 && md_stamp_cmp(&kept[i - 1], incoming) > 0)
+      i--;
+    return i;
+  }
+
+  /* Full: discard unless incoming is strictly newer than the current
+   * minimum (kept[0]) -- a tie is not an improvement, so it is
+   * discarded too, same as every other non-improving candidate. */
+  if (md_stamp_cmp(incoming, &kept[0]) <= 0)
+    return -1;
+
+  i = 0;
+  while (i + 1 < cap && md_stamp_cmp(&kept[i + 1], incoming) < 0)
+    i++;
+  return i;
+}
+
+int md_topn_insert(struct md_stamp *kept, int *slot, int *count,
+                   int cap, const struct md_stamp *incoming)
+{
+  int idx, ps, i;
+
+  if (!kept || !slot || !count || !incoming || cap <= 0
+      || *count < 0 || *count > cap)
+    return -1;
+
+  idx = md_topn_place(kept, *count, cap, incoming);
+  if (idx < 0)
+    return -1;
+
+  if (*count < cap) {
+    /* The slots in use are 0..count-1: the next one is free. */
+    ps = *count;
+    for (i = *count; i > idx; i--) {
+      kept[i] = kept[i - 1];
+      slot[i] = slot[i - 1];
+    }
+    (*count)++;
+  } else {
+    /* The oldest row goes; its pool slot takes the new one. */
+    ps = slot[0];
+    for (i = 0; i < idx; i++) {
+      kept[i] = kept[i + 1];
+      slot[i] = slot[i + 1];
+    }
+  }
+  kept[idx] = *incoming;
+  slot[idx] = ps;
+  return ps;
+}
+
+/* ------------------------------------------------------------------ */
+/* Replicated keys (push-2 final fix wave, M-2)                        */
+/* ------------------------------------------------------------------ */
+
+#define MD_KEY_LAST_PRESENT "last_present"
+
+int md_key_replicable(const char *key)
+{
+  if (!md_wire_key_valid(key))
+    return 0;
+  if (strlen(key) == sizeof(MD_KEY_LAST_PRESENT) - 1
+      && md_prefix_eq_ci(key, MD_KEY_LAST_PRESENT,
+                         sizeof(MD_KEY_LAST_PRESENT) - 1))
+    return 0;
+  return 1;
 }

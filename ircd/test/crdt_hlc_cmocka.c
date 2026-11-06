@@ -40,6 +40,15 @@
 #include "crdt_types.h"
 #include "crdt_state.h"
 
+/* Stub for feature_int: crdt_hlc.c's hlc_max_forward_ms() reads
+ * FEAT_HLC_MAX_FORWARD_MS through it.  Present only so crdt_hlc.o links
+ * standalone (the crdt_hlc_bound_cmocka.c precedent). */
+int feature_int(int feat)
+{
+  (void)feat;
+  return 60000;  /* ircd_features.c's F_I(HLC_MAX_FORWARD_MS) default */
+}
+
 /* A physical_ms comfortably beyond any plausible test-host wall clock
  * (~year 33658).  Seeding the clock here forces hlc_local_event/hlc_receive
  * down the logical-counter / adopt-remote branches deterministically. */

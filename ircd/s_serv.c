@@ -61,6 +61,7 @@
 #include "userload.h"
 #include "zline.h"
 #include "metadata.h"
+#include "metadata_sync.h"
 #include "bouncer_session.h"
 #include "webpush.h"
 #include "ircd_features.h"
@@ -590,14 +591,55 @@ int server_finish_burst(struct Client *cptr)
       client_send_privs(cli_user(acptr)->server, cptr, acptr);
 
       /* Burst user metadata if enabled.  MD is an IRCv3-aware extension —
-       * legacy peers (X3, vanilla ircu) log PARSE ERROR on receipt. */
+       * legacy peers (X3, vanilla ircu) log PARSE ERROR on receipt.
+       *
+       * W4 Task 8: never by nick unless nothing else names the user.  A
+       * logged-in user's keys go as the account's stamped rows
+       * ("MD =account") under the stamp the store holds, so the peer
+       * merges them by last-writer-wins instead of taking whatever it is
+       * sent (a key the store has no row for -- no store, or a row never
+       * written there -- goes under stamp 0.0.0, which any stamped row
+       * beats).  Another user's keys go by its session id ("MD !sessid")
+       * when the N above carried it (metadata_session_addressable),
+       * else by nick.  Both forms keep the user's own server as the
+       * line's origin: the receiver accepts a session- or nick-addressed
+       * write only from there. */
       if (feature_bool(FEAT_METADATA_BURST) && IsIRCv3Aware(cptr)) {
         struct MetadataEntry *entry;
+        const char *account = cli_user(acptr)->account;
+
         for (entry = cli_metadata(acptr); entry; entry = entry->next) {
-          sendcmdto_one(cli_user(acptr)->server, CMD_METADATA, cptr, "%s %s %s :%s",
-                        cli_name(acptr), entry->key,
-                        entry->visibility == METADATA_VIS_PRIVATE ? "P" : "*",
-                        entry->value ? entry->value : "");
+          const char *vis_tok = entry->visibility == METADATA_VIS_PRIVATE ? "P" : "*";
+          const char *value = entry->value ? entry->value : "";
+
+          if (account[0]) {
+            struct md_version v;
+            char valbuf[METADATA_VALUE_LEN];
+
+            /* An internal key (last_present, loaded into memory with the
+             * account's rows; a key the wire validator refuses) is this
+             * server's own: never a stamped row on the wire (push-2
+             * final fix wave, M-2). */
+            if (!md_key_replicable(entry->key))
+              continue;
+            if (!metadata_lmdb_is_available()
+                || metadata_account_get_version(account, entry->key, &v,
+                                                valbuf, sizeof(valbuf)) != 0) {
+              memset(&v.st, 0, sizeof(v.st));
+              v.tombstone = 0;
+              v.vis = entry->visibility;
+              v.value = value;
+              v.vlen = strlen(value);
+            }
+            metadata_emit_versioned(cli_user(acptr)->server, cptr, NULL,
+                                    account, entry->key, &v);
+          } else if (metadata_session_addressable(acptr)) {
+            sendcmdto_one(cli_user(acptr)->server, CMD_METADATA, cptr, "!%s %s %s :%s",
+                          cli_session_id(acptr), entry->key, vis_tok, value);
+          } else {
+            sendcmdto_one(cli_user(acptr)->server, CMD_METADATA, cptr, "%s %s %s :%s",
+                          cli_name(acptr), entry->key, vis_tok, value);
+          }
         }
       }
     }

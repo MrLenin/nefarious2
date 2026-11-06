@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <setjmp.h>
+#include <stdio.h>
 #include <string.h>
 #include <cmocka.h>
 
@@ -356,6 +357,289 @@ static void test_chunk_overflow(void **state)
   assert_int_equal(c.active, 0);
 }
 
+/* Final push-1 review M1(a): after an overflow, the rest of that row's
+ * pieces must not assemble a tail that the final piece then hands back
+ * as the whole value. The row stays poisoned until its own more=0
+ * piece; the next row (even one with the same identity) is clean. */
+static void test_chunk_overflow_discards_rest_of_row(void **state)
+{
+  struct md_chunk c;
+  char piece[1024];
+
+  (void)state;
+  memset(&c, 0, sizeof(c));
+  memset(piece, 'z', sizeof(piece));
+  piece[sizeof(piece) - 1] = '\0'; /* 1023 'z' bytes */
+
+  assert_int_equal(MD_CHUNK_PENDING,
+                   md_chunk_feed(&c, "acct", "7.0.1", "k1", 0, 1, piece));
+  assert_int_equal(MD_CHUNK_ERROR,
+                   md_chunk_feed(&c, "acct", "7.0.1", "k1", 0, 1, "x"));
+  /* The rest of the overflowed row: swallowed, never a fresh start. */
+  assert_int_equal(MD_CHUNK_ERROR,
+                   md_chunk_feed(&c, "acct", "7.0.1", "k1", 0, 1, "tail1"));
+  assert_int_equal(MD_CHUNK_ERROR,
+                   md_chunk_feed(&c, "acct", "7.0.1", "k1", 0, 0, "tail2"));
+  assert_int_equal(c.active, 0);
+  /* Its more=0 piece ended the poison: the next row is taken. */
+  assert_int_equal(MD_CHUNK_DONE,
+                   md_chunk_feed(&c, "acct", "7.0.1", "k1", 0, 0, "whole"));
+  assert_string_equal(c.value, "whole");
+}
+
+/* An overflow on the row's own final piece leaves nothing to discard. */
+static void test_chunk_overflow_on_final_piece_no_poison(void **state)
+{
+  struct md_chunk c;
+  char piece[1024];
+
+  (void)state;
+  memset(&c, 0, sizeof(c));
+  memset(piece, 'z', sizeof(piece));
+  piece[sizeof(piece) - 1] = '\0';
+
+  assert_int_equal(MD_CHUNK_PENDING,
+                   md_chunk_feed(&c, "acct", "7.0.1", "k1", 0, 1, piece));
+  assert_int_equal(MD_CHUNK_ERROR,
+                   md_chunk_feed(&c, "acct", "7.0.1", "k1", 0, 0, "x"));
+  assert_int_equal(MD_CHUNK_DONE,
+                   md_chunk_feed(&c, "acct", "7.0.1", "k1", 0, 0, "v"));
+  assert_string_equal(c.value, "v");
+}
+
+/* M1(b), an orphaned row: a row whose accumulation another row's line
+ * interrupted. Its later pieces are discarded, not merged as a tail. */
+static void test_chunk_mismatch_discards_rest_of_abandoned_row(void **state)
+{
+  struct md_chunk c;
+
+  (void)state;
+  memset(&c, 0, sizeof(c));
+
+  assert_int_equal(MD_CHUNK_PENDING,
+                   md_chunk_feed(&c, "acct", "7.0.1", "k1", 0, 1, "head"));
+  assert_int_equal(MD_CHUNK_DONE,
+                   md_chunk_feed(&c, "acct", "7.0.1", "k2", 0, 0, "other"));
+  assert_int_equal(c.dropped, 1);
+  assert_string_equal(c.value, "other");
+  assert_int_equal(MD_CHUNK_ERROR,
+                   md_chunk_feed(&c, "acct", "7.0.1", "k1", 0, 1, "mid"));
+  assert_int_equal(MD_CHUNK_ERROR,
+                   md_chunk_feed(&c, "acct", "7.0.1", "k1", 0, 0, "end"));
+  assert_int_equal(MD_CHUNK_DONE,
+                   md_chunk_feed(&c, "acct", "7.0.1", "k1", 0, 0, "whole"));
+  assert_string_equal(c.value, "whole");
+}
+
+/* W4 push-1 fix-wave N3(a): nested interruptions.  X is interrupted by
+ * Y, Y by Z: each interrupted row keeps its own poison, so X's tail is
+ * swallowed rather than merged as X's whole value (one poison slot let
+ * Y's poison overwrite X's), and Z's pending value survives the
+ * swallowed tails. */
+static void test_chunk_nested_interrupts_discard_each_row(void **state)
+{
+  struct md_chunk c;
+
+  (void)state;
+  memset(&c, 0, sizeof(c));
+
+  assert_int_equal(MD_CHUNK_PENDING,
+                   md_chunk_feed(&c, "acct", "7.0.1", "kx", 0, 1, "xh"));
+  assert_int_equal(MD_CHUNK_PENDING,
+                   md_chunk_feed(&c, "acct", "7.0.1", "ky", 0, 1, "yh"));
+  assert_int_equal(c.dropped, 1);
+  assert_int_equal(MD_CHUNK_PENDING,
+                   md_chunk_feed(&c, "acct", "7.0.1", "kz", 0, 1, "zh"));
+  assert_int_equal(c.dropped, 1);
+  /* X's tail: swallowed, not handed back as X's whole value. */
+  assert_int_equal(MD_CHUNK_ERROR,
+                   md_chunk_feed(&c, "acct", "7.0.1", "kx", 0, 0, "xt"));
+  /* Y's tail: swallowed too. */
+  assert_int_equal(MD_CHUNK_ERROR,
+                   md_chunk_feed(&c, "acct", "7.0.1", "ky", 0, 0, "yt"));
+  /* Z was never interrupted: it completes whole. */
+  assert_int_equal(MD_CHUNK_DONE,
+                   md_chunk_feed(&c, "acct", "7.0.1", "kz", 0, 0, "zt"));
+  assert_string_equal(c.value, "zhzt");
+  /* The tails ended both poisons: fresh deliveries of X and Y are taken. */
+  assert_int_equal(MD_CHUNK_DONE,
+                   md_chunk_feed(&c, "acct", "7.0.1", "kx", 0, 0, "xw"));
+  assert_string_equal(c.value, "xw");
+  assert_int_equal(MD_CHUNK_DONE,
+                   md_chunk_feed(&c, "acct", "7.0.1", "ky", 0, 0, "yw"));
+  assert_string_equal(c.value, "yw");
+}
+
+/* N3(a), at the slot count: MD_CHUNK_POISON_SLOTS rows interrupted in a
+ * chain each keep their poison; every one of their tails is swallowed. */
+static void test_chunk_poison_slots_hold_a_chain(void **state)
+{
+  struct md_chunk c;
+  char key[8];
+  int i;
+
+  (void)state;
+  memset(&c, 0, sizeof(c));
+
+  /* Rows k0..kN, each head interrupting the one before: k0..k(N-1) are
+   * poisoned, kN is pending. */
+  for (i = 0; i <= MD_CHUNK_POISON_SLOTS; i++) {
+    snprintf(key, sizeof(key), "k%d", i);
+    assert_int_equal(MD_CHUNK_PENDING,
+                     md_chunk_feed(&c, "acct", "7.0.1", key, 0, 1, "h"));
+  }
+  for (i = 0; i < MD_CHUNK_POISON_SLOTS; i++) {
+    snprintf(key, sizeof(key), "k%d", i);
+    assert_int_equal(MD_CHUNK_ERROR,
+                     md_chunk_feed(&c, "acct", "7.0.1", key, 0, 0, "t"));
+  }
+  snprintf(key, sizeof(key), "k%d", MD_CHUNK_POISON_SLOTS);
+  assert_int_equal(MD_CHUNK_DONE,
+                   md_chunk_feed(&c, "acct", "7.0.1", key, 0, 0, "t"));
+  assert_string_equal(c.value, "ht");
+}
+
+/* A piece of the pending row that disagrees on visibility is the same
+ * row (account, stamp, key) arriving inconsistent: the whole row goes. */
+static void test_chunk_vis_flip_discards_row(void **state)
+{
+  struct md_chunk c;
+
+  (void)state;
+  memset(&c, 0, sizeof(c));
+
+  assert_int_equal(MD_CHUNK_PENDING,
+                   md_chunk_feed(&c, "acct", "7.0.1", "k1", 0, 1, "aaa"));
+  assert_int_equal(MD_CHUNK_ERROR,
+                   md_chunk_feed(&c, "acct", "7.0.1", "k1", 1, 1, "bbb"));
+  assert_int_equal(MD_CHUNK_ERROR,
+                   md_chunk_feed(&c, "acct", "7.0.1", "k1", 0, 0, "cc"));
+  assert_int_equal(MD_CHUNK_DONE,
+                   md_chunk_feed(&c, "acct", "7.0.1", "k1", 0, 0, "v"));
+  assert_string_equal(c.value, "v");
+}
+
+/* md_chunk_abandon: a caller-side refusal of one piece (e.g. a bad
+ * flags token) that says more pieces follow (more=1) discards the
+ * pending row it belongs to and the rest of that row -- whether a value
+ * was pending or not. */
+static void test_chunk_abandon_discards_row(void **state)
+{
+  struct md_chunk c;
+
+  (void)state;
+  memset(&c, 0, sizeof(c));
+
+  assert_int_equal(MD_CHUNK_PENDING,
+                   md_chunk_feed(&c, "acct", "7.0.1", "k1", 0, 1, "aaa"));
+  md_chunk_abandon(&c, "acct", "7.0.1", "k1", 1);
+  assert_int_equal(c.active, 0);
+  assert_int_equal(MD_CHUNK_ERROR,
+                   md_chunk_feed(&c, "acct", "7.0.1", "k1", 0, 0, "cc"));
+  assert_int_equal(MD_CHUNK_DONE,
+                   md_chunk_feed(&c, "acct", "7.0.1", "k1", 0, 0, "v"));
+
+  /* A refused head: nothing pending yet, the rest still goes. */
+  md_chunk_abandon(&c, "acct", "8.0.1", "k2", 1);
+  assert_int_equal(MD_CHUNK_ERROR,
+                   md_chunk_feed(&c, "acct", "8.0.1", "k2", 0, 1, "p2"));
+  assert_int_equal(MD_CHUNK_ERROR,
+                   md_chunk_feed(&c, "acct", "8.0.1", "k2", 0, 0, "p3"));
+  assert_int_equal(MD_CHUNK_DONE,
+                   md_chunk_feed(&c, "acct", "8.0.1", "k2", 0, 0, "w"));
+  assert_string_equal(c.value, "w");
+
+  /* Abandoning another row leaves a pending one alone. */
+  assert_int_equal(MD_CHUNK_PENDING,
+                   md_chunk_feed(&c, "acct", "9.0.1", "k3", 0, 1, "aa"));
+  md_chunk_abandon(&c, "acct", "9.0.1", "zz", 1);
+  assert_int_equal(MD_CHUNK_DONE,
+                   md_chunk_feed(&c, "acct", "9.0.1", "k3", 0, 0, "bb"));
+  assert_string_equal(c.value, "aabb");
+}
+
+/* W4 push-1 fix-wave N3(b): a refused piece that is its row's final
+ * (or only) one (more=0) leaves nothing to discard after it.  The
+ * pending value of that row goes, but the row is not poisoned: the next
+ * delivery of the same (account, stamp, key) -- a re-send, a pull
+ * reply -- is taken, not swallowed once. */
+static void test_chunk_abandon_final_piece_no_poison(void **state)
+{
+  struct md_chunk c;
+
+  (void)state;
+  memset(&c, 0, sizeof(c));
+
+  /* A refused only piece. */
+  md_chunk_abandon(&c, "acct", "10.0.1", "k4", 0);
+  assert_int_equal(MD_CHUNK_DONE,
+                   md_chunk_feed(&c, "acct", "10.0.1", "k4", 0, 0, "v"));
+  assert_string_equal(c.value, "v");
+
+  /* A refused final piece of a pending row: the head is dropped (never
+   * completed into "aa" + the next delivery), and the next delivery of
+   * the row is taken whole. */
+  assert_int_equal(MD_CHUNK_PENDING,
+                   md_chunk_feed(&c, "acct", "11.0.1", "k5", 0, 1, "aa"));
+  md_chunk_abandon(&c, "acct", "11.0.1", "k5", 0);
+  assert_int_equal(c.active, 0);
+  assert_int_equal(MD_CHUNK_DONE,
+                   md_chunk_feed(&c, "acct", "11.0.1", "k5", 0, 0, "w"));
+  assert_string_equal(c.value, "w");
+}
+
+/* M2: an identity field that does not fit its buffer (an account over
+ * ACCOUNTLEN, a stamp text over MD_STAMP_BUFSIZE - 1) is refused, never
+ * truncated into a name that could match another row's, and the
+ * pending row is left alone. */
+static void test_chunk_rejects_oversize_identity(void **state)
+{
+  struct md_chunk c;
+  char longkey[200];
+
+  (void)state;
+  memset(&c, 0, sizeof(c));
+  memset(longkey, 'k', sizeof(longkey));
+  longkey[sizeof(longkey) - 1] = '\0';
+
+  assert_int_equal(MD_CHUNK_PENDING,
+                   md_chunk_feed(&c, "acct", "7.0.1", "k1", 0, 1, "aaa"));
+  /* 16 chars: one over ACCOUNTLEN; would truncate to "acct567890123456"'s
+   * first 15 and could pass for that account's row. */
+  assert_int_equal(MD_CHUNK_ERROR,
+                   md_chunk_feed(&c, "acct567890123456", "7.0.1", "k1", 0, 0, "x"));
+  assert_int_equal(MD_CHUNK_ERROR,
+                   md_chunk_feed(&c, "acct", "12345678901234567890.65535.65535", "k1", 0, 0, "x"));
+  assert_int_equal(MD_CHUNK_ERROR,
+                   md_chunk_feed(&c, "acct", "7.0.1", longkey, 0, 0, "x"));
+  assert_int_equal(c.active, 1);
+  assert_int_equal(MD_CHUNK_DONE,
+                   md_chunk_feed(&c, "acct", "7.0.1", "k1", 0, 0, "b"));
+  assert_string_equal(c.value, "aaab");
+  /* Exactly 15 is a valid account. */
+  assert_int_equal(MD_CHUNK_DONE,
+                   md_chunk_feed(&c, "acct56789012345", "7.0.1", "k1", 0, 0, "y"));
+}
+
+/* M2: a stamp text of MD_STAMP_BUFSIZE (32) characters or more -- a
+ * 20-digit ms with both 16-bit fields at five digits -- cannot be
+ * formatted back, kept as a chunk identity or clock-encoded into the
+ * buffers sized from MD_STAMP_BUFSIZE, so it is malformed. 31 is fine. */
+static void test_stamp_parse_rejects_over_bufsize(void **state)
+{
+  struct md_stamp s;
+  char buf[MD_STAMP_BUFSIZE];
+  char clk[MD_STAMP_BUFSIZE + 1];
+
+  (void)state;
+
+  assert_int_equal(-1, md_stamp_parse("12345678901234567890.65535.65535", &s));
+  assert_int_equal(-1, md_stamp_parse("00000000000000000001.00000.00000", &s));
+  assert_int_equal(0, md_stamp_parse("1234567890123456789.65535.65535", &s));
+  assert_true(md_stamp_format(buf, sizeof(buf), &s) == 31);
+  assert_true(md_clock_encode(clk, sizeof(clk), &s, 0) == 32);
+}
+
 static void test_pull_parse_ok(void **state)
 {
   char cmd[] = "MD", tgt[] = "?", seqs[] = "7", scope_s[] = "A";
@@ -467,6 +751,327 @@ static void test_pull_parse_seq_overflow_rejected(void **state)
   assert_int_equal(-1, md_pull_parse(5, parv, &seq, &scope, accounts, 16));
 }
 
+/* ------------------------------------------------------------------ */
+/* md_topn_place (fix round 1, 2026-11-02)                             */
+/* ------------------------------------------------------------------ */
+
+/* A tiny driver that applies md_topn_place the way
+ * mdsync_row_select_cb (ircd/metadata_sync.c) will: insert-or-discard,
+ * shifting the caller's own array by the returned index. The real
+ * caller also shifts a parallel payload array (key/value/vis/tombstone)
+ * in lockstep; these pure tests only need the stamps themselves. */
+static void topn_apply(struct md_stamp *kept, int *count, int cap,
+                        const struct md_stamp *incoming)
+{
+  int idx = md_topn_place(kept, *count, cap, incoming);
+  int i;
+
+  if (idx < 0)
+    return;
+
+  if (*count < cap) {
+    for (i = *count; i > idx; i--)
+      kept[i] = kept[i - 1];
+    (*count)++;
+  } else {
+    for (i = 0; i < idx; i++)
+      kept[i] = kept[i + 1];
+  }
+  kept[idx] = *incoming;
+}
+
+static void test_topn_fewer_than_cap(void **state)
+{
+  struct md_stamp kept[8];
+  int count = 0;
+  struct md_stamp s1 = { 5, 0, 0 }, s2 = { 3, 0, 0 }, s3 = { 9, 0, 0 };
+
+  (void)state;
+
+  topn_apply(kept, &count, 8, &s1);
+  topn_apply(kept, &count, 8, &s2);
+  topn_apply(kept, &count, 8, &s3);
+
+  assert_int_equal(3, count);
+  assert_true(kept[0].ms == 3);
+  assert_true(kept[1].ms == 5);
+  assert_true(kept[2].ms == 9);
+}
+
+static void test_topn_exactly_cap(void **state)
+{
+  struct md_stamp kept[4];
+  int count = 0;
+  int i;
+
+  (void)state;
+
+  /* Inserted newest-first (10,9,8,7): no eviction should ever trigger
+   * since count never exceeds cap, and the kept array must still end
+   * up ascending. */
+  for (i = 0; i < 4; i++) {
+    struct md_stamp s;
+    s.ms = (uint64_t)(10 - i);
+    s.logical = 0;
+    s.node = 0;
+    topn_apply(kept, &count, 4, &s);
+  }
+
+  assert_int_equal(4, count);
+  assert_true(kept[0].ms == 7);
+  assert_true(kept[1].ms == 8);
+  assert_true(kept[2].ms == 9);
+  assert_true(kept[3].ms == 10);
+}
+
+/* The exact shape of the row-cap bug (fix round 1): a raw key-order
+ * walk can deliver the truly newest row LAST, long after the cap is
+ * already full of older ones. md_topn_place must still let it evict
+ * the current oldest kept row instead of being discarded outright. */
+static void test_topn_more_than_cap_newest_last(void **state)
+{
+  struct md_stamp kept[3];
+  int count = 0;
+  struct md_stamp s1 = { 1, 0, 0 }, s2 = { 2, 0, 0 }, s3 = { 3, 0, 0 };
+  struct md_stamp newest = { 100, 0, 0 };
+
+  (void)state;
+
+  topn_apply(kept, &count, 3, &s1);
+  topn_apply(kept, &count, 3, &s2);
+  topn_apply(kept, &count, 3, &s3);
+  assert_int_equal(3, count);
+
+  topn_apply(kept, &count, 3, &newest);
+
+  assert_int_equal(3, count);
+  assert_true(kept[0].ms == 2);
+  assert_true(kept[1].ms == 3);
+  assert_true(kept[2].ms == 100);
+}
+
+static void test_topn_ties(void **state)
+{
+  struct md_stamp kept[2];
+  int count = 0;
+  struct md_stamp a = { 5, 0, 0 }, b = { 5, 0, 0 }, c = { 5, 0, 0 };
+
+  (void)state;
+
+  topn_apply(kept, &count, 2, &a);
+  topn_apply(kept, &count, 2, &b);
+  assert_int_equal(2, count);
+
+  /* Full, and c ties the current minimum (kept[0], stamp 5) exactly --
+   * not strictly newer, so discarded outright; the kept array is left
+   * untouched. */
+  assert_int_equal(-1, md_topn_place(kept, count, 2, &c));
+  assert_true(kept[0].ms == 5 && kept[1].ms == 5);
+}
+
+/* A row with no clock entry at all defaults to stamp 0.0.0 -- the
+ * controller ruling's "counts as oldest" rule. */
+static void test_topn_unstamped_is_oldest(void **state)
+{
+  struct md_stamp kept[2];
+  int count = 0;
+  struct md_stamp unstamped = { 0, 0, 0 };
+  struct md_stamp real = { 1, 0, 0 };
+  struct md_stamp newer = { 2, 0, 0 };
+
+  (void)state;
+
+  topn_apply(kept, &count, 2, &unstamped);
+  topn_apply(kept, &count, 2, &real);
+  assert_int_equal(2, count);
+  assert_true(kept[0].ms == 0);
+  assert_true(kept[1].ms == 1);
+
+  /* Cap full; a newer row must evict the unstamped one, not the real
+   * one -- 0.0.0 is the oldest, so it's the one at kept[0]. */
+  topn_apply(kept, &count, 2, &newer);
+  assert_int_equal(2, count);
+  assert_true(kept[0].ms == 1);
+  assert_true(kept[1].ms == 2);
+}
+
+/* ------------------------------------------------------------------ */
+/* md_topn_insert (push-2 final fix wave, M-4)                         */
+/* ------------------------------------------------------------------ */
+
+/* The caller's payload pool, as mdsync_row_select_cb keeps it: one
+ * entry per pool slot, written once when md_topn_insert hands that slot
+ * out and never moved after.  Here the payload is the stamp's ms, so a
+ * test can check that slot[] still names the right payload for each
+ * ordered position. */
+static void topn_insert_apply(struct md_stamp *kept, int *slot, int *count,
+                              int cap, uint64_t *pool,
+                              const struct md_stamp *incoming)
+{
+  int ps = md_topn_insert(kept, slot, count, cap, incoming);
+
+  if (ps >= 0)
+    pool[ps] = incoming->ms;
+}
+
+/* Every ordered position's payload is its stamp, and the slots used are
+ * a permutation of 0..count-1 (no slot handed out twice, none lost). */
+static void topn_insert_check(const struct md_stamp *kept, const int *slot,
+                              int count, const uint64_t *pool)
+{
+  int seen[64] = { 0 };
+  int i;
+
+  for (i = 0; i < count; i++) {
+    assert_true(slot[i] >= 0 && slot[i] < count);
+    assert_int_equal(0, seen[slot[i]]);
+    seen[slot[i]] = 1;
+    assert_true(pool[slot[i]] == kept[i].ms);
+    if (i > 0)
+      assert_true(md_stamp_cmp(&kept[i - 1], &kept[i]) <= 0);
+  }
+}
+
+static void test_topn_insert_fill(void **state)
+{
+  struct md_stamp kept[8];
+  int slot[8];
+  uint64_t pool[8];
+  int count = 0;
+  struct md_stamp s1 = { 5, 0, 0 }, s2 = { 3, 0, 0 }, s3 = { 9, 0, 0 };
+
+  (void)state;
+
+  topn_insert_apply(kept, slot, &count, 8, pool, &s1);
+  topn_insert_apply(kept, slot, &count, 8, pool, &s2);
+  topn_insert_apply(kept, slot, &count, 8, pool, &s3);
+
+  assert_int_equal(3, count);
+  assert_true(kept[0].ms == 3 && kept[1].ms == 5 && kept[2].ms == 9);
+  /* Below the cap a row takes the next unused slot: 5 -> 0, 3 -> 1,
+   * 9 -> 2, whatever its ordered position. */
+  assert_int_equal(1, slot[0]);
+  assert_int_equal(0, slot[1]);
+  assert_int_equal(2, slot[2]);
+  topn_insert_check(kept, slot, count, pool);
+}
+
+/* Full: the newest-last shape of the row-cap bug.  The evicted row's
+ * slot is the one handed back, and nothing else moves in the pool. */
+static void test_topn_insert_evicts_into_oldest_slot(void **state)
+{
+  struct md_stamp kept[3];
+  int slot[3];
+  uint64_t pool[3];
+  int count = 0;
+  struct md_stamp s1 = { 1, 0, 0 }, s2 = { 2, 0, 0 }, s3 = { 3, 0, 0 };
+  struct md_stamp mid = { 2, 5, 0 }, newest = { 100, 0, 0 }, old = { 0, 1, 0 };
+  int oldest_slot;
+
+  (void)state;
+
+  topn_insert_apply(kept, slot, &count, 3, pool, &s3);
+  topn_insert_apply(kept, slot, &count, 3, pool, &s1);
+  topn_insert_apply(kept, slot, &count, 3, pool, &s2);
+  assert_int_equal(3, count);
+  topn_insert_check(kept, slot, count, pool);
+
+  oldest_slot = slot[0];
+  assert_int_equal(oldest_slot, md_topn_insert(kept, slot, &count, 3, &newest));
+  pool[oldest_slot] = newest.ms;
+  assert_int_equal(3, count);
+  assert_true(kept[0].ms == 2 && kept[1].ms == 3 && kept[2].ms == 100);
+  topn_insert_check(kept, slot, count, pool);
+
+  /* A row landing in the middle evicts the oldest too. */
+  topn_insert_apply(kept, slot, &count, 3, pool, &mid);
+  assert_true(kept[0].ms == 2 && kept[0].logical == 5);
+  assert_true(kept[1].ms == 3 && kept[2].ms == 100);
+  topn_insert_check(kept, slot, count, pool);
+
+  /* Not newer than the oldest kept: discarded, nothing changes. */
+  assert_int_equal(-1, md_topn_insert(kept, slot, &count, 3, &old));
+  assert_int_equal(3, count);
+  topn_insert_check(kept, slot, count, pool);
+}
+
+/* A long ascending walk (the worst case for the old whole-row shift):
+ * the newest cap rows survive, every pool slot stays in use once. */
+static void test_topn_insert_ascending_walk(void **state)
+{
+  struct md_stamp kept[16];
+  int slot[16];
+  uint64_t pool[16];
+  int count = 0;
+  int i;
+
+  (void)state;
+
+  for (i = 1; i <= 200; i++) {
+    struct md_stamp s;
+
+    s.ms = (uint64_t)i;
+    s.logical = 0;
+    s.node = 0;
+    topn_insert_apply(kept, slot, &count, 16, pool, &s);
+  }
+  assert_int_equal(16, count);
+  for (i = 0; i < 16; i++)
+    assert_true(kept[i].ms == (uint64_t)(185 + i));
+  topn_insert_check(kept, slot, count, pool);
+}
+
+static void test_topn_insert_rejects_bad_args(void **state)
+{
+  struct md_stamp kept[2];
+  int slot[2];
+  int count = 0;
+  struct md_stamp s = { 1, 0, 0 };
+
+  (void)state;
+
+  assert_int_equal(-1, md_topn_insert(NULL, slot, &count, 2, &s));
+  assert_int_equal(-1, md_topn_insert(kept, NULL, &count, 2, &s));
+  assert_int_equal(-1, md_topn_insert(kept, slot, NULL, 2, &s));
+  assert_int_equal(-1, md_topn_insert(kept, slot, &count, 0, &s));
+  assert_int_equal(-1, md_topn_insert(kept, slot, &count, 2, NULL));
+  count = 3;
+  assert_int_equal(-1, md_topn_insert(kept, slot, &count, 2, &s));
+}
+
+/* ------------------------------------------------------------------ */
+/* md_key_replicable (push-2 final fix wave, M-2)                      */
+/* ------------------------------------------------------------------ */
+
+static void test_key_replicable(void **state)
+{
+  char longkey[65];
+  size_t i;
+
+  (void)state;
+
+  /* The user's own keys and the mode-synced / persistence keys travel. */
+  assert_int_equal(1, md_key_replicable("pronouns"));
+  assert_int_equal(1, md_key_replicable("umode.invisible"));
+  assert_int_equal(1, md_key_replicable("draft/persistence/hold"));
+  assert_int_equal(1, md_key_replicable("draft/persistence/profile/x/auto-replay"));
+  /* last_present is this server's own observation (a TTL row): never
+   * replicated or cleared, in any case. */
+  assert_int_equal(0, md_key_replicable("last_present"));
+  assert_int_equal(0, md_key_replicable("LAST_PRESENT"));
+  assert_int_equal(1, md_key_replicable("last_present2"));
+  assert_int_equal(1, md_key_replicable("last_presen"));
+  /* A key the wire validator refuses never goes out either. */
+  assert_int_equal(0, md_key_replicable(NULL));
+  assert_int_equal(0, md_key_replicable(""));
+  assert_int_equal(0, md_key_replicable("1abc"));
+  assert_int_equal(0, md_key_replicable("has space"));
+  for (i = 0; i < 64; i++)
+    longkey[i] = 'a';
+  longkey[64] = '\0';
+  assert_int_equal(0, md_key_replicable(longkey));
+}
+
 int main(void)
 {
   const struct CMUnitTest tests[] = {
@@ -490,10 +1095,30 @@ int main(void)
     cmocka_unit_test(test_chunk_single_line),
     cmocka_unit_test(test_chunk_mismatch_restarts),
     cmocka_unit_test(test_chunk_overflow),
+    cmocka_unit_test(test_chunk_overflow_discards_rest_of_row),
+    cmocka_unit_test(test_chunk_overflow_on_final_piece_no_poison),
+    cmocka_unit_test(test_chunk_mismatch_discards_rest_of_abandoned_row),
+    cmocka_unit_test(test_chunk_nested_interrupts_discard_each_row),
+    cmocka_unit_test(test_chunk_poison_slots_hold_a_chain),
+    cmocka_unit_test(test_chunk_vis_flip_discards_row),
+    cmocka_unit_test(test_chunk_abandon_discards_row),
+    cmocka_unit_test(test_chunk_abandon_final_piece_no_poison),
+    cmocka_unit_test(test_chunk_rejects_oversize_identity),
+    cmocka_unit_test(test_stamp_parse_rejects_over_bufsize),
     cmocka_unit_test(test_pull_parse_ok),
     cmocka_unit_test(test_pull_parse_rejects),
     cmocka_unit_test(test_pull_parse_empty_scope_no_oob),
     cmocka_unit_test(test_pull_parse_seq_overflow_rejected),
+    cmocka_unit_test(test_topn_fewer_than_cap),
+    cmocka_unit_test(test_topn_exactly_cap),
+    cmocka_unit_test(test_topn_more_than_cap_newest_last),
+    cmocka_unit_test(test_topn_ties),
+    cmocka_unit_test(test_topn_unstamped_is_oldest),
+    cmocka_unit_test(test_topn_insert_fill),
+    cmocka_unit_test(test_topn_insert_evicts_into_oldest_slot),
+    cmocka_unit_test(test_topn_insert_ascending_walk),
+    cmocka_unit_test(test_topn_insert_rejects_bad_args),
+    cmocka_unit_test(test_key_replicable),
   };
   return cmocka_run_group_tests(tests, NULL, NULL);
 }

@@ -33,6 +33,15 @@
 #include "s2s_chunk.h"
 #include "crdt_shadow.h"    /* M12: force_lastmod (static inline, pure) */
 
+/* Stub for feature_int: crdt_hlc.c's hlc_max_forward_ms() reads
+ * FEAT_HLC_MAX_FORWARD_MS through it.  Present only so crdt_hlc.o links
+ * standalone (the crdt_hlc_bound_cmocka.c precedent). */
+int feature_int(int feat)
+{
+  (void)feat;
+  return 60000;  /* ircd_features.c's F_I(HLC_MAX_FORWARD_MS) default */
+}
+
 /* ------------------------------------------------------------------ */
 /* helpers                                                            */
 /* ------------------------------------------------------------------ */

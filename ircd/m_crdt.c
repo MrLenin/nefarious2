@@ -1443,7 +1443,7 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
         struct Client *msrc = srcu ? srcu : (srcsrv ? srcsrv : &me);
         struct Client *osrv = srcu ? cli_user(srcu)->server : srcsrv;
         Debug((DEBUG_DEBUG, "CRDT MD: mesh %s %s from %s", ev[0], ev[1], srcyxx));
-        if (metadata_apply_relayed(msrc, ev[0], ev[1], evis, evalue)
+        if (metadata_apply_relayed(NULL, msrc, ev[0], ev[1], evis, evalue)
             && (!osrv || IsMeshStub(osrv))) {
           sendcmdto_set_skip_crdt_servers();
           if (evalue)

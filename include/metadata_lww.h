@@ -49,18 +49,21 @@ struct md_stamp {
   uint16_t node;
 };
 
-/** Buffer big enough for md_stamp_format()'s longest realistic output
- * plus the NUL.  (The theoretical worst case -- a 20-digit ms and two
- * 5-digit fields -- needs a byte more; callers with stamps anywhere near
- * UINT64_MAX milliseconds are not a real scenario this wire format
- * serves.) */
+/** Buffer big enough for the longest stamp text md_stamp_parse()
+ * accepts (MD_STAMP_BUFSIZE - 1 = 31 characters) plus the NUL, and so
+ * for md_stamp_format() of any stamp it returned.  The theoretical worst
+ * case -- a 20-digit ms and two 5-digit fields, 32 characters -- is
+ * refused by md_stamp_parse() rather than truncated downstream (chunk
+ * identity, clock row); a stamp anywhere near UINT64_MAX milliseconds
+ * is not a real scenario this wire format serves. */
 #define MD_STAMP_BUFSIZE 32
 
 /** Parse the decimal stamp text "<ms>.<logical>.<node>" in @a text into
  * @a out. Rejects anything that is not exactly three all-digit fields
  * (no sign, no leading '+', no trailing garbage) separated by exactly
- * two '.' characters, or where the second or third field does not fit
- * in a uint16_t.
+ * two '.' characters, where the second or third field does not fit
+ * in a uint16_t, or whose text is MD_STAMP_BUFSIZE characters or longer
+ * (it would not fit the buffers sized from MD_STAMP_BUFSIZE).
  * @return 0 on success, -1 if malformed.
  */
 extern int md_stamp_parse(const char *text, struct md_stamp *out);
@@ -179,6 +182,22 @@ extern enum md_target_kind md_target_classify(const char *parv1);
 extern int md_flags_parse(const char *tok, int *vis, int *tombstone,
                            int *more);
 
+/** How many interrupted rows one link's chunk state remembers to
+ * discard at once (struct md_chunk's poison slots).  A compliant sender
+ * never interleaves two rows' pieces on one link, so only a
+ * non-compliant one ever fills more than one; past this many live
+ * poisons a slot is reused in turn and that row's poison is forgotten. */
+#define MD_CHUNK_POISON_SLOTS 4
+
+/** One row whose remaining pieces are being discarded (see struct
+ * md_chunk). */
+struct md_chunk_poison {
+  int used;
+  char account[16];
+  char key[128];
+  char stamp[MD_STAMP_BUFSIZE];
+};
+
 /** Chunk-reassembly state for one stamped-account row's value, across
  * one or more wire lines joined by the `+` continuation flag. Each
  * field here except @a value/@a len/@a active/@a dropped identifies
@@ -196,26 +215,65 @@ struct md_chunk {
                   *   the start of every feed call. */
   size_t len;    /**< Bytes accumulated in @a value so far. */
   char value[1024];
+  /** Rows whose rest is being discarded (an overflow, an abandoned
+   * accumulation, an inconsistent or refused piece): every further piece
+   * of a row named in a used slot is swallowed, up to and including its
+   * more=0 piece (which frees the slot), so no tail of it is ever handed
+   * back as the whole value.  One slot per row, so a row interrupted
+   * while another row's poison is live keeps its own (W4 push-1 fix-wave
+   * N3(a)); when every slot is in use they are reused in turn (@a
+   * poison_next). */
+  struct md_chunk_poison poison[MD_CHUNK_POISON_SLOTS];
+  int poison_next;   /**< slot reused when every slot is in use */
 };
 
 enum { MD_CHUNK_ERROR = -1, MD_CHUNK_PENDING = 0, MD_CHUNK_DONE = 1 };
 
 /** Feed one wire line's piece into @a c's reassembly state.
  *
- * If nothing is pending, or @a account/@a stamp/@a key/@a vis differ
- * from what IS pending, any pending value is discarded (@a c->dropped
- * is set to 1) and accumulation restarts fresh from @a piece. Otherwise
- * @a piece is appended to the pending value. Accumulating past 1023
- * bytes total resets @a c (as if nothing had ever been fed) and returns
- * MD_CHUNK_ERROR.
+ * A row is identified by (account, stamp, key); every piece of it must
+ * also agree on @a vis.  Rules, in order:
+ *  - An identity field that does not fit its buffer (@a account over 15
+ *    bytes, i.e. ACCOUNTLEN; @a stamp of MD_STAMP_BUFSIZE bytes or more;
+ *    @a key of 128 or more) is refused: MD_CHUNK_ERROR, state untouched.
+ *    It is never truncated into a name that could match another row.
+ *  - A piece of a poisoned row (see struct md_chunk) is swallowed:
+ *    MD_CHUNK_ERROR, and the pending row (if another) is left alone;
+ *    its more=0 piece also ends that row's poison.
+ *  - A piece of the pending row that disagrees on @a vis: the pending
+ *    value and the rest of the row are discarded (poisoned, unless this
+ *    piece is the row's more=0 one), MD_CHUNK_ERROR.
+ *  - A piece of a different row while one is pending: the pending value
+ *    is discarded (@a c->dropped is set to 1) and the rest of THAT row
+ *    poisoned; accumulation restarts fresh from @a piece.
+ *  - Otherwise @a piece starts or extends the pending value.
+ *    Accumulating past 1023 bytes total discards the value and returns
+ *    MD_CHUNK_ERROR; when @a more is set the rest of the row is
+ *    poisoned too, so its remaining pieces never assemble a tail.
  *
  * @return MD_CHUNK_PENDING if @a more is set (wait for the next line),
  * MD_CHUNK_DONE if this completes the value (@a c->value/@a c->len hold
- * it), or MD_CHUNK_ERROR on overflow.
+ * it), or MD_CHUNK_ERROR when nothing is to be merged from this piece.
  */
 extern int md_chunk_feed(struct md_chunk *c, const char *account,
                           const char *stamp, const char *key, int vis,
                           int more, const char *piece);
+
+/** A caller refused one piece of row (@a account, @a stamp, @a key)
+ * without feeding it (e.g. a malformed or missing flags token):
+ * discard that row's pending value if it is the one pending and, when
+ * @a more says pieces of the row follow the refused one, poison the
+ * rest of the row, so they are never merged as the whole value.  When
+ * @a more is 0 the refused piece was the row's last (or only) one:
+ * nothing follows to discard, and poisoning would swallow the next
+ * delivery of the same row instead (W4 push-1 fix-wave N3(b)).  The
+ * caller decides @a more from what it can read of the line (see
+ * ms_metadata_stamped).  A different row's pending value is left alone.
+ * An identity that does not fit (see md_chunk_feed) is ignored:
+ * md_chunk_feed refuses every piece of such a row anyway.
+ */
+extern void md_chunk_abandon(struct md_chunk *c, const char *account,
+                              const char *stamp, const char *key, int more);
 
 /** Parse an MD PULL request's trailing parameters: parv[2] a decimal
  * sequence number, parv[3] exactly "A" or "R" (the pull scope), and
@@ -234,5 +292,77 @@ extern int md_chunk_feed(struct md_chunk *c, const char *account,
  */
 extern int md_pull_parse(int parc, char *parv[], unsigned long *seq,
                           char *scope, char *accounts[], int max);
+
+/** Bounded top-N-by-stamp selection (fix round 1, 2026-11-02): where a
+ * new row's stamp belongs among the up to @a cap rows a caller is
+ * keeping, newest first out of however many a full account walk visits
+ * -- the same "keep the newest, evict the oldest" shape
+ * mdsync_marker_cb (ircd/metadata_sync.c) already uses for read
+ * markers, generalized to compare by struct md_stamp (md_stamp_cmp)
+ * instead of a timestamp string, and factored out here, pure, so it is
+ * cmocka-testable on its own.
+ *
+ * This function touches no memory of its own: @a kept is read-only,
+ * ascending by stamp (index 0 = oldest), length @a count. It decides
+ * only WHERE @a incoming's stamp would land; the caller -- which alone
+ * knows the shape of the payload (key, value, visibility, tombstone
+ * flag) riding alongside each stamp -- performs the identical shift on
+ * ITS OWN parallel array using the returned index, then writes the new
+ * payload there (and, when @a count < @a cap, increments it):
+ *
+ *   - @a count < @a cap (room to spare): returns the insertion index
+ *     in [0, count] among the ascending kept stamps; the caller shifts
+ *     kept[idx..count-1] up by one to open the slot.
+ *   - @a count == @a cap and @a incoming is not newer than kept[0] (the
+ *     current oldest/smallest, ties included): returns -1 -- discard,
+ *     the caller's array is left untouched.
+ *   - @a count == @a cap and @a incoming IS newer than kept[0]: returns
+ *     the index in [0, cap) incoming's payload belongs at once the
+ *     caller has shifted kept[0..idx-1] down by one (evicting the old
+ *     kept[0]).
+ *
+ * @param[in] kept Ascending-by-stamp array of the rows currently held.
+ * @param[in] count Number of entries in @a kept (0 <= count <= cap).
+ * @param[in] cap Capacity of the caller's array (> 0).
+ * @param[in] incoming The candidate row's stamp.
+ * @return an insertion index as described above, or -1 to discard.
+ */
+extern int md_topn_place(const struct md_stamp *kept, int count, int cap,
+                         const struct md_stamp *incoming);
+
+/** md_topn_place plus the bookkeeping, over an index array instead of
+ * the payloads (push-2 final fix wave, M-4): the caller keeps its
+ * payloads (key, value, visibility, tombstone) in a pool of @a cap
+ * slots that never move, and @a slot[i] names the pool slot of the row
+ * at ordered position i.  This shifts only @a kept (the stamps) and
+ * @a slot, never a payload, and returns the pool slot the caller writes
+ * @a incoming's payload into:
+ *
+ *   - below the cap, the next unused slot (*@a count before the call;
+ *     the slots in use are always 0..count-1), and *@a count grows;
+ *   - at the cap, the slot of the row it evicts (the oldest, kept[0]);
+ *   - -1 when @a incoming is not newer than the oldest kept row (ties
+ *     included), or on a bad argument: nothing changes.
+ *
+ * @param[in,out] kept Ascending-by-stamp stamps of the rows held.
+ * @param[in,out] slot Pool slot of each held row, by ordered position.
+ * @param[in,out] count Number of rows held (0 <= *count <= cap).
+ * @param[in] cap Capacity of @a kept, @a slot and the caller's pool.
+ * @param[in] incoming The candidate row's stamp.
+ * @return the pool slot to fill, or -1 to discard.
+ */
+extern int md_topn_insert(struct md_stamp *kept, int *slot, int *count,
+                          int cap, const struct md_stamp *incoming);
+
+/** Does an account-store row with key @a key travel between servers
+ * (pull replies, burst rows) and belong to a user's METADATA CLEAR?
+ * (push-2 final fix wave, M-2.)  Not the internal keys:
+ *   - "last_present" (any case): each server's own observation of when
+ *     the account was last present, a TTL row account_conn.c writes and
+ *     reads locally;
+ *   - any key the wire validator refuses (md_wire_key_valid).
+ * @return 1 if @a key is replicated, 0 if it stays on this server.
+ */
+extern int md_key_replicable(const char *key);
 
 #endif /* INCLUDED_metadata_lww_h */
