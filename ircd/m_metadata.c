@@ -2055,24 +2055,6 @@ int ms_metadata(struct Client *cptr, struct Client *sptr, int parc, char *parv[]
   return 0;
 }
 
-/* Did a change from @a sptr pass a CRDT-aware server before reaching us?  The
- * tree path runs from the origin's server up its uplinks to &me; the first
- * CRDT server on it is the gateway that minted the change into the doc, and
- * a later one must not mint it again under a later stamp (stage-2 fix
- * review). */
-static int md_passed_crdt(struct Client *sptr)
-{
-  struct Client *s;
-
-  if (!sptr)
-    return 0;
-  s = IsServer(sptr) ? sptr : (cli_user(sptr) ? cli_user(sptr)->server : NULL);
-  for (; s && s != &me && cli_serv(s); s = cli_serv(s)->up)
-    if (IsCrdtAware(s))
-      return 1;
-  return 0;
-}
-
 /* Apply a metadata change that reached us from elsewhere (P10 MD or the
  * CR M 'E' mesh copy) exactly as ms_metadata does: the account form
  * ("*account") and the nick/channel form, each under the Tier C F2-b
@@ -2089,10 +2071,13 @@ int metadata_apply_relayed(struct Client *link, struct Client *sptr,
   struct Client *target_client = NULL;
   struct Channel *target_channel = NULL;
   int limit_rc = METADATA_LIMIT_OK;
-  /* The CR M 'E' mesh copy (@a link NULL), or a change that passed a CRDT
-   * server on its way here (md_passed_crdt): that server is the gateway that
-   * minted the doc entry, so this server must not mint one. */
-  int relayed_from_doc = !link || md_passed_crdt(sptr);
+  /* From a CRDT peer or the CR M 'E' mesh copy (@a link NULL): its origin
+   * already mirrored any doc entry, so this server must not mint one.  A
+   * change from a link that is not CRDT-aware is minted here, the gateway.
+   * (Judged by the direct link, as before the merge: a path walk that trusts
+   * every CRDT-built hop to have written the doc loses changes when one has
+   * not -- shadow off, no store, a legacy bridge between CRDT islands.) */
+  int relayed_from_doc = !link || IsCrdtAware(link);
 
   if (!is_valid_key(key))
     return 0;
@@ -2121,23 +2106,23 @@ int metadata_apply_relayed(struct Client *link, struct Client *sptr,
      * copy) was mirrored into the doc by its origin, so suspend the
      * storage-layer mirror.  One from a link that is not CRDT-aware has no
      * doc entry anywhere: this gateway mints it (stage-2 review). */
-    /* An account row is durable: the gateway that took it from the legacy
-     * side minted it into the doc under its stamp, and the doc reconcile
-     * writes it here under that same stamp.  A store write here would give
-     * it this server's later receive-time stamp, which could then refuse a
-     * newer doc value for good (stage-2 fix review), so this server only
-     * relays it.  Not shadowing: write it as before. */
-    if (relayed_from_doc && crdt_shadow_active())
-      return 1;
+    /* Tier C F2-b single-writer: suspend the doc mirror for a change its
+     * origin already mirrored.  Known gap (design call): this write's
+     * receive-time stamp can outrank a newer doc value; an unstamped legacy
+     * change has no version to carry. */
+    if (relayed_from_doc)
+      crdt_shadow_metadata_suspend(1);
     {
       struct md_stamp st = metadata_stamp_now();
 
       if (metadata_lmdb_is_available())
         (void)metadata_account_put_versioned(account_name, key, value,
                                              visibility, &st);
-      else
+      else if (!relayed_from_doc)
         metadata_doc_mirror_account(account_name, key, value, visibility, &st);
     }
+    if (relayed_from_doc)
+      crdt_shadow_metadata_suspend(0);
     metadata_account_apply_memory(account_name, key, value, visibility);
     return 1;
   }
@@ -2187,13 +2172,6 @@ int metadata_apply_relayed(struct Client *link, struct Client *sptr,
    * (single-writer); no early return until the resume below.  One from a
    * link that is not CRDT-aware has no doc entry: this gateway mints it,
    * or the doc reconcile would put the old value back (stage-2 review). */
-  /* A durable target (an authed user's key, a +R channel's) the gateway
-   * already put in the doc: the reconcile delivers it under its stamp, so it
-   * is not written here under a later one (as the "*account" form above). */
-  if (relayed_from_doc && crdt_shadow_active()
-      && (is_channel ? (target_channel->mode.mode & MODE_REGISTERED) != 0
-                     : (cli_user(target_client) && cli_user(target_client)->account[0])))
-    return 1;
   if (relayed_from_doc)
     crdt_shadow_metadata_suspend(1);
   if (is_channel)
