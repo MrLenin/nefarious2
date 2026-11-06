@@ -43,6 +43,8 @@
 #include "config.h"
 
 #include "bouncer_session.h"
+#include "bouncer_rebind_auth.h"
+#include "bouncer_count.h"
 #include "capab.h"
 #include "channel.h"
 #include "class.h"
@@ -146,6 +148,39 @@ static int bouncer_resume(struct Client *sptr, const char *token)
     return 0;
   }
 
+  /* A session belongs to one Keycloak user: a login under another id never
+   * attaches to it, token or not (user, 2026-10-23). */
+  if (bounce_rebind_kc_conflict(bounce_session_kc_id(session),
+                                cli_user(sptr)->kc_id)) {
+    send_fail(sptr, "BOUNCER", "INVALID_TOKEN", NULL,
+              "Session belongs to a different Keycloak user");
+    return 0;
+  }
+
+  /* A connection that already belongs to a session -- an alias, or a
+   * client a record names as its primary or lists on its roster -- is
+   * never made another session's primary (W3 Task 11 fix 1, M-2).
+   * Refused before anything changes. */
+  if (bounce_client_in_session(sptr)) {
+    send_fail(sptr, "BOUNCER", "SESSION_CONFLICT", session->hs_sessid,
+              "This connection already belongs to a session");
+    return 0;
+  }
+
+  /* Our held ghost is in channels (ruling W3-T11-f1c): the attach would
+   * move its memberships to this client here only -- the other servers
+   * and the legacy links would never learn of them, and the network would
+   * disagree about who is in those channels.  Refused before anything
+   * changes.  A login by SASL revives the ghost in place instead (its
+   * numeric, its channels everywhere).  A session held on another server
+   * is the attach's refusal (SESSION_REMOTE). */
+  if (session->hs_state == BOUNCE_HOLDING && session->hs_client
+      && MyUser(session->hs_client) && cli_user(session->hs_client)->channel) {
+    send_fail(sptr, "BOUNCER", "SESSION_HAS_CHANNELS", session->hs_sessid,
+              "Session is held in channels; reconnect with SASL to attach");
+    return 0;
+  }
+
   /* Compute replay "since" time from the ghost's idle time — messages
    * arriving after the user's last activity may not have been read.
    * Fall back to disconnect time if idle time is unavailable. */
@@ -156,16 +191,27 @@ static int bouncer_resume(struct Client *sptr, const char *token)
     since_time = (idle > 0) ? idle : session->hs_disconnect_time;
   }
 
-  /* Attach client to session */
-  ret = bounce_attach(session, sptr);
+  /* Attach client to session.  It is on the network already: the attach
+   * announces it (BS A) before a held ghost of ours leaves. */
+  ret = bounce_attach(session, sptr, 1);
+  if (ret == -2) {
+    /* Held on another server (W3 Task 11): only its holder can hand the
+     * session over, and a login there is how a client attaches to it.
+     * Nothing changed anywhere. */
+    const char *holder = bounce_held_elsewhere(session);
+    char text[BUFSIZE];
+
+    ircd_snprintf(0, text, sizeof(text),
+                  "Session is held on %s; reconnect with SASL to attach",
+                  holder ? holder : "another server");
+    send_fail(sptr, "BOUNCER", "SESSION_REMOTE", session->hs_sessid, text);
+    return 0;
+  }
   if (ret < 0) {
     send_fail(sptr, "BOUNCER", "INVALID_TOKEN", NULL,
               "Session is already in use");
     return 0;
   }
-
-  /* Broadcast attach to all servers */
-  bounce_broadcast(session, 'A', cli_yxx(sptr));
 
   send_note(sptr, "BOUNCER", "SESSION_RESUMED", session->hs_sessid,
             "Session resumed");
@@ -209,11 +255,7 @@ static void bouncer_listsessions_emit(struct Client *sptr,
   }
 
   if (s->hs_state == BOUNCE_HOLDING && s->hs_disconnect_time) {
-    time_t hold_time = bounce_compute_hold_time_ext(s);
-    time_t remaining = hold_time -
-                       (CurrentTime - s->hs_disconnect_time);
-    if (remaining < 0)
-      remaining = 0;
+    time_t remaining = bounce_hold_remaining(s); /* what the timer uses */
     ircd_snprintf(0, p, rem, "%s %s %s %ldm connects:%u aliases:%d",
                   s->hs_sessid,
                   s->hs_name[0] ? s->hs_name : "*",
@@ -331,6 +373,79 @@ static void bouncer_status_walker(struct BouncerSession *s, void *data)
   c->total_aliases += s->hs_alias_count;
 }
 
+/** Recount the core client counters from the users this server knows.
+ *
+ * Every registered user holds what its exit will release
+ * (bounce_count_held(): one registered user, a live local socket, a local
+ * announced user, an announced user, one in its server's count), so the
+ * counters must equal those sets summed over the users.  Reports each
+ * counter's drift (counter minus recount; 0 when every count was taken
+ * and given up once), and a line for each server whose count is off.
+ * The server counts cost one pass over the users per server: an oper
+ * command, run by hand.
+ */
+static void bouncer_status_recount(struct Client *sptr)
+{
+  struct Client *acptr;
+  struct Client *srv;
+  struct bounce_counts held;
+  unsigned long r_clients = 0, r_local = 0, r_local_ann = 0, r_ann = 0;
+  unsigned long servers_drift = 0;
+  unsigned int servers_off = 0;
+  char buf[400];
+
+  for (acptr = GlobalClientList; acptr; acptr = cli_next(acptr)) {
+    if (!IsUser(acptr))
+      continue;
+    bounce_count_held(MyConnect(acptr), IsBouncerAlias(acptr),
+                      !IsNoLcDecrement(acptr), &held);
+    r_clients += held.clients;
+    r_local += held.local_clients;
+    r_local_ann += held.local_announced;
+    r_ann += held.announced;
+  }
+
+  for (srv = GlobalClientList; srv; srv = cli_next(srv)) {
+    unsigned long n = 0;
+    long d;
+
+    if (!IsServer(srv) || srv == &me || !cli_serv(srv))
+      continue;
+    for (acptr = GlobalClientList; acptr; acptr = cli_next(acptr)) {
+      if (!IsUser(acptr) || !cli_user(acptr) || cli_user(acptr)->server != srv)
+        continue;
+      bounce_count_held(MyConnect(acptr), IsBouncerAlias(acptr),
+                        !IsNoLcDecrement(acptr), &held);
+      n += held.server_clients;
+    }
+    d = (long)cli_serv(srv)->clients - (long)n;
+    if (d) {
+      servers_off++;
+      servers_drift += (unsigned long)(d < 0 ? -d : d);
+      ircd_snprintf(0, buf, sizeof(buf),
+                    "recount server %s clients=%u recount=%lu drift=%ld",
+                    cli_name(srv), cli_serv(srv)->clients, n, d);
+      send_note(sptr, "BOUNCER", "STATUS", "recount", buf);
+    }
+  }
+
+  ircd_snprintf(0, buf, sizeof(buf),
+                "recount clients_drift=%ld local_clients_drift=%ld "
+                "local_announced_drift=%ld announced_drift=%ld "
+                "servers_drift=%lu servers_off=%u "
+                "(clients=%u/%lu local_clients=%u/%lu "
+                "local_announced=%u/%lu announced=%u/%lu)",
+                (long)UserStats.clients - (long)r_clients,
+                (long)UserStats.local_clients - (long)r_local,
+                (long)UserStats.local_announced_clients - (long)r_local_ann,
+                (long)UserStats.announced_clients - (long)r_ann,
+                servers_drift, servers_off,
+                UserStats.clients, r_clients, UserStats.local_clients, r_local,
+                UserStats.local_announced_clients, r_local_ann,
+                UserStats.announced_clients, r_ann);
+  send_note(sptr, "BOUNCER", "STATUS", "recount", buf);
+}
+
 /** Handle BOUNCER STATUS - server-wide bouncer accounting.
  *
  * Oper-only.  Compares walker-derived session/alias counts against
@@ -391,27 +506,29 @@ static int bouncer_status(struct Client *sptr)
                 HighestFd);
   send_note(sptr, "BOUNCER", "STATUS", "localarray", buf);
 
-  /* Audit: UserStats.local_clients should equal (LocalClientArray users) +
-   * (locally-managed holding ghosts).  Held ghosts have no fd so they
-   * are absent from LocalClientArray but still counted in local_clients
-   * until the session is destroyed, which is by design.
+  /* Audit: UserStats.local_clients should equal (LocalClientArray
+   * users) exactly -- live sockets only.  Held ghosts have no fd
+   * (absent from LocalClientArray) AND, since 996ca335, are not
+   * counted in local_clients either: bounce_hold_client decrements
+   * it when the socket closes and bounce_create_ghost never bumps
+   * it for a boot-spawned ghost, both setting FLAG_NO_LC_DECREMENT.
+   * RPL_LUSERME ("I have N clients") is a live-socket count, not a
+   * network-identity count, so holding ghosts stay out of it.
    *
    * drift > 0 means UserStats.local_clients is inflated relative to
-   * the sum of in-list users + holding ghosts → leak.
+   * the in-list users → leak (e.g. the ghost rebind that used to
+   * steal a decrement meant for some other local socket).
    * drift < 0 would mean it's deflated → over-decrement somewhere. */
-  drift = (long)UserStats.local_clients
-        - (long)(la_users + c.local_primary_holding);
+  drift = (long)UserStats.local_clients - (long)la_users;
 
   ircd_snprintf(0, buf, sizeof(buf),
                 "audit local_clients_drift=%ld "
                 "(expected=%u local_clients=%u; "
-                "expected = la_users[%u] + local_holding[%u])",
-                drift,
-                la_users + c.local_primary_holding,
-                UserStats.local_clients,
-                la_users, c.local_primary_holding);
+                "expected = la_users[%u])",
+                drift, la_users, UserStats.local_clients, la_users);
   send_note(sptr, "BOUNCER", "STATUS", "audit", buf);
 
+  bouncer_status_recount(sptr);
   return 0;
 }
 
@@ -445,8 +562,9 @@ static int bouncer_disconnect(struct Client *sptr, const char *sessid)
 
   for (s = as->as_sessions; s; s = s->hs_anext) {
     if (0 == strcmp(s->hs_sessid, sessid)) {
-      bounce_broadcast(s, 'X', NULL);
-      bounce_destroy(s);
+      /* Its holder ends it (here, or the end goes there); the asking
+       * connection carries on, unless it is a device of it. */
+      bounce_member_end(s, sptr, sptr, BOUNCE_MEMBER_END_DISCONNECT, NULL);
       send_note(sptr, "BOUNCER", "SESSION_DISCONNECTED", sessid,
                 "Session disconnected");
       return 0;
@@ -481,10 +599,6 @@ static int bouncer_reset(struct Client *cptr, struct Client *sptr,
 {
   struct AccountSessions *as;
   struct BouncerSession *s = NULL;
-  struct Client *primary;
-  struct Client *aliases[BOUNCER_MAX_ALIASES];
-  int alias_count = 0;
-  int i;
 
   if (!IsAccount(sptr)) {
     send_fail(sptr, "BOUNCER", "ACCOUNT_REQUIRED", NULL,
@@ -513,32 +627,15 @@ static int bouncer_reset(struct Client *cptr, struct Client *sptr,
   if (!s)
     goto notfound;
 
-  /* Snapshot all live connections before destroying the session — once
-   * bounce_destroy runs, hs_aliases[] is gone. */
-  primary = s->hs_client;
-  for (i = 0; i < s->hs_alias_count && alias_count < BOUNCER_MAX_ALIASES; i++) {
-    struct Client *al = findNUser(s->hs_aliases[i].ba_numeric);
-    if (al && IsBouncerAlias(al))
-      aliases[alias_count++] = al;
-  }
-
   send_note(sptr, "BOUNCER", "SESSION_RESET", s->hs_sessid,
             "Session reset; all attached connections terminating");
 
-  /* Destroy session record first so exit paths don't try to re-hold
-   * the primary or untrack against a vanishing session. */
-  bounce_broadcast(s, 'X', NULL);
-  bounce_destroy(s);
-
-  /* Exit aliases (skip caller — exited last). */
-  for (i = 0; i < alias_count; i++) {
-    if (aliases[i] != sptr)
-      exit_client(cptr, aliases[i], &me, "Bouncer session reset");
-  }
-
-  /* Exit primary (skip caller). */
-  if (primary && primary != sptr)
-    exit_client(cptr, primary, &me, "Bouncer session reset");
+  /* Its holder ends it and every connection of it: here when its primary
+   * is ours (or there is none), else the end goes to the primary's server
+   * -- a remote client is never exited here (that splits the network).
+   * The caller is not exited there. */
+  bounce_member_end(s, sptr, cptr, BOUNCE_MEMBER_END_RESET,
+                    "Bouncer session reset");
 
   /* Caller last. Returns CPTR_KILLED iff cptr == sptr. */
   return exit_client(cptr, sptr, &me, "Bouncer session reset");
@@ -558,10 +655,9 @@ notfound:
  * target's account name (and optionally a specific sessid when the
  * target account has multiple sessions).
  *
- * Same destructive semantics as RESET, but the oper invoking the
- * command is not the one being reset, so we don't need the "exit
- * caller last" ordering trick — just exit every targeted connection
- * directly.
+ * Same destructive semantics as RESET.  The oper invoking the command
+ * is usually not one of the session's connections; when it is (its own
+ * account), it is exited last, as RESET's caller is.
  *
  * Without sessid: targets the first session on the account (matches
  * RESET's "default" behaviour for the user's own session).  With
@@ -575,10 +671,7 @@ static int bouncer_oreset(struct Client *cptr, struct Client *sptr,
 {
   struct AccountSessions *as;
   struct BouncerSession *s = NULL;
-  struct Client *primary;
-  struct Client *aliases[BOUNCER_MAX_ALIASES];
-  int alias_count = 0;
-  int i;
+  int member;
 
   if (!account || !*account) {
     send_fail(sptr, "BOUNCER", "NEED_PARAM", "ORESET",
@@ -601,13 +694,9 @@ static int bouncer_oreset(struct Client *cptr, struct Client *sptr,
   if (!s)
     goto notfound;
 
-  /* Snapshot live connections before destroying the session record. */
-  primary = s->hs_client;
-  for (i = 0; i < s->hs_alias_count && alias_count < BOUNCER_MAX_ALIASES; i++) {
-    struct Client *al = findNUser(s->hs_aliases[i].ba_numeric);
-    if (al && IsBouncerAlias(al))
-      aliases[alias_count++] = al;
-  }
+  /* An oper resetting a session of its own account is one of its
+   * connections: it goes last, as RESET's caller does. */
+  member = (bounce_get_session(sptr) == s);
 
   /* Audit trail: emit a server notice so other opers can see who did
    * what.  Match the format used by other oper actions (KILL/GLINE). */
@@ -619,18 +708,14 @@ static int bouncer_oreset(struct Client *cptr, struct Client *sptr,
   send_note(sptr, "BOUNCER", "SESSION_RESET", s->hs_sessid,
             "Session reset by oper");
 
-  /* Destroy session record first so exit paths don't try to re-hold
-   * the primary or untrack against a vanishing session. */
-  bounce_broadcast(s, 'X', NULL);
-  bounce_destroy(s);
+  /* Its holder ends it and every connection of it: here when its primary
+   * is ours (or there is none), else the end goes to the primary's server
+   * -- a remote client is never exited here (that splits the network). */
+  bounce_member_end(s, sptr, cptr, BOUNCE_MEMBER_END_RESET,
+                    "Bouncer session reset by oper");
 
-  /* Exit all attached connections.  None of them is the caller (oper
-   * is on a different account), so plain order is fine. */
-  for (i = 0; i < alias_count; i++)
-    exit_client(cptr, aliases[i], &me, "Bouncer session reset by oper");
-  if (primary)
-    exit_client(cptr, primary, &me, "Bouncer session reset by oper");
-
+  if (member)
+    return exit_client(cptr, sptr, &me, "Bouncer session reset by oper");
   return 0;
 
 notfound:
@@ -711,6 +796,16 @@ static int bouncer_set(struct Client *sptr, int parc, char *parv[])
   if (0 == ircd_strcmp(parv[2], "HOLD")) {
     /* Account-wide hold preference - stored in metadata */
     if (0 == ircd_strcmp(parv[3], "on")) {
+      /* Turning hold on joins the account's session, or makes one when it
+       * has none (W3 12c-2b, user decision U3: all three hold-on paths).
+       * A refusal sets nothing: the preference stays as it was and
+       * nothing goes on the wire (U2). */
+      enum bounce_hold_on_plan plan = bounce_hold_on_plan_for(sptr);
+
+      if (bounce_hold_on_refused(plan)) {
+        bounce_hold_on_fail(sptr, "BOUNCER", plan, "SET");
+        return 0;
+      }
       metadata_set_client(sptr, "draft/persistence/hold", "1", METADATA_VIS_PRIVATE);
       /* Propagate to peers — metadata_set_client only handles local
        * memory + LMDB persistence; the S2S broadcast happens in
@@ -720,60 +815,61 @@ static int bouncer_set(struct Client *sptr, int parc, char *parv[])
        * attaches at the "no preference + DEFAULT_HOLD off" early
        * return.  Visibility "P" mirrors the wire format
        * m_metadata.c::metadata_cmd_set uses for PRIVATE metadata —
-       * target is the client's nick, key is draft/persistence/hold. */
+       * target is the client's nick, key is draft/persistence/hold.
+       * Sent before a join: it names the client by the nick it has now. */
       sendcmdto_serv_butone_v3(&me, CMD_METADATA, NULL, "%s %s P :1",
                             cli_name(sptr), "draft/persistence/hold");
 
-      /* Auto-create session if this client doesn't own one — turning hold on
-       * should be sufficient to get bouncer behavior without needing TOKEN.
-       * Use bounce_get_session(sptr) instead of bounce_has_sessions() so that
-       * stale sessions (whose primaries haven't been cleaned up yet) don't
-       * prevent this client from getting its own session. */
+      /* A client in no session joins the account's session, or makes one
+       * (bounce_hold_on(): BS C then BS A -- a peer receiving BS C alone
+       * has session->hs_client = NULL and cannot route a later local SASL
+       * connection through bounce_setup_local_alias).  A member's session
+       * stands. */
       if (!bounce_get_session(sptr)) {
         struct BouncerSession *session = NULL;
-        if (bounce_create(sptr, &session) == 0 && session) {
-          bounce_broadcast(session, 'C', NULL);
-          /* BS A is what makes peer servers resolve hs_client to the
-           * primary's Client struct on their side — without it, a peer
-           * receiving BS C has session->hs_client = NULL and cannot
-           * route a subsequent local SASL connection through
-           * bounce_setup_local_alias (it falls back to creating a
-           * parallel primary or treating the connection as a regular
-           * user).  register_user's BS A emit site at s_user.c only
-           * fires when register_user itself created the session — for
-           * sessions created here (post-registration via BOUNCER SET
-           * HOLD on), we must emit BS A explicitly. */
-          bounce_broadcast(session, 'A', cli_yxx(sptr));
 
+        switch (bounce_hold_on(sptr, 1, &session)) {
+        case BOUNCE_HOLD_ON_CREATED:
           send_note(sptr, "BOUNCER", "SESSION_CREATED", session->hs_sessid,
                     "Hold mode enabled, session created");
-        } else {
+          break;
+        case BOUNCE_HOLD_ON_JOINED:
+          send_note(sptr, "BOUNCER", "SETTINGS_UPDATED", NULL,
+                    "Hold mode enabled, attached to the account's session");
+          break;
+        case BOUNCE_HOLD_ON_FAILED:
           send_note(sptr, "BOUNCER", "SETTINGS_UPDATED", NULL,
                     "Hold mode enabled (session limit reached)");
+          break;
+        case BOUNCE_HOLD_ON_NOTHING:
+        case BOUNCE_HOLD_ON_REFUSED:   /* found only when acting: logged */
+          send_note(sptr, "BOUNCER", "SETTINGS_UPDATED", NULL,
+                    "Hold mode enabled");
+          break;
         }
       } else {
         send_note(sptr, "BOUNCER", "SETTINGS_UPDATED", NULL,
                   "Hold mode enabled");
       }
     } else if (0 == ircd_strcmp(parv[3], "off")) {
-      metadata_set_client(sptr, "draft/persistence/hold", "0", METADATA_VIS_PRIVATE);
-      /* Propagate "off" to peers — see comment in the "on" branch
-       * above.  Without this, peers retain a stale "1" preference. */
-      sendcmdto_serv_butone_v3(&me, CMD_METADATA, NULL, "%s %s P :0",
-                            cli_name(sptr), "draft/persistence/hold");
+      struct BouncerSession *session = bounce_get_session(sptr);
+
+      /* The preference, unless the end goes to the session's holder on
+       * another server, which writes it when it accepts the end. */
+      if (!session || bounce_end_asker_applies(bounce_member_end_route(session))) {
+        metadata_set_client(sptr, "draft/persistence/hold", "0", METADATA_VIS_PRIVATE);
+        /* Propagate "off" to peers — see comment in the "on" branch
+         * above.  Without this, peers retain a stale "1" preference. */
+        sendcmdto_serv_butone_v3(&me, CMD_METADATA, NULL, "%s %s P :0",
+                              cli_name(sptr), "draft/persistence/hold");
+      }
 
       /* Fix #24: Active teardown — user no longer wants bouncer behavior.
-       * Destroy the session (disconnects all aliases) so the primary
-       * continues as a normal non-bounced IRC client. */
-      {
-        struct BouncerSession *session = bounce_get_session(sptr);
-        if (session) {
-          bounce_broadcast(session, 'X', NULL);
-          /* Tombstone-then-unanchor (detaches primary inside so
-           * exit_one_client doesn't clean up a destroyed session). */
-          bounce_destroy_owned(session);
-        }
-      }
+       * Its holder ends the session (here, or the end goes there): every
+       * device of it is disconnected, and the primary continues as a
+       * normal non-bounced IRC client. */
+      if (session)
+        bounce_member_end(session, sptr, sptr, BOUNCE_MEMBER_END_HOLD_OFF, NULL);
 
       send_note(sptr, "BOUNCER", "SETTINGS_UPDATED", NULL,
                 "Hold mode disabled");
@@ -1009,11 +1105,7 @@ static int bouncer_info(struct Client *sptr)
       char info[512];
 
       if (s->hs_state == BOUNCE_HOLDING && s->hs_disconnect_time) {
-        time_t hold_time = bounce_compute_hold_time_ext(s);
-        time_t remaining = hold_time -
-                           (CurrentTime - s->hs_disconnect_time);
-        if (remaining < 0)
-          remaining = 0;
+        time_t remaining = bounce_hold_remaining(s); /* what the timer uses */
         ircd_snprintf(0, info, sizeof(info),
                       "state=%s hold=%s(%s) connects=%u "
                       "hold_time=%ldm session=%s",

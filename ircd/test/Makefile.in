@@ -15,14 +15,19 @@ TESTPROGS = \
 
 # CMocka test programs (proper assertions)
 #
-# @KC_CMOCKA_TESTPROGS@ is kc_url_cmocka kc_base64_cmocka kc_cache_cmocka
-# kc_jwt_cmocka kc_cred_derive_cmocka kc_error_classify_cmocka under
-# --enable-keycloak, and empty otherwise: those six link ../kc/*.o, which
-# ircd/Makefile only builds when Keycloak is enabled (see configure.in's
-# Keycloak block).  Their build rules stay defined below either way; they
+# @KC_CMOCKA_TESTPROGS@ is kc_url_cmocka kc_base64_cmocka kc_cache_cmocka ... webhook_subject_cmocka
+# kc_jwt_cmocka kc_cred_derive_cmocka kc_error_classify_cmocka
+# ircd_kc_adapter_cmocka under --enable-keycloak, and empty otherwise: the
+# kc suites link ../kc/*.o, which ircd/Makefile only builds when Keycloak
+# is enabled (see configure.in's Keycloak block), and the adapter's body is
+# #ifdef USE_LIBKC.  Their build rules stay defined below either way; they
 # are simply never requested.
+#
+# @EPOLL_CMOCKA_TESTPROGS@ is ircd_events_cmocka when the epoll engine is
+# built, and empty otherwise: it links ../engine_epoll.o.
 CMOCKA_TESTPROGS = \
 	@KC_CMOCKA_TESTPROGS@ \
+	@EPOLL_CMOCKA_TESTPROGS@ \
 	ircd_chattr_cmocka \
 	ircd_match_cmocka \
 	ircd_string_cmocka \
@@ -41,14 +46,26 @@ CMOCKA_TESTPROGS = \
 	crdt_meshmap_cmocka \
 	crdt_wire_hardening_cmocka \
 	register_throttle_cmocka \
+	ipcheck_refund_cmocka \
+	fakelag_cmocka \
 	webpush_mute_cmocka \
 	webpush_expiry_cmocka \
 	webpush_keyring_cmocka \
 	webpush_attention_cmocka \
 	bouncer_converge_cmocka \
+	bouncer_wire_cmocka \
+	bouncer_count_cmocka \
+	bouncer_rebind_auth_cmocka \
+	exit_reason_cmocka \
+	bouncer_deauth_cmocka \
+	sessid_index_cmocka \
+	metadata_lww_cmocka \
 	webpush_line_cmocka \
 	websocket_cmocka \
-	db_casefold_cmocka
+	db_casefold_cmocka \
+	account_id_cmocka \
+	webhook_eventlog_cmocka \
+	crdt_hlc_bound_cmocka
 
 CMOCKA_LIBS = -lcmocka
 ZSTD_LIBS = -lzstd
@@ -79,11 +96,21 @@ DEP_SRC = \
 	crdt_meshmap_cmocka.c \
 	crdt_wire_hardening_cmocka.c \
 	register_throttle_cmocka.c \
+	ipcheck_refund_cmocka.c \
+	fakelag_cmocka.c \
 	webpush_mute_cmocka.c \
 	webpush_expiry_cmocka.c \
 	webpush_keyring_cmocka.c \
 	webpush_attention_cmocka.c \
 	bouncer_converge_cmocka.c \
+	bouncer_wire_cmocka.c \
+	bouncer_count_cmocka.c \
+	bouncer_rebind_auth_cmocka.c \
+	exit_reason_cmocka.c \
+	bouncer_deauth_cmocka.c \
+	sessid_index_cmocka.c \
+	metadata_lww_cmocka.c \
+	webhook_eventlog_cmocka.c \
 	webpush_line_cmocka.c \
 	kc_url_cmocka.c \
 	kc_base64_cmocka.c \
@@ -91,8 +118,14 @@ DEP_SRC = \
 	kc_jwt_cmocka.c \
 	kc_cred_derive_cmocka.c \
 	kc_error_classify_cmocka.c \
+	ircd_kc_adapter_cmocka.c \
 	websocket_cmocka.c \
 	db_casefold_cmocka.c \
+	account_id_cmocka.c \
+	webhook_subject_cmocka.c \
+	kc_webhook_sig_cmocka.c \
+	ircd_events_cmocka.c \
+	crdt_hlc_bound_cmocka.c \
 	test_stub.c
 
 all: ${TESTPROGS}
@@ -231,6 +264,21 @@ REGISTER_THROTTLE_CMOCKA_OBJS = register_throttle_cmocka.o register_throttle_tes
 register_throttle_cmocka: $(REGISTER_THROTTLE_CMOCKA_OBJS)
 	${CC} -o $@ $(LDFLAGS) $(REGISTER_THROTTLE_CMOCKA_OBJS) $(CMOCKA_LIBS)
 
+# ipcheck_refund tests - the module is recompiled with a 1-bucket, 2-slot
+# table so a full bucket is reachable with arbitrary account names.
+# No test_stub.o: the module is pure by design (no log_write, no ircd deps).
+ipcheck_refund_test.o: ../ipcheck_refund.c ../../include/ipcheck_refund.h
+	${CC} ${CFLAGS} ${CPPFLAGS} -DIPCHECK_REFUND_TABLE_BITS=0 -DIPCHECK_REFUND_BUCKET_DEPTH=2 -c -o $@ ../ipcheck_refund.c
+
+IPCHECK_REFUND_CMOCKA_OBJS = ipcheck_refund_cmocka.o ipcheck_refund_test.o
+ipcheck_refund_cmocka: $(IPCHECK_REFUND_CMOCKA_OBJS)
+	${CC} -o $@ $(LDFLAGS) $(IPCHECK_REFUND_CMOCKA_OBJS) $(CMOCKA_LIBS)
+
+# fake-lag credit: header-only (include/fakelag.h)
+FAKELAG_CMOCKA_OBJS = fakelag_cmocka.o
+fakelag_cmocka: $(FAKELAG_CMOCKA_OBJS)
+	${CC} -o $@ $(LDFLAGS) $(FAKELAG_CMOCKA_OBJS) $(CMOCKA_LIBS)
+
 # kc_url tests - vendored libkc URL builders.  kc_url.c calls
 # curl_easy_escape in kc_url_group_by_path, hence -lcurl.  The test
 # stubs kc_get_log_ops itself so kc.o (and the whole HTTP stack) stays
@@ -269,6 +317,16 @@ kc_cred_derive_cmocka: $(KC_CRED_DERIVE_CMOCKA_OBJS)
 KC_ERROR_CLASSIFY_CMOCKA_OBJS = kc_error_classify_cmocka.o ../kc/kc_error_classify.o
 kc_error_classify_cmocka: $(KC_ERROR_CLASSIFY_CMOCKA_OBJS)
 	${CC} -o $@ $(LDFLAGS) $(KC_ERROR_CLASSIFY_CMOCKA_OBJS) $(CMOCKA_LIBS) $(JANSSON_LIBS)
+
+# ircd_kc_adapter tests - libkc's socket and timer bridge onto the event
+# engine.  The event layer is a fake in the test with the kernel's fd
+# semantics (lowest free number on open, epoll registrations keyed by the
+# number and dropped on close), so an engine call made with a number libkc
+# already gave back is observable.  No libkc objects are linked; libcrypto
+# is, for the OpenSSL error-queue drain after each call into libkc.
+IRCD_KC_ADAPTER_CMOCKA_OBJS = ircd_kc_adapter_cmocka.o test_stub.o ../ircd_kc_adapter.o
+ircd_kc_adapter_cmocka: $(IRCD_KC_ADAPTER_CMOCKA_OBJS)
+	${CC} -o $@ $(LDFLAGS) $(IRCD_KC_ADAPTER_CMOCKA_OBJS) $(CMOCKA_LIBS) $(SSL_LIBS)
 # websocket tests - frame decoding and handshake accumulation (#98, #99).
 # Includes websocket.c directly with stubs; needs OpenSSL for the accept key.
 WEBSOCKET_CMOCKA_OBJS = websocket_cmocka.o test_stub.o ../ircd_alloc.o ../ircd_string.o
@@ -282,6 +340,33 @@ websocket_cmocka: $(WEBSOCKET_CMOCKA_OBJS)
 DB_CASEFOLD_CMOCKA_OBJS = db_casefold_cmocka.o test_stub.o ../db_casefold.o ../ircd_string.o
 db_casefold_cmocka: $(DB_CASEFOLD_CMOCKA_OBJS)
 	${CC} -o $@ $(LDFLAGS) $(DB_CASEFOLD_CMOCKA_OBJS) $(CMOCKA_LIBS)
+
+# account_id tests - the compact Keycloak user id codec (pure; links the
+# webpush base64url helpers it reuses)
+ACCOUNT_ID_CMOCKA_OBJS = account_id_cmocka.o ../account_id.o ../webpush_keyring.o
+account_id_cmocka: $(ACCOUNT_ID_CMOCKA_OBJS)
+	${CC} -o $@ $(LDFLAGS) $(ACCOUNT_ID_CMOCKA_OBJS) $(CMOCKA_LIBS)
+
+# webhook_subject tests - the pure webhook subject decision over real
+# Keycloak admin-event shapes (fixtures/webhook); links no ircd objects
+WEBHOOK_SUBJECT_CMOCKA_OBJS = webhook_subject_cmocka.o ../webhook_subject.o ../account_id.o ../webpush_keyring.o
+webhook_subject_cmocka.o: ${srcdir}/webhook_subject_cmocka.c
+	${CC} ${CFLAGS} ${CPPFLAGS} -DWEBHOOK_FIXTURE_DIR='"${srcdir}/fixtures/webhook"' -c -o $@ ${srcdir}/webhook_subject_cmocka.c
+webhook_subject_cmocka: $(WEBHOOK_SUBJECT_CMOCKA_OBJS)
+	${CC} -o $@ $(LDFLAGS) $(WEBHOOK_SUBJECT_CMOCKA_OBJS) $(CMOCKA_LIBS) $(JANSSON_LIBS)
+
+# kc_webhook_sig tests - signature verification and the replay ring (pure; OpenSSL)
+KC_WEBHOOK_SIG_CMOCKA_OBJS = kc_webhook_sig_cmocka.o ../kc/kc_webhook_sig.o
+kc_webhook_sig_cmocka: $(KC_WEBHOOK_SIG_CMOCKA_OBJS)
+	${CC} -o $@ $(LDFLAGS) $(KC_WEBHOOK_SIG_CMOCKA_OBJS) $(CMOCKA_LIBS) $(SSL_LIBS)
+
+# ircd_events tests - an engine error never runs a socket's callback
+# inside the socket_add/socket_events/socket_state call that caused it.
+# Links the real event core and epoll engine, and makes real epoll calls
+# fail; the few ircd symbols around them are stubbed in the test.
+IRCD_EVENTS_CMOCKA_OBJS = ircd_events_cmocka.o test_stub.o ../ircd_events.o ../engine_epoll.o ../crdt_hlc.o
+ircd_events_cmocka: $(IRCD_EVENTS_CMOCKA_OBJS)
+	${CC} -o $@ $(LDFLAGS) $(IRCD_EVENTS_CMOCKA_OBJS) $(CMOCKA_LIBS)
 
 .c.o:
 	${CC} ${CFLAGS} ${CPPFLAGS} -c $< -o $@
@@ -387,12 +472,80 @@ webpush_attention_cmocka: $(WEBPUSH_ATTENTION_CMOCKA_OBJS)
 	${CC} -o $@ $(LDFLAGS) $(WEBPUSH_ATTENTION_CMOCKA_OBJS) $(CMOCKA_LIBS)
 
 # bouncer_converge tests - the module is pure (no ircd deps)
-bouncer_converge_test.o: ../bouncer_converge.c ../../include/bouncer_converge.h
+# The suite also links bouncer_wire (the hold-mark stamp it composes with).
+bouncer_converge_test.o: ../bouncer_converge.c ../../include/bouncer_converge.h \
+		../../include/bouncer_wire.h
 	${CC} ${CFLAGS} ${CPPFLAGS} -c -o $@ ../bouncer_converge.c
 
-BOUNCER_CONVERGE_CMOCKA_OBJS = bouncer_converge_cmocka.o bouncer_converge_test.o
+BOUNCER_CONVERGE_CMOCKA_OBJS = bouncer_converge_cmocka.o bouncer_converge_test.o \
+	bouncer_wire_test.o
 bouncer_converge_cmocka: $(BOUNCER_CONVERGE_CMOCKA_OBJS)
 	${CC} -o $@ $(LDFLAGS) $(BOUNCER_CONVERGE_CMOCKA_OBJS) $(CMOCKA_LIBS)
+
+# bouncer_wire tests - the module is pure (no ircd deps)
+bouncer_wire_test.o: ../bouncer_wire.c ../../include/bouncer_wire.h \
+		../../include/bouncer_rebind_auth.h
+	${CC} ${CFLAGS} ${CPPFLAGS} -c -o $@ ../bouncer_wire.c
+
+BOUNCER_WIRE_CMOCKA_OBJS = bouncer_wire_cmocka.o bouncer_wire_test.o
+bouncer_wire_cmocka: $(BOUNCER_WIRE_CMOCKA_OBJS)
+	${CC} -o $@ $(LDFLAGS) $(BOUNCER_WIRE_CMOCKA_OBJS) $(CMOCKA_LIBS)
+
+# bouncer_count tests - the module is pure (no ircd deps)
+bouncer_count_test.o: ../bouncer_count.c ../../include/bouncer_count.h
+	${CC} ${CFLAGS} ${CPPFLAGS} -c -o $@ ../bouncer_count.c
+
+BOUNCER_COUNT_CMOCKA_OBJS = bouncer_count_cmocka.o bouncer_count_test.o
+bouncer_count_cmocka: $(BOUNCER_COUNT_CMOCKA_OBJS)
+	${CC} -o $@ $(LDFLAGS) $(BOUNCER_COUNT_CMOCKA_OBJS) $(CMOCKA_LIBS)
+
+# bouncer_deauth tests - the module is pure (no ircd deps)
+bouncer_deauth_test.o: ../bouncer_deauth.c ../../include/bouncer_deauth.h
+	${CC} ${CFLAGS} ${CPPFLAGS} -c -o $@ ../bouncer_deauth.c
+
+BOUNCER_DEAUTH_CMOCKA_OBJS = bouncer_deauth_cmocka.o bouncer_deauth_test.o
+bouncer_deauth_cmocka: $(BOUNCER_DEAUTH_CMOCKA_OBJS)
+	${CC} -o $@ $(LDFLAGS) $(BOUNCER_DEAUTH_CMOCKA_OBJS) $(CMOCKA_LIBS)
+
+# sessid_index tests - the module is pure (no ircd deps)
+sessid_index_test.o: ../sessid_index.c ../../include/sessid_index.h
+	${CC} ${CFLAGS} ${CPPFLAGS} -c -o $@ ../sessid_index.c
+
+SESSID_INDEX_CMOCKA_OBJS = sessid_index_cmocka.o sessid_index_test.o
+sessid_index_cmocka: $(SESSID_INDEX_CMOCKA_OBJS)
+	${CC} -o $@ $(LDFLAGS) $(SESSID_INDEX_CMOCKA_OBJS) $(CMOCKA_LIBS)
+
+# metadata_lww tests - the module is pure (no ircd deps)
+metadata_lww_test.o: ../metadata_lww.c ../../include/metadata_lww.h
+	${CC} ${CFLAGS} ${CPPFLAGS} -c -o $@ ../metadata_lww.c
+
+METADATA_LWW_CMOCKA_OBJS = metadata_lww_cmocka.o metadata_lww_test.o
+metadata_lww_cmocka: $(METADATA_LWW_CMOCKA_OBJS)
+	${CC} -o $@ $(LDFLAGS) $(METADATA_LWW_CMOCKA_OBJS) $(CMOCKA_LIBS)
+
+# webhook_eventlog tests - the applied-events log is pure (no ircd deps, no jansson)
+webhook_eventlog_test.o: ../webhook_eventlog.c ../../include/webhook_eventlog.h
+	${CC} ${CFLAGS} ${CPPFLAGS} -c -o $@ ../webhook_eventlog.c
+
+WEBHOOK_EVENTLOG_CMOCKA_OBJS = webhook_eventlog_cmocka.o webhook_eventlog_test.o
+webhook_eventlog_cmocka: $(WEBHOOK_EVENTLOG_CMOCKA_OBJS)
+	${CC} -o $@ $(LDFLAGS) $(WEBHOOK_EVENTLOG_CMOCKA_OBJS) $(CMOCKA_LIBS)
+
+# bouncer_rebind_auth tests - the module is pure (no ircd deps)
+bouncer_rebind_auth_test.o: ../bouncer_rebind_auth.c ../../include/bouncer_rebind_auth.h
+	${CC} ${CFLAGS} ${CPPFLAGS} -c -o $@ ../bouncer_rebind_auth.c
+
+BOUNCER_REBIND_AUTH_CMOCKA_OBJS = bouncer_rebind_auth_cmocka.o bouncer_rebind_auth_test.o
+bouncer_rebind_auth_cmocka: $(BOUNCER_REBIND_AUTH_CMOCKA_OBJS)
+	${CC} -o $@ $(LDFLAGS) $(BOUNCER_REBIND_AUTH_CMOCKA_OBJS) $(CMOCKA_LIBS)
+
+# exit_reason tests - the module is pure (no ircd deps)
+exit_reason_test.o: ../exit_reason.c ../../include/exit_reason.h
+	${CC} ${CFLAGS} ${CPPFLAGS} -c -o $@ ../exit_reason.c
+
+EXIT_REASON_CMOCKA_OBJS = exit_reason_cmocka.o exit_reason_test.o
+exit_reason_cmocka: $(EXIT_REASON_CMOCKA_OBJS)
+	${CC} -o $@ $(LDFLAGS) $(EXIT_REASON_CMOCKA_OBJS) $(CMOCKA_LIBS)
 
 # webpush_line tests - the module is pure (no ircd deps)
 webpush_line_test.o: ../webpush_line.c ../../include/webpush_line.h
@@ -401,3 +554,10 @@ webpush_line_test.o: ../webpush_line.c ../../include/webpush_line.h
 WEBPUSH_LINE_CMOCKA_OBJS = webpush_line_cmocka.o webpush_line_test.o
 webpush_line_cmocka: $(WEBPUSH_LINE_CMOCKA_OBJS)
 	${CC} -o $@ $(LDFLAGS) $(WEBPUSH_LINE_CMOCKA_OBJS) $(CMOCKA_LIBS)
+
+# crdt_hlc_bound tests - the HLC_MAX_FORWARD_MS bound on hlc_receive_bounded.
+# Links the real crdt_hlc.o (built by the top-level `make` before this
+# runs); test_stub.o supplies log_write for the overflow warning path.
+CRDT_HLC_BOUND_CMOCKA_OBJS = crdt_hlc_bound_cmocka.o test_stub.o ../crdt_hlc.o
+crdt_hlc_bound_cmocka: $(CRDT_HLC_BOUND_CMOCKA_OBJS)
+	${CC} -o $@ $(LDFLAGS) $(CRDT_HLC_BOUND_CMOCKA_OBJS) $(CMOCKA_LIBS)

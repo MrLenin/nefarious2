@@ -31,6 +31,9 @@
 #ifndef INCLUDED_ircd_defs_h
 #include "ircd_defs.h"       /* sizes */
 #endif
+#ifndef INCLUDED_account_id_h
+#include "account_id.h"      /* ACCOUNT_ID_LEN */
+#endif
 
 struct DLink;
 struct Client;
@@ -65,6 +68,9 @@ struct Server {
 
   unsigned int ml_max_bytes;    /**< Remote server's MULTILINE_MAX_BYTES (0 = unknown/legacy) */
   unsigned int ml_max_lines;    /**< Remote server's MULTILINE_MAX_LINES (0 = unknown/legacy) */
+  unsigned long link_serial;    /**< Direct link: which establishment of a link
+                                     this is (server_estab), never reused; 0
+                                     for a server behind another */
 };
 
 /** Describes a user on the network. */
@@ -92,6 +98,7 @@ struct User {
   char               realhost[HOSTLEN + 1];   /**< actual hostname */
   char               account[ACCOUNTLEN + 1]; /**< IRC account name */
   time_t             acc_create;              /**< IRC account timestamp */
+  char               kc_id[ACCOUNT_ID_LEN + 1];  /**< Keycloak user id, compact; "" = unknown */
   char               swhois[BUFSIZE + 1];     /**< SWHOIS message */
   char               cloakip[HOSTLEN + 1];    /**< Cloaked IP */
   char               cloakhost[HOSTLEN + 1];  /**< Cloaked host */

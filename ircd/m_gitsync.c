@@ -48,6 +48,7 @@
 #include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <openssl/err.h>
 #include <openssl/pem.h>
 #include <openssl/x509.h>
 #include <openssl/evp.h>
@@ -315,6 +316,11 @@ cleanup:
     EVP_PKEY_free(pkey);
   if (bio)
     BIO_free(bio);
+  /* The first PEM_read_X509() fails on a key-first file and its reasons
+   * stay on the thread's OpenSSL error queue, where a TLS connection's
+   * next SSL_get_error() would read them as its own (ssl_clear_errors()
+   * in ssl.c): leave nothing behind. */
+  ERR_clear_error();
 
   return result;
 }
@@ -442,6 +448,15 @@ int mo_gitsync(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
         return send_reply(sptr, ERR_NOSUCHSERVER, target);
       }
       if (!IsMe(acptr)) {
+        /* GITSYNC is a fork-only P10 token; a legacy next hop doesn't
+         * know it and would just drop it as noise, but the
+         * wire-hygiene rule is that a legacy peer never receives what
+         * it does not understand, so refuse the oper's request up
+         * front instead of sending it. */
+        if (!IsIRCv3Aware(cli_from(acptr)))
+          return send_reply(sptr, SND_EXPLICIT | ERR_NOSUCHSERVER,
+                             "%s :Server does not take GITSYNC over a legacy link",
+                             cli_name(acptr));
         /* Forward to remote server */
         if (subarg)
           sendcmdto_one(sptr, CMD_GITSYNC, acptr, "%C %s %s", acptr, action, subarg);
@@ -759,13 +774,20 @@ int ms_gitsync(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
       acptr = find_match_server(target);
 
     if (!acptr || !IsMe(acptr)) {
-      /* Not for us, forward */
-      if (acptr) {
+      /* Not for us, forward -- unless the next hop toward it is a
+       * legacy (non-IRCv3-aware) link, in which case drop the forward:
+       * GITSYNC is a fork-only token that link doesn't understand.
+       * The oper's own server only saw an aware next hop (us), so this
+       * hop owes them the refusal mo_gitsync gives locally. */
+      if (acptr && IsIRCv3Aware(cli_from(acptr))) {
         if (subarg)
           sendcmdto_one(sptr, CMD_GITSYNC, acptr, "%C %s %s", acptr, action, subarg);
         else
           sendcmdto_one(sptr, CMD_GITSYNC, acptr, "%C %s", acptr, action);
-      }
+      } else if (acptr && IsUser(sptr))
+        send_reply(sptr, SND_EXPLICIT | ERR_NOSUCHSERVER,
+                   "%s :Server does not take GITSYNC over a legacy link",
+                   cli_name(acptr));
       return 0;
     }
     /* Fall through to handle locally */

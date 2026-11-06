@@ -96,12 +96,13 @@ extern void userstats_count_clear(struct Client *cptr);
 
 /** Count a remote user quit.
  *
- * Decrements clients (sockets) unconditionally.  announced_clients
- * decrements only if cptr is NOT a bouncer alias — aliases were
- * never counted in announced_clients (they came via BX C, not N).
- * The BX-X exit path for aliases reuses this macro for the
- * non-announced sides; gating the announced decrement on
- * !IsBouncerAlias prevents underflow. */
+ * Releases what Count_newremoteclient took: one registered user, one
+ * in its server's count, one announced user.  A remote alias must never
+ * reach this macro: it holds no count (BX C counts nothing, and a client
+ * converted into one in place gave its counts up then), and every exit
+ * path skips it.  The !IsBouncerAlias gate covers only the announced
+ * decrement; clients and the server's count would still be
+ * decremented. */
 #define Count_remoteclientquits(UserStats,cptr)                \
   do { \
     --UserStats.clients; \
@@ -194,8 +195,8 @@ void count_unknowns_underflow(const char *file, int line, const char *what);
  * ARE counted there from their creation through destroy.
  *
  * Announced counters decrement only if cptr is NOT a bouncer alias
- * — aliases got their announced bump at register_user but had it
- * removed by bounce_setup_local_alias when they were converted.
+ * — aliases got their announced bump at register_user but gave it up
+ * when they became one (bounce_setup_local_alias, a demote).
  * Held ghosts (IsBouncerHold) ARE still announced and need the
  * decrement on destroy. */
 #define Count_clientdisconnects(cptr, UserStats) \
@@ -212,6 +213,13 @@ void count_unknowns_underflow(const char *file, int line, const char *what);
         && match(feature_str(FEAT_DOMAINNAME), cli_sockhost(cptr)) == 0) \
       --current_load.local_count; \
   } while(0)
+/** Undo Count_unknownbecomesclient() for a local client that goes back to
+ * an unregistered connection before it was announced: a registration the
+ * bouncer defers (register_user()'s DEFER_PEER_INBOUND).  Its exit as an
+ * unknown, or its registration at the drain, counts it again.  The maxima
+ * stay where they are. */
+#define Count_clientbecomesunknown(cptr, UserStats) \
+  do { Count_clientdisconnects(cptr, UserStats); Count_newunknown(UserStats); } while (0)
 /** Update counters when a local server disconnects. */
 #define Count_serverdisconnects(UserStats)              do { --UserStats.local_servers; --UserStats.servers; } while(0)
 /** Update counters when an unknown client disconnects. */

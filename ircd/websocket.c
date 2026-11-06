@@ -183,17 +183,19 @@ static int parse_ws_handshake(const char *buffer, int length,
       /* Token-boundary scan (a hypothetical "notext.ircv3.net" must
        * not match); first supported token wins, and a preference
        * already chosen from an earlier header line is never
-       * overridden, so multi-header requests keep client order. */
+       * overridden, so multi-header requests keep client order.
+       * The line is not NUL-terminated at its "\r\n", so every step is
+       * bounded by end; each pass consumes at least one byte. */
       const char *p = line + 23;
-      while (*p && *subproto == WS_SUBPROTO_NONE) {
+      while (p < end && *subproto == WS_SUBPROTO_NONE) {
         const char *e;
         size_t n;
-        while (*p == ' ' || *p == '\t' || *p == ',')
+        while (p < end && (*p == ' ' || *p == '\t' || *p == ','))
           p++;
-        if (!*p)
+        if (p >= end)
           break;
         e = p;
-        while (*e && *e != ',' && *e != ' ' && *e != '\t' && *e != '\r')
+        while (e < end && *e != ',' && *e != ' ' && *e != '\t')
           e++;
         n = (size_t)(e - p);
         if (n == 14 && 0 == strncasecmp(p, "text.ircv3.net", 14))
@@ -385,6 +387,7 @@ int websocket_handshake(struct Client *cptr, const char *buffer, int length)
     resp_len = build_ws_forbidden_response(response);
     if (cli_socket(cptr).ssl) {
       SSL_write(cli_socket(cptr).ssl, response, resp_len);
+      ssl_clear_errors("after SSL_write");  /* unchecked: leave nothing */
     } else {
       unsigned int bytes_sent;
       os_send_nonb(cli_fd(cptr), response, resp_len, &bytes_sent);
@@ -407,6 +410,8 @@ int websocket_handshake(struct Client *cptr, const char *buffer, int length)
   /* Use SSL_write for SSL connections, os_send_nonb for plain */
   if (cli_socket(cptr).ssl) {
     int send_result = SSL_write(cli_socket(cptr).ssl, response, resp_len);
+    /* Its failure is not read through SSL_get_error(): leave nothing. */
+    ssl_clear_errors("after SSL_write");
     if (send_result <= 0) {
       Debug((DEBUG_DEBUG, "WebSocket: Failed to send handshake response to %s (SSL_write returned %d)",
              cli_sockhost(cptr), send_result));
@@ -738,21 +743,67 @@ static int ws_send_raw(struct Client *cptr, const unsigned char *data, int len)
 {
   /* Never interleave with a pending blocked TLS write or a stashed
    * partial frame: OpenSSL requires the retry SSL_write to present the
-   * SAME buffer (else SSL_ERROR_SSL "bad write retry" kills the
-   * connection), and a plaintext partial frame must be completed before
-   * any new bytes.  All callers are best-effort: WS PING responses are
-   * re-askable and close/keepalive frames are optional. */
+   * same record (a different one is SSL_ERROR_SSL "bad write retry" and
+   * the connection is killed), and a plaintext partial frame must be
+   * completed before any new bytes.  All callers are best-effort: WS
+   * PING responses are re-askable and close/keepalive frames are
+   * optional. */
   if (IsBlocked(cptr) || con_ws_txrem(cli_connect(cptr)))
     return 0;
 #ifdef USE_SSL
   if (cli_socket(cptr).ssl) {
-    int result = SSL_write(cli_socket(cptr).ssl, data, len);
-    return (result > 0) ? 1 : 0;
+    /* Written from a heap copy that becomes the stash on want-write, so
+     * the retry presents the same bytes at the same address.  Returning
+     * silently on want-write left OpenSSL holding this frame as ITS
+     * pending record: the keepalive PING (or a PONG to a client PING)
+     * went pending while the peer had stopped acknowledging -- a phone
+     * asleep, its small socket buffer full and the IRC queue empty --
+     * and the next data line was the kill. */
+    struct Connection *wcon = cli_connect(cptr);
+    char *copy = (char *)MyMalloc(len);
+    int result;
+
+    memcpy(copy, data, len);
+    ssl_clear_errors("before SSL_write");
+    result = SSL_write(cli_socket(cptr).ssl, copy, len);
+    if (result > 0) {
+      MyFree(copy);
+      return 1;
+    }
+    {
+      int se = SSL_get_error(cli_socket(cptr).ssl, result);
+      if (se == SSL_ERROR_WANT_WRITE || se == SSL_ERROR_WANT_READ) {
+        con_ws_txrem(wcon) = copy;
+        con_ws_txrem_len(wcon) = len;
+        con_ws_txrem_pos(wcon) = 0;
+        SetFlag(cptr, FLAG_BLOCKED);
+        update_write(cptr);
+      } else
+        MyFree(copy);
+      return 0;
+    }
   }
 #endif
   {
-    unsigned int bytes_sent;
-    return (os_send_nonb(cli_fd(cptr), (char *)data, len, &bytes_sent) == IO_SUCCESS) ? 1 : 0;
+    unsigned int bytes_sent = 0;
+    IOResult r = os_send_nonb(cli_fd(cptr), (char *)data, len, &bytes_sent);
+    if (r == IO_SUCCESS && bytes_sent >= (unsigned)len)
+      return 1;
+    if (r == IO_FAILURE)
+      return 0;
+    /* A short (or blocked) plaintext write: the bytes already on the
+     * wire are the head of this frame, so the rest must follow before
+     * any other frame. */
+    {
+      struct Connection *wcon = cli_connect(cptr);
+      con_ws_txrem(wcon) = (char *)MyMalloc(len);
+      memcpy(con_ws_txrem(wcon), data, len);
+      con_ws_txrem_len(wcon) = len;
+      con_ws_txrem_pos(wcon) = (int)bytes_sent;
+      SetFlag(cptr, FLAG_BLOCKED);
+      update_write(cptr);
+    }
+    return 0;
   }
 }
 

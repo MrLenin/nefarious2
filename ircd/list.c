@@ -46,9 +46,11 @@
 #include "s_user.h"
 #include "send.h"
 #include "struct.h"
+#include "uping.h"
 #include "whowas.h"
 #include "metadata.h"
 #include "bouncer_session.h"
+#include "sessid_index.h"
 
 /* #include <assert.h> -- Now using assert in ircd_log.h */
 #include <stddef.h>  /* offsetof */
@@ -77,6 +79,98 @@ static struct DLink* dlinkFreeList;
 static unsigned int dlinkAllocCount;
 /** Number of DLink structures in freelist. */
 static unsigned int dlinkFreeCount;
+
+/** Compile-time check that the pure sessid_index's key buffer and the
+ * Client's own session-id buffer never drift apart -- sessid_index.c
+ * may not include client.h to read S2S_SESSID_BUFSIZE itself (it stays
+ * free of ircd headers for the cmocka suite), so the two headers each
+ * carry their own constant and this catches the day one of them
+ * changes without the other. */
+typedef char sessid_index_keylen_matches_bufsize[
+  (SESSID_INDEX_KEYLEN == S2S_SESSID_BUFSIZE) ? 1 : -1];
+
+/** Predicate for client_find_by_session_id(): only live IsUser clients
+ * count, matching the GlobalClientList walk sessid_in_use_locally()
+ * used to do by hand. */
+static int sesslink_owner_is_user(void *owner)
+{
+  return IsUser((struct Client *)owner);
+}
+
+/** The one writer of Client::cli_session_id.  Keeps the field and the
+ * client's filing in the session-id index (cli_sesslink) in agreement;
+ * callers never touch either directly.
+ *
+ * Does NOT purge any presence/read-marker state anchored on the old id
+ * -- every call site has its own reason to purge (or not: an adopted
+ * shared ,S id at make_client time never purges, since nothing was
+ * ever anchored on the freshly-minted id it replaces) and purges
+ * before calling this, per the bouncer-analyst review of this change.
+ *
+ * @param[in,out] cptr    Client whose session id is changing.
+ * @param[in]     sessid  New session id, or "" / NULL to clear it.
+ */
+void client_set_session_id(struct Client *cptr, const char *sessid)
+{
+  assert(0 != cptr);
+  ircd_strncpy(cli_session_id(cptr), sessid ? sessid : "",
+               S2S_SESSID_BUFSIZE);
+  sessid_index_set(&cli_sesslink(cptr), cptr, cli_session_id(cptr));
+}
+
+/** Find every IsUser client currently carrying @a sessid.
+ *
+ * One session id can name several clients at once (a bouncer primary
+ * and its aliases; two kept-apart sessions that briefly share an id;
+ * in hard mode, two servers each restoring a ghost of the same
+ * session), so this counts and fills, like sessid_index_find -- it
+ * does not claim to answer "who is THE owner of this id."
+ *
+ * Every returned/counted client is double-checked against its live
+ * cli_session_id with strcmp, not just the index's key match: a writer
+ * that ever bypassed client_set_session_id would leave the index
+ * filed under a stale key, and this check means such a bug can only
+ * under-count, never hand back the wrong client.
+ *
+ * @param[in]  sessid  Session id to look up.
+ * @param[out] out     Array to fill with matching clients, or NULL
+ *                      (with @a max treated as 0) to just count.
+ * @param[in]  max     Capacity of @a out.
+ * @return Total number of IsUser clients carrying @a sessid.
+ */
+size_t client_find_by_session_id(const char *sessid, struct Client **out,
+                                  size_t max)
+{
+  /* Realistic fan-out for one id is small (BOUNCER_MAX_ALIASES = 16
+   * aliases + the primary; a kept-apart or hard-mode pair adds at
+   * most a few more), so a fixed scratch array comfortably covers it
+   * without the complexity of a growable one.  The scratch cap only
+   * bounds how many raw matches this call can inspect to apply the
+   * IsUser + strcmp filter above -- sessid_index_find's own total
+   * (used for counting without a fill) has no such limit. */
+  enum { SCRATCH_CAP = 64 };
+  void *scratch[SCRATCH_CAP];
+  size_t raw_total, scanned, matched, filled, i;
+
+  if (!sessid || !sessid[0])
+    return 0;
+
+  if (!out || max == 0)
+    return sessid_index_count_if(sessid, sesslink_owner_is_user);
+
+  raw_total = sessid_index_find(sessid, scratch, SCRATCH_CAP);
+  scanned = (raw_total < SCRATCH_CAP) ? raw_total : SCRATCH_CAP;
+  matched = filled = 0;
+  for (i = 0; i < scanned; i++) {
+    struct Client *c = (struct Client *)scratch[i];
+    if (!IsUser(c) || 0 != strcmp(cli_session_id(c), sessid))
+      continue;
+    matched++;
+    if (filled < max)
+      out[filled++] = c;
+  }
+  return matched;
+}
 
 /** Initialize the list manipulation support system.
  * Pre-allocate MAXCONNECTIONS Client and Connection structures.
@@ -159,6 +253,7 @@ static struct Connection* alloc_connection(void)
 
   memset(con, 0, sizeof(struct Connection));
   timer_init(&(con_proc(con)));
+  timer_init(&(con_sasltimeout(con)));
 
   return con;
 }
@@ -174,6 +269,8 @@ static void dealloc_connection(struct Connection* con)
   assert(con_verify(con));
   assert(!t_active(&(con_proc(con))));
   assert(!t_onqueue(&(con_proc(con))));
+  assert(!t_active(&(con_sasltimeout(con))));
+  assert(!t_onqueue(&(con_sasltimeout(con))));
 
   Debug((DEBUG_LIST, "Deallocating connection %p", con));
 
@@ -255,8 +352,13 @@ struct Client* make_client(struct Client *from, int status)
      * (PM).  A bouncer session — if one is created or resumed for this
      * client — adopts this value (or, on resume, overwrites it with the
      * bouncer's stored sessid so session-id continuity follows the
-     * bouncer session, not the underlying socket). */
-    generate_sessid(cli_session_id(cptr));
+     * bouncer session, not the underlying socket).  Nothing is anchored
+     * on a session id this Client has never had, so no purge here. */
+    {
+      char sessid_buf[S2S_SESSID_BUFSIZE];
+      generate_sessid(sessid_buf);
+      client_set_session_id(cptr, sessid_buf);
+    }
   } else {
     cli_connect(cptr) = cli_connect(from); /* use 'from's connection */
 
@@ -272,12 +374,16 @@ struct Client* make_client(struct Client *from, int status)
      *      on a single sessid for the client even when its origin
      *      server didn't supply one.  parse.c clears cli_s2s_sessid at
      *      the start of each incoming message, so reading it here gives
-     *      the carrying-message's value, never stale. */
+     *      the carrying-message's value, never stale.  Either way this
+     *      is a brand-new Client adopting a shared ,S id (or minting
+     *      its own first id): nothing to purge. */
     if (cli_s2s_sessid(cptr)[0])
-      ircd_strncpy(cli_session_id(cptr), cli_s2s_sessid(cptr),
-                   S2S_SESSID_BUFSIZE);
-    else
-      generate_sessid(cli_session_id(cptr));
+      client_set_session_id(cptr, cli_s2s_sessid(cptr));
+    else {
+      char sessid_buf[S2S_SESSID_BUFSIZE];
+      generate_sessid(sessid_buf);
+      client_set_session_id(cptr, sessid_buf);
+    }
   }
 
   assert(con_verify(cli_connect(cptr)));
@@ -324,6 +430,19 @@ void free_client(struct Client* cptr)
    * idempotent: a no-op for the common exit path (flags already cleared), the correct
    * release for every direct-free path. */
   userstats_count_clear(cptr);
+
+  /* The session-id index backstop: free_client is the single guaranteed
+   * teardown every client funnels through (same reasoning as the
+   * UserStats release above), and dealloc_client() below returns this
+   * Client to clientFreeList for reuse -- alloc_client() memsets the
+   * WHOLE struct, cli_sesslink included, the next time it is handed
+   * out.  A still-linked node that gets memset out from under the
+   * index corrupts its bucket's chain (its own sl_next zeroes to NULL,
+   * silently truncating whatever older entries followed it), so this
+   * must run before that reuse can happen.  Idempotent: a no-op for a
+   * client whose sessid was never set or already cleared. */
+  sessid_index_unlink(&cli_sesslink(cptr));
+
   /*
    * forget to remove the client from the hash table?
    */
@@ -341,6 +460,7 @@ void free_client(struct Client* cptr)
    * stragglers.  Idempotent — a second sweep is a fast token-hash walk
    * that finds nothing. */
   bounce_null_hs_client_pointing_at(cptr);
+  bounce_null_alias_primary_pointing_at(cptr);
 
   Debug((DEBUG_LIST, "Freeing client %s [%p], connection %p", cli_name(cptr),
 	 cptr, cli_connect(cptr)));
@@ -377,6 +497,12 @@ void free_client(struct Client* cptr)
             }
             abort_sasl(acptr, 0);  /* 0 = not a timeout, just abort */
             aborted++;
+            /* abort_sasl only drops the registration hold.  Resume it
+             * from the event loop, not from here: this runs inside
+             * free_client() of the server being torn down, and
+             * registration broadcasts to the network and may exit
+             * clients. */
+            sasl_resume_registration_later(acptr);
           }
           cli_saslagent(acptr) = NULL;
         }
@@ -481,6 +607,8 @@ void free_client(struct Client* cptr)
 	socket_del(&(cli_socket(cptr))); /* queue a socket delete */
       if (cli_freeflag(cptr) & FREEFLAG_TIMER)
 	timer_del(&(cli_proc(cptr))); /* queue a timer delete */
+      if (cli_freeflag(cptr) & FREEFLAG_SASLTIMER)
+	timer_del(&(cli_sasltimeout(cptr))); /* queue a timer delete */
 
       cli_connect(cptr) = 0;
     }
@@ -554,6 +682,15 @@ void remove_client_from_list(struct Client *cptr)
    * invariant unbypassable by construction — every Client free in the
    * codebase routes through remove_client_from_list or free_client. */
   bounce_null_hs_client_pointing_at(cptr);
+  bounce_null_alias_primary_pointing_at(cptr);
+  /* Same reason, for the bouncer's queue of deferred registrations
+   * (register_user()'s DEFER_PEER_INBOUND, the auth-time defer): the
+   * queue keeps the client's pointer, and the next drain would run
+   * register_user() on whatever client the freed memory becomes -- a
+   * second registration of a live client, which the hub did not survive
+   * on the bed.  Only the unregistered branch of exit_one_client() used to
+   * remove it.  Idempotent: a no-op for a client not queued. */
+  bounce_remove_pending_registration(cptr);
 
   /* Only try remove cptr from the list if it IS in the list.
    * cli_next(cptr) cannot be NULL here, as &me is always the end
@@ -575,7 +712,18 @@ void remove_client_from_list(struct Client *cptr)
     add_history(cptr, 0);
     off_history(cptr);
   }
+  /* A UPING in flight keeps the client's pointer (uping.c): it ends here,
+   * unreported, whichever exit branch ran -- the alias and held-ghost
+   * branches of exit_one_client() return before the normal branch's
+   * uping_cancel() (W3 12c-2b fix 2, N5).  Idempotent. */
+  if (IsUPing(cptr))
+    uping_cancel(cptr, 0);
   if (cli_user(cptr)) {
+    /* Its INVITEs, SILENCE list and MARKs go here, where every exit ends:
+     * the alias and held-ghost branches of exit_one_client() return before
+     * the normal branch frees them, and free_user() asserts no INVITE is
+     * left.  The client has left its channels by now. */
+    free_user_lists(cptr);
     free_user(cli_user(cptr));
     cli_user(cptr) = 0;
   }

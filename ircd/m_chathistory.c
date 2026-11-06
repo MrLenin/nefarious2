@@ -38,7 +38,12 @@
 #include "client.h"
 #include "hash.h"
 #include "history.h"
-#include "redact_index.h"   /* design B: redaction catch-up query */
+#include "redact_index.h"   /* redaction catch-up query (design B) */
+/* m_redact.c (handlers.h cannot be included here -- forward_history_write prototype nit) */
+extern void redact_apply_row(struct Client *src, const char *target, const char *msgid,
+                             const char *redact_msgid, uint64_t time_ms, const char *reason,
+                             const char *sender_str, const char *account_str);
+static void redact_catchup_kick(unsigned int store_num);   /* design B trigger (defined with the catch-up) */
 #include "ircd.h"
 #include "ircd_alloc.h"
 #include "ircd_compress.h"
@@ -708,9 +713,11 @@ static struct HistoryRowFilter *query_row_filter(struct Client *sptr,
 }
 
 /** Copy @a in to @a out without the server's own PM-history markers
- * (`+evilnet.github.io/sid=` and the legacy `+afternet.org/sid=`).  They
- * exist for the ephemeral participant check in check_history_access and
- * carry a session id that is nobody else's business.
+ * (`+evilnet.github.io/sid=` and the legacy `+afternet.org/sid=`, and the
+ * sender's and recipient's `ssid=` / `rsid=`).  They exist for the
+ * ephemeral participant check in check_history_access and for naming a
+ * conversation after the right session (replay.c), and carry session ids
+ * that are nobody else's business.
  * @return @a out (empty when nothing else was there). */
 static const char *strip_internal_tags(const char *in, char *out, size_t outsz)
 {
@@ -723,6 +730,8 @@ static const char *strip_internal_tags(const char *in, char *out, size_t outsz)
     const char *end = strchr(in, ';');
     size_t len = end ? (size_t)(end - in) : strlen(in);
     int internal = (len >= 22 && memcmp(in, "+evilnet.github.io/sid", 22) == 0)
+                   || (len >= 23 && memcmp(in, "+evilnet.github.io/ssid", 23) == 0)
+                   || (len >= 23 && memcmp(in, "+evilnet.github.io/rsid", 23) == 0)
                    || (len >= 17 && memcmp(in, "+afternet.org/sid", 17) == 0);
     if (!internal && len > 0 && pos + len + 2 <= outsz) {
       if (pos)
@@ -2997,8 +3006,12 @@ static void complete_targets_fed(struct FedRequest *req)
   filter_targets_window(&merged, ctx->ts1, ctx->ts2);
 
   /* Send to client with access filtering and limit enforcement */
+  /* Complete only if nothing was cut: a storage server that timed out
+   * or capped its rows (fed_truncated) leaves targets unlisted, and the
+   * end tag would tell the client it may skip them. */
   send_targets_batch(client, merged, req->limit, req->label,
-                     ctx->local_count + ctx->fed_count < req->limit);
+                     ctx->local_count + ctx->fed_count < req->limit
+                     && !req->fed_truncated);
 
   history_free_targets(merged);
 }
@@ -3083,11 +3096,18 @@ static int chathistory_targets(struct Client *sptr, const char *ref1_str,
   {
     struct HistoryTarget *sorted = merge_targets(targets, NULL);
     int fetch_limit = limit * 3;
+    /* Complete only when the network was exhausted.  If the local walk
+     * filled the page, federation was skipped, but other storage servers
+     * may hold targets that belong on it: say nothing, and let the client
+     * page on.  Without federation (or nobody to ask) local is all. */
+    int fed_skipped = feature_bool(FEAT_CHATHISTORY_FEDERATION)
+                      && count >= limit
+                      && count_storage_servers(NULL, 0) > 0;
     if (fetch_limit > 500)
       fetch_limit = 500;
     filter_targets_window(&sorted, ts1, ts2);
     send_targets_batch(sptr, sorted, limit, cli_label(sptr),
-                       count < fetch_limit && !slot_miss);
+                       count < fetch_limit && !slot_miss && !fed_skipped);
     history_free_targets(sorted);
   }
   history_free_targets(targets);
@@ -5736,6 +5756,11 @@ static void complete_redact_fed(struct FedRequest *req)
     sendcmdto_want_s2s_tags(1);
     sendcmdto_serv_butone_v3(sptr, CMD_REDACT, sptr, "%s %s :%s",
                           req->target, ctx->msgid, reason ? reason : "");
+
+    /* Disarm: this runs from a federation callback, outside any
+     * per-line reset, so a left-armed msgid tags the next unrelated
+     * client send with this REDACT's id (as m_redact.c does). */
+    sendcmdto_set_client_msgid(NULL);
   }
 }
 
@@ -7374,7 +7399,12 @@ int ms_chathistory(struct Client *cptr, struct Client *sptr, int parc, char *par
     int has_more = 0;
     int is_continuation = 0;
 
-    if (parc < 4)
+    /* The shortest form is the final continuation, "B <reqid> <msgid>
+     * :<b64>" (parc 5).  A 4-param line has no data: the continuation
+     * branch below would take the NULL parv[4] as its base64 and
+     * strlen() it.  Drop it here, before the forward, so it never
+     * reaches the request's origin either. */
+    if (parc < 5)
       return 0;
 
     reqid = parv[2];
@@ -7553,6 +7583,7 @@ int ms_chathistory(struct Client *cptr, struct Client *sptr, int parc, char *par
       ad->retention_days = retention;
       ad->last_update = CurrentTime;
       absence_close(server_ad_index(sptr));   /* back: close its absence */
+      redact_catchup_kick((unsigned int)server_ad_index(sptr));   /* what did we miss while it was away? */
 
       Debug((DEBUG_DEBUG, "CH A S: Server %s advertises storage with %d day retention",
              cli_name(sptr), retention));
@@ -7723,7 +7754,11 @@ int ms_chathistory(struct Client *cptr, struct Client *sptr, int parc, char *par
     int has_more = 0;
     int is_continuation = 0;
 
-    if (parc < 4)
+    /* The shortest form is the final continuation, "WB <target> <msgid>
+     * :<b64>" (parc 5).  A 4-param line has no data: the continuation
+     * branch below would take the NULL parv[4] as its base64 and
+     * strlen() it. */
+    if (parc < 5)
       return 0;
 
     target = parv[2];

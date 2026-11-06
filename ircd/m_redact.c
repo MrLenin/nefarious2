@@ -385,12 +385,14 @@ int m_redact(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
  * @param[in] parv Argument vector.
  * @return CPTR_KILLED if client was squit, else 0.
  */
-/* Apply a channel redaction that reached us from elsewhere (P10 REDACT or the
- * CR M 'R' mesh copy): placeholder the row, store ONE REDACT context row
- * under the origin's redact_msgid/time (one-time-per-message), fan out to
- * local members with the capability.  Idempotent: a repeat (two servers or
- * two users redacting the same message, or the catch-up query replaying one
- * we already applied) is still shown locally but stores no second row. */
+/* Apply a channel redaction that reached us from elsewhere (P10 REDACT, or
+ * the redaction catch-up replay): placeholder the row, store ONE REDACT
+ * context row under the origin's redact_msgid/time (one-time-per-message),
+ * fan out to local members with the capability.  Idempotent: a repeat (two
+ * servers or two users redacting the same message, or the catch-up query
+ * replaying one we already applied) is still shown locally but stores no
+ * second row.  @a sender_str / @a account_str name the stored redacter
+ * explicitly (catch-up); NULL derives them from @a src. */
 void redact_apply_row(struct Client *src, const char *target,
                       const char *msgid, const char *redact_msgid,
                       uint64_t time_ms, const char *reason,

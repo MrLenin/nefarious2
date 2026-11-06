@@ -87,7 +87,8 @@ UMKPASSWD_SRC = ${CRYPTO_SRC} \
 	memdebug.c \
 	umkpasswd.c
 
-# The KC_SRC list below is the vendored ircd/kc/*.c sources.  configure
+# The KC_SRC list below is the vendored ircd/kc/*.c sources plus
+# webhook_subject.c (its header includes kc/kc_webhook.h, so jansson).  configure
 # substitutes them only under --enable-keycloak, and nothing otherwise:
 # unlike every other optional consumer (sasl_auth.c, ircd_kc_adapter.c,
 # ...) the kc/ sources are verbatim from evilnet/libkc and carry no
@@ -120,6 +121,7 @@ IRCD_SRC = \
 	gitsync.c \
 	hash.c \
 	history.c \
+	ipcheck_refund.c \
 	redact_index.c \
 	chathistory_ephemeral.c \
 	chathistory_presence.c \
@@ -147,6 +149,7 @@ IRCD_SRC = \
 	lex.yy.c \
 	list.c \
 	listener.c \
+	sessid_index.c \
 	m_account.c \
 	m_admin.c \
 	m_asll.c \
@@ -225,10 +228,18 @@ IRCD_SRC = \
 	webpush_mute.c \
 	webpush_expiry.c \
 	webpush_keyring.c \
+	account_id.c \
+	webhook_eventlog.c \
 	webpush_attention.c \
 	bouncer_converge.c \
+	bouncer_wire.c \
+	bouncer_count.c \
+	bouncer_rebind_auth.c \
+	exit_reason.c \
+	bouncer_deauth.c \
 	webpush_line.c \
 	metadata.c \
+	metadata_lww.c \
 	m_rehash.c \
 	m_remove.c \
 	m_reset.c \
@@ -552,7 +563,10 @@ IPcheck.o: IPcheck.c ../config.h ../include/IPcheck.h ../include/client.h \
   ../include/ircd.h ../include/match.h ../include/msg.h \
   ../include/ircd_alloc.h ../include/ircd_events.h \
   ../include/ircd_features.h ../include/ircd_log.h ../include/ircd_string.h \
-  ../include/s_debug.h ../include/s_user.h ../include/send.h
+  ../include/s_debug.h ../include/s_user.h ../include/send.h \
+  ../include/ipcheck_refund.h
+ipcheck_refund.o: ipcheck_refund.c ../config.h ../include/ipcheck_refund.h \
+  ../include/ircd_defs.h
 channel.o: channel.c ../config.h ../include/channel.h ../include/class.h \
   ../include/client.h ../include/destruct_event.h ../include/hash.h \
   ../include/ircd.h ../include/ircd_alloc.h ../include/ircd_chattr.h \

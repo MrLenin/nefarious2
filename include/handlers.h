@@ -326,19 +326,19 @@ extern void broadcast_channel_advertisement(const char*);
 extern void chathistory_init_callbacks(void);
 extern int m_redact(struct Client*, struct Client*, int, char*[]);
 extern int ms_redact(struct Client*, struct Client*, int, char*[]);
-/* REDACT on the CRDT mesh (design B, live half): apply a channel redaction the
- * way ms_redact does (row placeholder + one REDACT context row + member
- * fan-out), and mint the CR M 'R' copy (1 if minted; caller then keeps the
- * tree relay off CRDT-aware links). */
+/* Apply a channel redaction that reached us from elsewhere the way ms_redact
+ * does (placeholder + ONE context row + member fan-out; idempotent).  The
+ * _row form takes the stored sender/account explicitly (the redaction
+ * catch-up replay keeps the original redacter; NULL = derive from src). */
 extern void redact_apply_remote(struct Client *src, const char *target,
                                 const char *msgid, const char *redact_msgid,
                                 uint64_t time_ms, const char *reason);
-/* Same with the stored sender/account given explicitly (catch-up replay keeps
- * the original redacter on the context row; NULL = derive from src). */
 extern void redact_apply_row(struct Client *src, const char *target,
                              const char *msgid, const char *redact_msgid,
                              uint64_t time_ms, const char *reason,
                              const char *sender_str, const char *account_str);
+/* REDACT on the CRDT mesh (design B, live half): mint the CR M 'R' copy
+ * (1 if minted; caller then keeps the tree relay off CRDT-aware links). */
 extern int redact_mesh_mint(struct Client *from, const char *target,
                             const char *msgid, const char *redact_msgid,
                             uint64_t time_ms, const char *reason);

@@ -1030,6 +1030,9 @@ static struct FeatureDesc {
   F_I(IPCHECK_CLONE_LIMIT, 0, 4, 0),
   F_I(IPCHECK_CLONE_PERIOD, 0, 40, 0),
   F_I(IPCHECK_CLONE_DELAY, 0, 600, 0),
+  F_B(IPCHECK_COUNT_REFUSALS, 0, 1, 0),
+  F_I(IPCHECK_SASL_REFUND, 0, 0, 0),
+  F_I(IPCHECK_SASL_REFUND_PERIOD, 0, 600, 0),
   F_I(CHANNELLEN, 0, 200, set_isupport_channellen),
 
   /* Some misc. default paths */
@@ -1186,7 +1189,13 @@ static struct FeatureDesc {
   F_I(WEBHOOK_PORT, 0, 0, 0),
   F_S(WEBHOOK_SECRET, FEAT_NODISP, "", 0),
   F_B(WEBHOOK_KILL_ON_DISABLE, 0, 0, 0),
-  F_B(WEBHOOK_KILL_ON_DELETE, 0, 1, 0),
+  F_I(WEBHOOK_EVENTLOG_SIZE, 0, 1024, 0),      /* applied-events log entries (webhook plan 4) */
+  F_I(WEBHOOK_EVENTLOG_WINDOW, 0, 86400, 0),   /* seconds of it a newly linked peer is caught up on */
+  /* Default OFF: deauth (AC U) propagates correctly network-wide, a
+   * local-only kill does not.  Forced network-wide disconnect needs its
+   * own design -- see the open design item in
+   * .claude/para/projects/2026-09-22-bouncer-deauth-correctness.md */
+  F_B(WEBHOOK_KILL_ON_DELETE, 0, 0, 0),
   F_I(SNOMASK_DEFAULT, 0, SNO_DEFAULT, 0),
   F_I(SNOMASK_OPERDEFAULT, 0, SNO_OPERDEFAULT, 0),
   F_S(TPATH, FEAT_CASE | FEAT_MYOPER, "ircd.tune", 0),
@@ -1426,6 +1435,7 @@ static struct FeatureDesc {
   F_B(MSGID, 0, 1, 0),
   F_B(P10_MESSAGE_TAGS, 0, 0, 0),
   F_S(AWAY_STAR_MSG, FEAT_NULL, "Away", 0),
+  F_I(HLC_MAX_FORWARD_MS, 0, 60000, 0),
   F_I(AWAY_THROTTLE, 0, 0, 0),
   F_B(METADATA_BURST, 0, 1, 0),
   F_S(METADATA_DB, 0, "metadata", 0),

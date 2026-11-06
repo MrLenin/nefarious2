@@ -85,6 +85,7 @@
 #include "capab.h"
 #include "channel.h"
 #include "chathistory_presence.h"
+#include "sasl_webhook.h"
 #include "client.h"
 #include "crdt_shadow.h"
 #include "handlers.h"
@@ -140,13 +141,11 @@ int ms_end_of_burst(struct Client* cptr, struct Client* sptr, int parc, char* pa
   /* (BX R retired in Phase 5; convergence is at-N-time per redesign
    * D.1 + D.3 — no EOB demote-retry pass.) */
 
-  /* Drain any deferred local-user registrations.  These were queued by
-   * check_auth_finished when SASL completed mid-burst — registering
-   * immediately would have created a fresh standalone primary racing
-   * peer's in-flight N for the same account.  Only drain when no peer
-   * is still bursting; otherwise wait for the last EOB to fire. */
-  if (!bounce_burst_in_progress())
-    bounce_drain_pending_registrations();
+  /* Deferred local-user registrations (queued by check_auth_finished when
+   * SASL completed mid-burst) are drained at the end of this read of the
+   * link (bounce_link_input_read()), once no peer is still bursting, not
+   * inside this line: lines after the EB in the same read are part of
+   * what the registration must see (W3 12c-2b fix round 3, I-1). */
 
   /* Prune stale alias entries from all sessions.  A peer's burst is
    * the authoritative source of which numerics it currently holds;
@@ -219,6 +218,12 @@ int ms_end_of_burst(struct Client* cptr, struct Client* sptr, int parc, char* pa
      * line as a parse error -- up to 20000 of them per relink (audit P4). */
     if (IsIRCv3Aware(sptr))
       presence_burst_sync(sptr);
+
+    /* Webhook plan 4: catch the peer up on the Keycloak events applied
+     * here while it was away (netsplit, downtime, a new server); it
+     * drops what it has and forwards what it lacks.  Self-gated on
+     * IsIRCv3Aware inside. */
+    sasl_webhook_link_catchup(sptr);
 
     /* Advertise chathistory storage capability (CH A S) to newly linked server.
      * Only advertise if we have CHATHISTORY_STORE enabled - this indicates we

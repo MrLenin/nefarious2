@@ -196,7 +196,13 @@ engine_add(struct Socket *sock)
          s_fd(sock), sock, state_to_name(s_state(sock))));
   set_events(sock, s_state(sock), s_events(sock), &evt);
   if (epoll_ctl(epoll_fd, EPOLL_CTL_ADD, s_fd(sock), &evt) < 0) {
-    event_generate(ET_ERROR, sock, errno);
+    /* Reported by the return value alone; see socket_add().  Callers
+     * read errno after a refusal, so keep it past the log call. */
+    int err = errno;
+
+    log_write(LS_SOCKET, L_WARNING, 0, "epoll: cannot add socket %d: %s",
+              s_fd(sock), strerror(err));
+    errno = err;
     return 0;
   }
   return 1;
@@ -216,7 +222,7 @@ engine_set_state(struct Socket *sock, enum SocketState new_state)
          sock, state_to_name(new_state)));
   set_events(sock, new_state, s_events(sock), &evt);
   if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, s_fd(sock), &evt) < 0)
-    event_generate(ET_ERROR, sock, errno);
+    socket_error(sock, errno); /* delivered by the loop, not here */
 }
 
 /** Handle change to preferred socket events.
@@ -233,7 +239,7 @@ engine_set_events(struct Socket *sock, unsigned new_events)
          sock, sock_flags(new_events)));
   set_events(sock, s_state(sock), new_events, &evt);
   if (epoll_ctl(epoll_fd, EPOLL_CTL_MOD, s_fd(sock), &evt) < 0)
-    event_generate(ET_ERROR, sock, errno);
+    socket_error(sock, errno); /* delivered by the loop, not here */
 }
 
 /** Remove a socket from the event engine.
@@ -280,6 +286,9 @@ engine_loop(struct Generators *gen)
     events_count = 20;
   events = MyMalloc(sizeof(events[0]) * events_count);
   while (running) {
+    /* Engine errors deferred since the last pass (socket_error()) */
+    socket_run_errors();
+
     if ((tmp = feature_int(FEAT_POLLS_PER_LOOP)) >= 20 && tmp != events_count) {
       events = MyRealloc(events, sizeof(events[0]) * tmp);
       events_count = tmp;

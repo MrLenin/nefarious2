@@ -225,6 +225,16 @@ void persistence_send_status(struct Client *to)
                 persistence_state_keyword(to));
 }
 
+/** Send the STATUS of a hold turned off: client-setting OFF, effective
+ * OFF -- what a PERSISTENCE SET OFF or DETACH carried to the session's
+ * holder on another server leads to once it is applied there. */
+static void persistence_send_status_off(struct Client *to)
+{
+  if (!to || !MyConnect(to))
+    return;
+  sendrawto_one(to, ":%s PERSISTENCE STATUS OFF OFF", cli_name(&me));
+}
+
 /** Handle STATUS / GET subcommand.  Both report the effective state. */
 static int persistence_cmd_status(struct Client *sptr)
 {
@@ -269,36 +279,59 @@ static int persistence_cmd_set(struct Client *sptr, int parc, char *parv[])
   arg = parv[2];
 
   if (0 == ircd_strcmp(arg, "ON")) {
+    /* Turning hold on joins the account's session, or makes one when it
+     * has none (W3 12c-2b, user decision U3).  A refusal sets nothing: the
+     * preference stays as it was and nothing goes on the wire (U2). */
+    enum bounce_hold_on_plan plan = bounce_hold_on_plan_for(sptr);
+
+    /* A refusal leaves the settings as they were.  Until the spec and our
+     * extension of it are separated, this subcommand follows the spec
+     * (ruling W3-T12c-2b-f1a): a SET that does not change the effective
+     * setting MUST NOT FAIL and MUST send STATUS -- the unchanged one --
+     * with a WARN saying why.  The client setting is not stored (user
+     * decision U2: nothing set, nothing on the wire), and the SET is not
+     * acknowledged: deviations recorded in the persistence plan. */
+    if (bounce_hold_on_refused(plan)) {
+      bounce_hold_on_fail(sptr, "PERSISTENCE", plan, "SET");
+      persistence_send_status(sptr);
+      return 0;
+    }
     metadata_set_client(sptr, "draft/persistence/hold", "1", METADATA_VIS_PRIVATE);
     sendcmdto_serv_butone_v3(&me, CMD_METADATA, NULL, "%s %s P :1",
                              cli_name(sptr), "draft/persistence/hold");
 
-    if (!bounce_get_session(sptr)) {
-      struct BouncerSession *session = NULL;
-      if (bounce_create(sptr, &session) == 0 && session) {
-        bounce_broadcast(session, 'C', NULL);
-        bounce_broadcast(session, 'A', cli_yxx(sptr));
-      }
-    }
+    /* A client in no session joins or makes one (BS C, then BS A); this
+     * reply sends the STATUS itself, after the SET line. */
+    if (!bounce_get_session(sptr))
+      bounce_hold_on(sptr, 0, NULL);
     send_persistence_reply(sptr, "SET", "ON");
     persistence_send_status(sptr);
     return 0;
   }
 
   if (0 == ircd_strcmp(arg, "OFF")) {
-    metadata_set_client(sptr, "draft/persistence/hold", "0", METADATA_VIS_PRIVATE);
-    sendcmdto_serv_butone_v3(&me, CMD_METADATA, NULL, "%s %s P :0",
-                             cli_name(sptr), "draft/persistence/hold");
+    struct BouncerSession *session = bounce_get_session(sptr);
+    int carried = session
+                  && !bounce_end_asker_applies(bounce_member_end_route(session));
 
-    {
-      struct BouncerSession *session = bounce_get_session(sptr);
-      if (session) {
-        bounce_broadcast(session, 'X', NULL);
-        bounce_destroy_owned(session);  /* tombstone-then-unanchor */
-      }
+    /* The preference, unless the end goes to the session's holder on
+     * another server, which writes it when it accepts the end. */
+    if (!carried) {
+      metadata_set_client(sptr, "draft/persistence/hold", "0", METADATA_VIS_PRIVATE);
+      sendcmdto_serv_butone_v3(&me, CMD_METADATA, NULL, "%s %s P :0",
+                               cli_name(sptr), "draft/persistence/hold");
     }
+    /* Its holder ends the session (here, or the end goes there); the
+     * primary carries on outside it, every device of it goes. */
+    if (session)
+      bounce_member_end(session, sptr, sptr, BOUNCE_MEMBER_END_HOLD_OFF, NULL);
     send_persistence_reply(sptr, "SET", "OFF");
-    persistence_send_status(sptr);
+    /* A carried end is the holder's to apply: nothing here is OFF yet, so
+     * the status is the outcome the reply promises. */
+    if (carried)
+      persistence_send_status_off(sptr);
+    else
+      persistence_send_status(sptr);
     return 0;
   }
 
@@ -832,6 +865,7 @@ static int persistence_cmd_profile(struct Client *sptr, int parc, char *parv[])
 static int persistence_cmd_detach(struct Client *sptr, int parc, char *parv[])
 {
   struct BouncerSession *session;
+  int carried;
 
   if (!IsAccount(sptr)) {
     send_fail(sptr, "PERSISTENCE", "ACCOUNT_REQUIRED", "DETACH",
@@ -853,27 +887,38 @@ static int persistence_cmd_detach(struct Client *sptr, int parc, char *parv[])
     return 0;
   }
 
-  /* Force logout also closes the account's webpush subscriptions: the
-   * browser keeps its own subscription object, but the server forgets
-   * every endpoint, so no push can fire for this account until a device
-   * re-registers (which happens automatically on the next login). */
-  webpush_forget_account(cli_user(sptr)->account);
+  /* The side effects are ours to apply unless the end goes to the
+   * session's holder on another server, which applies them when it
+   * accepts the end (and writes nothing when it refuses it). */
+  carried = !bounce_end_asker_applies(bounce_member_end_route(session));
+  if (!carried) {
+    /* Force logout also closes the account's webpush subscriptions: the
+     * browser keeps its own subscription object, but the server forgets
+     * every endpoint, so no push can fire for this account until a device
+     * re-registers (which happens automatically on the next login). */
+    webpush_forget_account(cli_user(sptr)->account);
 
-  /* Mirror PERSISTENCE SET OFF's tear-down: clear account-global hold
-   * preference, broadcast to peers, then destroy the session. */
-  metadata_set_client(sptr, "draft/persistence/hold", "0", METADATA_VIS_PRIVATE);
-  sendcmdto_serv_butone_v3(&me, CMD_METADATA, NULL, "%s %s P :0",
-                           cli_name(sptr), "draft/persistence/hold");
+    /* Mirror PERSISTENCE SET OFF's tear-down: clear account-global hold
+     * preference, broadcast to peers, then destroy the session. */
+    metadata_set_client(sptr, "draft/persistence/hold", "0", METADATA_VIS_PRIVATE);
+    sendcmdto_serv_butone_v3(&me, CMD_METADATA, NULL, "%s %s P :0",
+                             cli_name(sptr), "draft/persistence/hold");
+  }
 
-  bounce_broadcast(session, 'X', NULL);
-  /* Tombstone-then-unanchor (detaches our primary inside so
-   * exit_one_client cleanup doesn't operate on a destroyed session;
-   * matches the SET OFF path). */
-  bounce_destroy_owned(session);
+  /* Its holder ends the session (here, or the end goes there), and
+   * refuses as above when a connection there on a class that enforces
+   * persistence holds it; the primary carries on outside it, every device
+   * of it goes (matches the SET OFF path). */
+  bounce_member_end(session, sptr, sptr, BOUNCE_MEMBER_END_DETACH, NULL);
 
   send_persistence_reply(sptr, "DETACH", "OK");
-  /* STATUS now resolves to OFF (no session, hold=0). */
-  persistence_send_status(sptr);
+  /* Ended here, STATUS now resolves to OFF (no session, hold=0).  Carried
+   * to the holder, nothing here is OFF yet: the status is the outcome the
+   * reply promises. */
+  if (carried)
+    persistence_send_status_off(sptr);
+  else
+    persistence_send_status(sptr);
   return 0;
 }
 

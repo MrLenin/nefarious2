@@ -462,9 +462,11 @@ static void auth_loc_timeout_callback(struct Event* ev)
 static void auth_complete_sasl(struct Client *client)
 {
   if (IsSASLComplete(client) && cli_saslaccount(client)[0]) {
-    if (cli_saslacccreate(client))
-      cli_user(client)->acc_create = cli_saslacccreate(client);
+    /* The login's own timestamp (0 for a Keycloak login), never one left
+     * by an earlier login of this connection. */
+    cli_user(client)->acc_create = cli_saslacccreate(client);
     ircd_strncpy(cli_user(client)->account, cli_saslaccount(client), ACCOUNTLEN + 1);
+    ircd_strncpy(cli_user(client)->kc_id, cli_saslkcid(client), sizeof(cli_user(client)->kc_id));
     SetAccount(client);
   }
 
@@ -787,6 +789,13 @@ static int check_auth_finished(struct AuthRequest *auth)
       if (IsAccount(auth->client) && bounce_enabled_for(auth->client)
           && bounce_burst_in_progress()
           && bounce_defer_registration(auth->client) == 0) {
+        /* The wait from here is the server's, not the client's: a full
+         * CONNECTTIMEOUT for it, as register_user()'s own defer gives
+         * (register_user_unwind()); a re-defer by the drain keeps this
+         * clock, so the wait stays bounded.  Without it a login that
+         * spent most of its window in CAP/SASL met "Registration Timeout"
+         * part-way through a long netburst (W3 12c-2b carry, Minor 4). */
+        cli_firsttime(auth->client) = CurrentTime;
         sendrawto_one(auth->client,
                       "NOTICE * :*** Bouncer: SASL complete, waiting "
                       "for burst convergence before registration "
@@ -1855,6 +1864,18 @@ int auth_sasl_done(struct AuthRequest *auth)
   return check_auth_finished(auth);
 }
 
+/** Drop the SASL hold without re-checking registration.
+ * For callers that already run inside check_auth_finished() (the
+ * abort in auth_complete_sasl()) or while the client is being torn
+ * down (exit_client()), where resuming registration would be wrong.
+ * @param[in] auth Authorization request for client.
+ */
+void auth_sasl_clear(struct AuthRequest *auth)
+{
+  assert(auth != NULL);
+  FlagClr(&auth->flags, AR_SASL_PENDING);
+}
+
 /** Check if IAuth is configured to handle SASL authentication.
  * @return Non-zero if IAuth handles SASL, zero otherwise.
  */
@@ -2893,12 +2914,16 @@ static int iauth_cmd_done_account(struct IAuth *iauth, struct Client *cli,
     sendto_iauth(cli, "E Invalid :Account parameter too long");
     return 0;
   }
-  /* If account has a creation timestamp, use it. */
+  /* If account has a creation timestamp, use it -- and only it: without
+   * one, none, not what an earlier login of this connection left.  IAuth
+   * carries no Keycloak id either. */
   assert(cli_user(cli) != NULL);
   if (params[0][len] == ':') {
     cli_user(cli)->acc_create = strtoul(params[0] + len + 1, NULL, 10);
     params[0][len] = '\0';
-  }
+  } else
+    cli_user(cli)->acc_create = 0;
+  cli_user(cli)->kc_id[0] = '\0';
 
   /* Copy account name to User structure. */
   ircd_strncpy(cli_user(cli)->account, params[0], ACCOUNTLEN + 1);
@@ -3306,7 +3331,8 @@ static void iauth_parse(struct IAuth *iauth, char *message)
     /* Try to find the client associated with the request. */
     char *endptr;
     errno = 0;
-    id = strtol(params[0], &endptr, 10);
+    /* params[0] is NULL when the line has no parameters. */
+    id = (parc >= 3) ? strtol(params[0], &endptr, 10) : 0;
     if (parc < 3)
       sendto_iauth(NULL, "E Missing :Need <id> <ip> <port>");
     else if (errno == ERANGE || endptr == params[0] || (*endptr && !IsSpace(*endptr)))
@@ -3384,7 +3410,7 @@ static void iauth_read(struct IAuth *iauth)
   /* Parse each complete line. */
   for (sol = readbuf; (eol = strchr(sol, '\n')) != NULL; sol = eol + 1) {
     *eol = '\0';
-    if (*(eol - 1) == '\r') /* take out carriage returns, too... */
+    if (eol > sol && *(eol - 1) == '\r') /* take out carriage returns, too... */
       *(eol - 1) = '\0';
 
     /* If spammy debug, send the message to opers. */
@@ -3468,7 +3494,7 @@ static void iauth_read_stderr(struct IAuth *iauth)
   /* Send each complete line to SNO_AUTH. */
   for (sol = readbuf; (eol = strchr(sol, '\n')) != NULL; sol = eol + 1) {
     *eol = '\0';
-    if (*(eol - 1) == '\r') /* take out carriage returns, too... */
+    if (eol > sol && *(eol - 1) == '\r') /* take out carriage returns, too... */
       *(eol - 1) = '\0';
     Debug((DEBUG_ERROR, "IAuth error: %s", sol));
     log_write(LS_IAUTH, L_ERROR, 0, "IAuth error: %s", sol);

@@ -25,10 +25,12 @@
  * @version $Id: s_user.c 1919 2009-07-31 02:04:15Z entrope $
  */
 #include "config.h"
+#include "account_id.h"
 
 #include "s_user.h"
 #include "webpush.h"
 #include "bouncer_session.h"
+#include "bouncer_rebind_auth.h"
 #include "history.h"
 #include "capab.h"
 #include "IPcheck.h"
@@ -140,6 +142,44 @@ void free_user(struct User* user)
     assert(userCount>0);
     --userCount;
   }
+}
+
+/** Free what a user holds besides its channels: its pending INVITEs, its
+ * SILENCE list and its MARKs.
+ *
+ * remove_client_from_list() calls this for every client with a User, just
+ * before free_user(), so no exit path leaves them behind.  The normal
+ * branch of exit_one_client() frees them itself (this then finds the lists
+ * empty); its bouncer branches (an alias, a held ghost) return before that.
+ * A held ghost keeps its live face's INVITEs and, being MyConnect, is
+ * invited while it is held: its KILL, a collision or an X3 GHOST then
+ * failed free_user()'s assert(0 == user->invited) and aborted the server
+ * (without asserts, the channel's invite list kept the freed client and
+ * destruct_channel() read it).
+ *
+ * Call it after the client has left its channels.  An INVITE's channel is
+ * still valid then: destruct_channel() deletes a channel's invites before
+ * it frees the channel.  Local frees only; nothing is sent.
+ *
+ * @param[in] cptr Client whose lists are freed.
+ */
+void free_user_lists(struct Client *cptr)
+{
+  struct SLink *lp;
+  struct Ban *bp;
+
+  assert(0 != cptr);
+  assert(0 != cli_user(cptr));
+
+  while ((lp = cli_user(cptr)->invited))
+    del_invite(cptr, lp->value.chptr);
+
+  while ((bp = cli_user(cptr)->silence)) {
+    cli_user(cptr)->silence = bp->next;
+    free_ban(bp);
+  }
+
+  del_marks(cptr);
 }
 
 /** Find number of User structs allocated and memory used by them.
@@ -428,6 +468,28 @@ int hunt_server_prio_cmd(struct Client *from, const char *cmd, const char *tok,
 }
 
 
+/** Set by set_nick_relay_withhold_legacy(): the next register_user()
+ * relays a remote client's N to IRCv3-aware links only.  A plain static,
+ * which no S2S override reset touches: register_user() clears it on
+ * every call, and the one caller clears it again after its
+ * set_nick_name(), so it never outlives the introduction it was armed
+ * for.  Left set, it would hide the next remote user from the legacy
+ * links, which would KILL that user at its next nick change as an
+ * unknown numeric. */
+static int nick_relay_withhold_legacy;
+
+/** See include/s_user.h. */
+void set_nick_relay_withhold_legacy(void)
+{
+  nick_relay_withhold_legacy = 1;
+}
+
+/** See include/s_user.h. */
+void clear_nick_relay_withhold_legacy(void)
+{
+  nick_relay_withhold_legacy = 0;
+}
+
 /*
  * register_user
  *
@@ -449,6 +511,63 @@ int hunt_server_prio_cmd(struct Client *from, const char *cmd, const char *tok,
  *    this is not fair. It should actually request another
  *    nick from local user or kill him/her...
  */
+/** Arm, for the N relayed for another server's client, the hold mark
+ * (,H) that client's N arrived with.  A server never stamps a mark for a
+ * client it is not the home of: it passes on what came, or nothing.
+ * When the client's server is the link itself, the relay's tag source
+ * is no link (send.c reads a link's tags only for a client behind it),
+ * so the mark is armed here, beside the session id the hint armed --
+ * read from the line's own link, and only while that line is the one
+ * being handled.  Further away, the relay reads the link's ,S and ,H
+ * itself and this copy, the same mark, goes unused.  A mark that came
+ * without a session id is not passed on: it describes the client beside
+ * the id its home server sent, and the id armed here would be another
+ * (the hint's), so the pair would say something the home never said.
+ *
+ * @param[in] cptr The link the N arrived on.
+ * @param[in] sptr The client it introduced.
+ */
+static void relay_hold_mark(struct Client *cptr, struct Client *sptr)
+{
+  if (MyConnect(sptr) || !sendcmdto_stash_is_current(cptr))
+    return;
+  if (cli_s2s_held(cptr) && cli_s2s_sessid(cptr)[0])
+    sendcmdto_set_s2s_held(cli_s2s_held(cptr));
+}
+
+/** Put a local client whose registration the bouncer defers back to the
+ * unregistered connection it was before register_user()'s prologue
+ * (W3 12c-2b fix 2, N3): uncounted as a client and counted as unknown, its
+ * old status and command table, no oper or invisible count, no server
+ * notice mask.  The other user modes the prologue set stay; the drain's
+ * register_user() sets the same again.
+ * The wait from its first defer is the server's, not the client's: it gets
+ * a full CONNECTTIMEOUT for it (check_pings()), as iauth's extra wait does
+ * (check_auth_finished()); a re-defer by the drain keeps that clock, so the
+ * wait stays bounded (fix round 3, I-1).  A drain that never comes ends in
+ * "Registration Timeout", the auth-time defer's bound too.
+ *
+ * @param[in] sptr       The client (ours, not yet given a numeric).
+ * @param[in] status     Its status before the prologue.
+ * @param[in] handler    Its command table before the prologue.
+ * @param[in] first      Its first defer (else the drain deferred it again).
+ */
+static void register_user_unwind(struct Client *sptr, short status,
+                                 HandlerType handler, int first)
+{
+  assert(MyConnect(sptr) && IsUser(sptr));
+  Count_clientbecomesunknown(sptr, UserStats);
+  cli_status(sptr) = status;
+  cli_handler(sptr) = handler;
+  userstats_count_sync(sptr);   /* no user: no oper or invisible count */
+  /* Off the server-notice lists: an unknown client's exit never unlinks a
+   * snomask (fix round 3, I-3).  The drain's prologue sets +s again. */
+  ClearServNotice(sptr);
+  set_snomask(sptr, 0, SNO_SET);
+  if (first)
+    cli_firsttime(sptr) = CurrentTime;
+}
+
 /** Finish registering a user who has sent both NICK and USER.
  * For local connections, possibly check IAuth; make sure there is a
  * matching Client config block; clean the username field; check
@@ -477,7 +596,11 @@ int register_user(struct Client *cptr, struct Client *sptr)
   struct Channel*  chptr;
   struct BouncerSession* auto_session = NULL;
   int              auto_resumed = 0;
+  /* One-shot, consumed here by every call (every return path below
+   * leaves it clear); honoured only for a remote client's N relay. */
+  int              withhold_legacy = nick_relay_withhold_legacy;
 
+  nick_relay_withhold_legacy = 0;
   user->last = CurrentTime;
   parv[0] = cli_name(sptr);
   parv[1] = parv[2] = NULL;
@@ -504,6 +627,11 @@ int register_user(struct Client *cptr, struct Client *sptr)
 
   if (MyConnect(sptr))
   {
+    /* What the prologue below changes, for a registration the bouncer
+     * defers to put back (register_user_unwind()). */
+    short pre_status = cli_status(sptr);
+    HandlerType pre_handler = cli_handler(sptr);
+
     assert(cptr == sptr);
 
     /* Pre-flight: require-sasl reject must happen BEFORE
@@ -580,19 +708,72 @@ int register_user(struct Client *cptr, struct Client *sptr)
       }
 
       /* Try 2: Local relay-only ACTIVE ghost (no local socket, remote
-       * aliases only). When a user reconnects to the managing server,
-       * they should become the primary instead of another alias. */
+       * aliases only). When a user reconnects to the server holding it,
+       * they should become the primary instead of another alias.  The
+       * primary being ours (MyUser) is what makes this server the one: the
+       * origin the record noted goes stale. */
       if (!revive_target) {
         struct BouncerSession *active = bounce_find_any_session(cli_account(sptr));
         if (active && active->hs_state == BOUNCE_ACTIVE
             && active->hs_client && MyUser(active->hs_client)
-            && cli_fd(active->hs_client) == -1
-            && 0 == strcmp(active->hs_origin, cli_yxx(&me))) {
+            && cli_fd(active->hs_client) == -1) {
           time_t idle = cli_user(active->hs_client)
                       ? cli_user(active->hs_client)->last : 0;
           saved_since_time = (idle > 0) ? idle : active->hs_last_active;
           revive_target = active;
         }
+      }
+
+      /* A different Keycloak user under this account name (the account
+       * was deleted and recreated): the held session is not this
+       * login's (user decision 2026-10-21).  A held session with no
+       * other connection ends -- its user is gone -- and this connection
+       * registers fresh; one with aliases elsewhere is not revived, and
+       * bounce_auto_resume() below refuses the login rather than attach
+       * it to that session (user, 2026-10-23).  A ghost without an id
+       * adopts the login's (bounce_revive). */
+      if (revive_target && revive_target->hs_client
+          && bounce_rebind_kc_conflict(bounce_session_kc_id(revive_target),
+                                       cli_user(sptr)->kc_id)) {
+        struct Client *stale = revive_target->hs_client;
+        log_write(LS_USER, L_INFO, 0,
+                  "Bouncer: not reviving %s for %s: the session belongs to Keycloak "
+                  "id %s, the login %s%s", cli_name(stale), cli_account(sptr),
+                  bounce_session_kc_id(revive_target), cli_user(sptr)->kc_id,
+                  (revive_target->hs_state == BOUNCE_HOLDING
+                   && revive_target->hs_alias_count == 0
+                   && cli_saslkcidlive(sptr))
+                    ? "; ending the stale session" : "");
+        /* Ended only by a login Keycloak itself just confirmed (user,
+         * 2026-10-23): a deleted user's cached login or still-valid token
+         * must not end the current owner's session. */
+        if (revive_target->hs_state == BOUNCE_HOLDING
+            && revive_target->hs_alias_count == 0 && IsBouncerHold(stale)
+            && cli_saslkcidlive(sptr)) {
+          bounce_kill_session(revive_target,
+                              "Session ended: its Keycloak account was replaced");
+          ClearBouncerHold(stale);
+          exit_client(stale, stale, &me,
+                      "Session ended: its Keycloak account was replaced");
+        }
+        revive_target = NULL;
+      }
+      /* Never a revive into another identity (ruling W3-T12c-2b-f1b): a
+       * session whose primary's account changed under it (an OAUTHBEARER
+       * re-auth) is listed under this account with a primary of another;
+       * the chooser in bounce_auto_resume() below lets this login register
+       * in no session then. */
+      if (revive_target && revive_target->hs_client
+          && !bounce_session_primary_is_identity(revive_target,
+                                                 cli_user(sptr)->kc_id)) {
+        log_write(LS_USER, L_INFO, 0,
+                  "Bouncer: not reviving %s for %s: session %s's primary is "
+                  "not that identity (account %s)",
+                  cli_name(revive_target->hs_client), cli_account(sptr),
+                  revive_target->hs_sessid,
+                  IsAccount(revive_target->hs_client)
+                    ? cli_account(revive_target->hs_client) : "*");
+        revive_target = NULL;
       }
 
       if (revive_target && bounce_revive(revive_target, sptr) == 0) {
@@ -603,6 +784,13 @@ int register_user(struct Client *cptr, struct Client *sptr)
 
         /* Save temp client's nick in case ghost has different nick */
         ircd_strncpy(original_nick, cli_name(sptr), NICKLEN + 1);
+
+        /* The login gives back the connection attempt the accept charged
+         * (IPcheck_login_refund).  The attempt sits on the ghost's entry
+         * now (bounce_revive step 6a moved the IP and the flag); the
+         * SASL flag is still the temp's, so this goes before it is freed. */
+        if (IsSASLComplete(sptr) && IsIPChecked(ghost))
+          IPcheck_login_refund(ghost, cli_user(ghost)->account);
 
         /* Free the temp client (no network messages) */
         bounce_free_temp_client(sptr);
@@ -648,15 +836,17 @@ int register_user(struct Client *cptr, struct Client *sptr)
         /* Post-registration fakelag credit: modern clients burst init
          * commands (MONITOR, METADATA SUB, WHO, MODE...) right after 001;
          * the default ~10s cli_since headroom covers only ~5 of them.
-         * Start the client in surplus -- every command is still CHARGED
-         * (credit, not exemption), the one-shot grace just raises the
-         * initial burst budget; recvq byte caps still bound the wire.
+         * A credit the first charges absorb (fakelag_charge()) -- every
+         * command is still CHARGED (credit, not exemption), the one-shot
+         * grace just raises the initial burst budget; recvq byte caps still
+         * bound the wire.  Not a clock set below now: read_packet() floors
+         * the clock to the last read time and would erase that.
    * Authenticated clients only: an anonymous connection (the
    * drive-by/WS-flood surface) keeps the classic ~5-command burst. */
         {
           int grace = feature_int(FEAT_POSTREG_GRACE);
           if (grace > 0 && IsAccount(ghost))
-            cli_since(ghost) = CurrentTime - grace;
+            cli_lagcredit(ghost) = grace;
         }
 
         /* IRCv3 draft/metadata-2: mirror the normal-path self-metadata
@@ -669,6 +859,20 @@ int register_user(struct Client *cptr, struct Client *sptr)
         if (ircd_strcmp(original_nick, cli_name(ghost)) != 0) {
           sendcmdto_one(ghost, CMD_NICK, ghost, "%s", cli_name(ghost));
         }
+
+        /* The new socket takes over the ghost's user modes (+o, +x,
+         * +s ...); tell it what they are, as registration would. */
+        send_umode_signon(ghost);
+
+        /* The reviving socket's pre-registration AWAY (draft/pre-away),
+         * carried over by bounce_revive(); applied here as the fresh
+         * path does after the MOTD.  Through away_apply() so the
+         * session re-aggregates and the channels get away-notify. */
+        if (con_pre_away(cli_connect(ghost)))
+          away_apply(ghost, ghost,
+                     con_pre_away(cli_connect(ghost)) == 2
+                       ? (char *)"*" : con_pre_away_msg(cli_connect(ghost)),
+                     0);
 
         /* Replay channel state */
         bounce_send_channel_state(ghost);
@@ -723,6 +927,17 @@ int register_user(struct Client *cptr, struct Client *sptr)
      * max reached, or TLS policy mismatch).  Proceeding with a normal
      * NICK N introduction would collide with the primary on upstream
      * servers (same user@host kill).  Reject the duplicate. */
+    /* A session of this account belongs to a different Keycloak user and
+     * is still in use: never joined (bounce_auto_resume), and this login
+     * cannot register beside it.  Nothing was introduced, so no QUIT. */
+    if (auto_resumed == BOUNCE_RESUME_REJECT_KC_CONFLICT) {
+      ++ServerStats->is_ref;
+      SetFlag(sptr, FLAG_KILLED);
+      return exit_client(cptr, sptr, &me,
+                         "This account's session belongs to its previous "
+                         "Keycloak user; ask an operator");
+    }
+
     if (auto_resumed == BOUNCE_RESUME_REJECT_DUPLICATE) {
       ++ServerStats->is_ref;
       /* See note above: no numeric, no prior introduction → no QUIT. */
@@ -733,17 +948,71 @@ int register_user(struct Client *cptr, struct Client *sptr)
 
     /* Steady-state BS C race guard: peer has inbound bytes that may
      * carry a BS C for this account.  Defer registration; the drain
-     * triggered by BS C processing (or EB) will retry auto_resume
-     * once the peer data has been consumed.  See
-     * project_bsc_n_ordering_race memory for full discussion. */
+     * (bounce_drain_pending_registrations()) runs register_user() again
+     * once the peer data has been read.  See project_bsc_n_ordering_race
+     * memory for full discussion.
+     *
+     * Until then the client is the unregistered connection it was before
+     * the prologue above (W3 12c-2b fix 2, N3): counted as unknown, the
+     * unregistered command table (no JOIN, no PRIVMSG), no numeric, nothing
+     * on the wire -- a QUIT of a client with no numeric went out sourced
+     * from this server alone, which a peer reads as a server's QUIT.  The
+     * drain runs register_user() from the top, prologue and all, once. */
     if (auto_resumed == BOUNCE_RESUME_DEFER_PEER_INBOUND) {
+      /* Deferred again by the drain that retried it: no second notice,
+       * and the registration timeout it waits under stays as it was (fix
+       * round 3, I-1: the bound is from the first defer). */
+      int again = bounce_is_draining_registration(sptr);
       if (bounce_defer_registration(sptr) == 0) {
-        sendrawto_one(sptr,
-                      "NOTICE * :*** Bouncer: waiting for peer session "
-                      "announcement to settle before registering");
+        register_user_unwind(sptr, pre_status, pre_handler, !again);
+        if (!again)
+          sendrawto_one(sptr,
+                        "NOTICE * :*** Bouncer: waiting for peer session "
+                        "announcement to settle before registering");
         return 0;
       }
       /* defer failed (OOM?) — fall through to create as best-effort */
+    }
+
+    /* The nick this registration goes out under must be its own in the
+     * nick hash.  A deferred nick resolved for an alias attach
+     * (check_auth_finished(), the drain's pending-nick resolution) is set
+     * unhashed: its holder, a session primary of the same account, owns
+     * the hash entry, and only the alias route above registers under it.
+     * Any other route -- a hold opt-out, FOREIGN, a revive that fell back,
+     * and the orphan reclaim or create bounce_auto_resume() stops before
+     * changing anything (BOUNCE_RESUME_NICK_HELD) -- would introduce a
+     * second user of that nick, which the holder's servers answer with a
+     * nick-collision KILL.  A free nick is taken; a held one is refused:
+     * ERR_NICKNAMEINUSE, the client goes back to the unregistered
+     * connection it was, and its next NICK queues it again
+     * (set_nick_name()).  W3 12c-2b carry, Minor 1. */
+    if (auto_resumed == BOUNCE_RESUME_NICK_HELD
+        || (*(cli_name(sptr)) && FindClient(cli_name(sptr)) != sptr)) {
+      struct Client *owner = FindClient(cli_name(sptr));
+
+      if (auto_resumed != BOUNCE_RESUME_NICK_HELD && !owner)
+        hAddClient(sptr);
+      else {
+        char nick[NICKLEN + 1];
+
+        ircd_strncpy(nick, cli_name(sptr), sizeof(nick));
+        log_write(LS_USER, L_INFO, 0,
+                  "register_user: %s (%s) cannot register under %s, which %s "
+                  "holds: 433, it waits for a new NICK", nick,
+                  IsAccount(sptr) ? cli_account(sptr) : "*", nick,
+                  owner ? cli_name(owner) : "*");
+        register_user_unwind(sptr, pre_status, pre_handler, 0);
+        /* Never a hash entry left under a name it no longer has: the
+         * routes here hold the nick unhashed (another client owns the
+         * entry), but the clear must not depend on that (W3 final fix
+         * wave). */
+        if (FindClient(cli_name(sptr)) == sptr)
+          hRemClient(sptr);
+        cli_name(sptr)[0] = '\0';
+        send_reply(sptr, ERR_NICKNAMEINUSE, nick);
+        return 0;
+      }
     }
 
     SetLocalNumNick(sptr);
@@ -846,15 +1115,17 @@ int register_user(struct Client *cptr, struct Client *sptr)
     /* Post-registration fakelag credit: modern clients burst init
      * commands (MONITOR, METADATA SUB, WHO, MODE...) right after 001;
      * the default ~10s cli_since headroom covers only ~5 of them.
-     * Start the client in surplus -- every command is still CHARGED
-     * (credit, not exemption), the one-shot grace just raises the
-     * initial burst budget; recvq byte caps still bound the wire.
+     * A credit the first charges absorb (fakelag_charge()) -- every
+     * command is still CHARGED (credit, not exemption), the one-shot
+     * grace just raises the initial burst budget; recvq byte caps still
+     * bound the wire.  Not a clock set below now: read_packet() floors
+     * the clock to the last read time and would erase that.
    * Authenticated clients only: an anonymous connection (the
    * drive-by/WS-flood surface) keeps the classic ~5-command burst. */
     {
       int grace = feature_int(FEAT_POSTREG_GRACE);
       if (grace > 0 && IsAccount(sptr))
-        cli_since(sptr) = CurrentTime - grace;
+        cli_lagcredit(sptr) = grace;
     }
 
     /* IRCv3 draft/metadata-2: burst client's own metadata after registration.
@@ -872,39 +1143,13 @@ int register_user(struct Client *cptr, struct Client *sptr)
                            cli_sock_ip(sptr), get_client_class(sptr),
                            cli_info(sptr), NumNick(cptr) /* two %s's */);
 
+    /* A SASL login gives back the connection attempt the accept charged
+     * (IPcheck_login_refund: capped per account, off by default), before
+     * the IPcheck notice below reports the count. */
+    if (IsSASLComplete(sptr) && IsAccount(sptr) && IsIPChecked(sptr))
+      IPcheck_login_refund(sptr, cli_user(sptr)->account);
     if (IsIPChecked(sptr))
       IPcheck_connect_succeeded(sptr);
-
-    /* Apply pre-away state if set (IRCv3 draft/pre-away) */
-    {
-      int pre_away_type = con_pre_away(cli_connect(sptr));
-      if (pre_away_type) {
-        if (pre_away_type == 2) {
-          /* AWAY * - away with an unspecified reason, stored as the star
-           * (shown to non-pre-away clients as FEAT_AWAY_STAR_MSG at
-           * emission, see away_text_for). */
-          if (!user->away) {
-            user->away = (char*) MyMalloc(2);
-            user->away[0] = '*';
-            user->away[1] = '\0';
-          }
-          /* Don't broadcast AWAY * to servers - it's a hidden connection */
-        } else {
-          /* Normal away with message */
-          unsigned int len = strlen(con_pre_away_msg(cli_connect(sptr)));
-          if (user->away)
-            MyFree(user->away);
-          user->away = (char*) MyMalloc(len + 1);
-          strcpy(user->away, con_pre_away_msg(cli_connect(sptr)));
-          /* Broadcast to servers */
-          sendcmdto_serv_butone(sptr, CMD_AWAY, cptr, ":%s", user->away);
-        }
-        /* Clear pre-away state */
-        con_pre_away(cli_connect(sptr)) = 0;
-        con_pre_away_msg(cli_connect(sptr))[0] = '\0';
-
-      }
-    }
 
     /* Replay channel state and chathistory after session resume. */
     if (auto_resumed && auto_session) {
@@ -974,7 +1219,10 @@ int register_user(struct Client *cptr, struct Client *sptr)
    * N's ,S compact-tag segment so BX-aware peers can use it for at-N-time
    * convergence dispatch.  Set before each broadcast because the
    * override auto-clears after consumption.  No-op for non-bouncer
-   * users.
+   * users.  The hold mark (,H) rides beside it: the hint stamps one for
+   * a user of ours with an account, relay_hold_mark() copies the one a
+   * relayed N arrived with; both after the hint, which disarms any
+   * earlier mark.
    *
    * The frontier-introducer defer-to-legacy mechanism (skip_legacy_canon
    * + pending_canon_register) was REMOVED 2026-05-08: it broke fresh
@@ -993,38 +1241,63 @@ int register_user(struct Client *cptr, struct Client *sptr)
    * unconditionally to all peers; cascade-prevention happens elsewhere
    * (D.2 at-N-time dispatch on the receive side handles the multi-
    * server convergence cases without needing to defer the introduction). */
-  bounce_set_n_sessid_hint(sptr);
-  /* Send full IP address to IPv6-grokking servers.
-   *
-   * Phase 3l (CRDT-mesh): on a CRDT primary the user introduction rides the
-   * CRDT doc to CRDT-aware peers (crdt_shadow_reconcile_users materializes them
-   * there and §17.7-gateways a NICK onward to legacy), so forbid CRDT-aware
-   * peers on this emit.  Every link advertises the literal '6' (s_serv.c:144),
-   * so this require-IPV6 call carries all real traffic; the forbid-IPV6 call
-   * below is unchanged (vacuous here — no pre-v6 peers exist — so a hypothetical
-   * pre-v6 CRDT peer is the one documented leak, not reachable in this fleet). */
-  sendcmdto_flag_serv_butone(user->server, CMD_NICK, cptr,
-                             FLAG_IPV6,
-                             feature_bool(FEAT_CRDT_PRIMARY) ? FLAG_CRDT_AWARE
-                                                             : FLAG_LAST_FLAG,
-                             "%s %d %Tu %s %s %s%s%s%s %s%s :%s",
-                             cli_name(sptr), cli_hopcount(sptr) + 1,
-                             cli_lastnick(sptr),
-                             user->username, user->realhost,
-                             *tmpstr ? "+" : "", tmpstr, *tmpstr ? " " : "",
-                             iptobase64(ip_base64, &cli_ip(sptr), sizeof(ip_base64), 1),
-                             NumNick(sptr), cli_info(sptr));
-  bounce_set_n_sessid_hint(sptr);
-  /* Send fake IPv6 addresses to pre-IPv6 servers. */
-  sendcmdto_flag_serv_butone(user->server, CMD_NICK, cptr,
-                             FLAG_LAST_FLAG, FLAG_IPV6,
-                             "%s %d %Tu %s %s %s%s%s%s %s%s :%s",
-                             cli_name(sptr), cli_hopcount(sptr) + 1,
-                             cli_lastnick(sptr),
-                             user->username, user->realhost,
-                             *tmpstr ? "+" : "", tmpstr, *tmpstr ? " " : "",
-                             iptobase64(ip_base64, &cli_ip(sptr), sizeof(ip_base64), 0),
-                             NumNick(sptr), cli_info(sptr));
+  if (withhold_legacy && !MyConnect(sptr)) {
+    /* The relayed N goes to IRCv3-aware links only: the legacy links
+     * already hold this user under another numeric, and the caller
+     * renumbers that face to this one (BX P) instead.  An N here would
+     * make a legacy server collide the nick and KILL one side.  Every
+     * IRCv3-aware server announces IPv6, so the full-IP form is the only
+     * one needed. */
+    bounce_set_n_sessid_hint(sptr);
+    relay_hold_mark(cptr, sptr);
+    sendcmdto_flag_serv_butone(user->server, CMD_NICK, cptr,
+                               FLAG_IRCV3AWARE,
+                               feature_bool(FEAT_CRDT_PRIMARY) ? FLAG_CRDT_AWARE
+                                                               : FLAG_LAST_FLAG,
+                               "%s %d %Tu %s %s %s%s%s%s %s%s :%s",
+                               cli_name(sptr), cli_hopcount(sptr) + 1,
+                               cli_lastnick(sptr),
+                               user->username, user->realhost,
+                               *tmpstr ? "+" : "", tmpstr, *tmpstr ? " " : "",
+                               iptobase64(ip_base64, &cli_ip(sptr), sizeof(ip_base64), 1),
+                               NumNick(sptr), cli_info(sptr));
+  } else {
+    bounce_set_n_sessid_hint(sptr);
+    relay_hold_mark(cptr, sptr);
+    /* Send full IP address to IPv6-grokking servers.
+     *
+     * Phase 3l (CRDT-mesh): on a CRDT primary the user introduction rides the
+     * CRDT doc to CRDT-aware peers (crdt_shadow_reconcile_users materializes them
+     * there and §17.7-gateways a NICK onward to legacy), so forbid CRDT-aware
+     * peers on this emit (and on the IRCv3-only form above).  Every link
+     * advertises the literal '6' (s_serv.c), so this require-IPV6 call carries
+     * all real traffic; the forbid-IPV6 call below is unchanged (vacuous here --
+     * no pre-v6 peers exist -- so a hypothetical pre-v6 CRDT peer is the one
+     * documented leak, not reachable in this fleet). */
+    sendcmdto_flag_serv_butone(user->server, CMD_NICK, cptr,
+                               FLAG_IPV6,
+                               feature_bool(FEAT_CRDT_PRIMARY) ? FLAG_CRDT_AWARE
+                                                               : FLAG_LAST_FLAG,
+                               "%s %d %Tu %s %s %s%s%s%s %s%s :%s",
+                               cli_name(sptr), cli_hopcount(sptr) + 1,
+                               cli_lastnick(sptr),
+                               user->username, user->realhost,
+                               *tmpstr ? "+" : "", tmpstr, *tmpstr ? " " : "",
+                               iptobase64(ip_base64, &cli_ip(sptr), sizeof(ip_base64), 1),
+                               NumNick(sptr), cli_info(sptr));
+    bounce_set_n_sessid_hint(sptr);
+    relay_hold_mark(cptr, sptr);
+    /* Send fake IPv6 addresses to pre-IPv6 servers. */
+    sendcmdto_flag_serv_butone(user->server, CMD_NICK, cptr,
+                               FLAG_LAST_FLAG, FLAG_IPV6,
+                               "%s %d %Tu %s %s %s%s%s%s %s%s :%s",
+                               cli_name(sptr), cli_hopcount(sptr) + 1,
+                               cli_lastnick(sptr),
+                               user->username, user->realhost,
+                               *tmpstr ? "+" : "", tmpstr, *tmpstr ? " " : "",
+                               iptobase64(ip_base64, &cli_ip(sptr), sizeof(ip_base64), 0),
+                               NumNick(sptr), cli_info(sptr));
+  }
 
   /* Broadcast BS A for a newly created bouncer session.  Must come AFTER
    * the N token above so that receiving servers can findNUser() the
@@ -1032,12 +1305,25 @@ int register_user(struct Client *cptr, struct Client *sptr)
   if (auto_session && auto_session->hs_client == sptr)
     bounce_broadcast(auto_session, 'A', cli_yxx(sptr));
 
+  /* Apply a pre-registration AWAY (IRCv3 draft/pre-away) the way a live
+   * AWAY is applied: own state, session aggregation and replication,
+   * network broadcast.  Here, after the N and BS A above: the AWAY and
+   * BX U aw= it sends name the user and its session, and a peer that has
+   * not had the introduction drops them as from an unknown numeric.
+   * con_pre_away stays set -- it IS this connection's own state, and the
+   * aggregation reads it.  No numerics: the pre-registration AWAY got
+   * none either. */
+  if (MyUser(sptr) && con_pre_away(cli_connect(sptr)))
+    away_apply(sptr, sptr,
+               con_pre_away(cli_connect(sptr)) == 2
+                 ? (char *)"*" : con_pre_away_msg(cli_connect(sptr)),
+               0);
+
   clear_privs(sptr);
 
   /* Send user mode to client */
   if (MyUser(sptr))
   {
-    static struct Flags flags; /* automatically initialized to zeros */
     struct SLink *lp;
 
     if (cli_webirc(sptr) && !EmptyString(cli_webirc(sptr)))
@@ -1050,11 +1336,11 @@ int register_user(struct Client *cptr, struct Client *sptr)
     if (cli_sslclifp(sptr) && !EmptyString(cli_sslclifp(sptr))) {
       sendcmdto_serv_butone(&me, CMD_MARK, cptr, "%s %s :%s", cli_name(cptr), MARK_SSLCLIFP, cli_sslclifp(sptr));
       if (feature_bool(FEAT_CERT_EXPIRY_TRACKING) && cli_sslcliexp(sptr) > 0)
-        sendcmdto_serv_butone(&me, CMD_MARK, cptr, "%s %s :%lu", cli_name(cptr), MARK_SSLCLIEXP, (unsigned long)cli_sslcliexp(sptr));
+        sendcmdto_serv_butone_v3(&me, CMD_MARK, cptr, "%s %s :%lu", cli_name(cptr), MARK_SSLCLIEXP, (unsigned long)cli_sslcliexp(sptr));
     }
 
     if (!EmptyString(cli_wsorigin(sptr)))
-      sendcmdto_serv_butone(&me, CMD_MARK, cptr, "%s %s :%s", cli_name(cptr), MARK_WEBSOCKET, cli_wsorigin(sptr));
+      sendcmdto_serv_butone_v3(&me, CMD_MARK, cptr, "%s %s :%s", cli_name(cptr), MARK_WEBSOCKET, cli_wsorigin(sptr));
 
     if (cli_version(sptr) && !EmptyString(cli_version(sptr))) {
       sendcmdto_serv_butone(&me, CMD_MARK, cptr, "%s %s :%s", cli_name(cptr), MARK_CVERSION, cli_version(sptr));
@@ -1086,34 +1372,8 @@ int register_user(struct Client *cptr, struct Client *sptr)
                       cli_continentcode(sptr), cli_countryname(sptr));
     }
 
-    /* To avoid sending +r to the client due to auth-on-connect, set
-     * the "old" FLAG_ACCOUNT bit to match the client's value.
-     */
-    if (IsAccount(cptr))
-      FlagSet(&flags, FLAG_ACCOUNT);
-    else
-      FlagClr(&flags, FLAG_ACCOUNT);
-    if (IsCloakHost(cptr))
-      FlagSet(&flags, FLAG_CLOAKHOST);
-    else
-      FlagClr(&flags, FLAG_CLOAKHOST);
-    if (IsCloakIP(cptr))
-      FlagSet(&flags, FLAG_CLOAKIP);
-    else
-      FlagClr(&flags, FLAG_CLOAKIP);
-    if (IsFakeHost(cptr))
-      FlagSet(&flags, FLAG_FAKEHOST);
-    else
-      FlagClr(&flags, FLAG_FAKEHOST);
-    if (IsSetHost(cptr))
-      FlagSet(&flags, FLAG_SETHOST);
-    else
-      FlagClr(&flags, FLAG_SETHOST);
     client_set_privs(sptr, NULL);
-    send_umode(cptr, sptr, &flags, ALL_UMODES);
-    if ((cli_snomask(sptr) != feature_int(FEAT_SNOMASK_DEFAULT)) &&
-        HasFlag(sptr, FLAG_SERVNOTICE))
-      send_reply(sptr, RPL_SNOMASK, cli_snomask(sptr), cli_snomask(sptr));
+    send_umode_signon(sptr);
 
     if ((connclass = get_client_class_conf(sptr)) != NULL)
     {
@@ -1352,18 +1612,31 @@ int set_nick_name(struct Client* cptr, struct Client* sptr,
       /* Generate msgid for NICK change so clients get @msgid tag */
       {
         char nick_msgid[64] = "";
+        /* The event's ONE msgid and time, from one source.  A remote
+         * nick change reuses the tags its NICK line carried (cptr's
+         * stash), so all servers share one id -- but only while cptr's
+         * link is the one whose line is being handled.  SVSNICK passes
+         * the target user as cptr, and its stash is the target's link's
+         * last line, wherever the SVSNICK came from: another event,
+         * whose msgid and time the NICK went out and was stored under.
+         * Without such a source, mint, as for a local change. */
+        struct Client *tag_src = (!MyUser(sptr)
+                                  && sendcmdto_stash_is_current(cptr)
+                                  && cli_s2s_msgid(cptr)[0]) ? cptr : NULL;
+        uint64_t nick_ms;
+
         if (feature_bool(FEAT_MSGID)) {
-          /* Unified msgid: reuse the incoming S2S msgid for remote
-           * nick changes so all servers share one id. */
-          if (!MyUser(sptr) && cli_s2s_msgid(cptr)[0])
-            ircd_strncpy(nick_msgid, cli_s2s_msgid(cptr), sizeof(nick_msgid));
+          if (tag_src)
+            ircd_strncpy(nick_msgid, cli_s2s_msgid(tag_src), sizeof(nick_msgid));
           else
             generate_msgid(nick_msgid, sizeof(nick_msgid));
-          /* One time per event: the origin's tag time for a remote nick
-           * change, the msgid's mint time for a local one. */
-          sendcmdto_set_client_event(nick_msgid,
-                                     history_event_time_ms(MyUser(sptr) ? NULL : cptr));
         }
+        /* After any mint: the origin's tag time for a reused msgid, the
+         * mint time for a minted one.  The live NICK, the stored rows
+         * and the relay all carry it. */
+        nick_ms = history_event_time_ms(tag_src);
+        if (feature_bool(FEAT_MSGID))
+          sendcmdto_set_client_event(nick_msgid, nick_ms);
 
         /* If sender has a labeled-response label, send them a labeled NICK
          * echo first, then skip them in the broadcast to other members. */
@@ -1394,8 +1667,7 @@ int set_nick_name(struct Client* cptr, struct Client* sptr,
                         cli_name(sptr), cli_user(sptr)->username, cli_user(sptr)->host);
 
           /* Same event time the live NICK was tagged with (above) */
-          history_format_ms(timestamp, sizeof(timestamp),
-                            history_event_time_ms(MyUser(sptr) ? NULL : cptr));
+          history_format_ms(timestamp, sizeof(timestamp), nick_ms);
 
           for (chan = cli_user(sptr)->channel; chan; chan = chan->next_channel) {
             if (chan->channel->mode.exmode & EXMODE_NOSTORAGE)
@@ -1412,8 +1684,7 @@ int set_nick_name(struct Client* cptr, struct Client* sptr,
       if (nick_msgid[0]) {
         /* The same event time the rows were stored with (above), so every
          * server stores this msgid at ONE time (audit 2026-09-06 #16). */
-        sendcmdto_set_s2s_tags(history_event_time_ms(MyUser(sptr) ? NULL : cptr),
-                               nick_msgid);
+        sendcmdto_set_s2s_tags(nick_ms, nick_msgid);
         sendcmdto_want_s2s_tags(1);
       }
       }
@@ -1440,7 +1711,7 @@ int set_nick_name(struct Client* cptr, struct Client* sptr,
       if (MyUser(sptr) && IsAccount(sptr)) {
         struct BouncerSession *bsess = bounce_get_session(sptr);
         if (bsess && bsess->hs_alias_count > 0) {
-          sendcmdto_serv_butone(&me, CMD_BOUNCER_TRANSFER, cptr,
+          sendcmdto_serv_butone_v3(&me, CMD_BOUNCER_TRANSFER, cptr,
                                 "N %s%s %s %Tu",
                                 cli_yxx(cli_user(sptr)->server), cli_yxx(sptr),
                                 nick, cli_lastnick(sptr));
@@ -1522,6 +1793,15 @@ int set_nick_name(struct Client* cptr, struct Client* sptr,
            (void*)sptr, cli_fd(sptr), nick));
     strcpy(cli_name(sptr), nick);
     hAddClient(sptr);
+    /* A registration the bouncer deferred has no auth request left (it
+     * completed); a peer's N took its nick meanwhile (m_nick.c).  With a
+     * nick again, it waits for the drain once more.  W3 12c-2b fix 2. */
+    if (!cli_auth(sptr)) {
+      if (!bounce_is_pending_registration(sptr)
+          && bounce_defer_registration(sptr) == 0)
+        bounce_schedule_registration_drain();
+      return 0;
+    }
     return auth_set_nick(cli_auth(sptr), nick);
   }
 
@@ -1803,7 +2083,7 @@ void send_user_info(struct Client* sptr, char* names, int rpl, InfoFormatter fmt
     if (5 == ++arg_count)
       break;
   }
-  send_buffer(sptr, mb, 0);
+  send_reply_buffer(sptr, mb);
   msgq_clean(mb);
 }
 
@@ -2166,6 +2446,26 @@ int set_user_mode(struct Client *cptr, struct Client *sptr, int parc,
   char* fakehost = NULL;
   char* sethost = NULL;
   struct Client *acptr = NULL;
+  struct Client *snoc = NULL;
+  int sno_touched = 0;
+  /* What a -b does, after the mode loop (a +b later in the same command
+   * cancels all of it: the final state wins).  The hold preference: written
+   * here (hold_off), and told to every server (hold_off_tell).  The session
+   * end, run at the end of this function (see there): the record by its
+   * identity (end_session, compared, never read) and its account and id. */
+  int hold_off = 0;
+  int hold_off_tell = 0;
+  struct BouncerSession *end_session = NULL;
+  char end_account[ACCOUNTLEN + 1] = "";
+  char end_sessid[BOUNCER_SESSID_LEN] = "";
+  /* What the command's hold letters leave for the end of this function
+   * (bounce_hold_tail_step(): the last letter wins, ruling W3-T12b-f4b and
+   * 12b M1): the -b's end above, or the +b's join or create (W3 12c-2b),
+   * never both.  hold_on_tell: a +b of a device of ours toward a primary on
+   * another server stands, and its server tells the other servers the
+   * preference (bounce_hold_on_tells()). */
+  enum bounce_hold_tail hold_tail = BOUNCE_HOLD_TAIL_NONE;
+  int hold_on_tell = 0;
 
   if (MyUser(sptr) && (allow_modes & ALLOWMODES_SVSMODE))
     is_svsmode = 1;
@@ -2235,9 +2535,21 @@ int set_user_mode(struct Client *cptr, struct Client *sptr, int parc,
             int mwhat = MODE_ADD;
             unsigned int mi;
             for (pp = &parv[2]; *pp && pp < &parv[parc]; pp++) {
+              char **mode_arg = pp;  /* last parameter this mode string used */
               for (mm = *pp; *mm; mm++) {
                 if (*mm == '+') { mwhat = MODE_ADD; continue; }
                 if (*mm == '-') { mwhat = MODE_DEL; continue; }
+                /* The modes that take an argument consume the next
+                 * parameter, as the parse below does: an account, a
+                 * cloaked host or a sethost is not a string of mode
+                 * letters (the 'o' in a host set +o on the replica, and
+                 * the sync handed it to the local aliases). */
+                if (mode_arg + 1 < &parv[parc] && *(mode_arg + 1)
+                    && ((*mm == 's' && is_snomask(*(mode_arg + 1)))
+                        || (mwhat == MODE_ADD
+                            && (*mm == 'r' || *mm == 'C' || *mm == 'c'
+                                || *mm == 'f' || *mm == 'h'))))
+                  mode_arg++;
                 for (mi = 0; mi < USERMODELIST_SIZE; mi++) {
                   if (userModeList[mi].c == *mm) {
                     if (mwhat == MODE_ADD)
@@ -2248,8 +2560,9 @@ int set_user_mode(struct Client *cptr, struct Client *sptr, int parc,
                   }
                 }
               }
+              pp = mode_arg;
             }
-            bounce_sync_session_umodes(acptr);
+            bounce_sync_session_umodes(acptr, NULL, NULL);
           }
         }
 
@@ -2263,6 +2576,17 @@ int set_user_mode(struct Client *cptr, struct Client *sptr, int parc,
     }
     }
   }
+
+  /* The connection whose server notice mask this command reads and sets:
+   * the target when it is ours, else the asking alias when its primary is
+   * on another server.  A mask lives where its connection is (a remote
+   * Client's cli_snomask is its uplink link's Connection field); the
+   * session's other servers hear of it by BX K. */
+  if (MyConnect(acptr))
+    snoc = acptr;
+  else if (MyConnect(sptr) && sptr != acptr && cli_user(sptr)
+           && cli_user(sptr)->alias_primary == acptr)
+    snoc = sptr;
 
   if (parc < 3)
   {
@@ -2287,12 +2611,24 @@ int set_user_mode(struct Client *cptr, struct Client *sptr, int parc,
      * reply to the primary's socket and the alias never saw its own
      * umode query response. */
     send_reply(sptr, RPL_UMODEIS, buf);
-    if (HasFlag(acptr, FLAG_SERVNOTICE) && MyConnect(sptr)
-        && cli_snomask(acptr) !=
-        (unsigned int)(IsOper(acptr) ? feature_int(FEAT_SNOMASK_OPERDEFAULT) :
+    if (snoc && HasFlag(snoc, FLAG_SERVNOTICE) && MyConnect(sptr)
+        && cli_snomask(snoc) !=
+        (unsigned int)(IsOper(snoc) ? feature_int(FEAT_SNOMASK_OPERDEFAULT) :
          feature_int(FEAT_SNOMASK_DEFAULT)))
-      send_reply(sptr, RPL_SNOMASK, cli_snomask(acptr), cli_snomask(acptr));
+      send_reply(sptr, RPL_SNOMASK, cli_snomask(snoc), cli_snomask(snoc));
     return 0;
+  }
+
+  /* For an alias of a remote primary, the primary's +s here is a
+   * replica's (P10 never carries it): take the alias's own before setflags
+   * is, or the echo of this command (send_umode against setflags) shows a
+   * change of +s that did not happen and misses one that did. */
+  if (snoc && snoc != acptr)
+  {
+    if (HasFlag(snoc, FLAG_SERVNOTICE))
+      SetServNotice(acptr);
+    else
+      ClearServNotice(acptr);
   }
 
   /*
@@ -2301,8 +2637,8 @@ int set_user_mode(struct Client *cptr, struct Client *sptr, int parc,
    */
   setflags = cli_flags(acptr);
 
-  if (MyConnect(acptr))
-    tmpmask = cli_snomask(acptr);
+  if (snoc)
+    tmpmask = cli_snomask(snoc);
 
   /*
    * parse mode change string(s)
@@ -2317,6 +2653,7 @@ int set_user_mode(struct Client *cptr, struct Client *sptr, int parc,
         what = MODE_DEL;
         break;
       case 's':
+        sno_touched = 1;
         if (*(p + 1) && is_snomask(*(p + 1))) {
           snomask_given = 1;
           tmpmask = umode_make_snomask(tmpmask, *++p, what);
@@ -2347,12 +2684,13 @@ int set_user_mode(struct Client *cptr, struct Client *sptr, int parc,
           ClrFlag(acptr, FLAG_ADMIN);
           ClrFlag(acptr, FLAG_OPERED_LOCAL);
           ClrFlag(acptr, FLAG_OPERED_REMOTE);
-          if (MyConnect(acptr))
+          if (snoc)
           {
-            tmpmask = cli_snomask(acptr) & ~SNO_OPER;
-            if (MyUser(acptr))
-              cli_handler(acptr) = CLIENT_HANDLER;
+            tmpmask = cli_snomask(snoc) & ~SNO_OPER;
+            sno_touched = 1;
           }
+          if (MyUser(acptr))
+            cli_handler(acptr) = CLIENT_HANDLER;
           /* Clear the session-level oper grant.  Mirrors the do_oper
            * grant-set: state survives across primary changes, so we
            * must explicitly clear it on /DEOPER so a subsequent
@@ -2384,12 +2722,13 @@ int set_user_mode(struct Client *cptr, struct Client *sptr, int parc,
           ClrFlag(acptr, FLAG_LOCOP);
           ClrFlag(acptr, FLAG_OPERED_LOCAL);
           ClrFlag(acptr, FLAG_OPERED_REMOTE);
-          if (MyConnect(acptr))
+          if (snoc)
           {
-            tmpmask = cli_snomask(acptr) & ~SNO_OPER;
-            if (MyUser(acptr))
-              cli_handler(acptr) = CLIENT_HANDLER;
+            tmpmask = cli_snomask(snoc) & ~SNO_OPER;
+            sno_touched = 1;
           }
+          if (MyUser(acptr))
+            cli_handler(acptr) = CLIENT_HANDLER;
           _oper_sess = bounce_get_session(acptr);
           if (_oper_sess && _oper_sess->hs_oper_name[0]) {
             _oper_sess->hs_oper_name[0] = '\0';
@@ -2535,26 +2874,90 @@ int set_user_mode(struct Client *cptr, struct Client *sptr, int parc,
         break;
       case 'b':
         if (what == MODE_ADD) {
-          SetBncHoldPref(acptr);
-          if (MyUser(acptr))  /* see the 'Y' comment — home node owns the write */
-            metadata_set_client(acptr, "draft/persistence/hold", "1", METADATA_VIS_PRIVATE);
-          /* Auto-create bouncer session if local client doesn't have one */
-          if (MyUser(acptr) && IsAccount(acptr) && !bounce_get_session(acptr)) {
-            struct BouncerSession *session = NULL;
-            if (bounce_create(acptr, &session) == 0 && session)
-              bounce_broadcast(session, 'C', NULL);
-          }
-        } else {
-          ClearBncHoldPref(acptr);
-          if (MyUser(acptr))  /* see the 'Y' comment — home node owns the write */
-            metadata_set_client(acptr, "draft/persistence/hold", "0", METADATA_VIS_PRIVATE);
-          /* Destroy bouncer session if local client has one */
+          /* The command comes from a device of ours whose primary, the
+           * target, is on another server. */
+          int asker_device = MyConnect(sptr) && IsBouncerAlias(sptr)
+                             && cli_alias_primary(sptr) == acptr;
+          enum bounce_hold_on_plan plan = BOUNCE_HOLD_NOOP;
+
+          /* Turning hold on for a client of ours joins the account's
+           * session, or makes one when it has none (W3 12c-2b, user
+           * decisions U1-U3).  Planned here, run at the end of this
+           * function, after the mode line and the session sync (joining
+           * mid-loop would send this command's mode line from an alias).
+           * A refusal sets nothing: no +b, no preference, nothing on the
+           * wire (U2); an earlier -b in this command then stands. */
           if (MyUser(acptr)) {
-            struct BouncerSession *session = bounce_get_session(acptr);
-            if (session) {
-              bounce_broadcast(session, 'X', NULL);
-              bounce_destroy_owned(session);  /* tombstone-then-unanchor */
+            plan = bounce_hold_on_plan_for(acptr);
+            if (bounce_hold_on_refused(plan)) {
+              /* Whoever asked: a user of ours (an oper's SVSMODE too), else
+               * the target (a server's mode, services). */
+              bounce_hold_on_fail(MyUser(sptr) ? sptr : acptr, "MODE", plan,
+                                  cli_name(acptr));
+              hold_tail = bounce_hold_tail_step(hold_tail, 1, 0, 1);
+              break;
             }
+          }
+          /* A -b earlier in this command does not stand: as for any mode
+           * string, the final state wins (ruling W3-T12b-f4b).  No
+           * preference write or end of its goes ahead. */
+          hold_tail = bounce_hold_tail_step(hold_tail, 1,
+                                            bounce_hold_on_acts(plan), 0);
+          hold_off = hold_off_tell = 0;
+          end_session = NULL;
+          end_account[0] = end_sessid[0] = '\0';
+          hold_on_tell = bounce_hold_on_tells(asker_device, MyUser(acptr),
+                                              IsUser(acptr), 1);
+          SetBncHoldPref(acptr);
+          /* Home node (or the asking device's server) owns the write: see the
+           * 'Y' comment -- a remote copy re-asserting it would mint a fresh
+           * HLC into the doc and clobber the home's value. */
+          if (MyUser(acptr) || asker_device)
+            metadata_set_client(acptr, "draft/persistence/hold", "1", METADATA_VIS_PRIVATE);
+        } else {
+          struct BouncerSession *session = NULL;
+          /* The command comes from a device of ours whose primary, the
+           * target, is on another server. */
+          int asker_device = MyConnect(sptr) && IsBouncerAlias(sptr)
+                             && cli_alias_primary(sptr) == acptr;
+
+          /* The session to end: ours, or the one a device of ours of a
+           * primary on another server is in. */
+          if (MyUser(acptr) || asker_device)
+            session = bounce_get_session(acptr);
+          ClearBncHoldPref(acptr);
+          /* A +b earlier in this command does not stand: its join or
+           * create is cancelled, and its device's preference is not told
+           * (12b M1: the last letter wins). */
+          hold_tail = bounce_hold_tail_step(hold_tail, 0, session != NULL, 0);
+          hold_on_tell = 0;
+          /* The preference, unless the end goes to the session's holder on
+           * another server, which writes it (to every server) when it
+           * accepts the end.  Written after the mode loop (a +b later in
+           * this command cancels it), before the mode line goes out. */
+          hold_off = !session
+                     || bounce_end_asker_applies(bounce_member_end_route(session));
+          /* A primary on another server never sees this mode change (its
+           * server drops the M line, sourced from its own client, as a
+           * fake direction): the server of the device that asked tells
+           * every server the preference, as BOUNCER SET HOLD off does.
+           * Only that server (ruling W3-T12b-f4a): a server that receives
+           * a remote user's -b by its M line changes its own copy and
+           * tells nobody -- a hold 0 sent from there reaches the user's
+           * server after the user's own next +b and turns it off again --
+           * and nothing goes out for a client that is not a user yet (a
+           * -b in USER, an iauth or class mode). */
+          hold_off_tell = hold_off && asker_device && !MyUser(acptr)
+                          && IsUser(acptr);
+          /* End the session: its holder does (here, or the end goes
+           * there); the primary carries on outside it, every device of it
+           * goes.  Run last (below): the end can exit the mode's target. */
+          end_session = NULL;
+          end_account[0] = end_sessid[0] = '\0';
+          if (session) {
+            end_session = session;
+            ircd_strncpy(end_account, session->hs_account, sizeof(end_account));
+            ircd_strncpy(end_sessid, session->hs_sessid, sizeof(end_sessid));
           }
         }
         break;
@@ -2707,12 +3110,62 @@ int set_user_mode(struct Client *cptr, struct Client *sptr, int parc,
     {
       if (tmpmask != cli_snomask(acptr))
 	set_snomask(acptr, tmpmask, SNO_SET);
+      /* The answer goes to whoever asked: an alias's MODE <nick> acts on
+       * its primary (the _alias_of_target carve-out above), and the 008
+       * landed on the primary's socket while the alias that asked got
+       * none (field report 2026-10-21).  A server or services change
+       * still tells the user it changed. */
       if (cli_snomask(acptr) && snomask_given)
-	send_reply(acptr, RPL_SNOMASK, cli_snomask(acptr), cli_snomask(acptr));
+	send_reply((sptr != acptr && cli_user(sptr)
+	            && cli_user(sptr)->alias_primary == acptr) ? sptr : acptr,
+	           RPL_SNOMASK, cli_snomask(acptr), cli_snomask(acptr));
     }
     else
       set_snomask(acptr, 0, SNO_SET);
   }
+  else if (snoc && sno_touched)
+  {
+    /* A local alias of a primary on another server: the mask is this
+     * connection's own.  Only what the command touched (+s/-s, a mask,
+     * a -o strip) changes it -- the primary's flags here are a replica,
+     * and +s never travels in P10. */
+    if (tmpmask && feature_bool(FEAT_HIS_SNOTICES_OPER_ONLY)
+        && !IsAnOper(acptr) && !HasFlag(snoc, FLAG_SERVNOTICE))
+      tmpmask = 0;
+    if (tmpmask)
+    {
+      SetServNotice(snoc);
+      if (tmpmask != cli_snomask(snoc))
+        set_snomask(snoc, tmpmask, SNO_SET);
+      if (cli_snomask(snoc) && snomask_given)
+        send_reply(sptr, RPL_SNOMASK, cli_snomask(snoc), cli_snomask(snoc));
+    }
+    else
+    {
+      ClearServNotice(snoc);
+      set_snomask(snoc, 0, SNO_SET);
+    }
+  }
+  /* A -b that stands (no +b after it in this command): the hold
+   * preference, before the mode line goes out and before the end. */
+  if (hold_off) {
+    /* Only the home node or the asking device's server writes it (see the
+     * 'Y' comment): a remote copy taking a relayed or doc-reconciled -b
+     * would mint hold=0 with a fresh HLC and clobber the home's value. */
+    if (MyUser(acptr) || hold_off_tell)
+      metadata_set_client(acptr, "draft/persistence/hold", "0", METADATA_VIS_PRIVATE);
+    if (hold_off_tell)
+      sendcmdto_serv_butone_v3(&me, CMD_METADATA, NULL, "%s %s P :0",
+                               cli_name(acptr), "draft/persistence/hold");
+  }
+  /* A +b of a device of ours that stands, toward a primary on another
+   * server: its holder never sees the mode line (a fake direction there),
+   * so the device's server tells every server the preference, as for a -b
+   * (the f4a gate, for hold 1). */
+  if (hold_on_tell)
+    sendcmdto_serv_butone_v3(&me, CMD_METADATA, NULL, "%s %s P :1",
+                             cli_name(acptr), "draft/persistence/hold");
+
   /*
    * Compare new flags with old flags and send string which
    * will cause servers to update correctly.
@@ -2728,7 +3181,17 @@ int set_user_mode(struct Client *cptr, struct Client *sptr, int parc,
 	Debug((DEBUG_DEBUG, "Received timestamped account in user mode; "
 	      "account \"%s\", timestamp %Tu", account,
 	      cli_user(acptr)->acc_create));
-      }
+	{
+	  const char *id = strchr(ts, ':');
+	  if (id && account_id_valid(id + 1)) {
+	    ircd_strncpy(cli_user(acptr)->kc_id, id + 1, sizeof(cli_user(acptr)->kc_id));
+	    Debug((DEBUG_DEBUG, "Received account id %s in user mode for "
+		   "\"%s\"", cli_user(acptr)->kc_id, account));
+	  } else
+	    cli_user(acptr)->kc_id[0] = '\0';
+	}
+      } else
+	cli_user(acptr)->kc_id[0] = '\0';   /* +r arrived without one */
       ircd_strncpy(cli_user(acptr)->account, account, len);
       /* P1 A3 residue: eager metadata load for a live client that just
        * attached an account via SVSMODE/server MODE +r.  Guarded on
@@ -2866,7 +3329,35 @@ int set_user_mode(struct Client *cptr, struct Client *sptr, int parc,
 
   /* Sync user mode flags to all aliases of this primary.
    * Must be after mode application so aliases reflect the new state. */
-  bounce_sync_session_umodes(acptr);
+  bounce_sync_session_umodes(acptr, &setflags,
+                             MyUser(cptr) ? cptr : (force ? acptr : NULL));
+  /* An alias whose primary is remote holds the mask itself: the mask (and
+   * only the mask -- its other flags, FLAG_SSL among them, are its own)
+   * goes from it to the primary's server and the other members by BX K;
+   * the sync from a remote acptr leaves the mask alone. */
+  if (snoc && snoc != acptr)
+    bounce_sync_session_snomask(snoc);
+
+  /* A -b ends its session last: the end can exit the mode's target (a
+   * held ghost leaves with its session), and nothing above may touch the
+   * target after that.  The session is the very record the -b named,
+   * if its account still lists it (ruling W3-T12b-f4c): two records of
+   * one account can share an id (a session kept apart after a split), so
+   * the first record of that id may be another; the walk compares the
+   * saved record with each listed one and never reads through it. */
+  if (hold_tail == BOUNCE_HOLD_TAIL_END && end_sessid[0]) {
+    struct BouncerSession *es = bounce_session_listed(end_account, end_session,
+                                                      end_sessid);
+
+    if (es)
+      bounce_member_end(es, sptr, cptr, BOUNCE_MEMBER_END_HOLD_OFF, NULL);
+  }
+  /* A +b that stands joins the account's session, or makes one (W3
+   * 12c-2b): last, after the mode line and the session sync, as the target
+   * of this command is still the plain user that sent it.  The tail runs
+   * at most one of this and the end above. */
+  else if (hold_tail == BOUNCE_HOLD_TAIL_ON && MyUser(acptr))
+    bounce_hold_on(acptr, 1, NULL);
 
   /* Phase 3b CRDT shadow: refresh the user record so post-registration umode
    * changes (local /mode, S2S MODE, oper-up) stay reflected in the doc.
@@ -2912,13 +3403,19 @@ char *umode_str(struct Client *cptr)
       ; /* Empty loop */
     m--; /* back up over nul-termination */
 
-    if (cli_user(cptr)->acc_create) {
-      char nbuf[20];
+    if (cli_user(cptr)->acc_create || cli_user(cptr)->kc_id[0]) {
+      char nbuf[24 + ACCOUNT_ID_LEN];
       Debug((DEBUG_DEBUG, "Sending timestamped account in user mode for "
 	     "account \"%s\"; timestamp %Tu", cli_user(cptr)->account,
 	     cli_user(cptr)->acc_create));
-      ircd_snprintf(0, t = nbuf, sizeof(nbuf), ":%Tu",
-		    cli_user(cptr)->acc_create);
+      /* ":ts" as before; with an id, ":ts:id" -- ts is 0 when unknown so
+       * the id is always the third field. */
+      if (cli_user(cptr)->kc_id[0])
+        ircd_snprintf(0, t = nbuf, sizeof(nbuf), ":%Tu:%s",
+                      cli_user(cptr)->acc_create, cli_user(cptr)->kc_id);
+      else
+        ircd_snprintf(0, t = nbuf, sizeof(nbuf), ":%Tu",
+                      cli_user(cptr)->acc_create);
       while ((*m++ = *t++))
 	; /* Empty loop */
       m--; /* back up over nul-termination */
@@ -3079,6 +3576,47 @@ void send_umode(struct Client *cptr, struct Client *sptr, struct Flags *old,
     *m = '\0';
   if (*umodeBuf && cptr && *(cli_name(sptr)))
     sendcmdto_one(sptr, CMD_MODE, cptr, "%s %s", cli_name(sptr), umodeBuf);
+}
+
+/** Tell a newly signed-on connection the user modes it holds, and its
+ * server notice mask when that is not the default for what it is.  The
+ * end of registration does this; a bouncer revive or alias attach must
+ * too, since the connection takes over modes it never set itself (a
+ * services auto-oper's +o, +x, +s ...) and has no other way to learn
+ * them short of asking.
+ * @param[in] sptr Local user to tell.
+ */
+void send_umode_signon(struct Client *sptr)
+{
+  struct Flags flags;
+  unsigned int snodefault;
+
+  memset(&flags, 0, sizeof(flags));
+
+  /* To avoid sending +r to the client due to auth-on-connect, set
+   * the "old" FLAG_ACCOUNT bit to match the client's value.  The
+   * host-hiding flags are never shown to the client either.
+   */
+  if (IsAccount(sptr))
+    FlagSet(&flags, FLAG_ACCOUNT);
+  if (IsCloakHost(sptr))
+    FlagSet(&flags, FLAG_CLOAKHOST);
+  if (IsCloakIP(sptr))
+    FlagSet(&flags, FLAG_CLOAKIP);
+  if (IsFakeHost(sptr))
+    FlagSet(&flags, FLAG_FAKEHOST);
+  if (IsSetHost(sptr))
+    FlagSet(&flags, FLAG_SETHOST);
+  send_umode(sptr, sptr, &flags, ALL_UMODES);
+
+  /* As the reply to MODE <nick> does: the mask is news only when it is
+   * not what +s alone implies.  A zero mask is not announced: an alias
+   * of a remote primary has none until BX K brings it. */
+  snodefault = IsAnOper(sptr) ? feature_int(FEAT_SNOMASK_OPERDEFAULT)
+                              : feature_int(FEAT_SNOMASK_DEFAULT);
+  if (HasFlag(sptr, FLAG_SERVNOTICE) && cli_snomask(sptr) &&
+      cli_snomask(sptr) != snodefault)
+    send_reply(sptr, RPL_SNOMASK, cli_snomask(sptr), cli_snomask(sptr));
 }
 
 /**
