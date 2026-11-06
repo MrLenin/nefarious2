@@ -929,7 +929,7 @@ int crdt_gline_is_explicitly_removed(const struct CrdtNetworkState *st,
 void crdt_metadata_set(struct CrdtNetworkState *st, const char *key, uint32_t klen,
                        const void *val, uint32_t vlen)
 {
-  crdt_metadata_set_at(st, key, klen, val, vlen, NULL);
+  crdt_metadata_set_at(st, key, klen, val, vlen, NULL, 0, 0);
 }
 
 /* The metadata writes with an explicit timestamp: the stamped account row's own
@@ -937,25 +937,40 @@ void crdt_metadata_set(struct CrdtNetworkState *st, const char *key, uint32_t kl
  * row's writes the same way and a doc->store heal keeps the row's stamp.  The doc
  * clock moves past it (hlc_receive), as for any remote op.  @a at NULL: a fresh
  * local event, as before. */
-static struct HLC metadata_op_ts(struct CrdtNetworkState *st, const struct HLC *at)
+static struct HLC metadata_op_ts(struct CrdtNetworkState *st, const struct HLC *at,
+                                 uint64_t now_ms, uint64_t max_forward_ms)
 {
   if (!at)
     return hlc_local_event(&st->clock);
   /* Bounded, as every peer clock is (W4): a stamp too far ahead keeps its
    * place in the entry but does not drag the doc clock, which orders every
-   * other collection's local ops too.  The callers refuse such stamps. */
-  hlc_receive_bounded(&st->clock, at, hlc_wall_clock_ms(), hlc_max_forward_ms(),
-                      NULL);
+   * other collection's local ops too.  The callers refuse such stamps.  The
+   * wall clock and the bound come from the caller (the engine reads no
+   * features). */
+  hlc_receive_bounded(&st->clock, at, now_ms, max_forward_ms, NULL);
   return *at;
 }
 
-void crdt_metadata_set_at(struct CrdtNetworkState *st, const char *key, uint32_t klen,
-                          const void *val, uint32_t vlen, const struct HLC *at)
+/* The writer recorded for a metadata write: the stamp's own node when the
+ * row carries one.  Two servers that mint the same stamped row (each took it
+ * over a W4 link) then hold bit-identical entries, and the digest, which
+ * hashes the writer, agrees; with our numeric there, an equal ts never
+ * replaces (crdt_lwwmap_set), so each would keep its own copy for good. */
+static uint16_t metadata_op_writer(const struct CrdtNetworkState *st,
+                                   const struct HLC *at)
 {
-  struct HLC ts = metadata_op_ts(st, at);
+  return at ? at->node_id : st->my_numeric;
+}
+
+void crdt_metadata_set_at(struct CrdtNetworkState *st, const char *key, uint32_t klen,
+                          const void *val, uint32_t vlen, const struct HLC *at,
+                          uint64_t now_ms, uint64_t max_forward_ms)
+{
+  struct HLC ts = metadata_op_ts(st, at, now_ms, max_forward_ms);
+  uint16_t writer = metadata_op_writer(st, at);
   uint64_t seq;
   struct CrdtOp *op;
-  crdt_lwwmap_set(&st->metadata, key, klen, val, vlen, ts, st->my_numeric);
+  crdt_lwwmap_set(&st->metadata, key, klen, val, vlen, ts, writer);
   seq = st->next_seq++;
   op = op_new(st->my_numeric, seq, CRDT_OP_SET, CRDT_COLL_METADATA);
   op->key = memdup(key, klen);
@@ -963,28 +978,30 @@ void crdt_metadata_set_at(struct CrdtNetworkState *st, const char *key, uint32_t
   op->val = vlen ? memdup(val, vlen) : NULL;
   op->val_len = vlen;
   op->ts = ts;
-  op->writer = st->my_numeric;
+  op->writer = writer;
   record(st, op);
 }
 
 void crdt_metadata_del(struct CrdtNetworkState *st, const char *key, uint32_t klen)
 {
-  crdt_metadata_del_at(st, key, klen, NULL);
+  crdt_metadata_del_at(st, key, klen, NULL, 0, 0);
 }
 
 void crdt_metadata_del_at(struct CrdtNetworkState *st, const char *key, uint32_t klen,
-                          const struct HLC *at)
+                          const struct HLC *at, uint64_t now_ms,
+                          uint64_t max_forward_ms)
 {
-  struct HLC ts = metadata_op_ts(st, at);
+  struct HLC ts = metadata_op_ts(st, at, now_ms, max_forward_ms);
+  uint16_t writer = metadata_op_writer(st, at);
   uint64_t seq;
   struct CrdtOp *op;
-  crdt_lwwmap_delete(&st->metadata, key, klen, ts, st->my_numeric);
+  crdt_lwwmap_delete(&st->metadata, key, klen, ts, writer);
   seq = st->next_seq++;
   op = op_new(st->my_numeric, seq, CRDT_OP_DELETE, CRDT_COLL_METADATA);
   op->key = memdup(key, klen);
   op->key_len = klen;
   op->ts = ts;
-  op->writer = st->my_numeric;
+  op->writer = writer;
   record(st, op);
 }
 

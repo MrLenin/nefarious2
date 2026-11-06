@@ -3325,14 +3325,16 @@ void crdt_shadow_metadata_set(const char *account, const char *key,
     if (!permanent)
       return;                              /* TTL cache — not shared truth, skip */
     crdt_metadata_set_at(&g_crdt, dk, klen, value, (uint32_t)strlen(value),
-                         md_stamp_hlc(st, &at));
+                         md_stamp_hlc(st, &at), hlc_wall_clock_ms(),
+                         hlc_max_forward_ms());
     crdt_sync_push();
   } else {
     /* delete: only mint a tombstone for a key we actually converged */
     const struct CrdtLWWValue *v = crdt_metadata_get(&g_crdt, dk, klen);
     if (!v || !v->data)
       return;
-    crdt_metadata_del_at(&g_crdt, dk, klen, md_stamp_hlc(st, &at));
+    crdt_metadata_del_at(&g_crdt, dk, klen, md_stamp_hlc(st, &at),
+                         hlc_wall_clock_ms(), hlc_max_forward_ms());
     crdt_sync_push();
   }
 }
@@ -3359,7 +3361,8 @@ void crdt_shadow_metadata_remove_key(const void *key, uint32_t klen,
   v = crdt_metadata_get(&g_crdt, (const char *)key, klen);
   if (!v || !v->data)
     return;                                /* only tombstone a key we actually converged */
-  crdt_metadata_del_at(&g_crdt, (const char *)key, klen, md_stamp_hlc(st, &at));
+  crdt_metadata_del_at(&g_crdt, (const char *)key, klen, md_stamp_hlc(st, &at),
+                       hlc_wall_clock_ms(), hlc_max_forward_ms());
   crdt_sync_push();
 }
 

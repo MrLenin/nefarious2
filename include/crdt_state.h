@@ -749,10 +749,16 @@ void crdt_metadata_del(struct CrdtNetworkState *st, const char *key, uint32_t kl
 /** The same writes stamped with @a at (the stamped account row's own HLC) instead
  *  of a fresh local event; NULL @a at = a local event.  The doc clock moves past
  *  @a at. */
+/* @a at non-NULL: the row's own stamp, recorded as the entry's ts and, from
+ * its node_id, its writer, so two servers minting one stamped row hold the
+ * same entry.  @a now_ms / @a max_forward_ms bound how far the stamp moves
+ * the doc clock (0 = unbounded); unused when @a at is NULL. */
 void crdt_metadata_set_at(struct CrdtNetworkState *st, const char *key, uint32_t klen,
-                          const void *val, uint32_t vlen, const struct HLC *at);
+                          const void *val, uint32_t vlen, const struct HLC *at,
+                          uint64_t now_ms, uint64_t max_forward_ms);
 void crdt_metadata_del_at(struct CrdtNetworkState *st, const char *key, uint32_t klen,
-                          const struct HLC *at);
+                          const struct HLC *at, uint64_t now_ms,
+                          uint64_t max_forward_ms);
 int crdt_metadata_is_explicitly_removed(const struct CrdtNetworkState *st,
                                         const char *key, uint32_t klen);
 /** Return the current metadata LWW value (NULL if absent/tombstoned) — for the

@@ -718,7 +718,7 @@ static void test_metadata_set_at_keeps_row_stamp(void **state)
   crdt_state_init(&s1, 1);
   crdt_state_init(&s2, 2);
 
-  crdt_metadata_set_at(&s1, key, klen, "P:1", 3, &newer);
+  crdt_metadata_set_at(&s1, key, klen, "P:1", 3, &newer, now, 60000);
   v = crdt_metadata_get(&s1, key, klen);
   assert_non_null(v);
   assert_int_equal(0, hlc_compare(&v->ts, &newer));
@@ -730,24 +730,68 @@ static void test_metadata_set_at_keeps_row_stamp(void **state)
   assert_int_equal(0, hlc_compare(&v->ts, &newer));
 
   /* An older row arriving later (a delayed gateway import) does not win. */
-  crdt_metadata_set_at(&s2, key, klen, "P:0", 3, &older);
+  crdt_metadata_set_at(&s2, key, klen, "P:0", 3, &older, now, 60000);
   v = crdt_metadata_get(&s2, key, klen);
   assert_non_null(v);
   assert_memory_equal("P:1", v->data, 3);
 
   /* A stamped delete keeps its stamp, readable for the store heal. */
-  crdt_metadata_del_at(&s1, key, klen, &(struct HLC){ now + 2000, 0, 7 });
+  crdt_metadata_del_at(&s1, key, klen, &(struct HLC){ now + 2000, 0, 7 }, now, 60000);
   assert_int_equal(1, crdt_lwwmap_deleted_ts(&s1.metadata, key, klen, &dts));
   assert_int_equal(now + 2000, dts.physical_ms);
 
   /* A stamp beyond the forward bound does not drag the doc clock. */
-  crdt_metadata_set_at(&s2, key, klen, "P:2", 3, &far);
+  crdt_metadata_set_at(&s2, key, klen, "P:2", 3, &far, now, 60000);
   assert_true(s2.clock.physical_ms < far.physical_ms);
 
   crdt_state_clear(&s1);
   crdt_state_clear(&s2);
 }
 
+
+/* Two servers that each mint the same stamped row (each took it over its own
+ * W4 link) must end with one entry and equal digests.  The writer comes from
+ * the stamp, not the minting server, so the copies are bit-identical; with
+ * each server's own numeric there, an equal ts never replaces and the digests
+ * would differ for good (anti-entropy re-sending CR F every tick). */
+static void test_metadata_same_stamp_mints_converge(void **state)
+{
+  struct CrdtNetworkState s1, s2;
+  char key[32];
+  const struct CrdtLWWValue *v1, *v2;
+  uint64_t now = hlc_wall_clock_ms();
+  struct HLC row = { now - 500, 2, 9 };       /* stamped by server 9 */
+  struct HLC gone = { now - 100, 0, 9 };
+  uint32_t klen;
+  (void)state;
+
+  memcpy(key, "bob", 3); key[3] = '\0'; memcpy(key + 4, "avatar", 6);
+  klen = 3 + 1 + 6;
+  crdt_state_init(&s1, 1);
+  crdt_state_init(&s2, 2);
+
+  crdt_metadata_set_at(&s1, key, klen, "P:x", 3, &row, now, 60000);
+  crdt_metadata_set_at(&s2, key, klen, "P:x", 3, &row, now, 60000);
+  crdt_state_sync(&s2, &s1);
+  crdt_state_sync(&s1, &s2);
+  v1 = crdt_metadata_get(&s1, key, klen);
+  v2 = crdt_metadata_get(&s2, key, klen);
+  assert_non_null(v1);
+  assert_non_null(v2);
+  assert_int_equal(9, v1->writer);
+  assert_int_equal(9, v2->writer);
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+
+  /* The same holds for a stamped delete minted on both. */
+  crdt_metadata_del_at(&s1, key, klen, &gone, now, 60000);
+  crdt_metadata_del_at(&s2, key, klen, &gone, now, 60000);
+  crdt_state_sync(&s2, &s1);
+  crdt_state_sync(&s1, &s2);
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+
+  crdt_state_clear(&s1);
+  crdt_state_clear(&s2);
+}
 
 /* ================================================================== */
 /* Tier C F2-b: account metadata as a plain HLC-LWW doc collection keyed by the
@@ -4276,6 +4320,7 @@ int main(void)
     cmocka_unit_test(test_gline_doc_converges_same_lastmod),
     cmocka_unit_test(test_metadata_op_replicates),
     cmocka_unit_test(test_metadata_set_at_keeps_row_stamp),
+    cmocka_unit_test(test_metadata_same_stamp_mints_converge),
     cmocka_unit_test(test_bsess_op_replicates),
     cmocka_unit_test(test_bsess_winner),
     cmocka_unit_test(test_bconn_roster),
