@@ -112,10 +112,13 @@ struct md_version {
  * @a incoming is always taken. Otherwise the newer stamp wins outright.
  * On equal stamps: two tombstones keep the existing row (no-op either
  * way); one tombstone against one live row, the live row wins
- * regardless of which side it is on; two live rows compare their value
- * bytes (memcmp over the shorter length, then the longer value wins a
- * common-prefix tie) and the larger value wins; two identical live rows
- * (or the trivial self-compare) keep the existing row.
+ * regardless of which side it is on; two live rows compare as the doc
+ * compares their stored bytes ("P:" or "*:" and then the value): a
+ * private row beats a public one, and otherwise the larger value wins
+ * (memcmp over the shorter length, then the longer value wins a
+ * common-prefix tie); two identical live rows (or the trivial
+ * self-compare) keep the existing row.  A caller whose key is stored
+ * bare (server-managed) passes equal @a vis on both sides.
  *
  * @return 1 if @a incoming should replace @a local, 0 if @a local should
  * be kept.

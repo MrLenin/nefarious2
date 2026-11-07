@@ -3355,15 +3355,19 @@ static const struct HLC *md_stamp_hlc(const struct md_stamp *st, struct HLC *out
   return out;
 }
 
-/* Does the doc already hold @a st, or a newer version, for this key (live
- * or tombstoned)?  Then minting @a st again changes nothing: a stamped row
- * enters the doc only where it lacks that stamp or a newer one, so it is
- * idempotent whichever hop mints it (#12). */
-static int md_doc_has_stamp(const char *dk, uint32_t klen, const struct md_stamp *st)
+/* Does the doc already hold @a st's version of this key, or one that beats
+ * it (live or tombstoned)?  Then minting it again changes nothing: a stamped
+ * row enters the doc only where it would win, so it is idempotent whichever
+ * hop mints it (#12).  @a value is the doc encoding of the row, NULL for a
+ * delete.  On an equal stamp the doc's tie rule decides (crdt_lwwmap_set):
+ * a live row beats a tombstone, then the larger bytes win. */
+static int md_doc_has_stamp(const char *dk, uint32_t klen, const struct md_stamp *st,
+                            const char *value)
 {
   const struct CrdtLWWValue *v;
   struct HLC ts;
   struct md_stamp have;
+  int cmp;
 
   if (!st)
     return 0;
@@ -3375,7 +3379,19 @@ static int md_doc_has_stamp(const char *dk, uint32_t klen, const struct md_stamp
   have.ms = ts.physical_ms;
   have.logical = ts.logical;
   have.node = ts.node_id;
-  return md_stamp_cmp(&have, st) >= 0;
+  cmp = md_stamp_cmp(&have, st);
+  if (cmp)
+    return cmp > 0;
+  if (!value)
+    return 1;                    /* an equal-stamp delete displaces nothing */
+  if (!(v && v->data))
+    return 0;                    /* live beats the doc's tombstone */
+  {
+    uint32_t vl = (uint32_t)strlen(value);
+    uint32_t n = vl < v->data_len ? vl : v->data_len;
+    int c = n ? memcmp(value, v->data, n) : 0;
+    return c ? c < 0 : vl <= v->data_len;
+  }
 }
 
 void crdt_shadow_metadata_set(const char *account, const char *key,
@@ -3394,7 +3410,7 @@ void crdt_shadow_metadata_set(const char *account, const char *key,
    * hlc_global_receive's to refuse; the doc clock must not jump with it). */
   if (md_stamp_refused(st))
     return;
-  if (md_doc_has_stamp(dk, klen, st))
+  if (md_doc_has_stamp(dk, klen, st, value))
     return;
   if (value) {
     if (!permanent)
@@ -3508,10 +3524,14 @@ static void md_writeback_add(struct md_writeback *wb, const void *key, uint32_t 
   wb->klens[wb->n] = klen;
   wb->n++;
 }
-/* Is the store's row for (@a account, @a mkey) strictly newer than @a than,
- * and takeable (not too far ahead)? */
-static int md_store_strictly_newer(const char *account, const char *mkey,
-                                   const struct md_stamp *than)
+/* Does the store's row for (@a account, @a mkey) beat the doc's entry at
+ * @a dk by the doc's own rule (newer, or the equal-stamp tie on the bytes
+ * the mirror would write), and is it takeable (not too far ahead)?  The
+ * doc's rule, not md_lww_take's: the write-back is a mint, which the doc
+ * takes only where md_doc_has_stamp says it would win (a legacy bare doc
+ * value compares differently from its decoded form). */
+static int md_store_beats_doc(const char *account, const char *mkey,
+                              const char *dk, uint32_t dklen)
 {
   struct md_version local;
   char valbuf[METADATA_VALUE_LEN];
@@ -3526,11 +3546,21 @@ static int md_store_strictly_newer(const char *account, const char *mkey,
    * happen (the shadow off, or the doc losing the entry) is not repaired
    * here either; the two can tell apart only with a provenance mark on the
    * store row. */
-  return metadata_account_get_version(account, mkey, &local, valbuf,
-                                      sizeof valbuf) == 0
-         && local.st.node != g_crdt.my_numeric
-         && md_stamp_cmp(&local.st, than) > 0 && !md_stamp_refused(&local.st)
-         && (local.tombstone || metadata_account_row_permanent(account, mkey) == 1);
+  char enc[METADATA_VALUE_LEN + 8];
+
+  if (metadata_account_get_version(account, mkey, &local, valbuf,
+                                   sizeof valbuf) != 0
+      || local.st.node == g_crdt.my_numeric || md_stamp_refused(&local.st)
+      || (!local.tombstone && metadata_account_row_permanent(account, mkey) != 1))
+    return 0;
+  if (!local.tombstone) {        /* the encoding metadata_doc_mirror_account writes */
+    if (metadata_key_is_server_managed(mkey))
+      ircd_strncpy(enc, local.value, sizeof enc);
+    else
+      ircd_snprintf(0, enc, sizeof enc, "%s%s",
+                    local.vis == METADATA_VIS_PRIVATE ? "P:" : "*:", local.value);
+  }
+  return !md_doc_has_stamp(dk, dklen, &local.st, local.tombstone ? NULL : enc);
 }
 
 struct reconcile_metadata_ctx { unsigned int applied; struct md_writeback *wb; };
@@ -3602,7 +3632,7 @@ static void reconcile_metadata_set_cb(const char *key, uint32_t key_len,
     {
       int mrc = metadata_account_merge(account, mkey, &in);
 
-      if (mrc == 0 && md_store_strictly_newer(account, mkey, &in.st))
+      if (mrc == 0 && md_store_beats_doc(account, mkey, key, key_len))
         md_writeback_add(c->wb, key, key_len);
       if (mrc != 1)
         return;               /* the store's row is as new or newer (or a store error) */
@@ -3676,9 +3706,10 @@ static void reconcile_metadata_del_collect(const void *key, size_t klen, void *a
        * and a refused (far-ahead) tombstone is never applied: neither can
        * ever be reaped, so neither takes a slot. */
       if (md_stamp_cmp(&local.st, &tst) >= 0 || md_stamp_refused(&tst)) {
-        /* A live row strictly newer than the tombstone goes back into the
-         * doc, or the doc keeps the delete for good. */
-        if (md_stamp_cmp(&local.st, &tst) > 0 && !md_stamp_refused(&local.st)
+        /* A live row newer than the tombstone, or at its stamp (a live row
+         * wins the tie), goes back into the doc, or the doc keeps the delete
+         * for good. */
+        if (md_stamp_cmp(&local.st, &tst) >= 0 && !md_stamp_refused(&local.st)
             && local.st.node != g_crdt.my_numeric
             && metadata_account_row_permanent(account, mkey) == 1)
           md_writeback_add(d->wb, key, (uint32_t)klen);

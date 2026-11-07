@@ -1079,6 +1079,49 @@ static void test_bsess_op_replicates(void **state)
   crdt_state_clear(&s2);
 }
 
+/* Equal-stamp tie in the doc's LWW map: a live write beats a tombstone and
+ * the larger value bytes win, whichever arrives first (md_lww_take agrees). */
+static void lww_tie_apply(struct CrdtLWWMap *m, int order)
+{
+  struct HLC ts = { 5000, 3, 7 };
+  int i;
+  for (i = 0; i < 3; i++)
+    switch ((i + order) % 3) {
+    case 0: crdt_lwwmap_set(m, "k", 1, "*:abc", 5, ts, 7); break;
+    case 1: crdt_lwwmap_set(m, "k", 1, "P:abc", 5, ts, 7); break;
+    case 2: crdt_lwwmap_delete(m, "k", 1, ts, 7); break;
+    }
+}
+
+static void test_lww_equal_stamp_tie(void **state)
+{
+  (void)state;
+  int order;
+  for (order = 0; order < 3; order++) {
+    struct CrdtLWWMap m;
+    const struct CrdtLWWValue *v;
+    crdt_lwwmap_init(&m);
+    lww_tie_apply(&m, order);
+    v = crdt_lwwmap_get(&m, "k", 1);
+    assert_non_null(v);
+    assert_int_equal(5, v->data_len);
+    assert_memory_equal(v->data, "P:abc", 5);
+    crdt_lwwmap_clear(&m);
+  }
+  {
+    struct CrdtLWWMap m;                          /* longer wins a prefix tie */
+    struct HLC ts = { 5000, 3, 7 };
+    crdt_lwwmap_init(&m);
+    crdt_lwwmap_set(&m, "k", 1, "ab", 2, ts, 7);
+    assert_int_equal(1, crdt_lwwmap_set(&m, "k", 1, "abc", 3, ts, 7));
+    assert_int_equal(0, crdt_lwwmap_set(&m, "k", 1, "ab", 2, ts, 7));
+    assert_int_equal(0, crdt_lwwmap_set(&m, "k", 1, "abc", 3, ts, 7)); /* same: no-op */
+    assert_int_equal(0, crdt_lwwmap_delete(&m, "k", 1, ts, 7));
+    assert_int_equal(3, crdt_lwwmap_get(&m, "k", 1)->data_len);
+    crdt_lwwmap_clear(&m);
+  }
+}
+
 /* The GC hold keeps a stable bsess DELETE op, and so its tombstone, only
  * while the op still backs the tombstone: a later SET frees it. */
 static int gc_hold_all(uint8_t coll, const char *key, uint32_t key_len)
@@ -4575,6 +4618,7 @@ int main(void)
     cmocka_unit_test(test_bsess_op_replicates),
     cmocka_unit_test(test_bsess_winner),
     cmocka_unit_test(test_bsess_gc_hold),
+    cmocka_unit_test(test_lww_equal_stamp_tie),
     cmocka_unit_test(test_bconn_roster),
     cmocka_unit_test(test_blease_compare),
     cmocka_unit_test(test_blease_decide),

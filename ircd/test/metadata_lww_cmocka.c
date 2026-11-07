@@ -100,6 +100,22 @@ static void test_take_when_absent(void **state)
   assert_int_equal(1, md_lww_take(NULL, &tomb));
 }
 
+/* On an equal stamp a private row beats a public one, as the doc's
+ * "P:" / "*:" prefixed bytes compare ('P' > '*'), whatever the values. */
+static void test_equal_stamp_vis_tiebreak(void **state)
+{
+  struct md_version pub = { { 5, 0, 0 }, 0, 0, "zzz", 3 };
+  struct md_version priv = { { 5, 0, 0 }, 0, 1, "aaa", 3 };
+  struct md_version priv_same = { { 5, 0, 0 }, 0, 1, "zzz", 3 };
+
+  (void)state;
+
+  assert_int_equal(1, md_lww_take(&pub, &priv));
+  assert_int_equal(0, md_lww_take(&priv, &pub));
+  assert_int_equal(1, md_lww_take(&pub, &priv_same));
+  assert_int_equal(0, md_lww_take(&priv_same, &pub));
+}
+
 static void test_newer_wins_older_loses(void **state)
 {
   struct md_version a = { { 5, 0, 0 }, 0, 0, "x", 1 };
@@ -1086,6 +1102,7 @@ int main(void)
     cmocka_unit_test(test_later_set_beats_delete),
     cmocka_unit_test(test_equal_live_beats_tomb),
     cmocka_unit_test(test_equal_value_tiebreak_symmetric),
+    cmocka_unit_test(test_equal_stamp_vis_tiebreak),
     cmocka_unit_test(test_identical_keeps),
     cmocka_unit_test(test_clock_codec),
     cmocka_unit_test(test_wire_keys),

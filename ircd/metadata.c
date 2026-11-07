@@ -795,7 +795,7 @@ int metadata_account_get_version(const char *account, const char *key,
 int metadata_account_merge(const char *account, const char *key,
                            const struct md_version *in)
 {
-  struct md_version local;
+  struct md_version local, nin;
   char valbuf[METADATA_VALUE_LEN];
   int local_rc;
   struct HLC remote_hlc;
@@ -808,6 +808,13 @@ int metadata_account_merge(const char *account, const char *key,
   if (local_rc < 0)
     return -1;
 
+  /* A server-managed key's value is bare in the doc, so its visibility
+   * takes no part in the doc's equal-stamp tie; read it the same here. */
+  if (metadata_key_is_server_managed(key)) {
+    nin = *in;
+    nin.vis = local.vis = METADATA_VIS_PRIVATE;
+    in = &nin;
+  }
   if (!md_lww_take(local_rc == 1 ? NULL : &local, in))
     return 0;
 

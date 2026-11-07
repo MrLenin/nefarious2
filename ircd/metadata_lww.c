@@ -209,8 +209,13 @@ int md_lww_take(const struct md_version *local,
   if (local->tombstone != incoming->tombstone)
     return incoming->tombstone ? 0 : 1; /* the live row always wins */
 
-  /* Both live: the larger value wins (memcmp over the shorter length,
-   * then the longer value wins a common-prefix tie). */
+  /* Both live, as the doc compares them (crdt_lwwmap_set): its value is
+   * the "P:" or "*:" visibility prefix and then the value, so a private
+   * row ('P' > '*') beats a public one, and otherwise the larger value
+   * wins (memcmp over the shorter length, then the longer value wins a
+   * common-prefix tie). */
+  if (local->vis != incoming->vis)
+    return incoming->vis ? 1 : 0;   /* METADATA_VIS_PRIVATE (1) wins */
   {
     size_t minlen = local->vlen < incoming->vlen ? local->vlen : incoming->vlen;
     int c = minlen ? memcmp(incoming->value, local->value, minlen) : 0;
