@@ -145,6 +145,8 @@ void crdt_shadow_join(struct Channel *chptr, struct Client *who,
 /** Mirror a channel part/kick/quit-from-channel (called from
  *  remove_user_from_channel, for non-alias members). */
 void crdt_shadow_part(struct Channel *chptr, struct Client *who);
+/** Arm the part comment for the next crdt_shadow_part only (NULL = none). */
+void crdt_shadow_part_reason(const char *reason);
 
 /** Phase 3j: mark a channel's CRDT creationtime incarnation boundary (called from
  *  destruct_channel). Bumps the LOCAL ctime_del so a later recreate to a higher TS

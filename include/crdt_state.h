@@ -25,6 +25,9 @@
 #define CRDT_NUMERICLEN   6   /* 5-char P10 client numeric + NUL */
 #define CRDT_QUITREASON_LEN 192 /* quit reason carried on a user DELETE op */
 #define CRDT_QUIT_RING      64
+#define CRDT_PARTREASON_LEN 192 /* part comment carried on a member REMOVE op */
+#define CRDT_PARTKEY_LEN    256 /* "<chan> <numeric>" */
+#define CRDT_PARTREASON_MAX 4096 /* parked part reasons held between reconciles */
 #define CRDT_HOSTLEN     80   /* >= HOSTLEN(75)+1 */
 #define CRDT_REALLEN     56   /* >= REALLEN(50)+1 */
 #define CRDT_UMODELEN    32   /* umode_str() form, e.g. "+rix" */
@@ -453,6 +456,23 @@ struct CrdtNetworkState {
     char reason[CRDT_QUITREASON_LEN];
   } quit_ring[CRDT_QUIT_RING];
   unsigned                quit_ring_head;
+  /* Parked PART reasons, the membership twin of quit_ring: the first REMOVE op
+   * of a voluntary leave (priority 0) may carry the part comment as its value.
+   * When such an op applies, ("<chan> <numeric>", reason) is parked here, one
+   * entry per key (a later reason for the same member replaces it), for the
+   * doc-driven PART to consume (crdt_chan_part_reason_take).  A member ADD for
+   * the key drops it (the leave it described was superseded by a rejoin), and
+   * crdt_shadow_reconcile_removes clears every entry at the end of its pass, so
+   * a reason lives only from the apply that parked it to the next reconcile:
+   * it can never attach to a later leave, a kick, or a reused numeric.  The
+   * store grows to hold a whole delta (CRDT_PARTREASON_MAX caps it).  The
+   * OR-Set keeps no value, so this is digest- and snapshot-neutral, and an
+   * older peer simply ignores the value. */
+  struct CrdtPartReason {
+    char key[CRDT_PARTKEY_LEN];
+    char reason[CRDT_PARTREASON_LEN];
+  }                      *part_reasons;
+  unsigned                part_reasons_n, part_reasons_cap;
   /** Optional GC hold: when set and it returns nonzero for a DELETE op's
    *  collection and key, crdt_state_gc keeps the op (and so its tombstone)
    *  past causal stability.  Asked only while the op still backs the key's
@@ -476,6 +496,17 @@ void crdt_user_remove_reason(struct CrdtNetworkState *st, const char *numeric,
  * for @a numeric into @a buf; 1 if there was one, else 0 (buf untouched). */
 int crdt_user_quit_reason_take(struct CrdtNetworkState *st, const char *numeric,
                                char *buf, size_t buflen);
+/* crdt_chan_remove with the part comment carried on the first REMOVE op
+ * (NULL/"" = none). */
+void crdt_chan_remove_reason(struct CrdtNetworkState *st, const char *chan,
+                             const char *numeric, uint8_t priority,
+                             const char *reason);
+/* Take (and clear) the part comment parked by an applied reason-carrying
+ * member REMOVE for @a numeric on @a chan; 1 if there was one, else 0. */
+int crdt_chan_part_reason_take(struct CrdtNetworkState *st, const char *chan,
+                               const char *numeric, char *buf, size_t buflen);
+/* Drop every parked part reason (end of a removal reconcile pass). */
+void crdt_chan_part_reasons_clear(struct CrdtNetworkState *st);
 /** Phase 3m: 1 iff @a numeric has an explicit user delete-tombstone in the doc
  *  (gate for doc->live delete-on-leave; never true for a merely-absent user). */
 int crdt_user_is_explicitly_removed(const struct CrdtNetworkState *st,

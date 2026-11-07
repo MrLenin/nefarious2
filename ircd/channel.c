@@ -5725,7 +5725,11 @@ joinbuf_join(struct JoinBuf *jbuf, struct Channel *chan, unsigned int flags)
 	is_local) { /* got to remove user here */
       /* The presence hook closes at the PART's own HLC stamp (the row's). */
       presence_set_event_time(presence_event_time(part_msgid, part_ms));
+      /* the doc's member REMOVE carries the comment the channel just saw */
+      crdt_shadow_part_reason((flags & CHFL_BANNED || !jbuf->jb_comment) ?
+                              NULL : jbuf->jb_comment);
       remove_user_from_channel(jbuf->jb_source, chan);
+      crdt_shadow_part_reason(NULL);
       presence_set_event_time(0);
     }
   } else {
@@ -5953,7 +5957,11 @@ joinbuf_flush(struct JoinBuf *jbuf)
        * a different, later interval end (audit 2026-09-06 P2). */
       presence_set_event_time(presence_event_time(jbuf->jb_msgids[i],
                                                   jbuf->jb_msgid_time_ms));
+      /* the doc's member REMOVE carries the comment (m_part has already
+       * cleared it for a member who may not speak) */
+      crdt_shadow_part_reason(jbuf->jb_comment);
       remove_user_from_channel(jbuf->jb_source, jbuf->jb_channels[i]);
+      crdt_shadow_part_reason(NULL);
       presence_set_event_time(0);
     }
 

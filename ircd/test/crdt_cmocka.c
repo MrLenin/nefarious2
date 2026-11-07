@@ -2678,6 +2678,125 @@ static void test_user_remove_reason_rides_delete(void **state)
   crdt_state_clear(&s2);
 }
 
+/* The part comment rides the member's first REMOVE op (the OR-Set keeps no value):
+ * the receiver parks it once per leave, a reason-less PART and a KICK park none,
+ * and the digests still agree. */
+static void test_chan_part_reason_rides_remove(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s1, s2;
+  char why[CRDT_PARTREASON_LEN];
+  int i;
+  crdt_state_init(&s1, 4);
+  crdt_state_init(&s2, 3);
+
+  for (i = 0; i < 3; i++) {                  /* join churn: three add-tags for DAAAB */
+    crdt_chan_join(&s1, "#c", "DAAAB");
+    if (i < 2) crdt_chan_remove(&s1, "#c", "DAAAB", CRDT_PRIORITY_USER);
+  }
+  crdt_chan_join(&s1, "#c", "DAAAC");
+  crdt_chan_join(&s1, "#c", "DAAAD");
+  assert_true(crdt_state_sync(&s2, &s1) >= 0);
+
+  crdt_chan_remove_reason(&s1, "#c", "DAAAB", CRDT_PRIORITY_USER, "off to lunch");
+  crdt_chan_remove(&s1, "#c", "DAAAC", CRDT_PRIORITY_USER);              /* no reason */
+  crdt_chan_remove_reason(&s1, "#c", "DAAAD", CRDT_PRIORITY_CHANOP, "kicked"); /* not a part */
+  assert_int_equal(0, crdt_chan_part_reason_take(&s1, "#c", "DAAAB", why, sizeof why)); /* origin parks nothing */
+  assert_true(crdt_state_sync(&s2, &s1) >= 0);
+  why[0] = '\0';
+  assert_int_equal(1, crdt_chan_part_reason_take(&s2, "#c", "DAAAB", why, sizeof why));
+  assert_string_equal(why, "off to lunch");
+  assert_int_equal(0, crdt_chan_part_reason_take(&s2, "#c", "DAAAB", why, sizeof why)); /* once */
+  assert_int_equal(0, crdt_chan_part_reason_take(&s2, "#c", "DAAAC", why, sizeof why));
+  assert_int_equal(0, crdt_chan_part_reason_take(&s2, "#c", "DAAAD", why, sizeof why));
+  assert_int_equal(0, crdt_chan_part_reason_take(&s2, "#other", "DAAAB", why, sizeof why));
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+  assert_true(crdt_state_digest_materialized(&s1) == crdt_state_digest_materialized(&s2));
+
+  crdt_state_clear(&s1);
+  crdt_state_clear(&s2);
+}
+
+/* A part reason over the cap is cut on a UTF-8 boundary, never inside a
+ * sequence. */
+static void test_chan_part_reason_utf8_cut(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s1, s2;
+  char why[CRDT_PARTREASON_LEN], longr[CRDT_PARTREASON_LEN + 8];
+  crdt_state_init(&s1, 4);
+  crdt_state_init(&s2, 3);
+  crdt_chan_join(&s1, "#c", "DAAAB");
+  assert_true(crdt_state_sync(&s2, &s1) >= 0);
+  memset(longr, 'a', CRDT_PARTREASON_LEN - 2);
+  strcpy(longr + CRDT_PARTREASON_LEN - 2, "\xc3\xa9tail");  /* e-acute straddles the cap */
+  crdt_chan_remove_reason(&s1, "#c", "DAAAB", CRDT_PRIORITY_USER, longr);
+  assert_true(crdt_state_sync(&s2, &s1) >= 0);
+  assert_int_equal(1, crdt_chan_part_reason_take(&s2, "#c", "DAAAB", why, sizeof why));
+  assert_int_equal(CRDT_PARTREASON_LEN - 2, strlen(why));
+  crdt_state_clear(&s1);
+  crdt_state_clear(&s2);
+}
+
+/* A parked part reason never outlives the leave it describes: a rejoin in the
+ * same delta drops it, the newest reason for a member wins, CR/LF never reach
+ * the parked text, one delta can park more reasons than any fixed ring held,
+ * and the end-of-pass clear empties the store. */
+static void test_chan_part_reason_lifetime(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s1, s2;
+  char why[CRDT_PARTREASON_LEN], num[16];
+  int i;
+  crdt_state_init(&s1, 4);
+  crdt_state_init(&s2, 3);
+
+  /* PART "brb", rejoin, PART with no comment (e.g. suppressed by +m): nothing */
+  crdt_chan_join(&s1, "#c", "DAAAB");
+  crdt_chan_remove_reason(&s1, "#c", "DAAAB", CRDT_PRIORITY_USER, "brb");
+  crdt_chan_join(&s1, "#c", "DAAAB");
+  crdt_chan_remove(&s1, "#c", "DAAAB", CRDT_PRIORITY_USER);
+  /* PART "brb", rejoin, PART "bye": the second reason */
+  crdt_chan_join(&s1, "#c", "DAAAC");
+  crdt_chan_remove_reason(&s1, "#c", "DAAAC", CRDT_PRIORITY_USER, "brb");
+  crdt_chan_join(&s1, "#c", "DAAAC");
+  crdt_chan_remove_reason(&s1, "#c", "DAAAC", CRDT_PRIORITY_USER, "bye");
+  /* PART "old", rejoin: still a member, nothing parked */
+  crdt_chan_join(&s1, "#c", "DAAAD");
+  crdt_chan_remove_reason(&s1, "#c", "DAAAD", CRDT_PRIORITY_USER, "old");
+  crdt_chan_join(&s1, "#c", "DAAAD");
+  /* a reason with an embedded line break is cut at it */
+  crdt_chan_join(&s1, "#c", "DAAAE");
+  crdt_chan_remove_reason(&s1, "#c", "DAAAE", CRDT_PRIORITY_USER, "a\r\nPRIVMSG #c :x");
+  /* more leaves in one delta than the old 64-slot ring */
+  for (i = 0; i < 100; i++) {
+    snprintf(num, sizeof num, "DAB%02d", i);
+    crdt_chan_join(&s1, "#big", num);
+    crdt_chan_remove_reason(&s1, "#big", num, CRDT_PRIORITY_USER, num);
+  }
+  assert_true(crdt_state_sync(&s2, &s1) >= 0);
+
+  assert_int_equal(0, crdt_chan_part_reason_take(&s2, "#c", "DAAAB", why, sizeof why));
+  assert_int_equal(1, crdt_chan_part_reason_take(&s2, "#c", "DAAAC", why, sizeof why));
+  assert_string_equal(why, "bye");
+  assert_int_equal(0, crdt_chan_part_reason_take(&s2, "#c", "DAAAC", why, sizeof why));
+  assert_int_equal(0, crdt_chan_part_reason_take(&s2, "#c", "DAAAD", why, sizeof why));
+  assert_int_equal(1, crdt_chan_part_reason_take(&s2, "#c", "DAAAE", why, sizeof why));
+  assert_string_equal(why, "a");
+  for (i = 0; i < 100; i++) {
+    snprintf(num, sizeof num, "DAB%02d", i);
+    if (i == 50) break;                       /* leave half parked for the clear */
+    assert_int_equal(1, crdt_chan_part_reason_take(&s2, "#big", num, why, sizeof why));
+    assert_string_equal(why, num);
+  }
+  crdt_chan_part_reasons_clear(&s2);
+  assert_int_equal(0, crdt_chan_part_reason_take(&s2, "#big", "DAB60", why, sizeof why));
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+
+  crdt_state_clear(&s1);
+  crdt_state_clear(&s2);
+}
+
 /* LWW delete-tombstone GC: a user-remove tombstone is reclaimed only once its DELETE
  * op is causally stable (all peers saw it); kept while unstable (no resurrection). */
 static void test_lww_tombstone_gc(void **state)
@@ -4382,6 +4501,9 @@ int main(void)
     cmocka_unit_test(test_orphan_members_residue_converges),
     cmocka_unit_test(test_owner_remove_beats_snapshot_reimport),
     cmocka_unit_test(test_user_remove_reason_rides_delete),
+    cmocka_unit_test(test_chan_part_reason_rides_remove),
+    cmocka_unit_test(test_chan_part_reason_utf8_cut),
+    cmocka_unit_test(test_chan_part_reason_lifetime),
     cmocka_unit_test(test_digest_gc_invariant),
     cmocka_unit_test(test_decommission_replicates),
     cmocka_unit_test(test_decommission_reap_and_return),

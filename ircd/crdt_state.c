@@ -172,6 +172,9 @@ void crdt_state_clear(struct CrdtNetworkState *st)
   crdt_lwwmap_clear(&st->modes);
   crdt_lwwmap_clear(&st->members_status);
   crdt_lwwmap_clear(&st->kick_info);
+  free(st->part_reasons);
+  st->part_reasons = NULL;
+  st->part_reasons_n = st->part_reasons_cap = 0;
   crdt_lwwmap_clear(&st->chanmeta);
   crdt_lwwmap_clear(&st->glines);
   crdt_lwwmap_clear(&st->shuns);
@@ -231,6 +234,19 @@ void crdt_user_set(struct CrdtNetworkState *st, const char *numeric,
   record(st, op);
 }
 
+/* The length of @a reason cut to at most @a max bytes, never inside a UTF-8
+ * sequence. */
+static size_t reason_cut_len(const char *reason, size_t max)
+{
+  size_t rl = strlen(reason);
+  if (rl <= max)
+    return rl;
+  rl = max;
+  while (rl > 0 && ((unsigned char)reason[rl] & 0xC0) == 0x80)
+    rl--;
+  return rl;
+}
+
 void crdt_user_remove_reason(struct CrdtNetworkState *st, const char *numeric,
                              const char *reason)
 {
@@ -244,8 +260,7 @@ void crdt_user_remove_reason(struct CrdtNetworkState *st, const char *numeric,
   op->ts = ts;
   op->writer = st->my_numeric;
   if (reason && *reason) {           /* rides the op only; the tombstone keeps no value */
-    size_t rl = strlen(reason);
-    if (rl > CRDT_QUITREASON_LEN - 1) rl = CRDT_QUITREASON_LEN - 1;
+    size_t rl = reason_cut_len(reason, CRDT_QUITREASON_LEN - 1);
     op->val = memdup(reason, rl);
     op->val_len = (uint32_t)rl;
   }
@@ -264,6 +279,22 @@ void crdt_user_remove(struct CrdtNetworkState *st, const char *numeric)
   crdt_user_remove_reason(st, numeric, NULL);
 }
 
+/* Copy at most @a max-1 bytes of an op value, stopping at CR, LF or NUL: the
+ * text is relayed inside a P10/client line, so it must never split one. */
+static void reason_copy(char *dst, size_t max, const void *val, uint32_t vlen)
+{
+  const char *v = (const char *)val;
+  size_t i = 0;
+  while (i < vlen && i + 1 < max && v[i] && v[i] != '\r' && v[i] != '\n') {
+    dst[i] = v[i];
+    i++;
+  }
+  /* cut short: never end inside a UTF-8 sequence */
+  while (i > 0 && i < vlen && ((unsigned char)v[i] & 0xC0) == 0x80)
+    i--;
+  dst[i] = '\0';
+}
+
 static void quit_ring_note(struct CrdtNetworkState *st, const char *key, uint32_t klen,
                            const void *val, uint32_t vlen)
 {
@@ -271,7 +302,7 @@ static void quit_ring_note(struct CrdtNetworkState *st, const char *key, uint32_
   if (klen >= CRDT_NUMERICLEN) return;
   if (vlen > CRDT_QUITREASON_LEN - 1) vlen = CRDT_QUITREASON_LEN - 1;
   memcpy(st->quit_ring[i].num, key, klen); st->quit_ring[i].num[klen] = '\0';
-  memcpy(st->quit_ring[i].reason, val, vlen); st->quit_ring[i].reason[vlen] = '\0';
+  reason_copy(st->quit_ring[i].reason, sizeof st->quit_ring[i].reason, val, vlen);
   st->quit_ring_head = i + 1;
 }
 
@@ -337,8 +368,9 @@ void crdt_chan_join(struct CrdtNetworkState *st, const char *chan,
   record(st, op);
 }
 
-void crdt_chan_remove(struct CrdtNetworkState *st, const char *chan,
-                      const char *numeric, uint8_t priority)
+void crdt_chan_remove_reason(struct CrdtNetworkState *st, const char *chan,
+                             const char *numeric, uint8_t priority,
+                             const char *reason)
 {
   struct CrdtChannel *ch = crdt_state_channel(st, chan, 0);
   if (!ch) return;
@@ -362,9 +394,105 @@ void crdt_chan_remove(struct CrdtNetworkState *st, const char *chan,
       op->key_len = klen;
       op->tag = removed[i];
       op->priority = priority;
+      if (reason && *reason && priority == CRDT_PRIORITY_USER) {
+        /* the first op only: one parked reason per leave, never a stale spare
+         * that a later reason-less PART of the same member would pick up */
+        size_t rl = reason_cut_len(reason, CRDT_PARTREASON_LEN - 1);
+        op->val = memdup(reason, rl);
+        op->val_len = (uint32_t)rl;
+        reason = NULL;
+      }
       record(st, op);
     }
   } while (n == 64);
+}
+
+void crdt_chan_remove(struct CrdtNetworkState *st, const char *chan,
+                      const char *numeric, uint8_t priority)
+{
+  crdt_chan_remove_reason(st, chan, numeric, priority, NULL);
+}
+
+static int part_key(char *key, size_t keylen, const char *chan, uint32_t clen,
+                    const char *num, uint32_t nlen)
+{
+  if (!chan || !num || clen + 1 + nlen >= keylen) return 0;
+  memcpy(key, chan, clen); key[clen] = ' ';
+  memcpy(key + clen + 1, num, nlen); key[clen + 1 + nlen] = '\0';
+  return 1;
+}
+
+static int part_find(const struct CrdtNetworkState *st, const char *key)
+{
+  unsigned i;
+  for (i = 0; i < st->part_reasons_n; i++)
+    if (!strcmp(st->part_reasons[i].key, key))
+      return (int)i;
+  return -1;
+}
+
+static void part_drop(struct CrdtNetworkState *st, int i)
+{
+  if (i < 0) return;
+  st->part_reasons[i] = st->part_reasons[--st->part_reasons_n];  /* order-free */
+}
+
+static void part_reason_note(struct CrdtNetworkState *st, const char *chan, uint32_t clen,
+                             const char *num, uint32_t nlen, const void *val, uint32_t vlen)
+{
+  char key[CRDT_PARTKEY_LEN];
+  char why[CRDT_PARTREASON_LEN];
+  int i;
+  if (!part_key(key, sizeof key, chan, clen, num, nlen)) return;
+  reason_copy(why, sizeof why, val, vlen);
+  i = part_find(st, key);
+  if (!why[0]) { part_drop(st, i); return; }
+  if (i < 0) {
+    if (st->part_reasons_n == st->part_reasons_cap) {
+      unsigned ncap = st->part_reasons_cap ? st->part_reasons_cap * 2 : 16;
+      struct CrdtPartReason *n;
+      if (ncap > CRDT_PARTREASON_MAX) ncap = CRDT_PARTREASON_MAX;
+      if (ncap <= st->part_reasons_cap) return;   /* full: this leave goes bare */
+      n = realloc(st->part_reasons, ncap * sizeof *n);
+      if (!n) return;
+      st->part_reasons = n;
+      st->part_reasons_cap = ncap;
+    }
+    i = (int)st->part_reasons_n++;
+    strcpy(st->part_reasons[i].key, key);
+  }
+  strcpy(st->part_reasons[i].reason, why);    /* newest reason for this member wins */
+}
+
+static void part_reason_forget(struct CrdtNetworkState *st, const char *chan, uint32_t clen,
+                               const char *num, uint32_t nlen)
+{
+  char key[CRDT_PARTKEY_LEN];
+  if (st->part_reasons_n && part_key(key, sizeof key, chan, clen, num, nlen))
+    part_drop(st, part_find(st, key));
+}
+
+int crdt_chan_part_reason_take(struct CrdtNetworkState *st, const char *chan,
+                               const char *numeric, char *buf, size_t buflen)
+{
+  char key[CRDT_PARTKEY_LEN];
+  int i;
+  if (!part_key(key, sizeof key, chan, (uint32_t)strlen(chan), numeric,
+                (uint32_t)strlen(numeric)))
+    return 0;
+  if ((i = part_find(st, key)) < 0)
+    return 0;
+  if (buf && buflen) {
+    strncpy(buf, st->part_reasons[i].reason, buflen - 1);
+    buf[buflen - 1] = '\0';
+  }
+  part_drop(st, i);
+  return 1;
+}
+
+void crdt_chan_part_reasons_clear(struct CrdtNetworkState *st)
+{
+  st->part_reasons_n = 0;
 }
 
 /* Phase 3i: op-recording ban/except add/remove (mirrors crdt_chan_join/remove,
@@ -1839,10 +1967,16 @@ void crdt_state_apply_op(struct CrdtNetworkState *st, const struct CrdtOp *op)
 
   if (op->coll == CRDT_COLL_CHAN_MEMBERS) {
     struct CrdtChannel *ch = chan_get(st, op->chan, op->chan_len, 1);
-    if (op->type == CRDT_OP_ADD)
+    if (op->type == CRDT_OP_ADD) {
       crdt_orset_merge_add(&ch->members, op->key, op->key_len, op->tag);
-    else
+      /* a rejoin supersedes any leave reason still parked for this member */
+      part_reason_forget(st, op->chan, op->chan_len, op->key, op->key_len);
+    } else {
       crdt_orset_merge_remove(&ch->members, op->tag, op->priority);
+      if (op->val && op->val_len && op->priority == CRDT_PRIORITY_USER)
+        part_reason_note(st, op->chan, op->chan_len, op->key, op->key_len,
+                         op->val, op->val_len);   /* reason-carrying leave */
+    }
   } else if (op->coll == CRDT_COLL_CHAN_BANS ||
              op->coll == CRDT_COLL_CHAN_EXCEPTS) {   /* Phase 3i ban/except OR-Sets */
     struct CrdtChannel *ch = chan_get(st, op->chan, op->chan_len, 1);

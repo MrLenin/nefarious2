@@ -599,17 +599,28 @@ void crdt_shadow_join(struct Channel *chptr, struct Client *who,
   crdt_sync_push();                   /* eager-propagate to CRDT peers */
 }
 
+/* One-shot part comment for the next crdt_shadow_part, set by joinbuf_join
+ * around its remove_user_from_channel (the remove itself carries no reason). */
+static const char *g_part_reason;
+
+void crdt_shadow_part_reason(const char *reason)
+{
+  g_part_reason = reason;
+}
+
 void crdt_shadow_part(struct Channel *chptr, struct Client *who)
 {
   char num[16];
+  const char *why = g_part_reason;
+  g_part_reason = NULL;
   if (!shadow_on())
     return;
   if (!cli_user(who))
     return;
   if (from_crdt_peer(cli_from(who)))  /* single-writer: peer owns this op */
     return;
-  crdt_chan_remove(&g_crdt, chptr->chname, user_numeric(who, num, sizeof num),
-                   CRDT_PRIORITY_USER);
+  crdt_chan_remove_reason(&g_crdt, chptr->chname, user_numeric(who, num, sizeof num),
+                          CRDT_PRIORITY_USER, why);
   /* m15 (delete-on-leave): clear the member's status LWW on a clean leave so a stale
    * +o can't re-op them on a later rejoin (reconcile_mstatus_cb re-drives m->status
    * from the LWW-winning record). Mirrors the OR-Set remove above; `num` was just
@@ -6241,8 +6252,10 @@ void crdt_shadow_reconcile_removes(void)
 {
   unsigned int changed = 0;
   int bk;
-  if (!shadow_on() || !feature_bool(FEAT_CRDT_PRIMARY))
+  if (!shadow_on() || !feature_bool(FEAT_CRDT_PRIMARY)) {
+    crdt_chan_part_reasons_clear(&g_crdt);
     return;
+  }
   for (bk = 0; bk < CRDT_CHAN_BUCKETS; bk++) {
     struct CrdtChannel *dc;
     for (dc = g_crdt.chan_buckets[bk]; dc; dc = dc->next) {
@@ -6329,10 +6342,23 @@ void crdt_shadow_reconcile_removes(void)
                                          FLAG_CRDT_AWARE, "%H %C :%s", chptr, victim,
                                          ki->reason);
           } else {
-            sendcmdto_channel_butserv_butone(victim, CMD_PART, chptr, NULL, 0, "%H", chptr);
-            if (!victim_mesh_only)
-              sendcmdto_flag_serv_butone(victim, CMD_PART, NULL, FLAG_LAST_FLAG,
-                                         FLAG_CRDT_AWARE, "%H", chptr);
+            /* The part comment rides the member's first REMOVE op and is parked
+             * when that op applies here (crdt_chan_part_reason_take); none for a
+             * snapshot-merged or reason-less leave. */
+            char why[CRDT_PARTREASON_LEN];
+            int has = crdt_chan_part_reason_take(&g_crdt, nbuf, num, why, sizeof why);
+            if (has) {
+              sendcmdto_channel_butserv_butone(victim, CMD_PART, chptr, NULL, 0,
+                                               "%H :%s", chptr, why);
+              if (!victim_mesh_only)
+                sendcmdto_flag_serv_butone(victim, CMD_PART, NULL, FLAG_LAST_FLAG,
+                                           FLAG_CRDT_AWARE, "%H :%s", chptr, why);
+            } else {
+              sendcmdto_channel_butserv_butone(victim, CMD_PART, chptr, NULL, 0, "%H", chptr);
+              if (!victim_mesh_only)
+                sendcmdto_flag_serv_butone(victim, CMD_PART, NULL, FLAG_LAST_FLAG,
+                                           FLAG_CRDT_AWARE, "%H", chptr);
+            }
           }
         }
         remove_user_from_channel(victim, chptr);   /* chptr may be freed here */
@@ -6340,6 +6366,10 @@ void crdt_shadow_reconcile_removes(void)
       }
     }
   }
+  /* A part reason lives only until the pass after the apply that parked it:
+   * whatever was not consumed above (member not live here, a kick, a leave
+   * already handled) is dropped, so it can never attach to a later PART. */
+  crdt_chan_part_reasons_clear(&g_crdt);
   if (changed)
     log_write(LS_SYSTEM, L_NOTICE, 0,
               "CRDT member-reconcile: removed %u member(s) from doc", changed);
