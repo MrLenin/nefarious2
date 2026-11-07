@@ -434,7 +434,7 @@ shun_propagate(struct Client *cptr, struct Client *sptr, struct Shun *shun)
   /* SHUN cutover: legacy-only under FEAT_CRDT_SHUN_CUTOVER (forbid CRDT-aware); forbid=
    * FLAG_LAST_FLAG when off => no filter => identical to the old sendcmdto_serv_butone. */
   sendcmdto_flag_serv_butone(sptr, CMD_SHUN, cptr, FLAG_LAST_FLAG,
-			feature_bool(FEAT_CRDT_SHUN_CUTOVER) ? FLAG_CRDT_AWARE : FLAG_LAST_FLAG,
+			CrdtCutoverOn(FEAT_CRDT_SHUN_CUTOVER) ? FLAG_CRDT_AWARE : FLAG_LAST_FLAG,
 			"* %c%s%s%s %Tu %Tu %Tu :%s",
 			ShunIsRemActive(shun) ? '+' : '-', shun->sh_user,
 			shun->sh_host ? "@" : "",
@@ -995,7 +995,7 @@ shun_modify(struct Client *cptr, struct Client *sptr, struct Shun *shun,
   if (action != SHUN_LOCAL_ACTIVATE && action != SHUN_LOCAL_DEACTIVATE)
     /* SHUN cutover: legacy-only under the flag (see shun_propagate). */
     sendcmdto_flag_serv_butone(sptr, CMD_SHUN, cptr, FLAG_LAST_FLAG,
-			  feature_bool(FEAT_CRDT_SHUN_CUTOVER) ? FLAG_CRDT_AWARE : FLAG_LAST_FLAG,
+			  CrdtCutoverOn(FEAT_CRDT_SHUN_CUTOVER) ? FLAG_CRDT_AWARE : FLAG_LAST_FLAG,
 			  "* %s%s%s%s%s %Tu %Tu %Tu :%s",
 			  flags & SHUN_OPERFORCE ? "!" : "", op,
 			  shun->sh_user, shun->sh_host ? "@" : "",
@@ -1167,7 +1167,7 @@ shun_burst(struct Client *cptr)
   struct Shun *sshun;
 
   /* SHUN cutover: a CRDT-aware peer gets Shuns via the doc, not the P10 burst. */
-  if (feature_bool(FEAT_CRDT_SHUN_CUTOVER) && IsServer(cptr) && IsCrdtAware(cptr))
+  if (CrdtCutoverOn(FEAT_CRDT_SHUN_CUTOVER) && IsServer(cptr) && IsCrdtAware(cptr))
     return;
 
   shiter(GlobalShunList, shun, sshun) {
@@ -1193,7 +1193,7 @@ shun_resend(struct Client *cptr, struct Shun *shun)
     return 0;
 
   /* SHUN cutover: CRDT peers get Shuns via the doc, not a P10 resend. */
-  if (feature_bool(FEAT_CRDT_SHUN_CUTOVER) && IsServer(cptr) && IsCrdtAware(cptr))
+  if (CrdtCutoverOn(FEAT_CRDT_SHUN_CUTOVER) && IsServer(cptr) && IsCrdtAware(cptr))
     return 0;
 
   sendcmdto_one(&me, CMD_SHUN, cptr, "* %c%s%s%s %Tu %Tu %Tu :%s",

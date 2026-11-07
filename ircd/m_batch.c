@@ -1630,7 +1630,7 @@ process_multiline_batch(struct Client *sptr)
      * SUPPRESS the redundant P10 BX M to CRDT-aware directions (legacy peers still get
      * the P10 relay).  A healthy non-partitioned mesh keeps grouped BX M -> no flood,
      * no regression. */
-    if (feature_bool(FEAT_CRDT_PRIMARY)) {
+    if (crdt_primary_on()) {
       will_flood_cr = crdt_have_mesh_stub();
       for (member = chptr->members; !will_flood_cr && member;
            member = member->next_member) {

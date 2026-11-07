@@ -24,6 +24,7 @@
 #include "config.h"
 
 #include "s_bsd.h"
+#include "crdt_shadow.h"
 #include "bouncer_session.h"
 #include "capab.h"
 #include "client.h"
@@ -1910,6 +1911,11 @@ int connect_overlay(struct ConfItem* aconf, struct Client* by)
 {
   struct Client* cptr = 0;
   assert(0 != aconf);
+
+  /* An overlay carries only CR, which a node whose shadow is off (as
+   * latched at boot) neither sends nor applies: do not dial one. */
+  if (!crdt_shadow_boot_enabled())
+    return 0;
 
   if (aconf->dns_pending) {
     sendto_opmask_butone(0, SNO_OLDSNO, "Overlay %s connect DNS pending",

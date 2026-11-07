@@ -136,6 +136,15 @@ void crdt_shadow_init(uint16_t my_numeric);
 int crdt_shadow_boot_enabled(void);
 /** CRDT_ENABLED's feature notify: warns that a change waits for restart. */
 void crdt_shadow_enabled_changed(void);
+/** Doc-primary mode: the shadow is on (latched at boot) and CRDT_PRIMARY was
+ *  on at boot.  Every tree path withheld from C peers keys on this, so a node
+ *  whose shadow is off never skips C peers while minting nothing. */
+int crdt_primary_on(void);
+/** CRDT_PRIMARY's feature notify: warns that a change waits for restart. */
+void crdt_shadow_primary_changed(void);
+/** A ban-class cutover (FEAT_CRDT_GLINE/SHUN/ZLINE/JUPE_CUTOVER) is in force
+ *  only under doc-primary mode. */
+#define CrdtCutoverOn(feat) (crdt_primary_on() && feature_bool(feat))
 
 /** Mirror a channel join (called from add_user_to_channel). @a flags are the
  *  membership flags so the bridge can skip bouncer aliases. */

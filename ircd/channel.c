@@ -3009,7 +3009,7 @@ modebuf_flush_int(struct ModeBuf *mbuf, int all)
        * reaches CRDT-primary peers over CRDT (crdt_shadow_reconcile_modes /
        * _member_status), so relay P10 to LEGACY (non-CRDT) peers only.
        */
-      int crdt_only = feature_bool(FEAT_CRDT_PRIMARY) &&
+      int crdt_only = crdt_primary_on() &&
                       modebuf_is_crdt_only(mbuf);
       if (mode_msgid[0] && mode_time_ms) {
         sendcmdto_set_s2s_tags(mode_time_ms, mode_msgid);
@@ -5814,7 +5814,7 @@ joinbuf_join(struct JoinBuf *jbuf, struct Channel *chan, unsigned int flags)
        * Suppress the P10 JOIN to CRDT-aware servers (they learn it via the CRDT
        * member-add op + reconcile, which also gateways back to legacy); still
        * relay to legacy peers. CREATE/PART (joinbuf_flush) stay full P10. */
-      if (feature_bool(FEAT_CRDT_PRIMARY))
+      if (crdt_primary_on())
         sendcmdto_flag_serv_butone(jbuf->jb_source, CMD_JOIN, jbuf->jb_connect,
                                    FLAG_LAST_FLAG, FLAG_CRDT_AWARE,
                                    "%H %Tu", chan, chan->creationtime);
@@ -6010,7 +6010,7 @@ joinbuf_flush(struct JoinBuf *jbuf)
      * incarnation min-register) + default modes from the doc modes snapshot. Still
      * relay to legacy peers; a deep CRDT leaf with no legacy peer reaches legacy via
      * the 3f JOIN-gateway (the gateway node re-emits the founder JOIN). */
-    if (feature_bool(FEAT_CRDT_PRIMARY))
+    if (crdt_primary_on())
       sendcmdto_flag_serv_butone(jbuf->jb_source, CMD_CREATE, jbuf->jb_connect,
 				 FLAG_LAST_FLAG, FLAG_CRDT_AWARE,
 				 "%s %Tu", chanlist, jbuf->jb_create);
@@ -6021,7 +6021,7 @@ joinbuf_flush(struct JoinBuf *jbuf)
          && strlen(feature_str(FEAT_AUTOCHANMODES_LIST)) > 0 && MyUser(jbuf->jb_source)) {
       for (name = ircd_strtok(&p, chanlist, ","); name; name = ircd_strtok(&p, 0, ",")) {
         if (!IsLocalChannel(name)) {
-          if (feature_bool(FEAT_CRDT_PRIMARY))
+          if (crdt_primary_on())
             sendcmdto_flag_serv_butone(&me, CMD_MODE, jbuf->jb_connect,
                                        FLAG_LAST_FLAG, FLAG_CRDT_AWARE, "%s +%s",
                                        name, feature_str(FEAT_AUTOCHANMODES_LIST));
@@ -6043,7 +6043,7 @@ joinbuf_flush(struct JoinBuf *jbuf)
      * legacy peers. Putting PART on the SAME transport as JOIN (3f) removes the
      * P10-fast/CRDT-slow skew that otherwise lets reconcile-add resurrect a
      * just-parted member. KICK/QUIT are separate (CMD_KICK/CMD_QUIT, not joinbuf). */
-    if (feature_bool(FEAT_CRDT_PRIMARY))
+    if (crdt_primary_on())
       sendcmdto_flag_serv_butone(jbuf->jb_source, CMD_PART, jbuf->jb_connect,
 				 FLAG_LAST_FLAG, FLAG_CRDT_AWARE,
 				 jbuf->jb_comment ? "%s :%s" : "%s", chanlist,

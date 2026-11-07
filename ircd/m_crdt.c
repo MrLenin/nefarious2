@@ -903,7 +903,7 @@ int crdt_wall_demote(struct Channel *chptr)
 {
   struct Membership *memb;
   int sk;
-  if (!chptr || !feature_bool(FEAT_CRDT_ROUTE_WALL) || !feature_bool(FEAT_CRDT_PRIMARY))
+  if (!chptr || !feature_bool(FEAT_CRDT_ROUTE_WALL) || !crdt_primary_on())
     return 0;
   sk = crdt_have_mesh_stub();            /* partitioned -> CR-M is the carrier */
   for (memb = chptr->members; !sk && memb; memb = memb->next_member) {
@@ -1025,7 +1025,7 @@ void crdt_gossip_beacon_to(struct Client *only)
 {
   struct Client *acptr;
   char peers[256];
-  if (!crdt_shadow_active() || !feature_bool(FEAT_CRDT_PRIMARY))
+  if (!crdt_shadow_active() || !crdt_primary_on())
     return;
   /* build our own direct-peer set (also records our own mesh-map row); "*" when
    * we have no CRDT peers, so the positional param is always present. */
@@ -1194,7 +1194,7 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
          * Idempotent; the verify timer re-runs post-burst to heal SERVER-tree
          * race skips. No-op when the peer sent a normal BURST (this never fires
          * because no CR F is received in that case). */
-        if (feature_bool(FEAT_CRDT_PRIMARY) && IsBurstOrBurstAck(cptr))
+        if (crdt_primary_on() && IsBurstOrBurstAck(cptr))
           crdt_shadow_materialize_live();
         /* Orphan-reap owner sweep, eager pass: a CR F merge is the ONLY path a
          * stale OWN-origin record can re-import (merge-keep; deltas are SV-deduped

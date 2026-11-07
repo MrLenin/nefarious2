@@ -186,7 +186,7 @@ static void do_settopic(struct Client *sptr, struct Client *cptr,
        sendcmdto_set_s2s_tags(topic_time_ms, topic_msgid);
      }
      sendcmdto_want_s2s_tags(1);
-     if (feature_bool(FEAT_CRDT_PRIMARY)) {
+     if (crdt_primary_on()) {
        /* Phase 3d: CRDT-primary peers receive this topic via CRDT (the doc op +
         * crdt_shadow_reconcile_topics on the far side); relay the P10 TOPIC to
         * LEGACY (non-CRDT-aware) servers only. forbid=FLAG_CRDT_AWARE skips CRDT

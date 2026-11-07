@@ -293,7 +293,7 @@ int m_kick(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
     /* Phase 3k: KICK rides CRDT between CRDT-primary peers — suppress the P10 KICK
      * to CRDT-aware servers (they learn it via the CHANOP tombstone + kick_info +
      * reconcile, which also gateways KICK back to legacy); still relay to legacy. */
-    if (feature_bool(FEAT_CRDT_PRIMARY))
+    if (crdt_primary_on())
       sendcmdto_flag_serv_butone(sptr, CMD_KICK, cptr, FLAG_LAST_FLAG, FLAG_CRDT_AWARE,
 				 "%H %C :%s", chptr, who, comment);
     else
@@ -328,7 +328,7 @@ int m_kick(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
     presence_set_event_time(kick_msgid[0] ? presence_event_time(kick_msgid, kick_ms) : 0);
   }
 
-  if (feature_bool(FEAT_CRDT_PRIMARY)) {
+  if (crdt_primary_on()) {
     /* Phase 3k: mint the CRDT kick (CHANOP tombstone + kick_info) and remove the
      * victim IMMEDIATELY — the tombstone is authoritative so no zombie is needed,
      * and immediate removal avoids a reconcile double-KICK on this origin (local
@@ -460,7 +460,7 @@ int ms_kick(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
     /* Phase 3k: suppress the P10 KICK to CRDT peers (gateway-inbound legacy KICK
      * reaches the CRDT mesh via crdt_shadow_kick's tombstone below); still relay to
      * other legacy peers. */
-    if (feature_bool(FEAT_CRDT_PRIMARY))
+    if (crdt_primary_on())
       sendcmdto_flag_serv_butone(sptr, CMD_KICK, cptr, FLAG_LAST_FLAG, FLAG_CRDT_AWARE,
 				 "%H %C :%s", chptr, who, comment);
     else
@@ -484,7 +484,7 @@ int ms_kick(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
       sendcmdto_set_client_msgid(NULL);
 
       presence_set_event_time(kick_msgid[0] ? presence_event_time(kick_msgid, kick_time_ms) : 0);
-      if (feature_bool(FEAT_CRDT_PRIMARY)) {
+      if (crdt_primary_on()) {
         /* Phase 3k: gateway-inbound (legacy→CRDT) or local — mint the CRDT kick +
          * remove immediately (no zombie). crdt_shadow_kick self-gates when @a cptr
          * is a CRDT peer (they already minted it). */

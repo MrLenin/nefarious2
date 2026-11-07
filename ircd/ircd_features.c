@@ -1538,7 +1538,7 @@ static struct FeatureDesc {
   F_B(CRDT_ENABLED, 0, 0, crdt_shadow_enabled_changed),
   F_B(CRDT_SYNC, 0, 0, 0),
   F_B(CRDT_MESH, 0, 0, 0),
-  F_B(CRDT_PRIMARY, 0, 0, 0),
+  F_B(CRDT_PRIMARY, 0, 0, crdt_shadow_primary_changed),
   F_I(CRDT_GC_INTERVAL, 0, 60, 0),
   F_I(CRDT_BATCH_MS, 0, 10, 0),
   F_I(CRDT_STALE_TIMEOUT, 0, 300, 0),

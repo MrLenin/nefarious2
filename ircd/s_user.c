@@ -1273,7 +1273,7 @@ int register_user(struct Client *cptr, struct Client *sptr)
     relay_hold_mark(cptr, sptr);
     sendcmdto_flag_serv_butone(user->server, CMD_NICK, cptr,
                                FLAG_IRCV3AWARE,
-                               feature_bool(FEAT_CRDT_PRIMARY) ? FLAG_CRDT_AWARE
+                               crdt_primary_on() ? FLAG_CRDT_AWARE
                                                                : FLAG_LAST_FLAG,
                                "%s %d %Tu %s %s %s%s%s%s %s%s :%s",
                                cli_name(sptr), cli_hopcount(sptr) + 1,
@@ -1297,7 +1297,7 @@ int register_user(struct Client *cptr, struct Client *sptr)
      * documented leak, not reachable in this fleet). */
     sendcmdto_flag_serv_butone(user->server, CMD_NICK, cptr,
                                FLAG_IPV6,
-                               feature_bool(FEAT_CRDT_PRIMARY) ? FLAG_CRDT_AWARE
+                               crdt_primary_on() ? FLAG_CRDT_AWARE
                                                                : FLAG_LAST_FLAG,
                                "%s %d %Tu %s %s %s%s%s%s %s%s :%s",
                                cli_name(sptr), cli_hopcount(sptr) + 1,
@@ -1719,7 +1719,7 @@ int set_nick_name(struct Client* cptr, struct Client* sptr,
        * copy on CRDT peers).  This same relay, now legacy-only, IS the §17.7
        * gateway: when reconcile drives the rename via set_nick_name(cptr=CRDT
        * uplink), it re-emits the NICK to legacy here. */
-      if (feature_bool(FEAT_CRDT_PRIMARY)) {
+      if (crdt_primary_on()) {
         /* Tier2 P1 (#4): skip the legacy NICK for a mesh-only user — legacy SQUIT'd
          * its owning server and never received its NICK, so a rename sourced from it
          * would reference an unknown user.  The change rides the doc to CRDT peers
@@ -2069,7 +2069,7 @@ void send_umode_out(struct Client *cptr, struct Client *sptr,
          * Tier2 P1 (#4): also skip ALL legacy peers for a mesh-only subject — legacy
          * SQUIT'd its server and never got its NICK, so a MODE sourced from it would
          * reference an unknown user; the change rides the doc and returns on relink. */
-        && !(crdt_gate && feature_bool(FEAT_CRDT_PRIMARY)
+        && !(crdt_gate && crdt_primary_on()
              && (IsCrdtAware(acptr) || crdt_user_is_mesh_only(sptr))))
       sendcmdto_one(sptr, CMD_MODE, acptr, "%s %s", cli_name(sptr), umodeBuf);
   }

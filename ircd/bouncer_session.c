@@ -1537,7 +1537,7 @@ static int bounce_crdt_lease_held_elsewhere(const char *account,
 {
   const struct CrdtBouncerLease *lease;
 
-  if (!feature_bool(FEAT_CRDT_BOUNCER_DOC) || !feature_bool(FEAT_CRDT_PRIMARY))
+  if (!feature_bool(FEAT_CRDT_BOUNCER_DOC) || !crdt_primary_on())
     return 0;
   lease = crdt_shadow_blease_get(account, s->hs_sessid);
   return lease && lease->host != (uint16_t)base64toint(cli_yxx(&me))
@@ -1568,7 +1568,7 @@ static int bounce_crdt_lease_resume(struct Client *cptr, const char *account,
   int holder_fresh;
   enum CrdtBLeaseAction act;
 
-  if (!feature_bool(FEAT_CRDT_BOUNCER_DOC) || !feature_bool(FEAT_CRDT_PRIMARY))
+  if (!feature_bool(FEAT_CRDT_BOUNCER_DOC) || !crdt_primary_on())
     return -1;
   if (!session)
     session = bounce_find_any_session(account);
@@ -2116,7 +2116,7 @@ int bounce_create(struct Client *cptr, struct BouncerSession **out)
    * doc lease for a fresh sessid); crdt_blease_decide still arbitrates — if a
    * FRESH holder somehow has the lease (heal race) it returns <0 and we do
    * NOT claim here: the conflict path (M6d stand-down) stays timer-paced. */
-  if (feature_bool(FEAT_CRDT_PRIMARY)) {
+  if (crdt_primary_on()) {
     uint16_t myn = (uint16_t)base64toint(cli_yxx(&me));
     const struct CrdtBouncerLease *cur =
         crdt_shadow_blease_get(session->hs_account, session->hs_sessid);
@@ -3467,7 +3467,7 @@ time_t bounce_compute_hold_time_ext(struct BouncerSession *session)
 void bounce_crdt_tombstone_owned(struct BouncerSession *session)
 {
   assert(0 != session);
-  if (feature_bool(FEAT_CRDT_PRIMARY) && session->hs_client
+  if (crdt_primary_on() && session->hs_client
       && MyConnect(session->hs_client)) {
     crdt_shadow_bsess_remove(session->hs_account, session->hs_sessid);
     crdt_shadow_blease_remove(session->hs_account, session->hs_sessid);  /* M5 */
@@ -3489,7 +3489,7 @@ void bounce_destroy(struct BouncerSession *session)
 
   /* 5-5e M2: the primary holder tombstones its session record in the doc (before the
    * account/sessid strings are torn down). Single-writer gate matches the sweep. */
-  if (feature_bool(FEAT_CRDT_PRIMARY) && session->hs_client
+  if (crdt_primary_on() && session->hs_client
       && MyConnect(session->hs_client)) {
     crdt_shadow_bsess_remove(session->hs_account, session->hs_sessid);
     crdt_shadow_blease_remove(session->hs_account, session->hs_sessid);  /* M5 */
@@ -3823,7 +3823,7 @@ int bounce_crdt_bsess_mint_one(struct BouncerSession *s, int *conns)
   uint16_t myn;
   const char *me_yxx;
   int a;
-  if (!feature_bool(FEAT_CRDT_PRIMARY) || !s || s->hs_state == BOUNCE_DESTROYING)
+  if (!crdt_primary_on() || !s || s->hs_state == BOUNCE_DESTROYING)
     return 0;
 
   /* M2: the session record — single-writer = the PRIMARY holder. */
@@ -3912,7 +3912,7 @@ void bounce_crdt_bconn_touch(struct Client *who)
   char num[16];
   int a;
 
-  if (!feature_bool(FEAT_CRDT_BOUNCER_DOC) || !feature_bool(FEAT_CRDT_PRIMARY))
+  if (!feature_bool(FEAT_CRDT_BOUNCER_DOC) || !crdt_primary_on())
     return;
   if (!who || !MyConnect(who) || !IsUser(who) || !IsAccount(who)
       || !cli_user(who) || !cli_user(who)->server)
@@ -3995,7 +3995,7 @@ void bounce_crdt_bconn_apply(const char *account, const char *sessid,
 void bounce_crdt_bsess_sweep(void)
 {
   int i, n = 0, nc = 0, nl = 0;
-  if (!feature_bool(FEAT_CRDT_PRIMARY))
+  if (!crdt_primary_on())
     return;
   for (i = 0; i < BOUNCE_ACCOUNT_HASHSIZE; i++) {
     struct AccountSessions *as;
@@ -4139,7 +4139,7 @@ void bounce_crdt_replica_reap(void)
   int i, nd = 0;
   uint16_t by = 0;
 
-  if (!feature_bool(FEAT_CRDT_BOUNCER_DOC) || !feature_bool(FEAT_CRDT_PRIMARY))
+  if (!feature_bool(FEAT_CRDT_BOUNCER_DOC) || !crdt_primary_on())
     return;
 
   for (i = 0; i < BOUNCE_ACCOUNT_HASHSIZE && nd < REAP_BATCH; i++) {
@@ -4255,7 +4255,7 @@ void bounce_crdt_alias_reap(void)
   char doomed[REAP_BATCH][6];   /* YYXXX numerics */
   int i, nd = 0;
 
-  if (!feature_bool(FEAT_CRDT_BOUNCER_DOC) || !feature_bool(FEAT_CRDT_PRIMARY))
+  if (!feature_bool(FEAT_CRDT_BOUNCER_DOC) || !crdt_primary_on())
     return;
 
   for (i = 0; i < BOUNCE_ACCOUNT_HASHSIZE && nd < REAP_BATCH; i++) {
@@ -11163,7 +11163,7 @@ int bounce_yield_held_ghost(struct BouncerSession *session, struct Client *ghost
        * tombstones themselves wait until the devices are re-filed (below):
        * on a CRDT peer they are the BS X, and an early one would reap the
        * replica before our BX C reaches it. */
-      merged_owned = feature_bool(FEAT_CRDT_PRIMARY) && session->hs_client
+      merged_owned = crdt_primary_on() && session->hs_client
                      && MyConnect(session->hs_client);
       bounce_hs_client_assign_checked(session, NULL, "yield");
       /* Ours ends (BS X, destroy) once its devices are announced in the

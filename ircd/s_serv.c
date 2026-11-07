@@ -408,7 +408,7 @@ int server_finish_burst(struct Client *cptr)
    * crdt_shadow_doc_ready() guards against skipping BURST when our doc is not yet
    * a complete source (e.g. at cold boot) — then we fall back to a normal BURST
    * so the peer is never left missing users. */
-  if (IsCrdtAware(cptr) && feature_bool(FEAT_CRDT_PRIMARY) &&
+  if (IsCrdtAware(cptr) && crdt_primary_on() &&
       crdt_shadow_doc_ready()) {
     crdt_send_snapshot(cptr);
     sendcmdto_one(&me, CMD_END_OF_BURST, cptr, "");

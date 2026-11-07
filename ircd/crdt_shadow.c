@@ -414,6 +414,9 @@ int crdt_shadow_chan_local_check_add(const char *msgid)
  * life of every link: both follow the boot value, and a REHASH that changes
  * the feature takes effect at the next restart. */
 static int g_boot_enabled;
+/* CRDT_PRIMARY as read at boot: the doc-primary mode (tree paths withheld
+ * from C peers) must not flip under live links either. */
+static int g_boot_primary;
 
 /** Shadow is active only once initialised AND the feature was on at boot. */
 static int shadow_on(void)
@@ -424,6 +427,23 @@ static int shadow_on(void)
 int crdt_shadow_boot_enabled(void)
 {
   return g_inited && g_boot_enabled;
+}
+
+int crdt_primary_on(void)
+{
+  return shadow_on() && g_boot_primary;
+}
+
+void crdt_shadow_primary_changed(void)
+{
+  if (!g_inited || feature_bool(FEAT_CRDT_PRIMARY) == g_boot_primary)
+    return;
+  log_write(LS_SYSTEM, L_WARNING, 0,
+            "CRDT_PRIMARY is now %s but stays %s until restart",
+            feature_bool(FEAT_CRDT_PRIMARY) ? "TRUE" : "FALSE",
+            g_boot_primary ? "on" : "off");
+  sendto_opmask_butone(0, SNO_OLDSNO,
+                       "CRDT_PRIMARY changes take effect at the next restart");
 }
 
 void crdt_shadow_enabled_changed(void)
@@ -2097,7 +2117,7 @@ void crdt_shadow_reconcile_bouncer(void)
   struct reconcile_bsess_ctx cs = { 0 };
   struct reconcile_bconn_ctx ca = { 0 };
   if (!shadow_on() || !feature_bool(FEAT_CRDT_BOUNCER_DOC) ||
-      !feature_bool(FEAT_CRDT_PRIMARY))
+      !crdt_primary_on())
     return;
   /* sessions first (the replica record must exist before its aliases attach), then
    * aliases (their primary user must already be materialized by reconcile_users, which
@@ -2174,7 +2194,7 @@ void crdt_shadow_server_add(struct Client *srv)
 int crdt_shadow_mesh_reachable(struct Client *srv)
 {
   struct Client *acptr;
-  if (!shadow_on() || !feature_bool(FEAT_CRDT_PRIMARY))
+  if (!crdt_primary_on())
     return 0;
   if (!srv || !IsServer(srv) || !IsCrdtAware(srv) || !cli_serv(srv))
     return 0;
@@ -2244,7 +2264,7 @@ int crdt_tree_presence_suppress(struct Client *peer, struct Client *subject,
     return 0;
   peer_aware = peer && IsServer(peer) && IsCrdtAware(peer);
   subj_aware = subject && IsServer(subject) && IsCrdtAware(subject);
-  primary    = feature_bool(FEAT_CRDT_PRIMARY);
+  primary    = crdt_primary_on();
   suppress   = crdt_should_suppress_tree(feature_bool(FEAT_CRDT_MESHMAP_PRESENCE),
                                          primary, peer_aware, subj_aware);
   /* Shadow: flag still off but the candidate holds -> measure the beacon path. */
@@ -2279,7 +2299,7 @@ int crdt_intro_presence_suppress(struct Client *peer, struct Client *subject)
   peer_aware = peer && IsServer(peer) && IsCrdtAware(peer);
   subj_aware = subject && IsServer(subject) && IsCrdtAware(subject);
   return crdt_should_suppress_intro(feature_bool(FEAT_CRDT_LEGACY_PRESENCE),
-                                    feature_bool(FEAT_CRDT_PRIMARY),
+                                    crdt_primary_on(),
                                     peer_aware, subj_aware);
 }
 
@@ -2301,7 +2321,7 @@ int crdt_server_intro_suppress(struct Client *peer, struct Client *subject)
     return 0;
   peer_aware = peer && IsServer(peer) && IsCrdtAware(peer);
   subj_aware = subject && IsServer(subject) && IsCrdtAware(subject);
-  primary    = feature_bool(FEAT_CRDT_PRIMARY);
+  primary    = crdt_primary_on();
   suppress   = crdt_should_suppress_tree(feature_bool(FEAT_CRDT_TREE_RETIRE),
                                          primary, peer_aware, subj_aware);
   /* MR-5-0 shadow: SERVER-retire flag off but the both-ends candidate holds -> measure
@@ -4007,8 +4027,8 @@ void crdt_shadow_reconcile_glines(void)
   struct Gline *gl;
   struct Gline *lists[2];
   int li;
-  if (!shadow_on() || !feature_bool(FEAT_CRDT_GLINE_CUTOVER) ||
-      !feature_bool(FEAT_CRDT_PRIMARY))
+  if (!shadow_on() || !CrdtCutoverOn(FEAT_CRDT_GLINE_CUTOVER) ||
+      !crdt_primary_on())
     return;
   g_gline_reconciling = 1;
   crdt_lwwmap_foreach(&g_crdt.glines, reconcile_gline_add_cb, &c);
@@ -4160,8 +4180,8 @@ void crdt_shadow_reconcile_shuns(void)
   char masks[CRDT_GLINE_REMOVE_MAX][USERLEN + HOSTLEN + 4];
   int nr = 0, i, capped = 0;
   struct Shun *sh;
-  if (!shadow_on() || !feature_bool(FEAT_CRDT_SHUN_CUTOVER) ||
-      !feature_bool(FEAT_CRDT_PRIMARY))
+  if (!shadow_on() || !CrdtCutoverOn(FEAT_CRDT_SHUN_CUTOVER) ||
+      !crdt_primary_on())
     return;
   g_shun_reconciling = 1;
   crdt_lwwmap_foreach(&g_crdt.shuns, reconcile_shun_add_cb, &c);
@@ -4301,8 +4321,8 @@ void crdt_shadow_reconcile_zlines(void)
   char masks[CRDT_GLINE_REMOVE_MAX][HOSTLEN + 4];
   int nr = 0, i, capped = 0;
   struct Zline *zl;
-  if (!shadow_on() || !feature_bool(FEAT_CRDT_ZLINE_CUTOVER) ||
-      !feature_bool(FEAT_CRDT_PRIMARY))
+  if (!shadow_on() || !CrdtCutoverOn(FEAT_CRDT_ZLINE_CUTOVER) ||
+      !crdt_primary_on())
     return;
   g_zline_reconciling = 1;
   crdt_lwwmap_foreach(&g_crdt.zlines, reconcile_zline_add_cb, &c);
@@ -4432,8 +4452,8 @@ void crdt_shadow_reconcile_jupes(void)
   char names[CRDT_GLINE_REMOVE_MAX][HOSTLEN + 4];
   int nr = 0, i, capped = 0;
   struct Jupe *ju;
-  if (!shadow_on() || !feature_bool(FEAT_CRDT_JUPE_CUTOVER) ||
-      !feature_bool(FEAT_CRDT_PRIMARY))
+  if (!shadow_on() || !CrdtCutoverOn(FEAT_CRDT_JUPE_CUTOVER) ||
+      !crdt_primary_on())
     return;
   g_jupe_reconciling = 1;
   crdt_lwwmap_foreach(&g_crdt.jupes, reconcile_jupe_add_cb, &c);
@@ -4645,7 +4665,7 @@ void crdt_shadow_presence_diff(struct Client *to)
   time_t now = CurrentTime, stale = CRDT_BEACON_STALE;
   int i, d_bb, d_bp, bfs_only_b = 0, beacon_only = 0, bfs_only_p = 0, p10_only = 0;
 
-  if (!shadow_on() || !feature_bool(FEAT_CRDT_PRIMARY))
+  if (!crdt_primary_on())
     return;
   ournum = (unsigned int)base64toint(cli_yxx(&me));
 
@@ -4699,7 +4719,7 @@ void crdt_shadow_route_diff(struct Client *to)
   int agree = 0, mismatch = 0, mesh_only = 0, p10_only = 0;
   int i;
 
-  if (!shadow_on() || !feature_bool(FEAT_CRDT_PRIMARY))
+  if (!crdt_primary_on())
     return;
   ournum = (unsigned int)base64toint(cli_yxx(&me));
 
@@ -5838,7 +5858,7 @@ static void recon_user_cb(const char *key, uint32_t key_len,
 void crdt_shadow_reconcile_users(void)
 {
   struct recon_user_ctx c = { 0 };
-  if (!shadow_on() || !feature_bool(FEAT_CRDT_PRIMARY))
+  if (!crdt_primary_on())
     return;
   /* The burst guard is PER-USER (in recon_user_cb, scoped to the legacy uplink
    * toward each user's owning server), not a global gate here — see the rationale
@@ -5871,7 +5891,7 @@ void crdt_shadow_reconcile_user_removes(void)
   struct Client *acptr;
   char victims[CRDT_REMOVE_MAX][CRDT_NUMERICLEN];
   int nv = 0, i, capped = 0;
-  if (!shadow_on() || !feature_bool(FEAT_CRDT_PRIMARY))
+  if (!crdt_primary_on())
     return;
   /* collect FIRST — exit_client frees clients; never exit mid-walk */
   for (acptr = GlobalClientList; acptr; acptr = cli_next(acptr)) {
@@ -5975,7 +5995,7 @@ void crdt_shadow_reconcile_create_channels(void)
 {
   unsigned int created = 0;
   int bk;
-  if (!shadow_on() || !feature_bool(FEAT_CRDT_PRIMARY))
+  if (!crdt_primary_on())
     return;
   for (bk = 0; bk < CRDT_CHAN_BUCKETS; bk++) {
     struct CrdtChannel *dc;
@@ -6070,7 +6090,7 @@ void crdt_shadow_reconcile_topics(void)
 {
   unsigned int changed = 0;
   struct reconcile_topic_ctx ctx = { &changed };
-  if (!shadow_on() || !feature_bool(FEAT_CRDT_PRIMARY))
+  if (!crdt_primary_on())
     return;
   crdt_lwwmap_foreach(&g_crdt.topics, reconcile_topic_cb, &ctx);
   if (changed)
@@ -6134,7 +6154,7 @@ void crdt_shadow_reconcile_modes(void)
 {
   unsigned int changed = 0;
   struct reconcile_mode_ctx ctx = { &changed };
-  if (!shadow_on() || !feature_bool(FEAT_CRDT_PRIMARY))
+  if (!crdt_primary_on())
     return;
   crdt_lwwmap_foreach(&g_crdt.modes, reconcile_mode_cb, &ctx);
   if (changed)
@@ -6225,7 +6245,7 @@ void crdt_shadow_reconcile_member_status(void)
 {
   unsigned int changed = 0;
   struct reconcile_mstatus_ctx ctx = { &changed };
-  if (!shadow_on() || !feature_bool(FEAT_CRDT_PRIMARY))
+  if (!crdt_primary_on())
     return;
   crdt_lwwmap_foreach(&g_crdt.members_status, reconcile_mstatus_cb, &ctx);
   if (changed)
@@ -6298,7 +6318,7 @@ void crdt_shadow_reconcile_bans(void)
 {
   unsigned int changed = 0;
   int bk;
-  if (!shadow_on() || !feature_bool(FEAT_CRDT_PRIMARY))
+  if (!crdt_primary_on())
     return;
   for (bk = 0; bk < CRDT_CHAN_BUCKETS; bk++) {
     struct CrdtChannel *dc;
@@ -6374,7 +6394,7 @@ void crdt_shadow_reconcile_members(void)
 {
   unsigned int changed = 0;
   int bk;
-  if (!shadow_on() || !feature_bool(FEAT_CRDT_PRIMARY))
+  if (!crdt_primary_on())
     return;
   for (bk = 0; bk < CRDT_CHAN_BUCKETS; bk++) {
     struct CrdtChannel *dc;
@@ -6412,7 +6432,7 @@ void crdt_shadow_reconcile_removes(void)
 {
   unsigned int changed = 0;
   int bk;
-  if (!shadow_on() || !feature_bool(FEAT_CRDT_PRIMARY)) {
+  if (!crdt_primary_on()) {
     crdt_chan_part_reasons_clear(&g_crdt);
     return;
   }
@@ -6951,6 +6971,7 @@ void crdt_shadow_init(uint16_t my_numeric)
   crdt_state_init(&g_crdt, my_numeric);
   g_crdt.gc_hold = shadow_gc_hold;
   g_boot_enabled = feature_bool(FEAT_CRDT_ENABLED) ? 1 : 0;
+  g_boot_primary = feature_bool(FEAT_CRDT_PRIMARY) ? 1 : 0;
   /* Restart-epoch defense: seed next_seq from the wall clock (ms) so a restarted
    * server's freshly-reset op sequence never reuses seqs from a previous
    * incarnation that peers still remember in their state vectors (which would

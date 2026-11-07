@@ -272,7 +272,7 @@ int m_tagmsg(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
       /* R4a (channel-over-mesh): per-server local-delivery dedup (see relay_channel_message).
        * sendcmdto_channel_client_tags is local-only, so the skip-override there just
        * suppresses the redundant local TAGMSG when the CR-M plane already delivered it. */
-      if (feature_bool(FEAT_CRDT_PRIMARY) && tagmsg_msgid[0] &&
+      if (crdt_primary_on() && tagmsg_msgid[0] &&
           crdt_shadow_chan_local_check_add(tagmsg_msgid))
         sendcmdto_set_skip_local_members();
 
@@ -315,7 +315,7 @@ int m_tagmsg(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
          * CR-M flood below will carry it there (same member scan as the flood).  Set right
          * before the v3 call, which consumes the one-shot flag at entry. */
         int crdt_skip = 0;
-        if (feature_bool(FEAT_CRDT_PRIMARY)) {
+        if (crdt_primary_on()) {
           struct Membership *cmemb;
           crdt_skip = crdt_have_mesh_stub();   /* R6c: partitioned -> CR-M is the carrier */
           for (cmemb = chptr->members; !crdt_skip && cmemb; cmemb = cmemb->next_member) {
@@ -346,7 +346,7 @@ int m_tagmsg(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
        * member on a remote CRDT-aware server (not just mesh-only); deduped to
        * exactly-once per receiver via crdt_shadow_chan_local.
        * R6c: a partitioned node (crdt_have_mesh_stub) floods unconditionally (hidden members). */
-      if (feature_bool(FEAT_CRDT_PRIMARY)) {
+      if (crdt_primary_on()) {
         int fl = crdt_have_mesh_stub();
         struct Membership *mmemb;
         for (mmemb = chptr->members; !fl && mmemb; mmemb = mmemb->next_member) {
@@ -532,7 +532,7 @@ int ms_tagmsg(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
       sendcmdto_set_client_event(cli_s2s_msgid(cptr), history_event_time_ms(cptr));
 
     /* R4a (channel-over-mesh): per-server local-delivery dedup (see relay_channel_message). */
-    if (feature_bool(FEAT_CRDT_PRIMARY) && cli_s2s_msgid(cptr)[0] &&
+    if (crdt_primary_on() && cli_s2s_msgid(cptr)[0] &&
         crdt_shadow_chan_local_check_add(cli_s2s_msgid(cptr)))
       sendcmdto_set_skip_local_members();
 
@@ -546,7 +546,7 @@ int ms_tagmsg(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
     /* R6a (tree demote, see m_tagmsg): only a legacy-origin TAGMSG (!IsCrdtAware(cptr)) floods
      * here; suppress the redundant tree relay to CRDT-aware peers when we flood. */
     int crdt_skip = 0;
-    if (feature_bool(FEAT_CRDT_PRIMARY) && (!cptr || !IsCrdtAware(cptr))) {
+    if (crdt_primary_on() && (!cptr || !IsCrdtAware(cptr))) {
       struct Membership *cmemb;
       for (cmemb = chptr->members; cmemb; cmemb = cmemb->next_member) {
         struct Client *csrv = cli_user(cmemb->user) ? cli_user(cmemb->user)->server : NULL;
@@ -586,7 +586,7 @@ int ms_tagmsg(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
 
     /* R4a (channel-over-mesh): flood TAGMSG to any member on a remote CRDT-aware server,
      * only if entered from a non-CRDT direction (see server_relay_channel_message). */
-    if (feature_bool(FEAT_CRDT_PRIMARY) && (!cptr || !IsCrdtAware(cptr))) {
+    if (crdt_primary_on() && (!cptr || !IsCrdtAware(cptr))) {
       struct Membership *mmemb;
       for (mmemb = chptr->members; mmemb; mmemb = mmemb->next_member) {
         struct Client *msrv = cli_user(mmemb->user) ? cli_user(mmemb->user)->server : NULL;

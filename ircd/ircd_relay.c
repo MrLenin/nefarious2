@@ -629,7 +629,7 @@ void relay_channel_message(struct Client* sptr, const char* name, const char* te
       /* R4a (channel-over-mesh): per-server local-delivery dedup.  Mark this msgid as
        * delivered-to-our-locals via the tree; if the CR-M plane already delivered it
        * here, skip the redundant local fan-out (the relay to servers still happens). */
-      if (feature_bool(FEAT_CRDT_PRIMARY) && msgid[0] &&
+      if (crdt_primary_on() && msgid[0] &&
           crdt_shadow_chan_local_check_add(msgid))
         sendcmdto_set_skip_local_members();
 
@@ -637,7 +637,7 @@ void relay_channel_message(struct Client* sptr, const char* name, const char* te
        * CRDT-aware peer (same member scan as the flood), suppress the now-redundant tree
        * relay to CRDT-aware directions; legacy directions still get the tree copy.  Must be
        * set BEFORE the relay call, which consumes the one-shot flag at entry. */
-      if (feature_bool(FEAT_CRDT_PRIMARY)) {
+      if (crdt_primary_on()) {
         int sk = crdt_have_mesh_stub();   /* R6c: partitioned -> CR-M is the carrier */
         struct Membership *cmemb;
         for (cmemb = chptr->members; !sk && cmemb; cmemb = cmemb->next_member) {
@@ -674,7 +674,7 @@ void relay_channel_message(struct Client* sptr, const char* name, const char* te
      * channel view may be MISSING members (legacy users whose server can't be
      * re-materialized here), so a CRDT-aware member may not be visible; the flood lets the
      * mesh + a gateway deliver/bridge it. */
-    if (feature_bool(FEAT_CRDT_PRIMARY)) {
+    if (crdt_primary_on()) {
       int fl = crdt_have_mesh_stub();
       struct Membership *mmemb;
       for (mmemb = chptr->members; !fl && mmemb; mmemb = mmemb->next_member) {
@@ -831,14 +831,14 @@ void relay_channel_notice(struct Client* sptr, const char* name, const char* tex
       }
 
       /* R4a (channel-over-mesh): per-server local-delivery dedup (see relay_channel_message). */
-      if (feature_bool(FEAT_CRDT_PRIMARY) && msgid[0] &&
+      if (crdt_primary_on() && msgid[0] &&
           crdt_shadow_chan_local_check_add(msgid))
         sendcmdto_set_skip_local_members();
 
       /* R6a (tree demote, see relay_channel_message): suppress the redundant tree relay to
        * CRDT-aware directions when the CR-M flood below will carry it there.  Set before the
        * relay call (consumes the one-shot flag at entry). */
-      if (feature_bool(FEAT_CRDT_PRIMARY)) {
+      if (crdt_primary_on()) {
         int sk = crdt_have_mesh_stub();   /* R6c: partitioned -> CR-M is the carrier */
         struct Membership *cmemb;
         for (cmemb = chptr->members; !sk && cmemb; cmemb = cmemb->next_member) {
@@ -867,7 +867,7 @@ void relay_channel_notice(struct Client* sptr, const char* name, const char* tex
     /* R4a (channel-over-mesh): flood to any member on a remote CRDT-aware server (see
      * relay_channel_message); each receiver delivers exactly once via the dedup.
      * R6c: a partitioned node (crdt_have_mesh_stub) floods unconditionally (hidden members). */
-    if (feature_bool(FEAT_CRDT_PRIMARY)) {
+    if (crdt_primary_on()) {
       int fl = crdt_have_mesh_stub();
       struct Membership *mmemb;
       for (mmemb = chptr->members; !fl && mmemb; mmemb = mmemb->next_member) {
@@ -988,7 +988,7 @@ void server_relay_channel_message(struct Client* sptr, const char* name, const c
     }
 
     /* R4a (channel-over-mesh): per-server local-delivery dedup (see relay_channel_message). */
-    if (feature_bool(FEAT_CRDT_PRIMARY) && relay_msgid[0] &&
+    if (crdt_primary_on() && relay_msgid[0] &&
         crdt_shadow_chan_local_check_add(relay_msgid))
       sendcmdto_set_skip_local_members();
 
@@ -996,7 +996,7 @@ void server_relay_channel_message(struct Client* sptr, const char* name, const c
      * flood here — a CR-origin message was already flooded + tree-suppressed by its origin
      * and never reaches this server_relay path on an R6a peer.  Matching that gate, suppress
      * the redundant tree relay to CRDT-aware directions when we flood.  Set before the call. */
-    if (feature_bool(FEAT_CRDT_PRIMARY) && (!one || !IsCrdtAware(one))) {
+    if (crdt_primary_on() && (!one || !IsCrdtAware(one))) {
       struct Membership *cmemb;
       for (cmemb = chptr->members; cmemb; cmemb = cmemb->next_member) {
         struct Client *csrv = cli_user(cmemb->user) ? cli_user(cmemb->user)->server : NULL;
@@ -1025,7 +1025,7 @@ void server_relay_channel_message(struct Client* sptr, const char* name, const c
      * If it came from a CRDT peer, that peer already flooded it network-wide; re-flooding
      * would just be deduped waste (and a flood storm at scale).  Each receiving CRDT
      * server delivers to its locals exactly once via the crdt_shadow_chan_local dedup. */
-    if (feature_bool(FEAT_CRDT_PRIMARY) && (!one || !IsCrdtAware(one))) {
+    if (crdt_primary_on() && (!one || !IsCrdtAware(one))) {
       struct Membership *mmemb;
       for (mmemb = chptr->members; mmemb; mmemb = mmemb->next_member) {
         struct Client *msrv = cli_user(mmemb->user) ? cli_user(mmemb->user)->server : NULL;
@@ -1122,14 +1122,14 @@ void server_relay_channel_notice(struct Client* sptr, const char* name, const ch
     }
 
     /* R4a (channel-over-mesh): per-server local-delivery dedup (see relay_channel_message). */
-    if (feature_bool(FEAT_CRDT_PRIMARY) && relay_msgid[0] &&
+    if (crdt_primary_on() && relay_msgid[0] &&
         crdt_shadow_chan_local_check_add(relay_msgid))
       sendcmdto_set_skip_local_members();
 
     /* R6a (tree demote, see server_relay_channel_message): only a legacy-origin message
      * (!IsCrdtAware(one)) floods here; suppress the redundant tree relay to CRDT-aware
      * directions when we flood.  Set before the relay call. */
-    if (feature_bool(FEAT_CRDT_PRIMARY) && (!one || !IsCrdtAware(one))) {
+    if (crdt_primary_on() && (!one || !IsCrdtAware(one))) {
       struct Membership *cmemb;
       for (cmemb = chptr->members; cmemb; cmemb = cmemb->next_member) {
         struct Client *csrv = cli_user(cmemb->user) ? cli_user(cmemb->user)->server : NULL;
@@ -1154,7 +1154,7 @@ void server_relay_channel_notice(struct Client* sptr, const char* name, const ch
 
     /* R4a (channel-over-mesh): flood to any member on a remote CRDT-aware server, only
      * if entered from a non-CRDT direction (see server_relay_channel_message). */
-    if (feature_bool(FEAT_CRDT_PRIMARY) && (!one || !IsCrdtAware(one))) {
+    if (crdt_primary_on() && (!one || !IsCrdtAware(one))) {
       struct Membership *mmemb;
       for (mmemb = chptr->members; mmemb; mmemb = mmemb->next_member) {
         struct Client *msrv = cli_user(mmemb->user) ? cli_user(mmemb->user)->server : NULL;

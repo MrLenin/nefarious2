@@ -371,7 +371,7 @@ int64_t exit_face_departs(struct Client *c, const char *comment)
     /* Phase 3m (CRDT-mesh): on a CRDT primary the leave rides the doc to
      * CRDT-aware peers (the caller's crdt_shadow_user_remove tombstone), as
      * exit_client()'s QUIT loop keeps its Q off them. */
-    if (feature_bool(FEAT_CRDT_PRIMARY) && IsCrdtAware(link))
+    if (crdt_primary_on() && IsCrdtAware(link))
       continue;
     /* Armed per link: a send toward a legacy link consumes the override
      * without a tag region (as exit_client() arms its QUIT). */
@@ -1272,7 +1272,7 @@ int exit_client(struct Client *cptr,
                 * a QUIT sourced from it references an unknown user (un-routable).  Its
                 * removal rides the doc to other CRDT peers; legacy already considers
                 * it gone from the earlier server SQUIT. */
-               && !(feature_bool(FEAT_CRDT_PRIMARY)
+               && !(crdt_primary_on()
                     && (IsCrdtAware(dlp->value.cptr) || crdt_user_is_mesh_only(victim)))) {
 	/* Held ghosts: BX X already handled the silent destroy on
 	 * IRCv3-aware peers; non-IRCv3-aware peers don't process BX X
@@ -1380,7 +1380,7 @@ int exit_client(struct Client *cptr,
      * to us) has its users reaped here, leaving them orphaned (in-doc, not live) until
      * the next ~30s verify tick -> live unicast to them drops across the window.  Flag
      * a prompt re-materialize once victim is fully gone (below). */
-    crdt_resync_subtree = feature_bool(FEAT_CRDT_PRIMARY);
+    crdt_resync_subtree = crdt_primary_on();
   }
   exit_one_client(victim, comment);
 

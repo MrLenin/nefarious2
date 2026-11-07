@@ -316,7 +316,7 @@ zline_propagate(struct Client *cptr, struct Client *sptr, struct Zline *zline)
   /* ZLINE cutover: legacy-only under FEAT_CRDT_ZLINE_CUTOVER (forbid CRDT-aware); forbid=
    * FLAG_LAST_FLAG when off => no filter => identical to the old sendcmdto_serv_butone. */
   sendcmdto_flag_serv_butone(sptr, CMD_ZLINE, cptr, FLAG_LAST_FLAG,
-			feature_bool(FEAT_CRDT_ZLINE_CUTOVER) ? FLAG_CRDT_AWARE : FLAG_LAST_FLAG,
+			CrdtCutoverOn(FEAT_CRDT_ZLINE_CUTOVER) ? FLAG_CRDT_AWARE : FLAG_LAST_FLAG,
 			"* %c%s %Tu %Tu %Tu :%s",
 			ZlineIsRemActive(zline) ? '+' : '-',
 			zline->zl_mask, zline->zl_expire - TStime(),
@@ -775,7 +775,7 @@ zline_modify(struct Client *cptr, struct Client *sptr, struct Zline *zline,
   if (action != ZLINE_LOCAL_ACTIVATE && action != ZLINE_LOCAL_DEACTIVATE)
     /* ZLINE cutover: legacy-only under the flag (see zline_propagate). */
     sendcmdto_flag_serv_butone(sptr, CMD_ZLINE, cptr, FLAG_LAST_FLAG,
-			  feature_bool(FEAT_CRDT_ZLINE_CUTOVER) ? FLAG_CRDT_AWARE : FLAG_LAST_FLAG,
+			  CrdtCutoverOn(FEAT_CRDT_ZLINE_CUTOVER) ? FLAG_CRDT_AWARE : FLAG_LAST_FLAG,
 			  "* %s%s%s %Tu %Tu %Tu :%s",
 			  flags & ZLINE_OPERFORCE ? "!" : "", op,
 			  zline->zl_mask, zline->zl_expire - TStime(),
@@ -923,7 +923,7 @@ zline_burst(struct Client *cptr)
   struct Zline *szline;
 
   /* ZLINE cutover: a CRDT-aware peer gets Z-lines via the doc, not the P10 burst. */
-  if (feature_bool(FEAT_CRDT_ZLINE_CUTOVER) && IsServer(cptr) && IsCrdtAware(cptr))
+  if (CrdtCutoverOn(FEAT_CRDT_ZLINE_CUTOVER) && IsServer(cptr) && IsCrdtAware(cptr))
     return;
 
   zliter(GlobalZlineList, zline, szline) {
@@ -948,7 +948,7 @@ zline_resend(struct Client *cptr, struct Zline *zline)
     return 0;
 
   /* ZLINE cutover: CRDT peers get Z-lines via the doc, not a P10 resend. */
-  if (feature_bool(FEAT_CRDT_ZLINE_CUTOVER) && IsServer(cptr) && IsCrdtAware(cptr))
+  if (CrdtCutoverOn(FEAT_CRDT_ZLINE_CUTOVER) && IsServer(cptr) && IsCrdtAware(cptr))
     return 0;
 
   sendcmdto_one(&me, CMD_ZLINE, cptr, "* %c%s %Tu %Tu %Tu :%s",

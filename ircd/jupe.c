@@ -118,7 +118,7 @@ propagate_jupe(struct Client *cptr, struct Client *sptr, struct Jupe *jupe)
   /* JUPE cutover: legacy-only under FEAT_CRDT_JUPE_CUTOVER (forbid CRDT-aware); forbid=
    * FLAG_LAST_FLAG when off => no filter => identical to the old sendcmdto_serv_butone. */
   sendcmdto_flag_serv_butone(sptr, CMD_JUPE, cptr, FLAG_LAST_FLAG,
-			feature_bool(FEAT_CRDT_JUPE_CUTOVER) ? FLAG_CRDT_AWARE : FLAG_LAST_FLAG,
+			CrdtCutoverOn(FEAT_CRDT_JUPE_CUTOVER) ? FLAG_CRDT_AWARE : FLAG_LAST_FLAG,
 			"* %c%s %Tu %Tu :%s",
 			JupeIsRemActive(jupe) ? '+' : '-', jupe->ju_server,
 			jupe->ju_expire - CurrentTime, jupe->ju_lastmod,
@@ -364,7 +364,7 @@ jupe_burst(struct Client *cptr)
   struct Jupe *sjupe;
 
   /* JUPE cutover: a CRDT-aware peer gets jupes via the doc, not the P10 burst. */
-  if (feature_bool(FEAT_CRDT_JUPE_CUTOVER) && IsServer(cptr) && IsCrdtAware(cptr))
+  if (CrdtCutoverOn(FEAT_CRDT_JUPE_CUTOVER) && IsServer(cptr) && IsCrdtAware(cptr))
     return;
 
   for (jupe = GlobalJupeList; jupe; jupe = sjupe) { /* go through jupes */
@@ -391,7 +391,7 @@ jupe_resend(struct Client *cptr, struct Jupe *jupe)
     return 0;
 
   /* JUPE cutover: CRDT peers get jupes via the doc, not a P10 resend. */
-  if (feature_bool(FEAT_CRDT_JUPE_CUTOVER) && IsServer(cptr) && IsCrdtAware(cptr))
+  if (CrdtCutoverOn(FEAT_CRDT_JUPE_CUTOVER) && IsServer(cptr) && IsCrdtAware(cptr))
     return 0;
 
   sendcmdto_one(&me, CMD_JUPE, cptr, "* %c%s %Tu %Tu :%s",
