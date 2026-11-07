@@ -579,6 +579,11 @@ void crdt_shadow_join(struct Channel *chptr, struct Client *who,
   if (from_crdt_peer(cli_from(who)))  /* single-writer: peer owns this op */
     return;
   crdt_chan_join(&g_crdt, chptr->chname, user_numeric(who, num, sizeof num));
+  /* A rejoin supersedes any kick record for this member: drop it so a later
+   * plain PART is not read back as that kick on a peer (reconcile_removes'
+   * is_kick gate; the members_status gate alone fails once delete-on-leave
+   * has removed the status the rejoin wrote). */
+  crdt_kick_info_remove(&g_crdt, chptr->chname, num);
   /* Always stamp member status on join (not just op-on-join): members_status is
    * LWW and is NOT cleared on PART (delete-on-leave deferred), so a member who was
    * op'd, parted, and now rejoins PLAIN must overwrite the stale op record with a

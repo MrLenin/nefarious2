@@ -832,6 +832,10 @@ void crdt_kick_info_set(struct CrdtNetworkState *st, const char *chan,
                         const char *numeric, const struct CrdtKickInfo *ki);
 const struct CrdtLWWValue *crdt_kick_info_get(struct CrdtNetworkState *st,
                                               const char *chan, const char *numeric);
+/* Delete the kick record for @a numeric on @a chan, if one is live (a rejoin
+ * supersedes it, so a later plain PART is never read as that kick). */
+void crdt_kick_info_remove(struct CrdtNetworkState *st, const char *chan,
+                           const char *numeric);
 /** Get a member's status LWW value (NULL if absent), for the KICK-vs-PART HLC gate. */
 const struct CrdtLWWValue *crdt_member_status_get(struct CrdtNetworkState *st,
                                                   const char *chan, const char *numeric);

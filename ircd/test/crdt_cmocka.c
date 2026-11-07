@@ -1689,6 +1689,36 @@ static void test_kick_info_replicates_and_hlc_gates(void **state)
   crdt_state_clear(&s2);
 }
 
+/* A rejoin's kick-record delete replicates, so a plain PART after kick+rejoin is
+ * not read back as the old kick on a peer (the members_status gate alone fails
+ * once delete-on-leave has removed the status the rejoin wrote). */
+static void test_kick_info_remove_replicates(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s1, s2;
+  struct CrdtKickInfo ki;
+  uint64_t seq;
+  crdt_state_init(&s1, 4);
+  crdt_state_init(&s2, 3);
+  memset(&ki, 0, sizeof ki);
+  strcpy(ki.kicker, "DAAAA");
+  strcpy(ki.reason, "out");
+  crdt_kick_info_set(&s1, "#c", "DAAAB", &ki);
+  assert_true(crdt_state_sync(&s2, &s1) >= 0);
+  assert_non_null(crdt_kick_info_get(&s2, "#c", "DAAAB"));
+  crdt_kick_info_remove(&s1, "#c", "DAAAB");
+  assert_null(crdt_kick_info_get(&s1, "#c", "DAAAB"));
+  seq = s1.next_seq;
+  crdt_kick_info_remove(&s1, "#c", "DAAAB");        /* no live record: no op */
+  crdt_kick_info_remove(&s1, "#c", "DAAAZ");
+  assert_int_equal(seq, s1.next_seq);
+  assert_true(crdt_state_sync(&s2, &s1) >= 0);
+  assert_null(crdt_kick_info_get(&s2, "#c", "DAAAB"));
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+  crdt_state_clear(&s1);
+  crdt_state_clear(&s2);
+}
+
 /* ================================================================== */
 /* Scenario E — SQUIT as server-state transition (no tombstone storm) */
 /* ================================================================== */
@@ -4556,6 +4586,7 @@ int main(void)
     cmocka_unit_test(test_jupe_op_replicates),
     cmocka_unit_test(test_chan_ctime_min_incarnation),
     cmocka_unit_test(test_kick_info_replicates_and_hlc_gates),
+    cmocka_unit_test(test_kick_info_remove_replicates),
     cmocka_unit_test(test_E_squit_creates_no_membership_tombstones),
     cmocka_unit_test(test_server_state_converges),
     cmocka_unit_test(test_server_state_converges_mesh),

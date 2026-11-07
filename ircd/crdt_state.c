@@ -2529,6 +2529,17 @@ void crdt_member_status_remove(struct CrdtNetworkState *st, const char *chan,
     mint_meta_delete(st, &st->members_status, CRDT_COLL_MEMBER_STATUS, key, klen);
 }
 
+/* Delete the kick record for @a numeric on @a chan, if one is live (a rejoin
+ * supersedes it, so a later plain PART is never read as that kick). */
+void crdt_kick_info_remove(struct CrdtNetworkState *st, const char *chan,
+                           const char *numeric)
+{
+  char key[512];
+  uint32_t klen = chan_num_key(chan, numeric, key, sizeof key);
+  if (klen && crdt_lwwmap_get(&st->kick_info, key, klen))
+    mint_meta_delete(st, &st->kick_info, CRDT_COLL_KICK_INFO, key, klen);
+}
+
 /* M10 anchor test: a channel is FULLY gone iff its members OR-Set is empty AND
  * causally stable (no live member-removes: tomb_count==0) AND its ctime incarnation
  * is dead. tomb_count==0 (NOT ctime-dead alone) is the causal-stability signal:
