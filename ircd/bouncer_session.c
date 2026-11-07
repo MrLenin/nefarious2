@@ -7239,6 +7239,34 @@ enum bounce_end_route bounce_member_end(struct BouncerSession *s,
   return route;
 }
 
+/** Set while the gateway materializes a doc-written alias through
+ * bounce_alias_create: its BX C forward then goes to the legacy leg only. */
+static int bx_from_doc;
+
+/** Whether the doc already carries a received BS/BX line to our CRDT peers,
+ * so its onward relay can skip them: only when the line's origin is a CRDT
+ * node, which we take only from a real server with the C flag.  A mesh stub may be an anchor for a legacy
+ * server, so its lines are relayed.  A legacy origin writes nothing to the
+ * doc, so its line is the only carrier and must reach our CRDT peers too.
+ * (An overlay-only node has no P10 link and so still misses a legacy line;
+ * that needs a CR carrier.)
+ * @param[in] sptr Source of the received line.
+ * @return Non-zero to relay to the legacy leg only. */
+static int bs_origin_doc_covered(struct Client *sptr)
+{
+  struct Client *srv = sptr;
+
+  if (!feature_bool(FEAT_CRDT_BOUNCER_DOC) || !srv)
+    return 0;
+  if (!IsServer(srv) && !IsMe(srv) && !IsMeshStub(srv) && cli_user(srv))
+    srv = cli_user(srv)->server;
+  if (!srv)
+    return 0;
+  if (IsMe(srv))
+    return crdt_primary_on();
+  return IsServer(srv) && !IsMeshStub(srv) && IsCrdtAware(srv);
+}
+
 /** Handle incoming BS P10 message from another server.
  *
  * Subcommands:
@@ -7706,7 +7734,7 @@ bsc_forward:
        * M6a materializes the HOLDING replica, the doc-path state-apply keeps
        * it in sync, and held channels ride the Phase-3 member collection.
        * Re-relay legacy-only (gateway leg). */
-      if (feature_bool(FEAT_CRDT_BOUNCER_DOC))
+      if (bs_origin_doc_covered(sptr))
         sendcmdto_set_skip_crdt_servers();
       sendcmdto_serv_butone_v3(sptr, CMD_BOUNCER_SESSION,
                             cptr,
@@ -7718,7 +7746,7 @@ bsc_forward:
     } else {
       /* 5-5e M6b-1: ACTIVE create is doc-covered (origin server's sweep
        * wrote it; M6a materializes the replica) — re-relay legacy-only. */
-      if (feature_bool(FEAT_CRDT_BOUNCER_DOC))
+      if (bs_origin_doc_covered(sptr))
         sendcmdto_set_skip_crdt_servers();
       sendcmdto_serv_butone_v3(sptr, CMD_BOUNCER_SESSION,
                             cptr,
@@ -7931,7 +7959,7 @@ bsc_forward:
     /* Forward — preserve extended fields when present (per C.3).
      * 5-5e M6b-1b: ATTACH is doc-covered (state-apply flips replicas to
      * ACTIVE) — re-relay legacy-only. */
-    if (feature_bool(FEAT_CRDT_BOUNCER_DOC))
+    if (bs_origin_doc_covered(sptr))
       sendcmdto_set_skip_crdt_servers();
     if (parc >= 7) {
       sendcmdto_serv_butone_v3(sptr, CMD_BOUNCER_SESSION,
@@ -8071,7 +8099,7 @@ bsc_forward:
     /* Forward — 5-5e M6b-1b: DETACH is doc-covered (state-apply flips replicas
      * to HOLDING; held channels ride the member collection) — re-relay
      * legacy-only. */
-    if (feature_bool(FEAT_CRDT_BOUNCER_DOC))
+    if (bs_origin_doc_covered(sptr))
       sendcmdto_set_skip_crdt_servers();
     sendcmdto_serv_butone_v3(sptr, CMD_BOUNCER_SESSION,
                           cptr,
@@ -8139,7 +8167,7 @@ bsc_forward:
 
     /* Forward — 5-5e M6b-1: destroy is doc-covered via the primary
      * holder's bsessions tombstone; re-relay legacy-only. */
-    if (feature_bool(FEAT_CRDT_BOUNCER_DOC))
+    if (bs_origin_doc_covered(sptr))
       sendcmdto_set_skip_crdt_servers();
     sendcmdto_serv_butone_v3(sptr, CMD_BOUNCER_SESSION,
                           cptr,
@@ -8315,7 +8343,7 @@ bsc_forward:
      * CRDT peers — the grant rides the doc among them; only the legacy
      * leg should see the relayed BS O (and the gateway re-originates from
      * the doc anyway). */
-    if (feature_bool(FEAT_CRDT_BOUNCER_DOC))
+    if (bs_origin_doc_covered(sptr))
       sendcmdto_set_skip_crdt_servers();
     if (opername && *opername)
       sendcmdto_serv_butone_v3(sptr, CMD_BOUNCER_SESSION,
@@ -14750,7 +14778,7 @@ forward:
    * Legacy still gets it: on the gateway this IS the synth — the doc-materialize
    * path (bounce_materialize_alias_from_doc) reaches this forward and now emits
    * BX C to legacy only (the paired BX P below is already legacy-only). */
-  if (feature_bool(FEAT_CRDT_BOUNCER_DOC))
+  if (bx_from_doc || bs_origin_doc_covered(sptr))
     sendcmdto_set_skip_crdt_servers();
   if (alias_modes && *alias_modes)
     sendcmdto_serv_butone_v3(sptr, CMD_BOUNCER_TRANSFER, cptr,
@@ -14866,7 +14894,13 @@ int bounce_materialize_alias_from_doc(const char *account, const char *sessid,
   parv[4] = (char *)account;
   parv[5] = (char *)sessid;
   parv[6] = chanbuf;                          /* old-format BX C: parc 7, channels last */
-  bounce_alias_create(uplink, alias_server, 7, parv);
+  {
+    int was_from_doc = bx_from_doc;
+
+    bx_from_doc = 1;
+    bounce_alias_create(uplink, alias_server, 7, parv);
+    bx_from_doc = was_from_doc;
+  }
   return 1;
 }
 
