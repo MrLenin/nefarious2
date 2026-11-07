@@ -183,6 +183,28 @@ static void oper_password_verified(int result, void *arg)
   MyFree(ctx);
 }
 
+/** Copy @a modes into @a buf (of @a size) without any 'b'.  b is the
+ * bouncer hold (+b joins or makes the account's session, -b ends it): a
+ * mode string applied by do_oper() would run that in the middle of the
+ * OPER, on a client that may just have become an alias.  A hold is the
+ * user's own choice, never an Operator block's (W3 final fix wave).
+ * @return 1 when a 'b' was left out. */
+static int oper_umode_without_b(char *buf, size_t size, const char *modes)
+{
+  size_t n = 0;
+  int dropped = 0;
+
+  for (; *modes && n + 1 < size; modes++) {
+    if (*modes == 'b') {
+      dropped = 1;
+      continue;
+    }
+    buf[n++] = *modes;
+  }
+  buf[n] = '\0';
+  return dropped;
+}
+
 void do_oper(struct Client* cptr, struct Client* sptr, struct ConfItem* aconf, int flags)
 {
   struct Flags old_mode = cli_flags(sptr);
@@ -193,6 +215,7 @@ void do_oper(struct Client* cptr, struct Client* sptr, struct ConfItem* aconf, i
   char*        ajoinchan;
   char*        ajoinnotice;
   unsigned int snomask = 0;
+  char         umode_buf[BUFSIZE];
 
   parv[0] = cli_name(sptr);
   parv[1] = NULL;
@@ -255,6 +278,14 @@ void do_oper(struct Client* cptr, struct Client* sptr, struct ConfItem* aconf, i
   }
 
   modes = ConfUmode(aconf);
+  if (modes && oper_umode_without_b(umode_buf, sizeof(umode_buf), modes)) {
+    log_write(LS_OPER, L_WARNING, 0, "OPER (%s) by (%#C): the umode \"%s\" "
+              "of its class %s has b, which is not applied (a bouncer hold "
+              "is the user's own)", aconf->name, sptr, modes,
+              aconf->conn_class ? aconf->conn_class->cc_name : "*");
+    /* Nothing left but signs: no mode change to apply. */
+    modes = umode_buf[strspn(umode_buf, "+-")] ? umode_buf : NULL;
+  }
   if (modes) {
     if (MyUser(sptr)) {
       char *umodev[] = { NULL, NULL, NULL, NULL };
@@ -304,7 +335,7 @@ void do_oper(struct Client* cptr, struct Client* sptr, struct ConfItem* aconf, i
   /* Sync oper mode flags across all members of this client's bouncer
    * session — handles /OPER on alias as well as on primary.  Must be
    * after all mode and ConfUmode changes are applied. */
-  bounce_sync_session_umodes(sptr);
+  bounce_sync_session_umodes(sptr, NULL, sptr);
 
   send_reply(sptr, RPL_YOUREOPER);
 
@@ -484,12 +515,22 @@ int m_oper(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
     else
       srv = find_match_server(parv[1]);
 
+    if (!srv && !string_has_wildcards(parv[1]) && (srv = FindClient(parv[1]))
+        && !IsMeshStub(srv))
+      srv = NULL;                /* FindServer is IsServer-exact: keep only a stub */
+
     if (!srv)
       return send_reply(sptr, ERR_NOOPERHOST);
 
     if (IsMe(srv)) {
       parv[1] = parv[2];
       parv[2] = parv[3];
+    } else if (IsMeshStub(srv)) {
+      /* Reachable only over the CRDT mesh: a P10 send would dead-sink, and
+       * no mesh carrier moves an oper password (nor should one).  Refuse,
+       * as hunt_server_cmd does for a stub it cannot carry to. */
+      return send_reply(sptr, SND_EXPLICIT | ERR_NOSUCHSERVER,
+                        "%s :Server is not reachable", cli_name(srv));
     } else {
       sendcmdto_one(sptr, CMD_OPER, srv, "%C %s %s", srv, parv[2], parv[3]);
       SetOperedRemote(sptr);
@@ -546,6 +587,9 @@ int ms_oper(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
 
     if (!(acptr = FindNServer(parv[1])))
       return send_reply(sptr, ERR_NOOPERHOST);
+    else if (IsMeshStub(acptr))      /* see m_oper: never carried */
+      return send_reply(sptr, SND_EXPLICIT | ERR_NOSUCHSERVER,
+                        "%s :Server is not reachable", cli_name(acptr));
     else if (!IsMe(acptr)) {
       sendcmdto_one(sptr, CMD_OPER, acptr, "%C %s %s", acptr, parv[2],
                     parv[3]);

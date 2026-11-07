@@ -24,6 +24,7 @@
 #include "config.h"
 
 #include "s_bsd.h"
+#include "crdt_shadow.h"
 #include "bouncer_session.h"
 #include "capab.h"
 #include "client.h"
@@ -326,6 +327,66 @@ static void ssl_handshake_events(struct Client *cptr)
 }
 #endif /* USE_SSL */
 
+/** Complete a WebSocket frame left pending on the wire.
+ * Writes the remainder of con_ws_txrem from where the last attempt
+ * stopped.  OpenSSL is retried from the stash, which is the very buffer
+ * the frame was first offered from (ws_send_raw writes from its heap
+ * copy), as the retry-same-buffer rule requires.
+ * @param[in] cptr WebSocket client with a pending frame.
+ * @param[in,out] wrote_out Incremented by the bytes written here when
+ * the frame completes; when it does not, the bytes are accounted to
+ * sendB here and *wrote_out is reset to 0.
+ * @return 1 when the frame is complete (the stash is freed), 0 when it
+ * is still pending (FLAG_BLOCKED set) or the socket died
+ * (FLAG_DEADSOCKET set).
+ */
+int ws_flush_txrem(struct Client *cptr, unsigned int *wrote_out)
+{
+  struct Connection *wcon = cli_connect(cptr);
+  unsigned int remlen = (unsigned)(con_ws_txrem_len(wcon) - con_ws_txrem_pos(wcon));
+  unsigned int wrote = 0;
+  IOResult r = IO_BLOCKED;
+
+  assert(0 != con_ws_txrem(wcon));
+#ifdef USE_SSL
+  if (cli_socket(cptr).ssl) {
+    int sr;
+
+    ssl_clear_errors("before SSL_write");
+    sr = SSL_write(cli_socket(cptr).ssl,
+                   con_ws_txrem(wcon) + con_ws_txrem_pos(wcon), remlen);
+    if (sr > 0) { wrote = (unsigned)sr; r = IO_SUCCESS; }
+    else {
+      int se = SSL_get_error(cli_socket(cptr).ssl, sr);
+      r = (se == SSL_ERROR_WANT_WRITE || se == SSL_ERROR_WANT_READ)
+            ? IO_BLOCKED : IO_FAILURE;
+    }
+  } else
+#endif
+    r = os_send_nonb(cli_fd(cptr), con_ws_txrem(wcon) + con_ws_txrem_pos(wcon),
+                     remlen, &wrote);
+  if (wrote) {
+    *wrote_out += wrote;
+    con_ws_txrem_pos(wcon) += (int)wrote;
+  }
+  if (con_ws_txrem_pos(wcon) >= con_ws_txrem_len(wcon)) {
+    MyFree(con_ws_txrem(wcon));
+    con_ws_txrem(wcon) = NULL;
+    con_ws_txrem_len(wcon) = con_ws_txrem_pos(wcon) = 0;
+    return 1;
+  }
+  cli_sendB(cptr) += *wrote_out;
+  cli_sendB(&me)  += *wrote_out;
+  *wrote_out = 0;
+  if (r == IO_FAILURE) {
+    cli_error(cptr) = errno;
+    SetFlag(cptr, FLAG_DEADSOCKET);
+    return 0;
+  }
+  SetFlag(cptr, FLAG_BLOCKED);
+  return 0;
+}
+
 /** Attempt to send a sequence of bytes to the connection.
  * As a side effect, updates \a cptr's FLAG_BLOCKED setting
  * and sendB/sendK fields.
@@ -375,48 +436,14 @@ unsigned int deliver_it(struct Client *cptr, struct MsgQ *buf)
     unsigned int consumed = 0;  /* input bytes whose frames were FULLY written */
     struct Connection *wcon = cli_connect(cptr);
 
-    /* A previous flush left a partially-written frame on the wire
-     * (plaintext short write).  Its line was already consumed from the
-     * queue, so the REST of that exact frame must go out before any new
-     * frame -- resending from the frame start would corrupt the stream. */
-    if (con_ws_txrem(wcon)) {
-      unsigned int remlen = (unsigned)(con_ws_txrem_len(wcon) - con_ws_txrem_pos(wcon));
-      unsigned int wrote = 0;
-      IOResult r = IO_BLOCKED;
-#ifdef USE_SSL
-      if (cli_socket(cptr).ssl) {
-        int sr = SSL_write(cli_socket(cptr).ssl,
-                           con_ws_txrem(wcon) + con_ws_txrem_pos(wcon), remlen);
-        if (sr > 0) { wrote = (unsigned)sr; r = IO_SUCCESS; }
-        else {
-          int se = SSL_get_error(cli_socket(cptr).ssl, sr);
-          r = (se == SSL_ERROR_WANT_WRITE || se == SSL_ERROR_WANT_READ)
-                ? IO_BLOCKED : IO_FAILURE;
-        }
-      } else
-#endif
-        r = os_send_nonb(cli_fd(cptr), con_ws_txrem(wcon) + con_ws_txrem_pos(wcon),
-                         remlen, &wrote);
-      if (wrote) {
-        total_ws_written += wrote;
-        con_ws_txrem_pos(wcon) += (int)wrote;
-      }
-      if (con_ws_txrem_pos(wcon) >= con_ws_txrem_len(wcon)) {
-        MyFree(con_ws_txrem(wcon));
-        con_ws_txrem(wcon) = NULL;
-        con_ws_txrem_len(wcon) = con_ws_txrem_pos(wcon) = 0;
-      } else {
-        cli_sendB(cptr) += total_ws_written;
-        cli_sendB(&me)  += total_ws_written;
-        if (r == IO_FAILURE) {
-          cli_error(cptr) = errno;
-          SetFlag(cptr, FLAG_DEADSOCKET);
-          return 0;
-        }
-        SetFlag(cptr, FLAG_BLOCKED);
-        return 0;  /* remainder still pending; nothing new consumed */
-      }
-    }
+    /* A previous flush left a frame pending on the wire: a plaintext
+     * short write, or an out-of-band frame (keepalive PING, PONG) that
+     * went want-write inside OpenSSL.  Its bytes precede everything still
+     * queued, so the REST of that exact frame must go out before any new
+     * frame -- resending from the frame start would corrupt the stream,
+     * and a different frame is OpenSSL's "bad write retry". */
+    if (con_ws_txrem(wcon) && !ws_flush_txrem(cptr, &total_ws_written))
+      return 0;  /* still pending (or dead); nothing new consumed */
 
     /* Get data from message queue as iovecs */
     iovcnt = msgq_mapiov(buf, iov, IOV_MAX, &bytes_count);
@@ -500,7 +527,10 @@ unsigned int deliver_it(struct Client *cptr, struct MsgQ *buf)
 
 #ifdef USE_SSL
           if (cli_socket(cptr).ssl) {
-            int send_result = SSL_write(cli_socket(cptr).ssl, ws_frame, frame_len);
+            int send_result;
+
+            ssl_clear_errors("before SSL_write");
+            send_result = SSL_write(cli_socket(cptr).ssl, ws_frame, frame_len);
             if (send_result > 0) {
               result = IO_SUCCESS;
               total_ws_written += send_result;
@@ -721,16 +751,58 @@ static int completed_connection(struct Client* cptr)
   ClearPingSent(cptr);
 
   /* Flag string: h=hub, 6=ipv6, o=oplevels, v=IRCv3-aware S2S extensions,
-   * F=BX F (reconcile-end) handshake supported.
+   * F=BX F (reconcile-end) handshake supported, H=bouncer hold mark (,H)
+   * stamped and relayed (only while P10_MESSAGE_TAGS is on: the mark
+   * rides the compact tags).
    * Legacy peers ignore unknown flag chars. */
-  sendrawto_one(cptr, MSG_SERVER " %s 1 %Tu %Tu J%s %s%s +%s6%svFC :%s",
+  sendrawto_one(cptr, MSG_SERVER " %s 1 %Tu %Tu J%s %s%s +%s6%svF%s%s :%s",
                 cli_name(&me), cli_serv(&me)->timestamp, newts,
 		MAJOR_PROTOCOL, NumServCap(&me),
 		feature_bool(FEAT_HUB) ? "h" : "",
                 feature_bool(FEAT_OPLEVELS) ? "o" : "",
+                IsCrdtAware(&me) ? "C" : "",
+                feature_bool(FEAT_P10_MESSAGE_TAGS) ? "H" : "",
                 cli_info(&me));
+  if (feature_bool(FEAT_P10_MESSAGE_TAGS))
+    SetHoldMarkSent(cptr);
 
   return (IsDead(cptr)) ? 0 : 1;
+}
+
+/** Why @a cptr's socket died, as dead_link() recorded it, or @a dflt.
+ * (These read cli_info -- the realname -- when nothing was recorded, so a
+ * socket error could quit a user with their own realname.) */
+static const char *dead_reason(struct Client *cptr, const char *dflt)
+{
+  return (cptr && cli_connect(cptr) && cli_exit_reason(cptr)[0])
+         ? cli_exit_reason(cptr) : dflt;
+}
+
+/** Exit a client whose socket died -- or let the bouncer keep its
+ * session, when it is a session primary: the decision
+ * client_sock_callback() makes for an EOF or a read error.  A write error
+ * or a sendQ overflow is a dropped connection too (user decision
+ * 2026-10-21): a live device of the session takes over, as after a QUIT,
+ * else the session holds (bounce_promote_or_hold()).  The parse loops and
+ * check_pings() exited it outright, and a session with no other
+ * connection ended with it.
+ * @param[in] cptr Local client marked dead.
+ * @param[in] dflt Exit message when dead_link() recorded none.
+ * @return CPTR_KILLED when the client is gone, 0 when it is held.
+ */
+int exit_dead_client(struct Client *cptr, const char *dflt)
+{
+  const char *msg = dead_reason(cptr, dflt);
+
+  if (IsUser(cptr) && !IsBouncerAlias(cptr)) {
+    if (IsBouncerHold(cptr))
+      return 0;
+    /* Held: 0.  A device here took over (1), or nothing to keep: the
+     * client exits; after a promote its channels are already left. */
+    if (bounce_promote_or_hold(cptr, msg) == 0)
+      return 0;
+  }
+  return exit_client(cptr, cptr, &me, (char *)msg);
 }
 
 /** Close the physical connection.  Side effects: MyConnect(cptr)
@@ -775,8 +847,23 @@ void close_connection(struct Client *cptr)
     ServerStats->is_ni++;
 
   if (-1 < cli_fd(cptr)) {
-    flush_connections(cptr);
-    LocalClientArray[cli_fd(cptr)] = 0;
+    /* The fd is closed here, once, and nothing touches its number after
+     * that.  Everything that writes to it -- the queued lines, the TLS
+     * close_notify, the FIN -- goes first.  The number is free the moment
+     * close() returns, and the next open() in any thread (a RocksDB flush,
+     * a log file) gets it: a write after the close lands in that file (on
+     * the bed a 24-byte close_notify corrupted an SST being flushed), a
+     * second close() closes that file under its owner. */
+    int fd = cli_fd(cptr);
+
+    /* A WebSocket's one Close frame goes after the queued lines -- the
+     * ERROR exit_client() queued last among them -- since nothing may
+     * follow a Close (RFC 6455 §5.5.1). */
+    if (IsWebSocket(cptr))
+      websocket_close_flush(cptr);
+    else
+      flush_connections(cptr);
+    LocalClientArray[fd] = 0;
 
     /* Drain any data sitting in the recv buffer before close.  Linux's
      * close() sends RST (not FIN) when there's unread data in the kernel
@@ -787,36 +874,40 @@ void close_connection(struct Client *cptr)
      * (transport error)" with no visible KILL or ERROR rendered. */
     {
       char drainbuf[1024];
-      while (recv(cli_fd(cptr), drainbuf, sizeof(drainbuf), MSG_DONTWAIT) > 0)
+      while (recv(fd, drainbuf, sizeof(drainbuf), MSG_DONTWAIT) > 0)
         ;
     }
 
-    /* Use shutdown() instead of close() to send FIN gracefully.
-     * close() on a socket with unread data in the recv buffer sends RST,
-     * which discards pending data at the remote end's recv buffer (on Linux).
-     * shutdown(SHUT_RDWR) sends FIN and silently ACKs any incoming data,
-     * preventing RST.  The actual close(fd) is deferred to the ET_DESTROY
-     * callback via socket_del(), giving remote clients time to read any
-     * queued messages (ERROR, MONITOR 731 notifications, etc.). */
-    shutdown(cli_fd(cptr), SHUT_RDWR);
-    close(cli_fd(cptr));
-    socket_del(&(cli_socket(cptr))); /* queue Socket struct destroy */
-    cli_fd(cptr) = -1;
-    /* Why inline close() despite the surrounding "deferred close" comment
-     * block above: cli_fd is a macro for cli_connect(cptr)->con_socket.s_fd,
-     * the SAME field client_sock_callback's ET_DESTROY branch
-     * (s_bsd.c:1536) reads to decide whether to close the deferred fd.
-     * Nulling cli_fd at the end of this if-block also wipes s_fd, so
-     * ET_DESTROY's `if (s_fd >= 0) close(...)` is always false — meaning
-     * every shutdown'd fd would leak until process exit (~3 FDs/sec/worker
-     * under bare connect/QUIT churn).  Upstream nefarious-upstream
-     * (s_bsd.c:462) keeps close() inline for exactly this reason; the
-     * deferred-close refactor in fork commit b4acfe2 dropped it and
-     * regressed.  shutdown(SHUT_RDWR) still gives the graceful FIN this
-     * code path wanted; close() then relinquishes the user-space fd while
-     * the kernel finishes the TCP teardown via the standard linger /
-     * TIME_WAIT machinery — the trailing ERROR/KILL bytes already in the
-     * send buffer drain normally. */
+#ifdef USE_SSL
+    /* The TLS close_notify, after the last line and before the FIN, while
+     * the fd is still ours (non-blocking, best effort).  The SSL object
+     * goes with it: its BIO caches the fd number, and an SSL left for the
+     * socket's ET_DESTROY wrote its close_notify there after the close --
+     * into whatever had reused the number. */
+    ssl_free(&(cli_socket(cptr)));
+#endif /* USE_SSL */
+
+    /* shutdown(SHUT_RDWR) sends the FIN and silently ACKs any data still
+     * arriving, so the close() below does not turn it into an RST that
+     * would discard what the peer has not read yet. */
+    shutdown(fd, SHUT_RDWR);
+
+    /* Unregister from the engine while fd is still open (epoll_ctl DEL on
+     * a valid fd), and leave the socket no fd: socket_del_keepfd() sets
+     * s_fd -- which is cli_fd -- to -1 before the ET_DESTROY, synchronous
+     * here or deferred to the end of the running callback, so the
+     * ET_DESTROY never closes it a second time.  Then the one close.
+     * A socket already off the engine (GEN_DESTROY: a revive took it and
+     * the engine would not take it for the ghost, bounce_revive() -2)
+     * only gives up the fd. */
+    if (cli_socket(cptr).s_header.gh_flags & GEN_DESTROY) {
+      /* Reached only by a connection that never registered: bounce_revive()
+       * -2, whose caller puts it back to unregistered before it exits. */
+      assert(!IsRegistered(cptr));
+      s_fd(&(cli_socket(cptr))) = -1;
+    } else
+      socket_del_keepfd(&(cli_socket(cptr)));
+    close(fd);
   }
   SetFlag(cptr, FLAG_DEADSOCKET);
 
@@ -858,6 +949,27 @@ int net_close_unregistered_connections(struct Client* source)
     }
   }
   return count;
+}
+
+/** Give up on a client add_connection() made but never registered:
+ * release its IPcheck charge and free the Client and its Connection.  The
+ * client is on no list yet, so free_client() deallocates it at once; its
+ * fd must already be closed (cli_fd -1) and its socket, if it had one,
+ * deleted.
+ * @param[in] new_client Client to discard.
+ * @param[in] refund Give the attempt back as well as the live count: the
+ *   failure was not the client's doing.  Otherwise the attempt stays, as
+ *   it does when the same client fails in the read path a moment later.
+ */
+static void add_connection_drop(struct Client* new_client, int refund)
+{
+  if (IsIPChecked(new_client)) {
+    if (refund)
+      IPcheck_connect_fail(new_client, 1);
+    else
+      IPcheck_disconnect(new_client);
+  }
+  free_client(new_client);
 }
 
 /** Creates a client which has just connected to us on the given fd.
@@ -972,8 +1084,6 @@ void add_connection(struct Listener* listener, int fd) {
 /* Begin Zline */
   if (!feature_bool(FEAT_DISABLE_ZLINES) && (azline = zline_lookup(new_client, 0))) {
     ircd_snprintf(0, zreason, sizeof(zreason), "ERROR :Z-lined (%s)", azline->zl_reason);
-    if (IsIPChecked(new_client))
-      IPcheck_connect_fail(new_client, 1);
 #ifdef USE_SSL
     ssl_murder(ssl, fd, zreason);
 #else
@@ -981,6 +1091,7 @@ void add_connection(struct Listener* listener, int fd) {
     close(fd);
 #endif
     cli_fd(new_client) = -1;
+    add_connection_drop(new_client, 1);
     return;
   }
 /* End Zline */
@@ -988,8 +1099,6 @@ void add_connection(struct Listener* listener, int fd) {
 /* Begin Gline */
   if (!feature_bool(FEAT_DISABLE_GLINES) && (agline = gline_lookup(new_client, 0))) {
     ircd_snprintf(0, greason, sizeof(greason), "ERROR :G-lined (%s)", agline->gl_reason);
-    if (IsIPChecked(new_client))
-      IPcheck_connect_fail(new_client, 1);
 #ifdef USE_SSL
     ssl_murder(ssl, fd, greason);
 #else
@@ -997,6 +1106,7 @@ void add_connection(struct Listener* listener, int fd) {
     close(fd);
 #endif
     cli_fd(new_client) = -1;
+    add_connection_drop(new_client, 1);
     return;
   }
 /* End Gline */
@@ -1016,6 +1126,7 @@ void add_connection(struct Listener* listener, int fd) {
     close(fd);
 #endif /* USE_SSL */
     cli_fd(new_client) = -1;
+    add_connection_drop(new_client, 1);
     return;
   }
 
@@ -1024,10 +1135,22 @@ void add_connection(struct Listener* listener, int fd) {
     cli_socket(new_client).ssl = ssl;
     SetSSLNeedAccept(new_client);
     if (!ssl_accept(new_client)) {
-      socket_del(&(cli_socket(new_client)));
+      /* The handshake failed on bytes that were already waiting (a
+       * plaintext client on a TLS port, or a peer already gone);
+       * ssl_accept() freed the SSL.  The socket is unregistered with the
+       * fd still open and given no fd (socket_del_keepfd), so its
+       * ET_DESTROY -- synchronous here, the socket is not in a callback
+       * -- neither closes the fd nor, the Connection still naming its
+       * Client, frees anything; ssl_murder() then writes the ERROR, shuts
+       * down and closes the fd, once, and add_connection_drop() frees the
+       * Client and its Connection.  The live count is released and the
+       * attempt stays, as it does when the same bytes arrive a moment
+       * later and the read path exits the client. */
       cli_socket(new_client).ssl = NULL;
+      socket_del_keepfd(&(cli_socket(new_client)));
       ssl_murder(NULL, fd, sslerr_message);
       cli_fd(new_client) = -1;
+      add_connection_drop(new_client, 0);
       return;
     }
     /* The ClientHello may already have been waiting, in which case the
@@ -1083,11 +1206,95 @@ void update_write(struct Client* cptr)
   /* If there are messages that need to be sent along, or if the client
    * is in the middle of a /list, then we need to tell the engine that
    * we're interested in writable events--otherwise, we need to drop
-   * that interest.
+   * that interest.  A WebSocket frame left pending on the wire (an
+   * out-of-band PING or PONG that went want-write, with nothing queued
+   * behind it) counts: without the event, send_queued never completes it
+   * and it waits for the next line.
    */
   socket_events(&(cli_socket(cptr)),
-		((MsgQLength(&cli_sendQ(cptr)) || cli_listing(cptr) || cli_replay(cptr)) ?
+		((MsgQLength(&cli_sendQ(cptr)) || cli_listing(cptr) || cli_replay(cptr)
+		  || (IsWebSocket(cptr) && con_ws_txrem(cli_connect(cptr)))) ?
 		 SOCK_ACTION_ADD : SOCK_ACTION_DEL) | SOCK_EVENT_WRITABLE);
+}
+
+/** A connection fault forces @a cptr off: a flood, a WebSocket frame,
+ * size, fragment or UTF-8 error, a receive buffer that took no more
+ * data.  A fault is not an oper's verdict (user, 2026-10-27: bans end the
+ * session, faults promote): a session primary's other device takes over,
+ * or the session holds, as for a dead socket (bounce_forced_exit()).
+ * @return CPTR_KILLED, as exit_client() returns it for cptr itself. */
+static int exit_client_fault(struct Client *cptr, enum bounce_forced_exit why,
+                             const char *comment)
+{
+  if (bounce_forced_exit(cptr, cptr, why, comment))
+    return CPTR_KILLED; /* held: the ghost keeps the client, not the socket */
+  return exit_client(cptr, cptr, &me, comment);
+}
+
+/** Queue one complete WebSocket message on a client's recvQ.  Both the
+ * single-frame and the reassembled-fragment paths come through here, so
+ * neither can skip the per-class recv caps.
+ * @param cptr Client the message came from.
+ * @param buf Message bytes; must have room for one byte past @a len.
+ * @param len Message length.
+ * @return 1 to carry on, or exit_client_fault()'s result (CPTR_KILLED).
+ */
+static int ws_deliver(struct Client *cptr, char *buf, int len)
+{
+  int classify;
+
+  if (len <= 0)
+    return 1;
+  /* WebSocket IRC: messages don't require \r\n, add \n for parser */
+  if (buf[len - 1] != '\n')
+    buf[len++] = '\n';
+  classify = recv_classify(cptr, buf, len);
+  if (classify == RECV_CLASSIFY_TAG_OVERRUN
+      || classify == RECV_CLASSIFY_MSG_OVERRUN) {
+    const char *why = classify == RECV_CLASSIFY_TAG_OVERRUN
+                      ? "Excess Flood: tag region too large"
+                      : "Excess Flood: message region too large";
+
+    /* A line over a recv cap is a message too big to process: RFC 6455
+     * §7.4.1 gives that 1009, as a frame over WS_MAX_PAYLOAD gets, and
+     * keeps 1008 (policy) for when "there is no other more suitable
+     * status code (e.g., 1003 or 1009)".  The reason is the exit's. */
+    websocket_set_close(cptr, 1009, why);
+    return exit_client_fault(cptr, BOUNCE_FORCED_FLOOD, why);
+  }
+  if (dbuf_put(&(cli_recvQ(cptr)), buf, len) == 0)
+    return exit_client_fault(cptr, BOUNCE_FORCED_BUFFER, "dbuf_put fail");
+  return 1;
+}
+
+/** Hand one data frame of a fragmented message to the reassembly
+ * buffer, and queue the message once its final frame arrives.
+ * @return 1 to carry on, or exit_client_fault()'s result (CPTR_KILLED).
+ */
+static int ws_frag_feed(struct Client *cptr, int opcode, int is_fin,
+                        const char *payload, int len)
+{
+  char *msg;
+  int msg_len;
+
+  /* On a refusal websocket_frag_feed() has already set the connection's
+   * Close (1002, 1007 or 1009); what is left is to drop the connection,
+   * which sends it. */
+  switch (websocket_frag_feed(cptr, opcode, is_fin, payload, len,
+                              &msg, &msg_len)) {
+  case WS_FRAG_MORE:
+    return 1;
+  case WS_FRAG_DONE:
+    return ws_deliver(cptr, msg, msg_len);
+  case WS_FRAG_ORPHAN:
+    return exit_client_fault(cptr, BOUNCE_FORCED_WEBSOCKET, "WebSocket continuation without a message");
+  case WS_FRAG_BADUTF8:
+    return exit_client_fault(cptr, BOUNCE_FORCED_WEBSOCKET, "WebSocket text frame: invalid UTF-8");
+  case WS_FRAG_INTERLEAVED:
+    return exit_client_fault(cptr, BOUNCE_FORCED_WEBSOCKET, "WebSocket data frame inside a fragmented message");
+  default: /* WS_FRAG_OVERFLOW */
+    return exit_client_fault(cptr, BOUNCE_FORCED_WEBSOCKET, "WebSocket fragment overflow");
+  }
 }
 
 /** Read a 'packet' of data from a connection and process it.  Read in
@@ -1145,7 +1352,7 @@ ssl_read_again:
     if (ssl_pending(&cli_socket(cptr)) > 0) {
       /* Buffer current data and read more */
       if (dbuf_put(&(cli_recvQ(cptr)), readbuf, length) == 0)
-        return exit_client(cptr, cptr, &me, "dbuf_put fail");
+        return exit_client_fault(cptr, BOUNCE_FORCED_BUFFER, "dbuf_put fail");
       length = 0;
       goto ssl_read_again;
     }
@@ -1168,6 +1375,10 @@ ssl_read_again:
     if (result > 0 && cli_socket(cptr).ssl && ssl_pending(&cli_socket(cptr)) > 0)
       goto ssl_read_again;
 #endif
+    /* This read of the link is parsed: a registration deferred on its
+     * unread bytes may go ahead now (W3 12c-2b fix 2, row 412). */
+    if (result > 0)
+      bounce_link_input_read(cptr);
     return result;
   }
   else if (length > 0 && (IsHandshake(cptr) || IsConnecting(cptr))) {
@@ -1182,6 +1393,10 @@ ssl_read_again:
     if (result > 0 && cli_socket(cptr).ssl && ssl_pending(&cli_socket(cptr)) > 0)
       goto ssl_read_again;
 #endif
+    /* A link that registered in this read may have sent its whole burst,
+     * end of burst included, in it (fix round 3, I-1). */
+    if (result > 0 && IsServer(cptr))
+      bounce_link_input_read(cptr);
     return result;
   }
   else
@@ -1223,7 +1438,7 @@ ssl_read_again:
         /* Flush any previously buffered bytes into recvQ */
         if (buffered > 0) {
           if (dbuf_put(&(cli_recvQ(cptr)), client_buffer, buffered) == 0)
-            return exit_client(cptr, cptr, &me, "dbuf_put fail");
+            return exit_client_fault(cptr, BOUNCE_FORCED_BUFFER, "dbuf_put fail");
           cli_count(cptr) = 0;
         }
         /* readbuf falls through to normal dbuf_put below */
@@ -1292,7 +1507,7 @@ ssl_read_again:
        * than stack: 16 KB is too much stack, and read_packet() is not
        * reentrant anyway (readbuf is static too). */
       static char ws_payload[WS_MAX_PAYLOAD + 2];
-      int ws_len = 0, opcode = 0, consumed, is_fin = 0;
+      int ws_len = 0, opcode = 0, consumed, is_fin = 0, ret;
       unsigned char *ws_data;
       int ws_remaining;
       int copy_len;
@@ -1338,7 +1553,8 @@ ssl_read_again:
              * a frame the decoder accepts (WS_MAX_FRAME covers the largest
              * header plus WS_MAX_PAYLOAD), so treat it as a protocol error
              * rather than spin. */
-            return exit_client(cptr, cptr, &me, "WebSocket frame error");
+            websocket_set_close(cptr, 1002, "Protocol error");
+            return exit_client_fault(cptr, BOUNCE_FORCED_WEBSOCKET, "WebSocket frame error");
           }
           if (copy_len > src_len)
             copy_len = src_len;
@@ -1348,13 +1564,16 @@ ssl_read_again:
           src_len -= copy_len;
           continue;
         } else if (consumed == WS_DECODE_TOOBIG) {
-          /* Over WS_MAX_PAYLOAD: tell the client why before dropping it */
-          websocket_send_close(cptr, 1009, "Message too big");
-          return exit_client(cptr, cptr, &me, "WebSocket message too big");
+          /* Over WS_MAX_PAYLOAD: the Close tells the client why */
+          websocket_set_close(cptr, 1009, "Message too big");
+          return exit_client_fault(cptr, BOUNCE_FORCED_WEBSOCKET, "WebSocket message too big");
         } else if (consumed < 0) {
-          /* Frame error */
+          /* A protocol error (RFC 6455: RSV bits, a reserved opcode, an
+           * unmasked frame, a control frame over 125 bytes or without
+           * FIN): it is dropped with Close 1002 */
           Debug((DEBUG_DEBUG, "WebSocket: Frame error (consumed=%d)", consumed));
-          return exit_client(cptr, cptr, &me, "WebSocket frame error");
+          websocket_set_close(cptr, 1002, "Protocol error");
+          return exit_client_fault(cptr, BOUNCE_FORCED_WEBSOCKET, "WebSocket frame error");
         }
 
         Debug((DEBUG_DEBUG, "WebSocket frame payload: '%.50s'", ws_payload));
@@ -1372,8 +1591,8 @@ ssl_read_again:
             cli_ws_ctl_since(cptr) = CurrentTime;
           cli_ws_ctl_since(cptr) += WS_CONTROL_FLOOD_CHARGE;
           if (cli_ws_ctl_since(cptr) - CurrentTime > WS_CONTROL_FLOOD_CEIL) {
-            websocket_send_close(cptr, 1008, "Excess Flood");
-            return exit_client(cptr, cptr, &me, "Excess Flood");
+            websocket_set_close(cptr, 1008, "Excess Flood");
+            return exit_client_fault(cptr, BOUNCE_FORCED_FLOOD, "Excess Flood");
           }
         }
 
@@ -1381,53 +1600,23 @@ ssl_read_again:
         if (opcode >= WS_OPCODE_CLOSE) {
           if (!websocket_handle_control(cptr, opcode, ws_payload, ws_len)) {
             /* Close frame received.  A WS CLOSE is transport teardown --
-             * the WebSocket-layer FIN -- so route it through the bouncer
-             * hold gate exactly like the dead-link path below (~1746)
-             * does for a TCP drop.  Every other disconnect entry point
-             * (dead-link, QUIT, ping timeout) consults the gate; without
-             * this, a clean WS close destroyed a persistent session an
-             * unclean drop would have kept.  Mirrors the dead-link
-             * shape deliberately: no immediate-promote shortcut here
-             * (see that site's comment for the promote/BX X race). */
-            if (IsUser(cptr) && bounce_should_hold(cptr)) {
-              if (bounce_hold_client(cptr, "WebSocket closed") == 0)
-                return CPTR_KILLED; /* held: ghost owns the socket now */
-              /* hold failed -> fall through to normal exit */
-            }
+             * the WebSocket-layer FIN -- so it goes through the bouncer's
+             * disconnect rule exactly like the dead-link path below does
+             * for a TCP drop, and a QUIT does: a live device of the
+             * session takes over, else the session holds or (hold off)
+             * ends.  Without this, a clean WS close destroyed a
+             * persistent session an unclean drop would have kept. */
+            if (IsUser(cptr) && !IsBouncerAlias(cptr)
+                && bounce_promote_or_hold(cptr, "WebSocket closed") == 0)
+              return CPTR_KILLED; /* held: ghost owns the socket now */
+            /* Promoted here (channels already left), or nothing to keep */
             return exit_client(cptr, cptr, &me, "WebSocket closed");
           }
         }
         /* Handle continuation frame (part of fragmented message) */
         else if (opcode == WS_OPCODE_CONTINUATION) {
-          /* Append to fragment buffer */
-          if (cli_ws_frag_len(cptr) + ws_len <= 16384) {
-            memcpy(cli_ws_frag_buf(cptr) + cli_ws_frag_len(cptr), ws_payload, ws_len);
-            cli_ws_frag_len(cptr) += ws_len;
-          } else {
-            /* Fragment too large */
-            return exit_client(cptr, cptr, &me, "WebSocket fragment overflow");
-          }
-          if (is_fin) {
-            /* Fragment complete - deliver reassembled message */
-            char *frag_data = cli_ws_frag_buf(cptr);
-            int frag_len = cli_ws_frag_len(cptr);
-            if (frag_len > 0) {
-              /* RFC 6455 Section 8.1: text frames must be valid UTF-8 */
-              if (cli_ws_frag_opcode(cptr) == WS_OPCODE_TEXT) {
-                frag_data[frag_len] = '\0';
-                if (!string_is_valid_utf8(frag_data))
-                  return exit_client(cptr, cptr, &me, "WebSocket text frame: invalid UTF-8");
-              }
-              /* Add line ending if needed */
-              if (frag_len < 16384 - 1 && frag_data[frag_len - 1] != '\n') {
-                frag_data[frag_len++] = '\n';
-              }
-              if (dbuf_put(&(cli_recvQ(cptr)), frag_data, frag_len) == 0)
-                return exit_client(cptr, cptr, &me, "dbuf_put fail");
-            }
-            cli_ws_frag_len(cptr) = 0;
-            cli_ws_frag_opcode(cptr) = 0;
-          }
+          if ((ret = ws_frag_feed(cptr, opcode, is_fin, ws_payload, ws_len)) != 1)
+            return ret;
         }
         /* Handle data frames (TEXT or BINARY) */
         else if (opcode == WS_OPCODE_TEXT || opcode == WS_OPCODE_BINARY) {
@@ -1442,15 +1631,12 @@ ssl_read_again:
             Debug((DEBUG_DEBUG, "WebSocket: Autodetected mode from opcode %d, text=%d",
                    opcode, IsWSText(cptr)));
           }
-          if (!is_fin) {
-            /* First fragment - save to fragment buffer */
-            cli_ws_frag_opcode(cptr) = opcode;
-            if (ws_len <= 16384) {
-              memcpy(cli_ws_frag_buf(cptr), ws_payload, ws_len);
-              cli_ws_frag_len(cptr) = ws_len;
-            } else {
-              return exit_client(cptr, cptr, &me, "WebSocket fragment overflow");
-            }
+          if (!is_fin || cli_ws_frag_opcode(cptr) != 0) {
+            /* A first fragment starts the reassembly buffer.  A data
+             * frame while a fragmented message is in progress goes there
+             * too, and is refused (RFC 6455 §5.4). */
+            if ((ret = ws_frag_feed(cptr, opcode, is_fin, ws_payload, ws_len)) != 1)
+              return ret;
           } else {
             /* Complete frame - deliver immediately */
             if (ws_len > 0) {
@@ -1458,26 +1644,20 @@ ssl_read_again:
                * Sanitize invalid sequences to U+FFFD. */
               if (opcode == WS_OPCODE_TEXT) {
                 ws_payload[ws_len] = '\0';
-                if (!string_is_valid_utf8(ws_payload)) {
+                /* The whole payload: a U+0000 in it is a character, and
+                 * a check of the C string stopped there. */
+                if (!string_is_valid_utf8_len(ws_payload, ws_len)) {
+                  /* string_sanitize_utf8() reads the C string too: it
+                   * returns the length up to the first NUL, or -1 when
+                   * nothing before it needed a change.  What follows the
+                   * NUL it never saw, so it is not delivered (the parser
+                   * ends the line at a NUL anyway). */
                   int new_len = string_sanitize_utf8(ws_payload);
-                  if (new_len > 0)
-                    ws_len = new_len;
+                  ws_len = new_len >= 0 ? new_len : (int)strlen(ws_payload);
                 }
               }
-              /* WebSocket IRC: messages don't require \r\n, add \n for parser */
-              if (ws_len < (int)sizeof(ws_payload) - 1 &&
-                  ws_payload[ws_len - 1] != '\n') {
-                ws_payload[ws_len++] = '\n';
-              }
-              {
-                int classify = recv_classify(cptr, (const char *)ws_payload, ws_len);
-                if (classify == RECV_CLASSIFY_TAG_OVERRUN)
-                  return exit_client(cptr, cptr, &me, "Excess Flood: tag region too large");
-                if (classify == RECV_CLASSIFY_MSG_OVERRUN)
-                  return exit_client(cptr, cptr, &me, "Excess Flood: message region too large");
-              }
-              if (dbuf_put(&(cli_recvQ(cptr)), ws_payload, ws_len) == 0)
-                return exit_client(cptr, cptr, &me, "dbuf_put fail");
+              if ((ret = ws_deliver(cptr, ws_payload, ws_len)) != 1)
+                return ret;
             }
           }
         }
@@ -1501,11 +1681,11 @@ ssl_read_again:
     if (length > 0) {
       int classify = recv_classify(cptr, readbuf, length);
       if (classify == RECV_CLASSIFY_TAG_OVERRUN)
-        return exit_client(cptr, cptr, &me, "Excess Flood: tag region too large");
+        return exit_client_fault(cptr, BOUNCE_FORCED_FLOOD, "Excess Flood: tag region too large");
       if (classify == RECV_CLASSIFY_MSG_OVERRUN)
-        return exit_client(cptr, cptr, &me, "Excess Flood: message region too large");
+        return exit_client_fault(cptr, BOUNCE_FORCED_FLOOD, "Excess Flood: message region too large");
       if (dbuf_put(&(cli_recvQ(cptr)), readbuf, length) == 0)
-        return exit_client(cptr, cptr, &me, "dbuf_put fail");
+        return exit_client_fault(cptr, BOUNCE_FORCED_BUFFER, "dbuf_put fail");
     }
 
     /*
@@ -1523,7 +1703,7 @@ ssl_read_again:
      */
     {
       if (DBufLength(&(cli_recvQ(cptr))) > get_recvq(cptr) + FULL_MSG_SIZE)
-        return exit_client(cptr, cptr, &me, "Excess Flood");
+        return exit_client_fault(cptr, BOUNCE_FORCED_FLOOD, "Excess Flood");
     }
 
     while (DBufLength(&(cli_recvQ(cptr))) && !NoNewLine(cptr) && 
@@ -1732,6 +1912,11 @@ int connect_overlay(struct ConfItem* aconf, struct Client* by)
   struct Client* cptr = 0;
   assert(0 != aconf);
 
+  /* An overlay carries only CR, which a node whose shadow is off (as
+   * latched at boot) neither sends nor applies: do not dial one. */
+  if (!crdt_shadow_boot_enabled())
+    return 0;
+
   if (aconf->dns_pending) {
     sendto_opmask_butone(0, SNO_OLDSNO, "Overlay %s connect DNS pending",
                          aconf->name);
@@ -1820,7 +2005,7 @@ void client_sock_callback(struct Event* ev)
   struct Client* cptr;
   struct Connection* con;
   char *fmt = "%s";
-  char *fallback = 0;
+  const char *fallback = 0;
 
   assert(0 != ev_socket(ev));
 
@@ -1833,14 +2018,17 @@ void client_sock_callback(struct Event* ev)
     con = (struct Connection*) s_data(ev_socket(ev));
     s_data(ev_socket(ev)) = NULL;  /* Claim it - subsequent events see NULL */
     if (!con) {
-      /* Still need to close the deferred fd even if connection was already claimed */
+      /* Still need to release a socket that still owns its fd even if the
+       * connection was already claimed: the SSL first (its close_notify
+       * needs the open fd; ssl_free sends none once s_fd is -1), then the
+       * one close. */
+#ifdef USE_SSL
+      ssl_free(ev_socket(ev));
+#endif
       if (s_fd(ev_socket(ev)) >= 0) {
         close(s_fd(ev_socket(ev)));
         s_fd(ev_socket(ev)) = -1;
       }
-#ifdef USE_SSL
-      ssl_free(ev_socket(ev));
-#endif
       return;  /* Already claimed by earlier event or intentionally NULL */
     }
   } else {
@@ -1862,30 +2050,37 @@ void client_sock_callback(struct Event* ev)
   case ET_DESTROY:
     con_freeflag(con) &= ~FREEFLAG_SOCKET;
 
-    /* Deferred close: close_connection() used shutdown() instead of close()
-     * to avoid RST.  Now actually release the file descriptor. */
+#ifdef USE_SSL
+    /* Free SSL BEFORE potentially freeing the Connection, because the
+     * Socket struct is embedded inside Connection.  Reversing the order
+     * would read/write freed memory (use-after-free).  And before the
+     * close below: its close_notify goes to the fd while it is still
+     * open.  A socket close_connection() released has no fd (s_fd -1) and
+     * no SSL by now; ssl_free never writes once s_fd is -1. */
+    ssl_free(ev_socket(ev));
+#endif /* USE_SSL */
+
+    /* A socket that still owns its fd (s_fd >= 0: freed without
+     * close_connection(), e.g. a local alias's direct free) is closed
+     * here, once.  close_connection() and the bouncer revive hand the
+     * socket over with s_fd -1 (socket_del_keepfd), and closed or moved
+     * the fd themselves. */
     if (s_fd(ev_socket(ev)) >= 0) {
       close(s_fd(ev_socket(ev)));
       s_fd(ev_socket(ev)) = -1;
     }
 
-#ifdef USE_SSL
-    /* Free SSL BEFORE potentially freeing the Connection, because the
-     * Socket struct is embedded inside Connection.  Reversing the order
-     * would read/write freed memory (use-after-free). */
-    ssl_free(ev_socket(ev));
-#endif /* USE_SSL */
     if (!con_freeflag(con) && !cptr)
       free_connection(con);
     break;
 
   case ET_CONNECT: /* socket connection completed */
     if (!completed_connection(cptr) || IsDead(cptr))
-      fallback = cli_info(cptr);
+      fallback = dead_reason(cptr, "Connection failed");
     break;
 
   case ET_ERROR: /* an error occurred */
-    fallback = cli_info(cptr);
+    fallback = dead_reason(cptr, "Socket error");
     cli_error(cptr) = ev_data(ev);
     /* If the OS told us we have a bad file descriptor, we should
      * record that for future reference.
@@ -1950,7 +2145,7 @@ void client_sock_callback(struct Event* ev)
     }
     if (s_state(&(con_socket(con))) == SS_CONNECTING || IsSSLNeedConnect(cptr)) {
       if (!completed_connection(cptr)) {
-        fallback = cli_info(cptr);
+        fallback = dead_reason(cptr, "Connection failed");
         break;
       }
       if (IsSSLNeedConnect(cptr))
@@ -1990,7 +2185,7 @@ void client_sock_callback(struct Event* ev)
       }
       if (s_state(&(con_socket(con))) == SS_CONNECTING || IsSSLNeedConnect(cptr)) {
         if (!completed_connection(cptr)) {
-          fallback = cli_info(cptr);
+          fallback = dead_reason(cptr, "Connection failed");
           break;
         }
         if (IsSSLNeedConnect(cptr))
@@ -2016,6 +2211,22 @@ void client_sock_callback(struct Event* ev)
     if (!msg)
       msg = "Unknown error";
 
+    /* Re-entrancy guard.  Nefarious's event model is synchronous
+     * (event_add == event_execute).  If we got here via an ET_ERROR
+     * synthesised from inside engine_set_events on epoll_ctl failure —
+     * which can happen when send_buffer → update_write → socket_events
+     * tries to MOD a dead fd — then the outer frame is already inside
+     * exit_client (FLAG_CLOSING is set there).  A recursive
+     * exit_client_msg here would run remove_client_from_list, zero
+     * cli_connect, and return into the outer send_buffer mid-line,
+     * which then NULL-derefs at `++cli_sendM(to)`.  Let the outer
+     * frame finish the teardown; we've already marked DEADSOCKET.
+     * First, before the bouncer is asked: the client is already on its
+     * way out, and its exit decided what happens to its session (a
+     * promote or hold here would act on a client being exited). */
+    if (HasFlag(cptr, FLAG_CLOSING))
+      return;
+
     /* Bouncer alias: skip hold logic — just clean up.
      * exit_client_msg() → exit_client() sends BX X to other servers. */
     if (IsUser(cptr) && IsBouncerAlias(cptr)) {
@@ -2028,50 +2239,26 @@ void client_sock_callback(struct Event* ev)
     if (IsUser(cptr) && IsBouncerHold(cptr))
       return;
 
-    /* Check if client should enter bouncer HOLD mode instead of exiting.
-     *
-     * Immediate-promote shortcut (mirrors m_quit.c): a primary disconnect
-     * with a LOCAL alias promotes inline — same-server alias state is
-     * synchronously authoritative, so the BX P numeric swap can't race a
-     * concurrent BX X from the alias's home server (we ARE that server).
-     * This must match the clean-/QUIT path: a socket EOF and a /QUIT are the
-     * same event to the bouncer, and holding a ghost while a live local alias
-     * sits ready is wrong (the session should continue under the alias, not
-     * leave a phantom held primary).  ONLY when every alias is remote do we
-     * hold and defer the promote (bounce_schedule_cross_server_promote /
-     * hold-expire), which is the cross-server BX-X race window. */
-    if (IsUser(cptr) && bounce_should_hold(cptr)) {
-      struct BouncerSession *bsess = bounce_get_session(cptr);
-      int promoted = -1;
-      if (bsess && bsess->hs_client == cptr && bsess->hs_alias_count > 0)
-        promoted = bounce_promote_alias(bsess, 1 /* local_only */);
-      if (promoted == 0) {
-        /* Inline local promote done — channels stripped, BX P + BS T sent.
-         * Fall through to the normal exit so the old primary leaves cleanly. */
-      } else if (bounce_hold_client(cptr, msg) == 0) {
-        /* Entered HOLDING.  Remote-only aliases: schedule a settled-tick
-         * promote (lets any concurrent BX X land first). */
-        if (bsess && bsess->hs_alias_count > 0)
-          bounce_schedule_cross_server_promote(bsess);
-        return;  /* Held - don't exit_client */
-      }
-      /* If hold failed, fall through to normal exit */
+    /* A session primary: an EOF or a read error goes through the
+     * bouncer's disconnect rule as a QUIT does (bounce_promote_or_hold).
+     * A live device of the session takes over: one on this server at
+     * once (its state here is the truth, so the BX P cannot cross its own
+     * BX X), one on another server after a hold, at the next tick: a BX X
+     * for it this server has already read is seen first, one still on the
+     * wire can cross the BX P (narrowed, not closed).  With no device the
+     * session holds, or with hold off ends.  Cooperative roaming (user alive on
+     * both ends) uses the BX C session move instead. */
+    {
+      /* The exit's own comment ("Read error: ..."): a hold keeps it, and
+       * a hold that ends with nothing to take over leaves with it. */
+      char reason[1024];
+
+      ircd_snprintf(0, reason, sizeof(reason), fmt, msg);
+      if (IsUser(cptr) && bounce_promote_or_hold(cptr, reason) == 0)
+        return; /* held: the ghost keeps its channels, no QUIT */
+      /* Promoted here (channels already left), or nothing to keep */
+      exit_client(cptr, cptr, &me, reason);
     }
-
-    /* Re-entrancy guard.  Nefarious's event model is synchronous
-     * (event_add == event_execute).  If we got here via an ET_ERROR
-     * synthesised from inside engine_set_events on epoll_ctl failure —
-     * which can happen when send_buffer → update_write → socket_events
-     * tries to MOD a dead fd — then the outer frame is already inside
-     * exit_client (FLAG_CLOSING set at s_misc.c:768).  A recursive
-     * exit_client_msg here would run remove_client_from_list, zero
-     * cli_connect, and return into the outer send_buffer mid-line,
-     * which then NULL-derefs at `++cli_sendM(to)`.  Let the outer
-     * frame finish the teardown; we've already marked DEADSOCKET. */
-    if (HasFlag(cptr, FLAG_CLOSING))
-      return;
-
-    exit_client_msg(cptr, cptr, &me, fmt, msg);
   }
 }
 

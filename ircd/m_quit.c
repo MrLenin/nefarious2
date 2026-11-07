@@ -91,75 +91,32 @@
 #include "struct.h"
 #include "s_misc.h"
 #include "ircd_reply.h"
+#include "ircd_snprintf.h"
 #include "send.h"
 
 /* #include <assert.h> -- Now using assert in ircd_log.h */
 #include <string.h>
 
-/*
- * m_quit - client message handler 
- *
- * parv[0]        = sender prefix
- * parv[parc - 1] = comment
+/** The comment a QUIT from @a sptr leaves with: what channel members see
+ * and what is relayed.  A channel it cannot speak in signs it off; a
+ * channel that drops quit text (+Q) or blocks colour (and the text has
+ * some) leaves "Quit"; one that strips colour strips it; UTF8ONLY
+ * sanitizes the text, or with UTF8ONLY_STRICT drops it; otherwise
+ * "Quit: <text>", or "Quit" with none.  Read from the channels the client
+ * is in now, so before anything takes them from it.
+ * @param[in] sptr The quitting client.
+ * @param[in,out] text Its QUIT text, or NULL (UTF8ONLY may rewrite it in
+ *                place).
+ * @param[out] buf Where a composed comment is written.
+ * @param[in] len Size of @a buf.
+ * @return The comment: @a buf or a constant string.
  */
-int m_quit(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
+static const char *quit_comment(struct Client *sptr, char *text,
+                                char *buf, size_t len)
 {
   int stripquit = 0;
   int blockcolor = 0;
   int stripcolor = 0;
-  const char* text;
-
-  assert(0 != cptr);
-  assert(0 != sptr);
-  assert(cptr == sptr);
-
-  /* Bouncer alias: skip all hold logic — just clean up.
-   * exit_client() sends BX X to notify other servers. */
-  if (IsBouncerAlias(sptr))
-    return exit_client(cptr, sptr, sptr, "Quit");
-
-  /* Fix #25: Check if client should enter bouncer HOLD mode instead of
-   * quitting.  Clients routinely send QUIT on disconnect — the whole
-   * purpose of hold is to survive that and keep channels alive.
-   *
-   * Immediate-promote (design intent: clean primary QUIT with alias
-   * remaining → BX P numeric swap, NO HOLDING transition).  We only
-   * promote inline if the chosen alias is on THIS server — same-server
-   * alias state is synchronously authoritative, so the BX P broadcast
-   * can't race a concurrent BX X from the alias's home server (we ARE
-   * that server).  When every alias is on a remote server, fall
-   * through to bounce_hold_client; the existing hold-expire path
-   * still promotes, just with the safety of network-settled state.
-   * (Cross-server immediate-promote without a race window is a v2.)
-   *
-   * On successful inline promote: the session continues under the new
-   * primary, the old primary's channels are silently stripped by
-   * bounce_promote_alias, and we fall through to normal exit_client
-   * which produces no visible QUIT to channels (none left to send to).
-   * Peers see BX P + BS T then the primary's clean Q. */
-  if (IsUser(sptr) && bounce_should_hold(sptr)) {
-    const char *comment = (parc > 1 && !BadPtr(parv[parc - 1]))
-                          ? parv[parc - 1] : "Quit";
-    struct BouncerSession *bsess = bounce_get_session(sptr);
-    int promoted = -1;
-    if (bsess && bsess->hs_client == sptr && bsess->hs_alias_count > 0)
-      promoted = bounce_promote_alias(bsess, 1 /* local_only */);
-    if (promoted == 0) {
-      /* Inline local promote succeeded; fall through to exit_client.
-       * Channels already stripped, BX P + BS T already broadcast. */
-    } else if (bounce_hold_client(sptr, comment) == 0) {
-      /* Entered HOLDING.  If a remote alias is available, schedule a
-       * 0-tick deferred promote — any concurrent BX X for the chosen
-       * winner has a chance to land during the intervening tick, and
-       * the timer's re-evaluation picks a still-live alias.  See
-       * bounce_schedule_cross_server_promote and Layer 2 of
-       * .claude/plans/alias-promote-race-fix.md. */
-      if (bsess && bsess->hs_alias_count > 0)
-        bounce_schedule_cross_server_promote(bsess);
-      return 0; /* Held (will promote at next tick or hold-expire) */
-    }
-    /* If hold failed too, fall through to normal quit */
-  }
 
   if (cli_user(sptr)) {
     struct Membership* chan;
@@ -171,34 +128,78 @@ int m_quit(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
         if (chan->channel->mode.exmode & EXMODE_STRIPCOLOR)
           stripcolor = 1;
         if (!IsZombie(chan) && !IsDelayedJoin(chan) && !member_can_send_to_channel(chan, 0))
-        return exit_client(cptr, sptr, sptr, "Signed off");
+          return "Signed off";
     }
   }
+
+  if (BadPtr(text))
+    return "Quit";
 
   /* UTF8ONLY enforcement on quit message */
-  if (parc > 1 && !BadPtr(parv[parc - 1]) &&
-      feature_bool(FEAT_UTF8ONLY) && !string_is_valid_utf8(parv[parc - 1])) {
-    if (feature_bool(FEAT_UTF8ONLY_STRICT)) {
-      /* Strict mode: use default quit message instead of rejecting */
-      return exit_client(cptr, sptr, sptr, "Quit");
-    }
-    /* Warn mode: sanitize the quit message */
-    string_sanitize_utf8(parv[parc - 1]);
+  if (feature_bool(FEAT_UTF8ONLY) && !string_is_valid_utf8(text)) {
+    if (feature_bool(FEAT_UTF8ONLY_STRICT))
+      return "Quit";  /* Strict mode: the default quit message */
+    string_sanitize_utf8(text);  /* Warn mode: sanitize the quit message */
   }
 
-  if (parc > 1 && !BadPtr(parv[parc - 1]) && !stripquit)
-    if (blockcolor && HasColor(parv[parc - 1]))
-      return exit_client(cptr, sptr, sptr, "Quit");
-    else if (stripcolor) {
-      text = StripColor(parv[parc - 1]);
-      if (EmptyString(text))
-        return exit_client(cptr, sptr, sptr, "Quit");
-      else
-        return exit_client_msg(cptr, sptr, sptr, "Quit: %s", text);
-    } else
-      return exit_client_msg(cptr, sptr, sptr, "Quit: %s", parv[parc - 1]);
-  else
+  if (stripquit || (blockcolor && HasColor(text)))
+    return "Quit";
+  if (stripcolor) {
+    const char *stripped = StripColor(text);
+    if (EmptyString(stripped))
+      return "Quit";
+    ircd_snprintf(0, buf, len, "Quit: %s", stripped);
+    return buf;
+  }
+  ircd_snprintf(0, buf, len, "Quit: %s", text);
+  return buf;
+}
+
+/*
+ * m_quit - client message handler 
+ *
+ * parv[0]        = sender prefix
+ * parv[parc - 1] = comment
+ */
+int m_quit(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
+{
+  char buf[1024];
+  const char *comment;
+
+  assert(0 != cptr);
+  assert(0 != sptr);
+  assert(cptr == sptr);
+
+  /* Bouncer alias: skip all hold logic — just clean up.
+   * exit_client() sends BX X to notify other servers. */
+  if (IsBouncerAlias(sptr))
     return exit_client(cptr, sptr, sptr, "Quit");
+
+  /* The comment the exit would use, composed while the client is still in
+   * its channels.  A hold keeps the same comment: a hold that ends with
+   * nothing to take over (hold off, the device elsewhere already gone)
+   * leaves with it, so it must say what this QUIT would have -- never the
+   * raw text, which no channel rule has seen. */
+  comment = quit_comment(sptr, parc > 1 ? parv[parc - 1] : NULL,
+                         buf, sizeof(buf));
+
+  /* A session primary: the bouncer decides first (bounce_promote_or_hold).
+   * A live device of the session takes over -- one on this server at
+   * once, one elsewhere at the next tick, whatever the hold preference --
+   * else the session holds or, with hold off, ends.  Clients send QUIT
+   * on their way out all the time; holding is what keeps the session and
+   * its channels across that.
+   *
+   * After a promote here the session goes on under the device; the old
+   * primary's channels are already left (bounce_promote_alias), so the
+   * exit below shows no QUIT in them.  Peers see BX P + BS T, then the
+   * primary's Q. */
+  if (IsUser(sptr) && bounce_promote_or_hold(sptr, comment) == 0)
+    return 0; /* Held (a device elsewhere takes over at the next tick, or
+               * the hold runs its course) */
+
+  /* Promoted here, or nothing to keep: the normal quit. */
+  return exit_client(cptr, sptr, sptr, comment);
 }
 
 
@@ -221,6 +222,14 @@ int ms_quit(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
    */
   {
     int rc;
+    /* A legacy peer's QUIT line carries no tags of its own, so the
+     * link's stash is still whatever its last line left there, or
+     * empty.  Mint once into that same stash before arming it: the
+     * onward relay reads the stash while this line is current, and
+     * arming below hands the identical id and time to the local
+     * broadcast and rows, so all three agree. */
+    if (feature_bool(FEAT_P10_MESSAGE_TAGS) && !cli_s2s_msgid(cptr)[0])
+      s2s_mint_link_event(cptr);
     /* This QUIT line's own tags (the link stash holds exactly this line
      * now) -- so exit_client stamps the quitter's rows with them and not
      * with whatever the link carried last on a KILL/collision/SQUIT. */

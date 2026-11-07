@@ -97,6 +97,7 @@
 #include "ircd_features.h"
 #include "history.h"
 #include "crdt_shadow.h"
+#include "history_trim_codec.h"
 #include "chathistory_presence.h"
 
 /* #include <assert.h> -- Now using assert in ircd_log.h */
@@ -120,6 +121,7 @@ static void store_kick_event(struct Client *sptr, struct Channel *chptr,
   const char *msgid;
   char sender[HISTORY_SENDER_LEN];
   char kick_text[512];
+  char owner[HTC_OWNER_MAX];
   const char *account;
 
   if (!history_is_available())
@@ -163,6 +165,8 @@ static void store_kick_event(struct Client *sptr, struct Channel *chptr,
   /* Get account name if logged in */
   account = (cli_user(sptr) && cli_user(sptr)->account[0])
             ? cli_user(sptr)->account : NULL;
+  /* The row's trim owner: the client whose account it carries. */
+  history_owner_of(owner, sizeof(owner), sptr);
 
   /* Build kick text: "kicked_nick :reason" */
   ircd_snprintf(0, kick_text, sizeof(kick_text), "%s :%s",
@@ -170,7 +174,7 @@ static void store_kick_event(struct Client *sptr, struct Channel *chptr,
 
   /* Store in database */
   history_store_message(msgid, timestamp, chptr->chname, NULL, sender,
-                        account, HISTORY_KICK, kick_text, NULL);
+                        account, HISTORY_KICK, kick_text, NULL, owner);
 }
 #endif /* USE_ROCKSDB */
 
@@ -289,7 +293,7 @@ int m_kick(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
     /* Phase 3k: KICK rides CRDT between CRDT-primary peers — suppress the P10 KICK
      * to CRDT-aware servers (they learn it via the CHANOP tombstone + kick_info +
      * reconcile, which also gateways KICK back to legacy); still relay to legacy. */
-    if (feature_bool(FEAT_CRDT_PRIMARY))
+    if (crdt_primary_on())
       sendcmdto_flag_serv_butone(sptr, CMD_KICK, cptr, FLAG_LAST_FLAG, FLAG_CRDT_AWARE,
 				 "%H %C :%s", chptr, who, comment);
     else
@@ -324,7 +328,7 @@ int m_kick(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
     presence_set_event_time(kick_msgid[0] ? presence_event_time(kick_msgid, kick_ms) : 0);
   }
 
-  if (feature_bool(FEAT_CRDT_PRIMARY)) {
+  if (crdt_primary_on()) {
     /* Phase 3k: mint the CRDT kick (CHANOP tombstone + kick_info) and remove the
      * victim IMMEDIATELY — the tombstone is authoritative so no zombie is needed,
      * and immediate removal avoids a reconcile double-KICK on this origin (local
@@ -456,7 +460,7 @@ int ms_kick(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
     /* Phase 3k: suppress the P10 KICK to CRDT peers (gateway-inbound legacy KICK
      * reaches the CRDT mesh via crdt_shadow_kick's tombstone below); still relay to
      * other legacy peers. */
-    if (feature_bool(FEAT_CRDT_PRIMARY))
+    if (crdt_primary_on())
       sendcmdto_flag_serv_butone(sptr, CMD_KICK, cptr, FLAG_LAST_FLAG, FLAG_CRDT_AWARE,
 				 "%H %C :%s", chptr, who, comment);
     else
@@ -480,7 +484,7 @@ int ms_kick(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
       sendcmdto_set_client_msgid(NULL);
 
       presence_set_event_time(kick_msgid[0] ? presence_event_time(kick_msgid, kick_time_ms) : 0);
-      if (feature_bool(FEAT_CRDT_PRIMARY)) {
+      if (crdt_primary_on()) {
         /* Phase 3k: gateway-inbound (legacy→CRDT) or local — mint the CRDT kick +
          * remove immediately (no zombie). crdt_shadow_kick self-gates when @a cptr
          * is a CRDT peer (they already minted it). */

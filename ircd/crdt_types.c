@@ -382,6 +382,20 @@ static struct CrdtLWWEntry *lww_find(const struct CrdtLWWMap *map,
   return NULL;
 }
 
+/* Equal-stamp tie for a write over a live entry: the larger value bytes win
+ * (memcmp over the shorter length, then the longer value).  1 if @a data
+ * replaces the entry's value.  md_lww_take settles the same tie the same
+ * way, so the doc and the metadata store agree. */
+static int lww_tie_bytes_win(const struct CrdtLWWEntry *e, const void *data,
+                             uint32_t data_len)
+{
+  uint32_t n = data_len < e->val.data_len ? data_len : e->val.data_len;
+  int c = n ? memcmp(data, e->val.data, n) : 0;
+  if (c)
+    return c > 0;
+  return data_len > e->val.data_len;
+}
+
 int crdt_lwwmap_set(struct CrdtLWWMap *map, const char *key, uint32_t key_len,
                     const void *data, uint32_t data_len,
                     struct HLC ts, uint16_t writer)
@@ -403,7 +417,12 @@ int crdt_lwwmap_set(struct CrdtLWWMap *map, const char *key, uint32_t key_len,
     map->entry_count++;
     return 1;
   }
-  if (hlc_compare(&ts, &e->val.ts) > 0) {     /* newer write wins */
+  /* A newer write wins.  On an equal stamp (one server writing twice under
+   * one HLC) a live write beats a tombstone, and between two live writes
+   * the larger value bytes win, so every node keeps the same entry
+   * whichever op it applied first. */
+  int cmp = hlc_compare(&ts, &e->val.ts);
+  if (cmp > 0 || (cmp == 0 && (e->deleted || lww_tie_bytes_win(e, data, data_len)))) {
     free(e->val.data);
     e->val.data = memdup(data, data_len);
     e->val.data_len = data_len;
@@ -438,6 +457,19 @@ int crdt_lwwmap_is_deleted(const struct CrdtLWWMap *map,
   return (e && e->deleted) ? 1 : 0;
 }
 
+/* The delete-tombstone's HLC: 1 and *@a out filled iff @a key's last write was a
+ * delete (crdt_lwwmap_is_deleted), else 0. */
+int crdt_lwwmap_deleted_ts(const struct CrdtLWWMap *map, const char *key,
+                           uint32_t key_len, struct HLC *out)
+{
+  struct CrdtLWWEntry *e = lww_find(map, key, key_len);
+  if (!e || !e->deleted)
+    return 0;
+  if (out)
+    *out = e->val.ts;
+  return 1;
+}
+
 int crdt_lwwmap_delete(struct CrdtLWWMap *map, const char *key,
                        uint32_t key_len, struct HLC ts, uint16_t writer)
 {
@@ -456,7 +488,7 @@ int crdt_lwwmap_delete(struct CrdtLWWMap *map, const char *key,
     map->entry_count++;
     return 1;
   }
-  if (hlc_compare(&ts, &e->val.ts) > 0) {
+  if (hlc_compare(&ts, &e->val.ts) > 0) {   /* on an equal stamp the entry stays */
     free(e->val.data);
     e->val.data = NULL;
     e->val.data_len = 0;

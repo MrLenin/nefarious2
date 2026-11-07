@@ -45,6 +45,8 @@
 #include "handlers.h"        /* crdt_sync_broadcast */
 #include "mark.h"            /* Tier C F1-b: MARK_* sub-type tags */
 #include "ircd_geoip.h"      /* Tier C F1-b: geoip_apply_mark (rebuild names from codes) */
+#include "metadata_lww.h"    /* stamped account rows: md_version, md_stamp */
+#include "metadata_sync.h"   /* the =account emit, account-wide apply */
 #include "metadata.h"        /* Tier C F2-a: metadata_readmarker_set (doc -> readmarkers_cf) */
 #include "webpush_store.h"   /* Tier C F2-c: webpush subscription store (doc <-> LMDB) */
 
@@ -232,6 +234,13 @@ int crdt_shadow_should_standby(unsigned int num, const char *my_yxx)
   return crdt_gateway_should_standby((int)base64toint(my_yxx), fronter_num, fresh);
 }
 
+int crdt_legacy_link_standby(struct Client *link)
+{
+  return link && IsServer(link) && !IsCrdtAware(link)
+         && crdt_shadow_should_standby((unsigned int)base64toint(cli_yxx(link)),
+                                       cli_yxx(&me));
+}
+
 /* MR-5 event-driven beacon-burst: when a CRDT peer links, hand it the full current
  * beacon set at once, instead of making it wait up to a CRDT_BEACON_STALE window for the
  * periodic 30s flood + eager relay to reach it.  Closes the cold-link "blind leaf" gap
@@ -406,10 +415,55 @@ int crdt_shadow_chan_local_check_add(const char *msgid)
                               CRDT_CHAN_LOCAL_WINDOW);
 }
 
-/** Shadow is active only once initialised AND the feature is enabled. */
+/* CRDT_ENABLED as read at boot.  The 'C' SERVER flag says this server's
+ * shadow writes the doc (peers skip the tree path for C peers: KICK, NICK,
+ * modes, glines, metadata), so the shadow and the flag must agree for the
+ * life of every link: both follow the boot value, and a REHASH that changes
+ * the feature takes effect at the next restart. */
+static int g_boot_enabled;
+/* CRDT_PRIMARY as read at boot: the doc-primary mode (tree paths withheld
+ * from C peers) must not flip under live links either. */
+static int g_boot_primary;
+
+/** Shadow is active only once initialised AND the feature was on at boot. */
 static int shadow_on(void)
 {
-  return g_inited && feature_bool(FEAT_CRDT_ENABLED);
+  return g_inited && g_boot_enabled;
+}
+
+int crdt_shadow_boot_enabled(void)
+{
+  return g_inited && g_boot_enabled;
+}
+
+int crdt_primary_on(void)
+{
+  return shadow_on() && g_boot_primary;
+}
+
+void crdt_shadow_primary_changed(void)
+{
+  if (!g_inited || feature_bool(FEAT_CRDT_PRIMARY) == g_boot_primary)
+    return;
+  log_write(LS_SYSTEM, L_WARNING, 0,
+            "CRDT_PRIMARY is now %s but stays %s until restart",
+            feature_bool(FEAT_CRDT_PRIMARY) ? "TRUE" : "FALSE",
+            g_boot_primary ? "on" : "off");
+  sendto_opmask_butone(0, SNO_OLDSNO,
+                       "CRDT_PRIMARY changes take effect at the next restart");
+}
+
+void crdt_shadow_enabled_changed(void)
+{
+  if (!g_inited || feature_bool(FEAT_CRDT_ENABLED) == g_boot_enabled)
+    return;
+  log_write(LS_SYSTEM, L_WARNING, 0,
+            "CRDT_ENABLED is now %s but stays %s until restart (the C server "
+            "flag and the shadow follow the boot value)",
+            feature_bool(FEAT_CRDT_ENABLED) ? "TRUE" : "FALSE",
+            g_boot_enabled ? "on" : "off");
+  sendto_opmask_butone(0, SNO_OLDSNO,
+                       "CRDT_ENABLED changes take effect at the next restart");
 }
 
 /** Single-writer gate (Phase 3a). Returns true if a state event reached us via
@@ -552,6 +606,11 @@ void crdt_shadow_join(struct Channel *chptr, struct Client *who,
   if (from_crdt_peer(cli_from(who)))  /* single-writer: peer owns this op */
     return;
   crdt_chan_join(&g_crdt, chptr->chname, user_numeric(who, num, sizeof num));
+  /* A rejoin supersedes any kick record for this member: drop it so a later
+   * plain PART is not read back as that kick on a peer (reconcile_removes'
+   * is_kick gate; the members_status gate alone fails once delete-on-leave
+   * has removed the status the rejoin wrote). */
+  crdt_kick_info_remove(&g_crdt, chptr->chname, num);
   /* Always stamp member status on join (not just op-on-join): members_status is
    * LWW and is NOT cleared on PART (delete-on-leave deferred), so a member who was
    * op'd, parted, and now rejoins PLAIN must overwrite the stale op record with a
@@ -572,17 +631,28 @@ void crdt_shadow_join(struct Channel *chptr, struct Client *who,
   crdt_sync_push();                   /* eager-propagate to CRDT peers */
 }
 
+/* One-shot part comment for the next crdt_shadow_part, set by joinbuf_join
+ * around its remove_user_from_channel (the remove itself carries no reason). */
+static const char *g_part_reason;
+
+void crdt_shadow_part_reason(const char *reason)
+{
+  g_part_reason = reason;
+}
+
 void crdt_shadow_part(struct Channel *chptr, struct Client *who)
 {
   char num[16];
+  const char *why = g_part_reason;
+  g_part_reason = NULL;
   if (!shadow_on())
     return;
   if (!cli_user(who))
     return;
   if (from_crdt_peer(cli_from(who)))  /* single-writer: peer owns this op */
     return;
-  crdt_chan_remove(&g_crdt, chptr->chname, user_numeric(who, num, sizeof num),
-                   CRDT_PRIORITY_USER);
+  crdt_chan_remove_reason(&g_crdt, chptr->chname, user_numeric(who, num, sizeof num),
+                          CRDT_PRIORITY_USER, why);
   /* m15 (delete-on-leave): clear the member's status LWW on a clean leave so a stale
    * +o can't re-op them on a later rejoin (reconcile_mstatus_cb re-drives m->status
    * from the LWW-winning record). Mirrors the OR-Set remove above; `num` was just
@@ -772,6 +842,15 @@ int crdt_shadow_bsess_removed(const char *account, const char *sessid)
   if (!shadow_on())
     return 0;
   return crdt_bsess_is_explicitly_removed(&g_crdt, account, sessid);
+}
+
+/** As crdt_shadow_bsess_removed, and names the tombstone's writer in @a by. */
+int crdt_shadow_bsess_removed_by(const char *account, const char *sessid,
+                                 uint16_t *by)
+{
+  if (!shadow_on())
+    return 0;
+  return crdt_bsess_removed_by(&g_crdt, account, sessid, by);
 }
 
 /* M6c-1 BX Inc-2 (fix): is this connection's bconn doc record still LIVE (not
@@ -1184,7 +1263,14 @@ void crdt_shadow_ch_storage_publish(void)
   num[2] = '\0';
 
   stores    = feature_bool(FEAT_CHATHISTORY_STORE) ? 1u : 0u;
-  retention = (uint32_t)feature_int(FEAT_CHATHISTORY_RETENTION);
+  /* The effective coverage, as CH A S/R advertise it (upstream fdea6814):
+   * once the trim engine's oldest-overall eviction moves the store's real
+   * cutoff, the configured retention overstates what a query can find.
+   * A negative value has no doc meaning; it reads as unlimited (0). */
+  {
+    int days = history_coverage_days();
+    retention = days < 0 ? 0u : (uint32_t)days;
+  }
   cur       = crdt_chstore_get(&g_crdt, num);
 
   if (!stores) {
@@ -2038,7 +2124,7 @@ void crdt_shadow_reconcile_bouncer(void)
   struct reconcile_bsess_ctx cs = { 0 };
   struct reconcile_bconn_ctx ca = { 0 };
   if (!shadow_on() || !feature_bool(FEAT_CRDT_BOUNCER_DOC) ||
-      !feature_bool(FEAT_CRDT_PRIMARY))
+      !crdt_primary_on())
     return;
   /* sessions first (the replica record must exist before its aliases attach), then
    * aliases (their primary user must already be materialized by reconcile_users, which
@@ -2115,7 +2201,7 @@ void crdt_shadow_server_add(struct Client *srv)
 int crdt_shadow_mesh_reachable(struct Client *srv)
 {
   struct Client *acptr;
-  if (!shadow_on() || !feature_bool(FEAT_CRDT_PRIMARY))
+  if (!crdt_primary_on())
     return 0;
   if (!srv || !IsServer(srv) || !IsCrdtAware(srv) || !cli_serv(srv))
     return 0;
@@ -2185,7 +2271,7 @@ int crdt_tree_presence_suppress(struct Client *peer, struct Client *subject,
     return 0;
   peer_aware = peer && IsServer(peer) && IsCrdtAware(peer);
   subj_aware = subject && IsServer(subject) && IsCrdtAware(subject);
-  primary    = feature_bool(FEAT_CRDT_PRIMARY);
+  primary    = crdt_primary_on();
   suppress   = crdt_should_suppress_tree(feature_bool(FEAT_CRDT_MESHMAP_PRESENCE),
                                          primary, peer_aware, subj_aware);
   /* Shadow: flag still off but the candidate holds -> measure the beacon path. */
@@ -2220,7 +2306,7 @@ int crdt_intro_presence_suppress(struct Client *peer, struct Client *subject)
   peer_aware = peer && IsServer(peer) && IsCrdtAware(peer);
   subj_aware = subject && IsServer(subject) && IsCrdtAware(subject);
   return crdt_should_suppress_intro(feature_bool(FEAT_CRDT_LEGACY_PRESENCE),
-                                    feature_bool(FEAT_CRDT_PRIMARY),
+                                    crdt_primary_on(),
                                     peer_aware, subj_aware);
 }
 
@@ -2242,7 +2328,7 @@ int crdt_server_intro_suppress(struct Client *peer, struct Client *subject)
     return 0;
   peer_aware = peer && IsServer(peer) && IsCrdtAware(peer);
   subj_aware = subject && IsServer(subject) && IsCrdtAware(subject);
-  primary    = feature_bool(FEAT_CRDT_PRIMARY);
+  primary    = crdt_primary_on();
   suppress   = crdt_should_suppress_tree(feature_bool(FEAT_CRDT_TREE_RETIRE),
                                          primary, peer_aware, subj_aware);
   /* MR-5-0 shadow: SERVER-retire flag off but the both-ends candidate holds -> measure
@@ -3276,27 +3362,97 @@ static uint32_t metadata_doc_key(const char *account, const char *key,
  * cache (last_present / ms_metadata remote cache) and is NOT converged. Self-skips while
  * a doc-driven reconcile or a P10-relayed apply is in flight (single-writer + loop
  * prevention). Called from metadata_account_set_ts (the storage chokepoint). */
+/* Is @a st too far ahead to take?  The bound's zero means unbounded, as
+ * hlc_receive_bounded reads it (md_stamp_ahead alone would refuse every
+ * future stamp under a zero bound). */
+static int md_stamp_refused(const struct md_stamp *st)
+{
+  uint64_t max = hlc_max_forward_ms();
+  return st && max && md_stamp_ahead(st, hlc_wall_clock_ms(), max);
+}
+
+/* An md_stamp as the doc's HLC (the same three fields). */
+static const struct HLC *md_stamp_hlc(const struct md_stamp *st, struct HLC *out)
+{
+  if (!st)
+    return NULL;
+  out->physical_ms = st->ms;
+  out->logical = st->logical;
+  out->node_id = st->node;
+  return out;
+}
+
+/* Does the doc already hold @a st's version of this key, or one that beats
+ * it (live or tombstoned)?  Then minting it again changes nothing: a stamped
+ * row enters the doc only where it would win, so it is idempotent whichever
+ * hop mints it (#12).  @a value is the doc encoding of the row, NULL for a
+ * delete.  On an equal stamp the doc's tie rule decides (crdt_lwwmap_set):
+ * a live row beats a tombstone, then the larger bytes win. */
+static int md_doc_has_stamp(const char *dk, uint32_t klen, const struct md_stamp *st,
+                            const char *value)
+{
+  const struct CrdtLWWValue *v;
+  struct HLC ts;
+  struct md_stamp have;
+  int cmp;
+
+  if (!st)
+    return 0;
+  v = crdt_metadata_get(&g_crdt, dk, klen);
+  if (v && v->data)
+    ts = v->ts;
+  else if (!crdt_lwwmap_deleted_ts(&g_crdt.metadata, dk, klen, &ts))
+    return 0;
+  have.ms = ts.physical_ms;
+  have.logical = ts.logical;
+  have.node = ts.node_id;
+  cmp = md_stamp_cmp(&have, st);
+  if (cmp)
+    return cmp > 0;
+  if (!value)
+    return 1;                    /* an equal-stamp delete displaces nothing */
+  if (!(v && v->data))
+    return 0;                    /* live beats the doc's tombstone */
+  {
+    uint32_t vl = (uint32_t)strlen(value);
+    uint32_t n = vl < v->data_len ? vl : v->data_len;
+    int c = n ? memcmp(value, v->data, n) : 0;
+    return c ? c < 0 : vl <= v->data_len;
+  }
+}
+
 void crdt_shadow_metadata_set(const char *account, const char *key,
-                              const char *value, int permanent)
+                              const char *value, int permanent,
+                              const struct md_stamp *st)
 {
   char dk[CHANNELLEN + METADATA_KEY_LEN + 4];  /* account-or-channel slot; see metadata_doc_key */
   uint32_t klen;
+  struct HLC at;
   if (!shadow_on() || g_metadata_reconciling || g_metadata_remote_applying)
     return;
   klen = metadata_doc_key(account, key, dk, sizeof dk);
   if (!klen)
     return;
+  /* A stamp too far ahead stays out of the doc (its merge was the bounded
+   * hlc_global_receive's to refuse; the doc clock must not jump with it). */
+  if (md_stamp_refused(st))
+    return;
+  if (md_doc_has_stamp(dk, klen, st, value))
+    return;
   if (value) {
     if (!permanent)
       return;                              /* TTL cache — not shared truth, skip */
-    crdt_metadata_set(&g_crdt, dk, klen, value, (uint32_t)strlen(value));
+    crdt_metadata_set_at(&g_crdt, dk, klen, value, (uint32_t)strlen(value),
+                         md_stamp_hlc(st, &at), hlc_wall_clock_ms(),
+                         hlc_max_forward_ms());
     crdt_sync_push();
   } else {
     /* delete: only mint a tombstone for a key we actually converged */
     const struct CrdtLWWValue *v = crdt_metadata_get(&g_crdt, dk, klen);
     if (!v || !v->data)
       return;
-    crdt_metadata_del(&g_crdt, dk, klen);
+    crdt_metadata_del_at(&g_crdt, dk, klen, md_stamp_hlc(st, &at),
+                         hlc_wall_clock_ms(), hlc_max_forward_ms());
     crdt_sync_push();
   }
 }
@@ -3311,17 +3467,20 @@ void crdt_shadow_metadata_set(const char *account, const char *key,
  * mint fires; the "only tombstone a converged key" read skips TTL-cache keys that were
  * never doc-present. reconcile_metadata_del_collect (store-walk, gated on
  * crdt_metadata_is_explicitly_removed) then reaps the store copy on every node. */
-void crdt_shadow_metadata_remove_key(const void *key, uint32_t klen)
+void crdt_shadow_metadata_remove_key(const void *key, uint32_t klen,
+                                     const struct md_stamp *st)
 {
   const struct CrdtLWWValue *v;
+  struct HLC at;
   if (!shadow_on() || g_metadata_reconciling || g_metadata_remote_applying)
     return;
-  if (!key || !klen)
+  if (!key || !klen || md_stamp_refused(st))
     return;
   v = crdt_metadata_get(&g_crdt, (const char *)key, klen);
   if (!v || !v->data)
     return;                                /* only tombstone a key we actually converged */
-  crdt_metadata_del(&g_crdt, (const char *)key, klen);
+  crdt_metadata_del_at(&g_crdt, (const char *)key, klen, md_stamp_hlc(st, &at),
+                       hlc_wall_clock_ms(), hlc_max_forward_ms());
   crdt_sync_push();
 }
 
@@ -3372,7 +3531,66 @@ void crdt_shadow_diag_metadata_entry(struct Client *sptr, const char *account,
  * permanent value if the store copy is missing or differs (echo-guarded so a
  * P10-delivered value isn't bounced back + no write churn). Runs under
  * g_metadata_reconciling so metadata_account_set_permanent's mirror self-skips. */
-struct reconcile_metadata_ctx { unsigned int applied; };
+/* Store rows strictly newer than the doc's entry for their key, to write
+ * back into the doc once the reconcile walks are done: without it nothing
+ * writes such a row into the doc (its mirror was suspended, or the store
+ * merged it from a link while the doc missed it) and the two stay
+ * different for good.  Collected during the walks (the doc map must not
+ * change under crdt_lwwmap_foreach), written after them. */
+struct md_writeback {
+  char keys[CRDT_METADATA_REMOVE_MAX][CHANNELLEN + METADATA_KEY_LEN + 4];
+  uint32_t klens[CRDT_METADATA_REMOVE_MAX];
+  int n;
+};
+static void md_writeback_add(struct md_writeback *wb, const void *key, uint32_t klen)
+{
+  if (!wb || wb->n >= CRDT_METADATA_REMOVE_MAX || klen == 0
+      || klen > sizeof wb->keys[0])
+    return;                     /* the rest wait for the next tick */
+  memcpy(wb->keys[wb->n], key, klen);
+  wb->klens[wb->n] = klen;
+  wb->n++;
+}
+/* Does the store's row for (@a account, @a mkey) beat the doc's entry at
+ * @a dk by the doc's own rule (newer, or the equal-stamp tie on the bytes
+ * the mirror would write), and is it takeable (not too far ahead)?  The
+ * doc's rule, not md_lww_take's: the write-back is a mint, which the doc
+ * takes only where md_doc_has_stamp says it would win (a legacy bare doc
+ * value compares differently from its decoded form). */
+static int md_store_beats_doc(const char *account, const char *mkey,
+                              const char *dk, uint32_t dklen)
+{
+  struct md_version local;
+  char valbuf[METADATA_VALUE_LEN];
+
+  /* A live row must be permanent: a TTL cache row is no shared truth and
+   * never enters the doc (crdt_shadow_metadata_set skips it too).  The row
+   * must carry another server's stamp.  A newer row stamped by us is
+   * usually an unstamped relayed change stored under our receive-time
+   * stamp (the mirror suspended, its origin minted it), and publishing it
+   * would let every receiver outrank the origin, even a newer write,
+   * network-wide.  The cost: a local write of ours whose mirror did not
+   * happen (the shadow off, or the doc losing the entry) is not repaired
+   * here either; the two can tell apart only with a provenance mark on the
+   * store row. */
+  char enc[METADATA_VALUE_LEN + 8];
+
+  if (metadata_account_get_version(account, mkey, &local, valbuf,
+                                   sizeof valbuf) != 0
+      || local.st.node == g_crdt.my_numeric || md_stamp_refused(&local.st)
+      || (!local.tombstone && metadata_account_row_permanent(account, mkey) != 1))
+    return 0;
+  if (!local.tombstone) {        /* the encoding metadata_doc_mirror_account writes */
+    if (metadata_key_is_server_managed(mkey))
+      ircd_strncpy(enc, local.value, sizeof enc);
+    else
+      ircd_snprintf(0, enc, sizeof enc, "%s%s",
+                    local.vis == METADATA_VIS_PRIVATE ? "P:" : "*:", local.value);
+  }
+  return !md_doc_has_stamp(dk, dklen, &local.st, local.tombstone ? NULL : enc);
+}
+
+struct reconcile_metadata_ctx { unsigned int applied; struct md_writeback *wb; };
 static void reconcile_metadata_set_cb(const char *key, uint32_t key_len,
                                       const struct CrdtLWWValue *val, void *ctx)
 {
@@ -3382,7 +3600,7 @@ static void reconcile_metadata_set_cb(const char *key, uint32_t key_len,
   char account[CHANNELLEN + 1], mkey[METADATA_KEY_LEN + 1];
   char cur[METADATA_VALUE_LEN + 1], docval[METADATA_VALUE_LEN + 1];
   uint32_t al, kl;
-  int docvis, curvis;
+  int docvis, curvis, same;
   if (!val || !val->data || !val->data_len || val->data_len > METADATA_VALUE_LEN)
     return;
   nul = memchr(key, '\0', key_len);          /* key = account\0metakey (opaque split) */
@@ -3405,9 +3623,8 @@ static void reconcile_metadata_set_cb(const char *key, uint32_t key_len,
    * vis; compare BOTH against the split doc value.  The pre-A2 guard compared the
    * stripped store value against the still-prefixed docval, which mismatches every
    * private row and re-writes it each 30s tick — split first, then compare. */
-  if (metadata_account_get_vis(account, mkey, cur, sizeof cur, &curvis) == 0 &&
-      curvis == docvis && strcmp(cur, docraw) == 0)
-    return;
+  same = metadata_account_get_vis(account, mkey, cur, sizeof cur, &curvis) == 0 &&
+         curvis == docvis && strcmp(cur, docraw) == 0;
   /* Heal the store with the decoded (raw, vis); set_ts re-encodes the prefix and
    * self-skips its doc mirror (g_metadata_reconciling).  On a REAL store change
    * ONLY (we are past the echo guard), materialize the converged value into every
@@ -3415,9 +3632,57 @@ static void reconcile_metadata_set_cb(const char *key, uint32_t key_len,
    * delivery half that closes the M8 staleness class.  apply_converged is memory +
    * notify only (no store write, no doc op, no umode flag-sync) so it cannot
    * re-enter set_ts / the doc mirror. */
-  if (metadata_account_set_permanent(account, mkey, docraw, docvis) == 0) {
+  /* Heal the store under the doc entry's own HLC, which is the stamped row's
+   * stamp (crdt_shadow_metadata_set carries it), through the stamped merge: the
+   * store keeps a newer row it already has, and the healed row is the origin's,
+   * never a fresh stamp that would beat a newer "MD =account" still in flight
+   * (stage-2 review).  set_ts's doc mirror self-skips (g_metadata_reconciling). */
+  {
+    struct md_version in;
+
+    in.st.ms = val->ts.physical_ms;
+    in.st.logical = val->ts.logical;
+    in.st.node = val->ts.node_id;
+    in.tombstone = 0;
+    in.vis = docvis;
+    in.value = docraw;
+    in.vlen = strlen(docraw);
+    /* A row stamped too far ahead (a skewed writer) is refused, as
+     * ms_metadata_stamped refuses it on the wire, so the doc-fed store and
+     * the P10-fed store agree on what they hold. */
+    if (md_stamp_refused(&in.st))
+      return;
+    /* Always the version merge, even when the content matches (stage-2 fix
+     * review): the doc may hold the same value under a newer stamp, which the
+     * store must take so it refuses an older row in flight.  The merge is a
+     * point read when the store already has this stamp. */
+    {
+      int mrc = metadata_account_merge(account, mkey, &in);
+
+      if (mrc == 0 && md_store_beats_doc(account, mkey, key, key_len))
+        md_writeback_add(c->wb, key, key_len);
+      if (mrc != 1)
+        return;               /* the store's row is as new or newer (or a store error) */
+    }
+    if (same) {
+      /* Only the stamp moved: memory and subscribers already have the value;
+       * the links that never see the doc still need the version. */
+      if (!IsChannelName(account))
+        metadata_emit_versioned_skip_crdt(&me, account, mkey, &in);
+      return;
+    }
     c->applied++;
-    metadata_apply_converged(account, mkey, docraw, docvis);
+    if (IsChannelName(account)) {
+      /* Memory + notify only (the doc-only delivery half of the M8 class). */
+      metadata_apply_converged(account, mkey, docraw, docvis);
+    } else {
+      /* An account row: every client of the account, mode-synced keys through
+       * umode_sync_apply for our own connections (account-wide modes on a
+       * mesh-only peer), then the stamped row to IRCv3 links that are not
+       * CRDT-aware, which never see the doc. */
+      metadata_account_apply_memory(account, mkey, docraw, docvis);
+      metadata_emit_versioned_skip_crdt(&me, account, mkey, &in);
+    }
   }
 }
 
@@ -3431,6 +3696,7 @@ struct reconcile_metadata_del_ctx {
   uint32_t klens[CRDT_METADATA_REMOVE_MAX];
   int nr;
   int capped;
+  struct md_writeback *wb;
 };
 static void reconcile_metadata_del_collect(const void *key, size_t klen, void *arg)
 {
@@ -3439,6 +3705,45 @@ static void reconcile_metadata_del_collect(const void *key, size_t klen, void *a
     return;
   if (!crdt_metadata_is_explicitly_removed(&g_crdt, key, (uint32_t)klen))
     return;
+  /* A store row newer than the doc's tombstone stands (the stamped merge below
+   * would keep it): skip it here, or every tick re-collects it and enough of
+   * them starve the real deletes out of the capped slots. */
+  {
+    struct HLC dts;
+    const char *nul = memchr(key, '\0', klen);
+    char account[CHANNELLEN + 1], mkey[METADATA_KEY_LEN + 1];
+    size_t al = nul ? (size_t)(nul - (const char *)key) : 0;
+    size_t kl = nul ? klen - al - 1 : 0;
+    struct md_version local;
+    char valbuf[METADATA_VALUE_LEN];
+    struct md_stamp tst;
+
+    if (!nul || al == 0 || al > CHANNELLEN || kl == 0 || kl > METADATA_KEY_LEN)
+      return;
+    memcpy(account, key, al); account[al] = '\0';
+    memcpy(mkey, nul + 1, kl); mkey[kl] = '\0';
+    if (crdt_lwwmap_deleted_ts(&g_crdt.metadata, key, (uint32_t)klen, &dts)
+        && metadata_account_get_version(account, mkey, &local, valbuf,
+                                        sizeof valbuf) == 0
+        && !local.tombstone) {
+      tst.ms = dts.physical_ms;
+      tst.logical = dts.logical;
+      tst.node = dts.node_id;
+      /* md_lww_take keeps a live row against an equal-stamp tombstone too,
+       * and a refused (far-ahead) tombstone is never applied: neither can
+       * ever be reaped, so neither takes a slot. */
+      if (md_stamp_cmp(&local.st, &tst) >= 0 || md_stamp_refused(&tst)) {
+        /* A live row newer than the tombstone, or at its stamp (a live row
+         * wins the tie), goes back into the doc, or the doc keeps the delete
+         * for good. */
+        if (md_stamp_cmp(&local.st, &tst) >= 0 && !md_stamp_refused(&local.st)
+            && local.st.node != g_crdt.my_numeric
+            && metadata_account_row_permanent(account, mkey) == 1)
+          md_writeback_add(d->wb, key, (uint32_t)klen);
+        return;
+      }
+    }
+  }
   if (d->nr >= CRDT_METADATA_REMOVE_MAX) { d->capped = 1; return; }
   memcpy(d->keys[d->nr], key, klen);
   d->klens[d->nr] = (uint32_t)klen;
@@ -3454,16 +3759,24 @@ void crdt_shadow_reconcile_metadata(void)
 {
   struct reconcile_metadata_ctx c = { 0 };
   struct reconcile_metadata_del_ctx *d;
-  unsigned int removed = 0;
+  struct md_writeback *wb;
+  unsigned int removed = 0, written_back = 0;
   int i;
   if (!shadow_on())
     return;
+  /* Without a store there is nothing to heal (the stamped merge refuses every
+   * row), and every entry would cost a refused merge each tick. */
+  if (!metadata_lmdb_is_available())
+    return;
+  wb = (struct md_writeback *)MyCalloc(1, sizeof *wb);
+  c.wb = wb;
   g_metadata_reconciling = 1;
   crdt_lwwmap_foreach(&g_crdt.metadata, reconcile_metadata_set_cb, &c);
 
   /* DELETE pass — heap-alloc the collector (large arrays; off the stack). */
   d = (struct reconcile_metadata_del_ctx *)MyCalloc(1, sizeof *d);
   if (d) {
+    d->wb = wb;
     metadata_account_foreach_key(reconcile_metadata_del_collect, d);
     for (i = 0; i < d->nr; i++) {
       const char *k = d->keys[i];
@@ -3490,7 +3803,32 @@ void crdt_shadow_reconcile_metadata(void)
        * wider fan-out leaks no content either way, only delivery breadth. */
       oldvis = METADATA_VIS_PUBLIC;
       metadata_account_get_vis(account, mkey, oldval, sizeof oldval, &oldvis);
-      if (metadata_account_set(account, mkey, NULL, METADATA_VIS_PUBLIC) == 0) { /* delete from store; vis ignored */
+      /* The tombstone under the doc's own delete HLC (the stamped row's), through
+       * the stamped merge: a newer live row in the store stands. */
+      {
+        struct md_version in;
+        struct HLC dts;
+
+        if (!crdt_lwwmap_deleted_ts(&g_crdt.metadata, k, d->klens[i], &dts))
+          continue;
+        in.st.ms = dts.physical_ms;
+        in.st.logical = dts.logical;
+        in.st.node = dts.node_id;
+        in.tombstone = 1;
+        in.vis = oldvis;
+        in.value = NULL;
+        in.vlen = 0;
+        if (md_stamp_refused(&in.st)
+            || metadata_account_merge(account, mkey, &in) != 1)
+          continue;
+        if (!IsChannelName(account)) {
+          removed++;
+          metadata_account_apply_memory(account, mkey, NULL, oldvis);
+          metadata_emit_versioned_skip_crdt(&me, account, mkey, &in);
+          continue;
+        }
+      }
+      {
         removed++;
         /* Drop the reaped key from every local session's live cli_metadata and
          * notify (value=NULL => memory remove + unset notify).  This rides the
@@ -3510,10 +3848,46 @@ void crdt_shadow_reconcile_metadata(void)
   }
   g_metadata_reconciling = 0;
 
-  if (c.applied || removed)
+  /* Write back the store rows strictly newer than the doc, under their own
+   * stamps (the mirror's usual path, now that the walks are done and the
+   * reconcile guard is down).  Re-read: a row may have changed since. */
+  if (wb) {
+    for (i = 0; i < wb->n; i++) {
+      const char *k = wb->keys[i];
+      const char *nul = memchr(k, '\0', wb->klens[i]);
+      char account[CHANNELLEN + 1], mkey[METADATA_KEY_LEN + 1];
+      char valbuf[METADATA_VALUE_LEN + 1];
+      struct md_version local;
+      uint32_t al, kl;
+
+      if (!nul)
+        continue;
+      al = (uint32_t)(nul - k);
+      kl = wb->klens[i] - al - 1;
+      if (al == 0 || al > CHANNELLEN || kl == 0 || kl > METADATA_KEY_LEN)
+        continue;
+      memcpy(account, k, al); account[al] = '\0';
+      memcpy(mkey, nul + 1, kl); mkey[kl] = '\0';
+      if (metadata_account_get_version(account, mkey, &local, valbuf,
+                                       sizeof valbuf) != 0
+          || md_stamp_refused(&local.st) || local.st.node == g_crdt.my_numeric)
+        continue;
+      if (local.tombstone)
+        crdt_shadow_metadata_set(account, mkey, NULL, 1, &local.st);
+      else if (metadata_account_row_permanent(account, mkey) == 1)
+        metadata_doc_mirror_account(account, mkey, local.value, local.vis,
+                                    &local.st);
+      else
+        continue;                         /* became a TTL row since */
+      written_back++;
+    }
+    MyFree(wb);
+  }
+
+  if (c.applied || removed || written_back)
     log_write(LS_SYSTEM, L_INFO, 0,
-              "CRDT metadata-reconcile: %u set, %u removed from doc",
-              c.applied, removed);
+              "CRDT metadata-reconcile: %u set, %u removed from doc, %u written back",
+              c.applied, removed, written_back);
 }
 
 /* ---- Global-state track: GLINEs as CRDT-native doc state (step 2 shadow-write) ---- */
@@ -3660,8 +4034,8 @@ void crdt_shadow_reconcile_glines(void)
   struct Gline *gl;
   struct Gline *lists[2];
   int li;
-  if (!shadow_on() || !feature_bool(FEAT_CRDT_GLINE_CUTOVER) ||
-      !feature_bool(FEAT_CRDT_PRIMARY))
+  if (!shadow_on() || !CrdtCutoverOn(FEAT_CRDT_GLINE_CUTOVER) ||
+      !crdt_primary_on())
     return;
   g_gline_reconciling = 1;
   crdt_lwwmap_foreach(&g_crdt.glines, reconcile_gline_add_cb, &c);
@@ -3813,8 +4187,8 @@ void crdt_shadow_reconcile_shuns(void)
   char masks[CRDT_GLINE_REMOVE_MAX][USERLEN + HOSTLEN + 4];
   int nr = 0, i, capped = 0;
   struct Shun *sh;
-  if (!shadow_on() || !feature_bool(FEAT_CRDT_SHUN_CUTOVER) ||
-      !feature_bool(FEAT_CRDT_PRIMARY))
+  if (!shadow_on() || !CrdtCutoverOn(FEAT_CRDT_SHUN_CUTOVER) ||
+      !crdt_primary_on())
     return;
   g_shun_reconciling = 1;
   crdt_lwwmap_foreach(&g_crdt.shuns, reconcile_shun_add_cb, &c);
@@ -3954,8 +4328,8 @@ void crdt_shadow_reconcile_zlines(void)
   char masks[CRDT_GLINE_REMOVE_MAX][HOSTLEN + 4];
   int nr = 0, i, capped = 0;
   struct Zline *zl;
-  if (!shadow_on() || !feature_bool(FEAT_CRDT_ZLINE_CUTOVER) ||
-      !feature_bool(FEAT_CRDT_PRIMARY))
+  if (!shadow_on() || !CrdtCutoverOn(FEAT_CRDT_ZLINE_CUTOVER) ||
+      !crdt_primary_on())
     return;
   g_zline_reconciling = 1;
   crdt_lwwmap_foreach(&g_crdt.zlines, reconcile_zline_add_cb, &c);
@@ -4085,8 +4459,8 @@ void crdt_shadow_reconcile_jupes(void)
   char names[CRDT_GLINE_REMOVE_MAX][HOSTLEN + 4];
   int nr = 0, i, capped = 0;
   struct Jupe *ju;
-  if (!shadow_on() || !feature_bool(FEAT_CRDT_JUPE_CUTOVER) ||
-      !feature_bool(FEAT_CRDT_PRIMARY))
+  if (!shadow_on() || !CrdtCutoverOn(FEAT_CRDT_JUPE_CUTOVER) ||
+      !crdt_primary_on())
     return;
   g_jupe_reconciling = 1;
   crdt_lwwmap_foreach(&g_crdt.jupes, reconcile_jupe_add_cb, &c);
@@ -4298,7 +4672,7 @@ void crdt_shadow_presence_diff(struct Client *to)
   time_t now = CurrentTime, stale = CRDT_BEACON_STALE;
   int i, d_bb, d_bp, bfs_only_b = 0, beacon_only = 0, bfs_only_p = 0, p10_only = 0;
 
-  if (!shadow_on() || !feature_bool(FEAT_CRDT_PRIMARY))
+  if (!crdt_primary_on())
     return;
   ournum = (unsigned int)base64toint(cli_yxx(&me));
 
@@ -4352,7 +4726,7 @@ void crdt_shadow_route_diff(struct Client *to)
   int agree = 0, mismatch = 0, mesh_only = 0, p10_only = 0;
   int i;
 
-  if (!shadow_on() || !feature_bool(FEAT_CRDT_PRIMARY))
+  if (!crdt_primary_on())
     return;
   ournum = (unsigned int)base64toint(cli_yxx(&me));
 
@@ -5491,7 +5865,7 @@ static void recon_user_cb(const char *key, uint32_t key_len,
 void crdt_shadow_reconcile_users(void)
 {
   struct recon_user_ctx c = { 0 };
-  if (!shadow_on() || !feature_bool(FEAT_CRDT_PRIMARY))
+  if (!crdt_primary_on())
     return;
   /* The burst guard is PER-USER (in recon_user_cb, scoped to the legacy uplink
    * toward each user's owning server), not a global gate here — see the rationale
@@ -5524,7 +5898,7 @@ void crdt_shadow_reconcile_user_removes(void)
   struct Client *acptr;
   char victims[CRDT_REMOVE_MAX][CRDT_NUMERICLEN];
   int nv = 0, i, capped = 0;
-  if (!shadow_on() || !feature_bool(FEAT_CRDT_PRIMARY))
+  if (!crdt_primary_on())
     return;
   /* collect FIRST — exit_client frees clients; never exit mid-walk */
   for (acptr = GlobalClientList; acptr; acptr = cli_next(acptr)) {
@@ -5628,7 +6002,7 @@ void crdt_shadow_reconcile_create_channels(void)
 {
   unsigned int created = 0;
   int bk;
-  if (!shadow_on() || !feature_bool(FEAT_CRDT_PRIMARY))
+  if (!crdt_primary_on())
     return;
   for (bk = 0; bk < CRDT_CHAN_BUCKETS; bk++) {
     struct CrdtChannel *dc;
@@ -5723,7 +6097,7 @@ void crdt_shadow_reconcile_topics(void)
 {
   unsigned int changed = 0;
   struct reconcile_topic_ctx ctx = { &changed };
-  if (!shadow_on() || !feature_bool(FEAT_CRDT_PRIMARY))
+  if (!crdt_primary_on())
     return;
   crdt_lwwmap_foreach(&g_crdt.topics, reconcile_topic_cb, &ctx);
   if (changed)
@@ -5787,7 +6161,7 @@ void crdt_shadow_reconcile_modes(void)
 {
   unsigned int changed = 0;
   struct reconcile_mode_ctx ctx = { &changed };
-  if (!shadow_on() || !feature_bool(FEAT_CRDT_PRIMARY))
+  if (!crdt_primary_on())
     return;
   crdt_lwwmap_foreach(&g_crdt.modes, reconcile_mode_cb, &ctx);
   if (changed)
@@ -5878,7 +6252,7 @@ void crdt_shadow_reconcile_member_status(void)
 {
   unsigned int changed = 0;
   struct reconcile_mstatus_ctx ctx = { &changed };
-  if (!shadow_on() || !feature_bool(FEAT_CRDT_PRIMARY))
+  if (!crdt_primary_on())
     return;
   crdt_lwwmap_foreach(&g_crdt.members_status, reconcile_mstatus_cb, &ctx);
   if (changed)
@@ -5951,7 +6325,7 @@ void crdt_shadow_reconcile_bans(void)
 {
   unsigned int changed = 0;
   int bk;
-  if (!shadow_on() || !feature_bool(FEAT_CRDT_PRIMARY))
+  if (!crdt_primary_on())
     return;
   for (bk = 0; bk < CRDT_CHAN_BUCKETS; bk++) {
     struct CrdtChannel *dc;
@@ -6027,7 +6401,7 @@ void crdt_shadow_reconcile_members(void)
 {
   unsigned int changed = 0;
   int bk;
-  if (!shadow_on() || !feature_bool(FEAT_CRDT_PRIMARY))
+  if (!crdt_primary_on())
     return;
   for (bk = 0; bk < CRDT_CHAN_BUCKETS; bk++) {
     struct CrdtChannel *dc;
@@ -6065,8 +6439,10 @@ void crdt_shadow_reconcile_removes(void)
 {
   unsigned int changed = 0;
   int bk;
-  if (!shadow_on() || !feature_bool(FEAT_CRDT_PRIMARY))
+  if (!crdt_primary_on()) {
+    crdt_chan_part_reasons_clear(&g_crdt);
     return;
+  }
   for (bk = 0; bk < CRDT_CHAN_BUCKETS; bk++) {
     struct CrdtChannel *dc;
     for (dc = g_crdt.chan_buckets[bk]; dc; dc = dc->next) {
@@ -6153,10 +6529,23 @@ void crdt_shadow_reconcile_removes(void)
                                          FLAG_CRDT_AWARE, "%H %C :%s", chptr, victim,
                                          ki->reason);
           } else {
-            sendcmdto_channel_butserv_butone(victim, CMD_PART, chptr, NULL, 0, "%H", chptr);
-            if (!victim_mesh_only)
-              sendcmdto_flag_serv_butone(victim, CMD_PART, NULL, FLAG_LAST_FLAG,
-                                         FLAG_CRDT_AWARE, "%H", chptr);
+            /* The part comment rides the member's first REMOVE op and is parked
+             * when that op applies here (crdt_chan_part_reason_take); none for a
+             * snapshot-merged or reason-less leave. */
+            char why[CRDT_PARTREASON_LEN];
+            int has = crdt_chan_part_reason_take(&g_crdt, nbuf, num, why, sizeof why);
+            if (has) {
+              sendcmdto_channel_butserv_butone(victim, CMD_PART, chptr, NULL, 0,
+                                               "%H :%s", chptr, why);
+              if (!victim_mesh_only)
+                sendcmdto_flag_serv_butone(victim, CMD_PART, NULL, FLAG_LAST_FLAG,
+                                           FLAG_CRDT_AWARE, "%H :%s", chptr, why);
+            } else {
+              sendcmdto_channel_butserv_butone(victim, CMD_PART, chptr, NULL, 0, "%H", chptr);
+              if (!victim_mesh_only)
+                sendcmdto_flag_serv_butone(victim, CMD_PART, NULL, FLAG_LAST_FLAG,
+                                           FLAG_CRDT_AWARE, "%H", chptr);
+            }
           }
         }
         remove_user_from_channel(victim, chptr);   /* chptr may be freed here */
@@ -6164,6 +6553,10 @@ void crdt_shadow_reconcile_removes(void)
       }
     }
   }
+  /* A part reason lives only until the pass after the apply that parked it:
+   * whatever was not consumed above (member not live here, a kick, a leave
+   * already handled) is dropped, so it can never attach to a later PART. */
+  crdt_chan_part_reasons_clear(&g_crdt);
   if (changed)
     log_write(LS_SYSTEM, L_NOTICE, 0,
               "CRDT member-reconcile: removed %u member(s) from doc", changed);
@@ -6553,11 +6946,39 @@ static void crdt_shadow_verify_cb(struct Event *ev)
   }
 }
 
+/* GC hold (crdt_state_gc): a bsessions tombstone stays while a record of
+ * that session that the replica reap may still end exists here, so the
+ * reap, which may wait on it (bounce_crdt_replica_reap), still finds it when
+ * it acts.  The engine asks only for a DELETE op that still backs its key's
+ * tombstone. */
+static int shadow_gc_hold(uint8_t coll, const char *key, uint32_t key_len)
+{
+  char account[ACCOUNTLEN + 1], sessid[BOUNCER_SESSID_LEN];
+  const char *z;
+  uint32_t alen, slen;
+
+  if (coll != CRDT_COLL_BSESSIONS || !key)
+    return 0;
+  z = memchr(key, '\0', key_len);
+  if (!z)
+    return 0;
+  alen = (uint32_t)(z - key);
+  slen = key_len - alen - 1;
+  if (alen > ACCOUNTLEN || slen == 0 || slen >= sizeof sessid)
+    return 0;
+  memcpy(account, key, alen); account[alen] = '\0';
+  memcpy(sessid, z + 1, slen); sessid[slen] = '\0';
+  return bounce_record_awaits_reap(account, sessid);
+}
+
 void crdt_shadow_init(uint16_t my_numeric)
 {
   if (g_inited)
     return;
   crdt_state_init(&g_crdt, my_numeric);
+  g_crdt.gc_hold = shadow_gc_hold;
+  g_boot_enabled = feature_bool(FEAT_CRDT_ENABLED) ? 1 : 0;
+  g_boot_primary = feature_bool(FEAT_CRDT_PRIMARY) ? 1 : 0;
   /* Restart-epoch defense: seed next_seq from the wall clock (ms) so a restarted
    * server's freshly-reset op sequence never reuses seqs from a previous
    * incarnation that peers still remember in their state vectors (which would

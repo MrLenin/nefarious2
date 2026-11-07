@@ -23,6 +23,7 @@ struct irc_in_addr;
 extern int string_has_wildcards(const char* str);
 
 extern int string_is_valid_utf8(const char* str);
+extern int string_is_valid_utf8_len(const char* str, size_t len);
 extern int string_sanitize_utf8(char* str);
 
 extern int string_contains_non_ascii (const char* str);
@@ -36,6 +37,7 @@ extern int         ircd_strcmp(const char *a, const char *b);
 extern int         ircd_strncmp(const char *a, const char *b, size_t n);
 extern int csv_contains_token(const char* csv, const char* token);
 extern int ircd_utf8_clamp(char* s, size_t maxbytes);
+extern size_t ircd_line_body_clamp(const char* line, size_t len, size_t body_max);
 extern int ircd_text_mentions(const char* text, const char* nick);
 extern char* ircd_json_escape(char* dst, size_t dstlen, const char* src);
 extern int         unique_name_vector(char* names, char token,

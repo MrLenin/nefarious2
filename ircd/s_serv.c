@@ -61,6 +61,7 @@
 #include "userload.h"
 #include "zline.h"
 #include "metadata.h"
+#include "metadata_sync.h"
 #include "bouncer_session.h"
 #include "webpush.h"
 #include "ircd_features.h"
@@ -132,21 +133,30 @@ int server_estab(struct Client *cptr, struct ConfItem *aconf)
   inpath = cli_name(cptr);
 
   if (IsUnknown(cptr)) {
+    int holdmark = feature_bool(FEAT_P10_MESSAGE_TAGS);
+
     if (aconf->passwd[0])
       sendrawto_one(cptr, MSG_PASS " :%s", aconf->passwd);
     /*
      *  Pass my info to the new server.
      *  Flag string: h=hub, 6=ipv6, o=oplevels, v=IRCv3-aware S2S extensions,
-     *               F=BX F (reconcile-end) handshake supported.
+     *               F=BX F (reconcile-end) handshake supported,
+     *               H=bouncer hold mark (,H) stamped and relayed -- only
+     *                 while P10_MESSAGE_TAGS is on, as the mark rides the
+     *                 compact tags.
      *  Legacy peers ignore unknown flag chars (set_server_flags has no
      *  default in its switch).
      */
-    sendrawto_one(cptr, MSG_SERVER " %s 1 %Tu %Tu J%s %s%s +%s6%svFC :%s",
+    sendrawto_one(cptr, MSG_SERVER " %s 1 %Tu %Tu J%s %s%s +%s6%svF%s%s :%s",
 		  cli_name(&me), cli_serv(&me)->timestamp,
 		  cli_serv(cptr)->timestamp, MAJOR_PROTOCOL, NumServCap(&me),
 		  feature_bool(FEAT_HUB) ? "h" : "",
                   feature_bool(FEAT_OPLEVELS) ? "o" : "",
+                  IsCrdtAware(&me) ? "C" : "",
+                  holdmark ? "H" : "",
 		  *(cli_info(&me)) ? cli_info(&me) : "IRCers United");
+    if (holdmark)
+      SetHoldMarkSent(cptr);
   }
 
   det_confs_butmask(cptr, CONF_SERVER | CONF_UWORLD);
@@ -157,6 +167,13 @@ int server_estab(struct Client *cptr, struct ConfItem *aconf)
   cli_handler(cptr) = SERVER_HANDLER;
   Count_unknownbecomesserver(UserStats);
   SetBurst(cptr);
+  /* This link's incarnation: a record keyed by the link's Client pointer
+   * (which the Client freelist hands out again) also names the serial, so
+   * it never reads as the next link's. */
+  {
+    static unsigned long link_serials;
+    cli_serv(cptr)->link_serial = ++link_serials;
+  }
 
 /*    nextping = CurrentTime; */
 
@@ -211,7 +228,7 @@ int server_estab(struct Client *cptr, struct ConfItem *aconf)
     if (crdt_server_intro_suppress(acptr, cptr))
       continue;
     sendcmdto_one(&me, CMD_SERVER, acptr,
-		  "%s 2 0 %Tu J%02u %s%s +%s%s%s%s%s%s%s%s :%s", cli_name(cptr),
+		  "%s 2 0 %Tu J%02u %s%s +%s%s%s%s%s%s%s%s%s :%s", cli_name(cptr),
 		  cli_serv(cptr)->timestamp, Protocol(cptr), NumServCap(cptr),
 		  IsHub(cptr) ? "h" : "", IsService(cptr) ? "s" : "",
 		  IsIPv6(cptr) ? "6" : "", IsOpLevels(cptr) ? "o" : "",
@@ -219,6 +236,7 @@ int server_estab(struct Client *cptr, struct ConfItem *aconf)
 		  IsRenameCapable(cptr) ? "r" : "",
 		  IsBxfAware(cptr) ? "F" : "",
 		  IsCrdtAware(cptr) ? "C" : "",
+		  IsHoldMark(cptr) ? "H" : "",
                   cli_info(cptr));
   }
 
@@ -302,7 +320,7 @@ int server_estab(struct Client *cptr, struct ConfItem *aconf)
       if (crdt_server_intro_suppress(cptr, acptr))
         continue;
       sendcmdto_one(cli_serv(acptr)->up, CMD_SERVER, cptr,
-		    "%s %d 0 %Tu %s%u %s%s +%s%s%s%s%s%s%s%s :%s", cli_name(acptr),
+		    "%s %d 0 %Tu %s%u %s%s +%s%s%s%s%s%s%s%s%s :%s", cli_name(acptr),
 		    cli_hopcount(acptr) + 1, cli_serv(acptr)->timestamp,
 		    protocol_str, Protocol(acptr), NumServCap(acptr),
 		    IsHub(acptr) ? "h" : "", IsService(acptr) ? "s" : "",
@@ -310,6 +328,7 @@ int server_estab(struct Client *cptr, struct ConfItem *aconf)
 		    IsIRCv3Aware(acptr) ? "v" : "",
 		    IsRenameCapable(acptr) ? "r" : "",
 		    IsBxfAware(acptr) ? "F" : "", IsCrdtAware(acptr) ? "C" : "",
+		    IsHoldMark(acptr) ? "H" : "",
                     cli_info(acptr));
     }
   }
@@ -349,17 +368,29 @@ int server_estab(struct Client *cptr, struct ConfItem *aconf)
 /** Send the deferred-able tail of the burst: N tokens for users,
  * BS for bouncer sessions, channel BURST modes, EB.
  *
- * For IRCv3-aware peers this runs from the BX F handler after both
- * sides' reconcile is complete; for legacy peers it runs inline at the
- * end of server_estab.  Either way, by the time we reach this point any
- * active-vs-active demote has flipped its loser to alias state, so the
- * IsBouncerAlias filter on the N loop (and on bounce_burst's session
- * iteration) keeps duplicate racing-nick N's off the wire.
+ * For any peer, IRCv3-aware or legacy: it runs inline at the end of
+ * server_estab (the peer's SERVER line) unless bouncer convergence is
+ * in flight, in which case server_estab gates the peer and this runs at
+ * release instead -- from bounce_release_idle_gates at a
+ * convergence-completion site (a peer's EB, an attach or revive) or
+ * from the 1-second bounce_legacy_burst_gate_tick fallback.  Either
+ * way, by the time we reach this point any active-vs-active demote has
+ * flipped its loser to alias state, so the IsBouncerAlias filter on the
+ * N loop (and on bounce_burst's session iteration) keeps duplicate
+ * racing-nick N's off the wire.
  */
 int server_finish_burst(struct Client *cptr)
 {
   struct Client *acptr;
   struct SLink *lp;
+  /* The burst can run while another link's line is handled (a gate
+   * released at a peer's EB, an attach or a revive).  None of its lines
+   * is that line's: while it runs no link's stash is the current line's,
+   * so the tags a burst line carries are its own (the hint below), never
+   * the handled line's msgid, time, session id or hold mark. */
+  struct Client *inbound = sendcmdto_inbound_link();
+
+  sendcmdto_set_inbound_link(NULL);
 
   /* MR-5 event-driven beacon-burst: hand a freshly-linked CRDT peer the full current
    * beacon set NOW so it can anchor the far servers (whose P10 SERVER intros tree-
@@ -377,11 +408,12 @@ int server_finish_burst(struct Client *cptr)
    * crdt_shadow_doc_ready() guards against skipping BURST when our doc is not yet
    * a complete source (e.g. at cold boot) — then we fall back to a normal BURST
    * so the peer is never left missing users. */
-  if (IsCrdtAware(cptr) && feature_bool(FEAT_CRDT_PRIMARY) &&
+  if (IsCrdtAware(cptr) && crdt_primary_on() &&
       crdt_shadow_doc_ready()) {
     crdt_send_snapshot(cptr);
     sendcmdto_one(&me, CMD_END_OF_BURST, cptr, "");
     sendcmdto_one(&me, CMD_END_OF_BURST_ACK, cptr, "");
+    sendcmdto_set_inbound_link(inbound);   /* as the normal end of the burst does */
     return 0;
   }
 
@@ -422,34 +454,22 @@ int server_finish_burst(struct Client *cptr)
     {
       char xxx_buf[25];
       char *s = umode_str(acptr);
+      char held_mark;
 
-      /* Legacy-face suppression: if cptr is a non-IRCv3-aware peer and
-       * acptr is bouncer-bound to a session that has already had a face
-       * introduced toward cptr (typically by an earlier walk-step on a
-       * different session connection, or by an inbound burst that's
-       * already been forwarded here), skip the entire user introduction
-       * block.  Per design: legacy peers see exactly one N per bouncer
-       * session — BX-aware side may juggle primary/alias state
-       * internally without disturbing legacy's view.  The recorded
-       * face's local Client struct stays alive (becomes IsBouncerAlias
-       * on demote) and routing back to legacy resolves through it.
+      /* A legacy peer gets every user of the walk, as it gets every N we
+       * relay: aliases are not users of the walk (above), so a session
+       * shows one face unless it has two primaries for the moment (two
+       * copies of it met after a split and are not merged yet).  Then the
+       * legacy peer holds both faces, as a relay would have given it,
+       * and the merge retracts the one it converts (a QUIT); the survivor
+       * stays known to it.  Holding back all but the first face of a
+       * session here left the legacy peer with no face at all once the
+       * merge retracted that first one, and its channel members unknown.
        *
-       * Scope this to the acptr's own session, not all sessions for the
-       * account.  An account-bearing but non-bouncer-bound client (no
-       * cli_session_id, or session opt-out via draft/persistence/hold=0) is a
-       * legitimately independent presence and must get its own N to
-       * legacy peers — even if some bouncer client happens to share
-       * the account.  Future multi-session-per-account work falls out
-       * of session-keying for free; nothing changes here. */
+       * The first face sent to the peer is noted for the session (CHECK
+       * shows it; a later swap or retraction of that face updates it). */
       if (!IsIRCv3Aware(cptr) && IsAccount(acptr)) {
         struct BouncerSession *bs = bounce_get_session(acptr);
-        if (bs && bounce_session_legacy_face_for(bs, cli_yxx(cptr))) {
-          Debug((DEBUG_INFO,
-                 "Bouncer: burst-suppressing N for %s to legacy %s "
-                 "— session %s already has a face there",
-                 cli_name(acptr), cli_name(cptr), bs->hs_sessid));
-          continue;
-        }
         if (bs) {
           char face_buf[6];
           ircd_snprintf(0, face_buf, sizeof(face_buf), "%s%s",
@@ -460,13 +480,23 @@ int server_finish_burst(struct Client *cptr)
 
       /* Per redesign A.2: stage the bouncer session-id hint for the
        * outgoing N's ,S compact-tag segment, so bouncer-aware peers
-       * can dispatch at-N-time convergence in m_nick.  Gated on
-       * IsIRCv3Aware because the override is a one-shot global cleared
-       * by format_s2s_tags_with_client — legacy peers don't reach that
-       * codepath, so the override would persist into a subsequent
-       * unrelated IRCv3-aware emit with a stale sessid. */
-      if (IsIRCv3Aware(cptr))
-        bounce_set_n_sessid_hint(acptr);
+       * can dispatch at-N-time convergence in m_nick.  Only toward an
+       * IRCv3-aware peer (a legacy one gets no tag region).
+       *
+       * The hint is cleared right after the send, not left to
+       * format_s2s_tags_with_client, which consumes it only when it
+       * uses it.  The burst runs from the burst-gate timer and from
+       * callbacks, where no per-line reset follows: a leftover hint would
+       * ride the next tagged line (a later burst line, the EB, any timer
+       * send) with this user's sessid.  (No link's stash competes with
+       * it here: the burst runs with no inbound line, above.)
+       *
+       * The hint also stages the hold mark (,H) of a user of ours: one
+       * computation, so ",S names a session" and the mark agree.  It
+       * stages none for a user of another server: only its home server
+       * stamps one, and what it stamped then is not known now.  The mark
+       * is cleared with the hint, for the same reasons. */
+      held_mark = IsIRCv3Aware(cptr) ? bounce_set_n_sessid_hint(acptr) : 0;
       sendcmdto_one(cli_user(acptr)->server, CMD_NICK, cptr,
 		    "%s %d %Tu %s %s %s%s%s%s %s%s :%s",
 		    cli_name(acptr), cli_hopcount(acptr) + 1, cli_lastnick(acptr),
@@ -474,6 +504,14 @@ int server_finish_burst(struct Client *cptr)
 		    *s ? "+" : "", s, *s ? " " : "",
 		    iptobase64(xxx_buf, &cli_ip(acptr), sizeof(xxx_buf), IsIPv6(cptr)),
 		    NumNick(acptr), cli_info(acptr));
+      sendcmdto_set_s2s_sessid(NULL);
+      sendcmdto_set_s2s_held(0);
+      /* The mark this link's server will decide from, should one of its
+       * own clients meet ours on this nick before its burst ends: kept
+       * so we decide from the same snapshot (a socket that dies, or an
+       * alias that leaves, in the meantime changes nothing). */
+      if (held_mark && bounce_hold_marks_trusted(cptr))
+        bounce_note_burst_stamp(acptr, cptr, held_mark);
 
       if (cli_user(acptr) && !EmptyString(cli_user(acptr)->swhois))
         sendcmdto_one(cli_user(acptr)->server, CMD_SWHOIS, cptr, "%C :%s", acptr,
@@ -495,12 +533,16 @@ int server_finish_burst(struct Client *cptr)
       if (cli_sslclifp(acptr) && !EmptyString(cli_sslclifp(acptr))) {
         sendcmdto_one(cli_user(acptr)->server, CMD_MARK, cptr, "%s %s :%s",
                       cli_name(acptr), MARK_SSLCLIFP, cli_sslclifp(acptr));
-        if (feature_bool(FEAT_CERT_EXPIRY_TRACKING) && cli_sslcliexp(acptr) > 0)
+        /* SSLCLIEXP and WEBSOCKET are fork-only MARK types; a legacy
+         * next hop doesn't understand them, so skip them in the burst
+         * to a non-IRCv3-aware peer (wire-hygiene rule). */
+        if (feature_bool(FEAT_CERT_EXPIRY_TRACKING) && cli_sslcliexp(acptr) > 0 &&
+            IsIRCv3Aware(cptr))
           sendcmdto_one(cli_user(acptr)->server, CMD_MARK, cptr, "%s %s :%lu",
                         cli_name(acptr), MARK_SSLCLIEXP, (unsigned long)cli_sslcliexp(acptr));
       }
 
-      if (!EmptyString(cli_wsorigin(acptr)))
+      if (!EmptyString(cli_wsorigin(acptr)) && IsIRCv3Aware(cptr))
         sendcmdto_one(cli_user(acptr)->server, CMD_MARK, cptr, "%s %s :%s",
                       cli_name(acptr), MARK_WEBSOCKET, cli_wsorigin(acptr));
 
@@ -550,14 +592,55 @@ int server_finish_burst(struct Client *cptr)
       client_send_privs(cli_user(acptr)->server, cptr, acptr);
 
       /* Burst user metadata if enabled.  MD is an IRCv3-aware extension —
-       * legacy peers (X3, vanilla ircu) log PARSE ERROR on receipt. */
+       * legacy peers (X3, vanilla ircu) log PARSE ERROR on receipt.
+       *
+       * W4 Task 8: never by nick unless nothing else names the user.  A
+       * logged-in user's keys go as the account's stamped rows
+       * ("MD =account") under the stamp the store holds, so the peer
+       * merges them by last-writer-wins instead of taking whatever it is
+       * sent (a key the store has no row for -- no store, or a row never
+       * written there -- goes under stamp 0.0.0, which any stamped row
+       * beats).  Another user's keys go by its session id ("MD !sessid")
+       * when the N above carried it (metadata_session_addressable),
+       * else by nick.  Both forms keep the user's own server as the
+       * line's origin: the receiver accepts a session- or nick-addressed
+       * write only from there. */
       if (feature_bool(FEAT_METADATA_BURST) && IsIRCv3Aware(cptr)) {
         struct MetadataEntry *entry;
+        const char *account = cli_user(acptr)->account;
+
         for (entry = cli_metadata(acptr); entry; entry = entry->next) {
-          sendcmdto_one(cli_user(acptr)->server, CMD_METADATA, cptr, "%s %s %s :%s",
-                        cli_name(acptr), entry->key,
-                        entry->visibility == METADATA_VIS_PRIVATE ? "P" : "*",
-                        entry->value ? entry->value : "");
+          const char *vis_tok = entry->visibility == METADATA_VIS_PRIVATE ? "P" : "*";
+          const char *value = entry->value ? entry->value : "";
+
+          if (account[0]) {
+            struct md_version v;
+            char valbuf[METADATA_VALUE_LEN];
+
+            /* An internal key (last_present, loaded into memory with the
+             * account's rows; a key the wire validator refuses) is this
+             * server's own: never a stamped row on the wire (push-2
+             * final fix wave, M-2). */
+            if (!md_key_replicable(entry->key))
+              continue;
+            if (!metadata_lmdb_is_available()
+                || metadata_account_get_version(account, entry->key, &v,
+                                                valbuf, sizeof(valbuf)) != 0) {
+              memset(&v.st, 0, sizeof(v.st));
+              v.tombstone = 0;
+              v.vis = entry->visibility;
+              v.value = value;
+              v.vlen = strlen(value);
+            }
+            metadata_emit_versioned(cli_user(acptr)->server, cptr, NULL,
+                                    account, entry->key, &v);
+          } else if (metadata_session_addressable(acptr)) {
+            sendcmdto_one(cli_user(acptr)->server, CMD_METADATA, cptr, "!%s %s %s :%s",
+                          cli_session_id(acptr), entry->key, vis_tok, value);
+          } else {
+            sendcmdto_one(cli_user(acptr)->server, CMD_METADATA, cptr, "%s %s %s :%s",
+                          cli_name(acptr), entry->key, vis_tok, value);
+          }
         }
       }
     }
@@ -590,6 +673,7 @@ int server_finish_burst(struct Client *cptr)
    * The trailing EA here is the correction that lands after peer's
    * BURST_ACK is set, clearing the ! marker in /MAP and /STATS u. */
   sendcmdto_one(&me, CMD_END_OF_BURST_ACK, cptr, "");
+  sendcmdto_set_inbound_link(inbound);
   return 0;
 }
 

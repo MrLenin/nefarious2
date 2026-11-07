@@ -24,6 +24,7 @@
 #include "config.h"
 
 #include "zline.h"
+#include "bouncer_session.h"
 #include "channel.h"
 #include "client.h"
 #include "crdt_shadow.h"  /* ZLINE global-state track: mirror global Z-lines into the CRDT doc */
@@ -208,12 +209,19 @@ do_zline(struct Client *cptr, struct Client *sptr, struct Zline *zline)
       sendto_opmask_butone_global(&me, SNO_GLINE, "Z-line active for %s",
                            get_client_name(acptr, SHOW_IP));
 
-      /* and get rid of him */
-      if ((tval = exit_client_msg(cptr, acptr, &me, "Z-lined%s%s%s",
-          (!feature_bool(FEAT_HIS_ZLINE_REASON) ? " (" : ""),
-          (!feature_bool(FEAT_HIS_ZLINE_REASON) ? zline->zl_reason : ""),
-          (!feature_bool(FEAT_HIS_ZLINE_REASON) ? ")" : ""))))
-        retval = tval; /* retain killed status */
+      /* and get rid of him -- and of the bouncer session his connection
+       * carries: enforcement ends it, as a KILL does */
+      {
+        char reason[BUFSIZE];
+
+        ircd_snprintf(0, reason, sizeof(reason), "Z-lined%s%s%s",
+            (!feature_bool(FEAT_HIS_ZLINE_REASON) ? " (" : ""),
+            (!feature_bool(FEAT_HIS_ZLINE_REASON) ? zline->zl_reason : ""),
+            (!feature_bool(FEAT_HIS_ZLINE_REASON) ? ")" : ""));
+        bounce_forced_exit(cptr, acptr, BOUNCE_FORCED_BAN, reason);
+        if ((tval = exit_client(cptr, acptr, &me, reason)))
+          retval = tval; /* retain killed status */
+      }
     }
   }
   return retval;
@@ -308,7 +316,7 @@ zline_propagate(struct Client *cptr, struct Client *sptr, struct Zline *zline)
   /* ZLINE cutover: legacy-only under FEAT_CRDT_ZLINE_CUTOVER (forbid CRDT-aware); forbid=
    * FLAG_LAST_FLAG when off => no filter => identical to the old sendcmdto_serv_butone. */
   sendcmdto_flag_serv_butone(sptr, CMD_ZLINE, cptr, FLAG_LAST_FLAG,
-			feature_bool(FEAT_CRDT_ZLINE_CUTOVER) ? FLAG_CRDT_AWARE : FLAG_LAST_FLAG,
+			CrdtCutoverOn(FEAT_CRDT_ZLINE_CUTOVER) ? FLAG_CRDT_AWARE : FLAG_LAST_FLAG,
 			"* %c%s %Tu %Tu %Tu :%s",
 			ZlineIsRemActive(zline) ? '+' : '-',
 			zline->zl_mask, zline->zl_expire - TStime(),
@@ -767,7 +775,7 @@ zline_modify(struct Client *cptr, struct Client *sptr, struct Zline *zline,
   if (action != ZLINE_LOCAL_ACTIVATE && action != ZLINE_LOCAL_DEACTIVATE)
     /* ZLINE cutover: legacy-only under the flag (see zline_propagate). */
     sendcmdto_flag_serv_butone(sptr, CMD_ZLINE, cptr, FLAG_LAST_FLAG,
-			  feature_bool(FEAT_CRDT_ZLINE_CUTOVER) ? FLAG_CRDT_AWARE : FLAG_LAST_FLAG,
+			  CrdtCutoverOn(FEAT_CRDT_ZLINE_CUTOVER) ? FLAG_CRDT_AWARE : FLAG_LAST_FLAG,
 			  "* %s%s%s %Tu %Tu %Tu :%s",
 			  flags & ZLINE_OPERFORCE ? "!" : "", op,
 			  zline->zl_mask, zline->zl_expire - TStime(),
@@ -915,7 +923,7 @@ zline_burst(struct Client *cptr)
   struct Zline *szline;
 
   /* ZLINE cutover: a CRDT-aware peer gets Z-lines via the doc, not the P10 burst. */
-  if (feature_bool(FEAT_CRDT_ZLINE_CUTOVER) && IsServer(cptr) && IsCrdtAware(cptr))
+  if (CrdtCutoverOn(FEAT_CRDT_ZLINE_CUTOVER) && IsServer(cptr) && IsCrdtAware(cptr))
     return;
 
   zliter(GlobalZlineList, zline, szline) {
@@ -940,7 +948,7 @@ zline_resend(struct Client *cptr, struct Zline *zline)
     return 0;
 
   /* ZLINE cutover: CRDT peers get Z-lines via the doc, not a P10 resend. */
-  if (feature_bool(FEAT_CRDT_ZLINE_CUTOVER) && IsServer(cptr) && IsCrdtAware(cptr))
+  if (CrdtCutoverOn(FEAT_CRDT_ZLINE_CUTOVER) && IsServer(cptr) && IsCrdtAware(cptr))
     return 0;
 
   sendcmdto_one(&me, CMD_ZLINE, cptr, "* %c%s %Tu %Tu %Tu :%s",

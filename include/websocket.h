@@ -67,6 +67,16 @@ struct Client;
  * WS_HANDSHAKE_MAX without a terminating blank line. */
 #define WS_HANDSHAKE_TOOBIG (-2)
 
+/** Longest Close reason, in bytes: a control frame's payload is at most
+ * 125 bytes (RFC 6455 §5.5), two of them the status code. */
+#define WS_CLOSE_REASON_MAX 123
+
+/** websocket_set_close() status meaning "a Close with no status code":
+ * the frame goes out with an empty body.  RFC 6455 §7.4.1 reserves 1005
+ * for exactly this and forbids it on the wire, so it never collides with
+ * a status that is sent. */
+#define WS_CLOSE_NO_STATUS 1005
+
 /** Handle WebSocket handshake for a new connection.
  * @param[in] cptr Client attempting to connect.
  * @param[in] buffer Raw data received.
@@ -97,7 +107,8 @@ extern int websocket_handshake_feed(struct Client *cptr, const char *data,
  * @param[out] opcode The frame opcode.
  * @param[out] is_fin Set to 1 if FIN bit is set (final fragment), 0 otherwise.
  * @return Number of bytes consumed from frame, 0 if incomplete, -1 on
- *   error, WS_DECODE_TOOBIG if the payload exceeds WS_MAX_PAYLOAD.
+ *   a protocol error (the caller answers Close 1002), WS_DECODE_TOOBIG if
+ *   the payload exceeds WS_MAX_PAYLOAD (Close 1009).
  */
 extern int websocket_decode_frame(const unsigned char *frame, int frame_len,
                                   char *payload, int payload_size,
@@ -113,7 +124,11 @@ extern int websocket_decode_frame(const unsigned char *frame, int frame_len,
 extern int websocket_encode_frame(const char *data, int data_len,
                                   unsigned char *frame, int text_mode);
 
-/** Handle a WebSocket control frame.
+/** Handle a WebSocket control frame.  A PING is answered at once; a
+ * CLOSE sets the connection's Close to the answer (websocket_set_close():
+ * its status echoed, or 1002 for a status no Close may carry or a 1-byte
+ * body, 1007 for a reason that is not UTF-8) and asks the caller to close
+ * the connection.
  * @param[in] cptr Client connection.
  * @param[in] opcode Frame opcode.
  * @param[in] payload Frame payload.
@@ -123,14 +138,68 @@ extern int websocket_encode_frame(const char *data, int data_len,
 extern int websocket_handle_control(struct Client *cptr, int opcode,
                                     const char *payload, int payload_len);
 
-/** Send a WebSocket Close frame with a status code (best effort).
+/** websocket_frag_feed() return values. */
+#define WS_FRAG_MORE      0    /**< Fragment buffered, message not complete */
+#define WS_FRAG_DONE      1    /**< Message complete in *msg / *msg_len */
+#define WS_FRAG_OVERFLOW (-1)  /**< Message would exceed WS_MAX_PAYLOAD */
+#define WS_FRAG_ORPHAN   (-2)  /**< CONTINUATION with no message started */
+#define WS_FRAG_BADUTF8  (-3)  /**< Reassembled TEXT message is not UTF-8 */
+#define WS_FRAG_INTERLEAVED (-4) /**< TEXT/BINARY frame while a message is in progress */
+
+/** Add one data frame of a fragmented message to the client's
+ * reassembly buffer.  Called for a non-FIN TEXT/BINARY frame (starts a
+ * message), for every CONTINUATION frame, and for any TEXT/BINARY frame
+ * while a message is in progress, which it refuses (RFC 6455 §5.4).
+ * Before it returns a refusal (a negative value) it has set the
+ * connection's Close (websocket_set_close()) to the status RFC 6455
+ * answers it with: 1002 Protocol Error for WS_FRAG_ORPHAN and
+ * WS_FRAG_INTERLEAVED, 1007 Invalid Payload Data for WS_FRAG_BADUTF8,
+ * 1009 Message Too Big for WS_FRAG_OVERFLOW.  The caller drops the
+ * connection, which sends it.
  * @param[in] cptr Client connection.
- * @param[in] code RFC 6455 status code (e.g. 1009 Message Too Big).
- * @param[in] reason Optional short reason text (truncated to 123 bytes).
+ * @param[in] opcode Frame opcode.
+ * @param[in] is_fin 1 if this frame ends the message.
+ * @param[in] payload Frame payload.
+ * @param[in] len Payload length.
+ * @param[out] msg On WS_FRAG_DONE, the reassembled message (NUL-terminated,
+ *   in the client's buffer, with room for one more byte after the NUL).
+ * @param[out] msg_len On WS_FRAG_DONE, its length.
+ * @return One of the WS_FRAG_* values.
  */
+extern int websocket_frag_feed(struct Client *cptr, int opcode, int is_fin,
+                               const char *payload, int len,
+                               char **msg, int *msg_len);
+
+/** Send an empty WebSocket PING (keepalive, best effort). */
 extern void websocket_send_ping(struct Client *cptr);
+/** Arm the periodic WebSocket keepalive PING timer. */
 extern void websocket_ping_timer_init(void);
-extern void websocket_send_close(struct Client *cptr, int code,
-                                 const char *reason);
+
+/** Set the Close frame a connection ends with.  One Close goes out per
+ * connection, and no data frame after it (RFC 6455 §5.5.1).  The first
+ * call decides it -- a refusal's status, the answer to the client's own
+ * Close, or else the farewell 1000 exit_client() and a bouncer hold set
+ * on the way out -- and later calls change nothing.  Nothing is sent
+ * here: websocket_close_flush() sends it when the socket is closed.
+ * @param[in] cptr Client connection.
+ * @param[in] code RFC 6455 status code (e.g. 1009 Message Too Big), or
+ *   WS_CLOSE_NO_STATUS for a Close with an empty body.
+ * @param[in] reason Optional short reason text: made UTF-8 (an invalid
+ *   byte becomes U+FFFD) and cut to WS_CLOSE_REASON_MAX bytes at a
+ *   character boundary.
+ */
+extern void websocket_set_close(struct Client *cptr, int code,
+                                const char *reason);
+
+/** Flush a WebSocket connection that is being closed: the lines queued on
+ * it (exit_client()'s "ERROR :Closing Link" is the last), then its one
+ * Close frame, when websocket_set_close() set one and none has gone out.
+ * Web IRC clients show the quit reason from the ERROR line, and nothing
+ * may follow the Close, so the ERROR goes first.  close_connection()
+ * calls this in place of flush_connections() (best effort: a dead or
+ * blocked socket gets no Close).
+ * @param[in] cptr Client connection.
+ */
+extern void websocket_close_flush(struct Client *cptr);
 
 #endif /* INCLUDED_websocket_h */

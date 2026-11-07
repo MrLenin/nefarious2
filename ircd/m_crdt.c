@@ -903,7 +903,7 @@ int crdt_wall_demote(struct Channel *chptr)
 {
   struct Membership *memb;
   int sk;
-  if (!chptr || !feature_bool(FEAT_CRDT_ROUTE_WALL) || !feature_bool(FEAT_CRDT_PRIMARY))
+  if (!chptr || !feature_bool(FEAT_CRDT_ROUTE_WALL) || !crdt_primary_on())
     return 0;
   sk = crdt_have_mesh_stub();            /* partitioned -> CR-M is the carrier */
   for (memb = chptr->members; !sk && memb; memb = memb->next_member) {
@@ -1025,7 +1025,7 @@ void crdt_gossip_beacon_to(struct Client *only)
 {
   struct Client *acptr;
   char peers[256];
-  if (!crdt_shadow_active() || !feature_bool(FEAT_CRDT_PRIMARY))
+  if (!crdt_shadow_active() || !crdt_primary_on())
     return;
   /* build our own direct-peer set (also records our own mesh-map row); "*" when
    * we have no CRDT peers, so the positional param is always present. */
@@ -1194,7 +1194,7 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
          * Idempotent; the verify timer re-runs post-burst to heal SERVER-tree
          * race skips. No-op when the peer sent a normal BURST (this never fires
          * because no CR F is received in that case). */
-        if (feature_bool(FEAT_CRDT_PRIMARY) && IsBurstOrBurstAck(cptr))
+        if (crdt_primary_on() && IsBurstOrBurstAck(cptr))
           crdt_shadow_materialize_live();
         /* Orphan-reap owner sweep, eager pass: a CR F merge is the ONLY path a
          * stale OWN-origin record can re-import (merge-keep; deltas are SV-deduped
@@ -1429,6 +1429,8 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
         if (!*q || *q == ':') break;
         ev[ec++] = q;
         while (*q && *q != ' ') q++;
+        if (*q)                /* end the token here: the third one is */
+          *q++ = '\0';         /* not followed by another pass of the loop */
       }
       while (*q == ' ') q++;
       if (ec == 3 && ((ev[2][0] == 'P' || ev[2][0] == '*') && !ev[2][1])) {
@@ -1442,10 +1444,23 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
       if (ec >= 2) {
         struct Client *msrc = srcu ? srcu : (srcsrv ? srcsrv : &me);
         struct Client *osrv = srcu ? cli_user(srcu)->server : srcsrv;
+        /* Re-emit to legacy when no tree copy reaches it: the origin skipped
+         * CRDT peers on the tree, so legacy servers behind us hear it only
+         * from us when the origin is a mesh stub here, or when our way to it
+         * is a CRDT-aware link.  This rests on the supported single-gateway
+         * topology (one CRDT node fronts each legacy island); crdt_m_seen
+         * stops the echo of our own re-emit.  With no tree presence every
+         * gateway passes this gate alike, so a legacy link whose MR-4d
+         * designated fronter is another gateway gets nothing from us; on a
+         * tree path (via_crdt) only the gateway on it passes, so no standby. */
+        int via_crdt = osrv && !IsMe(osrv) && cli_from(osrv)
+                       && IsCrdtAware(cli_from(osrv));
         Debug((DEBUG_DEBUG, "CRDT MD: mesh %s %s from %s", ev[0], ev[1], srcyxx));
-        if (metadata_apply_relayed(msrc, ev[0], ev[1], evis, evalue)
-            && (!osrv || IsMeshStub(osrv))) {
+        if (metadata_apply_relayed(NULL, msrc, ev[0], ev[1], evis, evalue)
+            && (!osrv || IsMeshStub(osrv) || via_crdt)) {
           sendcmdto_set_skip_crdt_servers();
+          if (!via_crdt || IsMeshStub(osrv))  /* an anchor is its own CRDT-aware cli_from */
+            sendcmdto_set_skip_links(crdt_legacy_link_standby);
           if (evalue)
             sendcmdto_serv_butone_v3(msrc, CMD_METADATA, NULL, "%s %s %s :%s", ev[0], ev[1],
                                      evis == METADATA_VIS_PRIVATE ? "P" : "*", evalue);

@@ -68,8 +68,10 @@
 #include "userload.h"
 #include "watch.h"
 #include "history.h"
+#include "history_trim_codec.h"
 #include "chathistory_presence.h"
 #include "sasl_auth.h"
+#include "session_markread.h"
 
 /* #include <assert.h> -- Now using assert in ircd_log.h */
 #include <fcntl.h>
@@ -224,6 +226,7 @@ static void store_quit_events(struct Client *sptr, const char *comment,
   char fallback_msgid[64];
   const char *msgid;
   char sender[HISTORY_SENDER_LEN];
+  char owner[HTC_OWNER_MAX];
   const char *account;
 
   if (!history_is_available())
@@ -283,6 +286,8 @@ static void store_quit_events(struct Client *sptr, const char *comment,
   /* Get account name if logged in */
   account = (cli_user(sptr) && cli_user(sptr)->account[0])
             ? cli_user(sptr)->account : NULL;
+  /* The row's trim owner: the client whose account it carries. */
+  history_owner_of(owner, sizeof(owner), sptr);
 
   /* Store QUIT event for each channel the user is on.
    * Same msgid is used across all channels — it's a single event.
@@ -294,10 +299,90 @@ static void store_quit_events(struct Client *sptr, const char *comment,
 
     history_store_message(msgid, timestamp, member->channel->chname, NULL,
                           sender, account, HISTORY_QUIT,
-                          comment ? comment : "", NULL);
+                          comment ? comment : "", NULL, owner);
   }
 }
 #endif /* USE_ROCKSDB */
+
+/** See include/s_misc.h.
+ *
+ * Factored from exit_client() and exit_one_client() for a client that
+ * stays connected (W3 12c-2b, design D.1): a live user of ours joining a
+ * bouncer session leaves the network under the face it had, once, before
+ * it becomes a device of the session's primary.  One msgid and one event
+ * time cover every part of it:
+ *  - the QUIT to the members of its channels (not to @a c itself, which
+ *    stays: its own socket is told by its caller);
+ *  - the HISTORY_QUIT rows of those channels;
+ *  - the WATCH/MONITOR logoff of its nick;
+ *  - a Q from it toward every server link -- the IRCv3-aware links carry
+ *    the tags, a legacy link gets the plain line -- except a link whose
+ *    burst is still gated: we have sent it no N for @a c, and the burst it
+ *    gets at the release carries what @a c is then.
+ * It is still a plain user here: a line toward a server link from one of
+ * our aliases is rewritten to its primary for a legacy link (ruling
+ * W3-P2), and the Q must leave as @a c's own.
+ *
+ * Nothing else of exit_one_client's runs: no channel removal (the caller
+ * does it, with the presence time this returns), no count, no flag.  The
+ * face's ephemeral read markers go with its session id (the connection
+ * takes the session's id next).
+ *
+ * Kept in step with exit_one_client()'s QUIT emission (its "if
+ * (!IsBouncerInternalDestroy(bcptr))" block) and exit_client()'s Q loop:
+ * a change to what a QUIT carries there belongs here too.
+ */
+int64_t exit_face_departs(struct Client *c, const char *comment)
+{
+  struct DLink *dlp;
+  char msgid[64] = "";
+  uint64_t ms = 0;
+  int64_t quit_time = 0;
+
+  if (!c || !MyUser(c) || !cli_user(c) || !cli_serv(&me))
+    return 0;
+  if (!comment)
+    comment = "";
+
+  if (feature_bool(FEAT_MSGID) || feature_bool(FEAT_P10_MESSAGE_TAGS)) {
+    generate_msgid(msgid, sizeof(msgid));
+    ms = history_event_time_ms(NULL);
+    quit_time = presence_event_time(msgid, ms);
+  }
+
+  if (msgid[0] && feature_bool(FEAT_MSGID))
+    sendcmdto_set_client_event(msgid, ms);
+  sendcmdto_common_channels_butone(c, CMD_QUIT, c, ":%s", comment);
+  sendcmdto_set_client_msgid(NULL);
+
+#ifdef USE_ROCKSDB
+  store_quit_events(c, comment, msgid[0] ? msgid : NULL, ms);
+#endif
+
+  check_status_watch(c, RPL_LOGOFF);
+  if (cli_session_id(c)[0])
+    readmarker_ephemeral_purge(cli_session_id(c));
+
+  for (dlp = cli_serv(&me)->down; dlp; dlp = dlp->next) {
+    struct Client *link = dlp->value.cptr;
+
+    if (!link || !IsServer(link) || IsBurstGated(link))
+      continue;
+    /* Phase 3m (CRDT-mesh): on a CRDT primary the leave rides the doc to
+     * CRDT-aware peers (the caller's crdt_shadow_user_remove tombstone), as
+     * exit_client()'s QUIT loop keeps its Q off them. */
+    if (crdt_primary_on() && IsCrdtAware(link))
+      continue;
+    /* Armed per link: a send toward a legacy link consumes the override
+     * without a tag region (as exit_client() arms its QUIT). */
+    if (msgid[0])
+      sendcmdto_set_s2s_tags(ms, msgid);
+    sendcmdto_one(c, CMD_QUIT, link, ":%s", comment);
+  }
+  if (msgid[0])
+    sendcmdto_set_s2s_tags(0, NULL);
+  return quit_time;
+}
 
 /**
  * Exit one client, local or remote. Assuming for local client that
@@ -339,6 +424,8 @@ static void exit_one_client(struct Client* bcptr, const char* comment)
      * still valid (gated on FEAT_CRDT_ENABLED; skips bouncer aliases). */
     crdt_shadow_user_remove(bcptr, comment);
 
+    /* (A client whose registration was deferred leaves the pending queue
+     * in remove_client_from_list(), where every exit ends.) */
     /* Purge per-Client ephemeral session-scoped state before the rest
      * of the teardown sequence — cli_session_id is still valid here,
      * which lets future subsystems (chathistory PM ring, read-marker
@@ -358,7 +445,8 @@ static void exit_one_client(struct Client* bcptr, const char* comment)
      * bounce_setup_local_alias re-purposed it), so its slot in
      * UserStats.local_clients/clients must be released here.  Remote aliases
      * (created via BX C in bounce_alias_create) bypass Count_newremoteclient
-     * entirely, so they have nothing to decrement. */
+     * entirely, and a client converted into one in place gave its counts up
+     * then, so they have nothing to decrement. */
     if (IsBouncerAlias(bcptr)) {
       /* Network KILL on an alias ends the entire session per design
        * intent invariant #12.  Propagate the KILL to the primary (if
@@ -405,6 +493,17 @@ static void exit_one_client(struct Client* bcptr, const char* comment)
         del_list_watch(bcptr);
       bounce_alias_untrack(bcptr);
       remove_user_from_all_channels(bcptr);
+      /* What a user holds besides its channels, freed as the normal branch
+       * below frees it: a client that became an alias while it held an
+       * INVITE (a live client joining a session, a demoted primary, a
+       * client converted in place) still has it, and free_user() asserts
+       * none is left (W3 12c-2b fix round 1, C1). */
+      while ((lp = cli_user(bcptr)->invited))
+        del_invite(bcptr, lp->value.chptr);
+      while ((bp = cli_user(bcptr)->silence)) {
+        cli_user(bcptr)->silence = bp->next;
+        free_ban(bp);
+      }
       RemoveYXXClient(cli_user(bcptr)->server, cli_yxx(bcptr));
       remove_client_from_list(bcptr);
       return;
@@ -442,10 +541,16 @@ static void exit_one_client(struct Client* bcptr, const char* comment)
         if (bsess && bsess->hs_client == bcptr)
           bounce_kill_session(bsess, comment);
       }
+      /* Its counts, as the normal branch releases them: a held ghost is a
+       * client of ours (the hold flag is ours alone, and a rebind to
+       * another server's client clears it), but another server's client
+       * that ever carried the flag holds what its N counted. */
       if (MyConnect(bcptr)) {
         if (IsIPChecked(bcptr))
           IPcheck_disconnect(bcptr);
         Count_clientdisconnects(bcptr, UserStats);
+      } else if (!IsBouncerAlias(bcptr)) {
+        Count_remoteclientquits(UserStats, bcptr);
       }
       /* Release the held ghost's oper/inv count (flag-keyed). */
       userstats_count_clear(bcptr);
@@ -515,6 +620,11 @@ static void exit_one_client(struct Client* bcptr, const char* comment)
      * channel members reaches legacy peers anyway. */
     int64_t quit_time = 0;   /* presence stamp for the removals below */
     uint64_t quit_ms_for_rows = 0;
+    /* The QUIT of a face that leaves while its connection stays (a live
+     * client joining a bouncer session) is exit_face_departs() above: the
+     * same parts (channel QUIT, HISTORY_QUIT rows, presence time, WATCH
+     * logoff, the Q toward the links) under one msgid.  A change to what a
+     * QUIT carries here belongs there too. */
     if (!IsBouncerInternalDestroy(bcptr)) {
       char quit_msgid[64] = "";
       if (feature_bool(FEAT_MSGID)) {
@@ -609,16 +719,9 @@ static void exit_one_client(struct Client* bcptr, const char* comment)
   }
   else if (IsUnknown(bcptr) || IsConnecting(bcptr) || IsHandshake(bcptr)) {
     Count_unknowndisconnects(UserStats);
-    /* If this client was deferred awaiting EOB-drain (SASL completed
-     * mid-burst), remove from the queue so the drain doesn't deref a
-     * freed Client.  Idempotent; no-op if not queued. */
-    bounce_remove_pending_registration(bcptr);
+    /* (A client deferred awaiting the EOB drain leaves the pending queue
+     * in remove_client_from_list().) */
   }
-  /* Frontier-introducer cleanup: dying primary mustn't leave a stale
-   * pending-canon entry that would later try to emit N to legacy peers
-   * for a freed Client*.  Idempotent. */
-  bounce_pending_canon_unregister(bcptr);
-
   /* Legacy-face cleanup: if this Client was recorded as a session's
    * legacy face on any peer, clear that entry so the next emit re-
    * introduces a live face.  Walk all sessions for the account; for
@@ -669,37 +772,47 @@ static void exit_one_client(struct Client* bcptr, const char* comment)
           Debug((DEBUG_INFO, "Bouncer: destroy@exit-holding-killed sess=%s "
                  "client=%s aliases=%d",
                  bsess->hs_sessid, cli_name(bcptr), bsess->hs_alias_count));
+          bounce_crdt_tombstone_owned(bsess);   /* doc tombstones while bcptr still proves ownership */
           bsess->hs_client = NULL;
           if (bsess->hs_alias_count > 0) {
             int i;
             for (i = bsess->hs_alias_count - 1; i >= 0; i--) {
               struct Client *alias = findNUser(bsess->hs_aliases[i].ba_numeric);
-              if (alias)
+              /* Only aliases, and never the client being exited here: a
+               * roster entry that names it would exit it twice. */
+              if (alias && alias != bcptr && IsBouncerAlias(alias))
                 exit_client(alias, alias, &me,
                             comment && *comment ? comment : "Session killed");
             }
           }
           bounce_broadcast(bsess, 'X', NULL);
           bounce_destroy(bsess);
-        } else if (bsess->hs_alias_count > 0) {
-          /* Ghost exited via clean path (hold expiry, internal cleanup)
-           * while aliases exist.  Promote before we lose the ghost
-           * reference — promote needs hs_client to remove ghost from
-           * channels silently. */
-          bounce_promote_alias(bsess, 0);
-          /* hs_client now points to the promoted alias, not the ghost.
-           * exit_one_client continues: ghost has no channels → no QUIT. */
+        } else if (bounce_session_has_live_alias(bsess)
+                   && bounce_promote_alias(bsess, 0) == 0) {
+          /* Ghost exited via a clean path while a live device of its own
+           * copy remains: promoted before we lose the ghost reference --
+           * promote needs hs_client to remove the ghost from channels
+           * silently.  hs_client now points to the promoted alias, not
+           * the ghost; exit_one_client continues: the ghost has no
+           * channels, so no QUIT. */
         } else {
-          /* No aliases — ghost is the only thing keeping the session
-           * alive.  Destroy to prevent dangling pointers. */
+          /* Nothing of its own copy took over -- no alias, or only
+           * another copy's devices, which follow their own primary (the
+           * hold expiry ends such a copy the same way).  The ghost was
+           * the only thing keeping the session: end it everywhere, or the
+           * record would stay HOLDING with no primary and no timer. */
           Debug((DEBUG_INFO, "Bouncer: destroy@exit-holding-no-aliases sess=%s "
-                 "client=%s",
-                 bsess->hs_sessid, cli_name(bcptr)));
+                 "client=%s aliases=%d",
+                 bsess->hs_sessid, cli_name(bcptr), bsess->hs_alias_count));
+          bounce_crdt_tombstone_owned(bsess);   /* doc tombstones while bcptr still proves ownership */
           bsess->hs_client = NULL;
           bounce_broadcast(bsess, 'X', NULL);
           bounce_destroy(bsess);
         }
       } else if (bsess->hs_state == BOUNCE_ACTIVE) {
+        /* Ownership read before the slot is cleared: only the branches
+         * below that end the session tombstone its doc records. */
+        struct Client *owner = bsess->hs_client;
         bsess->hs_client = NULL;
         if (HasFlag(bcptr, FLAG_KILLED)) {
           /* KILL: force-destroy session regardless of aliases */
@@ -710,11 +823,16 @@ static void exit_one_client(struct Client* bcptr, const char* comment)
             int i;
             for (i = bsess->hs_alias_count - 1; i >= 0; i--) {
               struct Client *alias = findNUser(bsess->hs_aliases[i].ba_numeric);
-              if (alias)
+              /* Only aliases, and never the client being exited here: a
+               * roster entry that names it would exit it twice. */
+              if (alias && alias != bcptr && IsBouncerAlias(alias))
                 exit_client(alias, alias, &me,
                             comment && *comment ? comment : "Session killed");
             }
           }
+          bsess->hs_client = owner;            /* doc tombstones while it */
+          bounce_crdt_tombstone_owned(bsess);  /* still proves ownership */
+          bsess->hs_client = NULL;
           bounce_broadcast(bsess, 'X', NULL);
           bounce_destroy(bsess);
         } else if (MyUser(bcptr) && bounce_enabled_for(bcptr)
@@ -723,6 +841,9 @@ static void exit_one_client(struct Client* bcptr, const char* comment)
           Debug((DEBUG_INFO, "Bouncer: destroy@exit-active-orphan sess=%s "
                  "client=%s",
                  bsess->hs_sessid, cli_name(bcptr)));
+          bsess->hs_client = owner;            /* doc tombstones while it */
+          bounce_crdt_tombstone_owned(bsess);  /* still proves ownership */
+          bsess->hs_client = NULL;
           bounce_broadcast(bsess, 'X', NULL);
           bounce_destroy(bsess);
         }
@@ -740,6 +861,7 @@ static void exit_one_client(struct Client* bcptr, const char* comment)
    * pointing at the dying Client so subsequent recompute/lookup paths
    * don't UAF-deref. */
   bounce_null_hs_client_pointing_at(bcptr);
+  bounce_null_alias_primary_pointing_at(bcptr);
 
   /*
    * Update IPregistry
@@ -910,6 +1032,7 @@ int exit_client(struct Client *cptr,
   struct DLink *dlp;
   time_t on_for;
   int crdt_resync_subtree = 0;   /* R3: prompt re-materialize of a mesh-reachable reaped subtree */
+  int quit_armed = 0;   /* this exit armed the QUIT's S2S msgid/time */
 
   char comment1[HOSTLEN + HOSTLEN + 2];
   assert(killer);
@@ -919,10 +1042,12 @@ int exit_client(struct Client *cptr,
 
     /* WebSocket farewell (best effort): label the close with the exit
      * reason so browser clients can distinguish a server-side close
-     * from a network cut (otherwise every death is a bare 1006).
-     * Dead sockets can't be written to -- skip. */
+     * from a network cut (otherwise every death is a bare 1006), unless
+     * a refusal or the client's own Close already set the status.
+     * close_connection() below sends it, after the ERROR line queued
+     * here.  Dead sockets can't be written to -- skip. */
     if (IsWebSocket(victim) && !IsDead(victim) && cli_fd(victim) >= 0)
-      websocket_send_close(victim, 1000, comment);
+      websocket_set_close(victim, 1000, comment);
 
     if (feature_bool(FEAT_CONNEXIT_NOTICES) && IsUser(victim))
       sendto_opmask_butone_global(&me, SNO_CONNEXIT,
@@ -1042,16 +1167,20 @@ int exit_client(struct Client *cptr,
     sendto_opmask_butone(0, SNO_NETWORK, "Net break: %C %C (%s)",
 			 cli_serv(victim)->up, victim, comment);
 
-    /* Clear legacy_face records keyed by the departing peer's YXX.
-     * Without this, a peer that reconnects on the same numeric is treated
-     * as having already received our N introductions — bounce_emit_
-     * legacy_n_intro skips the emit and the peer's burst arrives with
-     * channel members referencing unannounced numerics. */
+    /* Clear legacy_face records keyed by the departing peer's YXX: they
+     * name faces of the link that left (CHECK shows them; no emit reads
+     * them). */
     bounce_clear_legacy_faces_for_peer(cli_yxx(victim));
+    /* And the session ids BS C left unmirrored that the departing
+     * servers announced: their next burst announces them again.  Nor do
+     * their clients carry, any more, the id a session of ours beat. */
+    bounce_unmirrored_clear_for_server(victim);
+    bounce_peer_sessid_clear_for_server(victim);
 
-    /* Prepare alias promotions: mark sessions where the managing server
-     * is departing and surviving aliases exist. Sets hs_promoting to
-     * suppress bounce_sync_alias_part() during exit_downlinks(). */
+    /* Prepare alias promotions: mark sessions whose primary leaves with
+     * the departing server and that have surviving aliases. Sets
+     * hs_promoting to suppress bounce_sync_alias_part() during
+     * exit_downlinks(). */
     bounce_prepare_squit_promotions(victim);
 
     /* Execute promotions BEFORE the SQUIT broadcast loop below.
@@ -1103,7 +1232,7 @@ int exit_client(struct Client *cptr,
      * (the gateway's .2 leg), so a gateway-local alias destroy still notifies .2. */
     if (feature_bool(FEAT_CRDT_BOUNCER_DOC) && IsBouncerAlias(victim))
       sendcmdto_set_skip_crdt_servers();
-    sendcmdto_serv_butone(&me, CMD_BOUNCER_TRANSFER, cli_from(killer),
+    sendcmdto_serv_butone_v3(&me, CMD_BOUNCER_TRANSFER, cli_from(killer),
                           "X %s", client_full);
   }
 
@@ -1143,7 +1272,7 @@ int exit_client(struct Client *cptr,
                 * a QUIT sourced from it references an unknown user (un-routable).  Its
                 * removal rides the doc to other CRDT peers; legacy already considers
                 * it gone from the earlier server SQUIT. */
-               && !(feature_bool(FEAT_CRDT_PRIMARY)
+               && !(crdt_primary_on()
                     && (IsCrdtAware(dlp->value.cptr) || crdt_user_is_mesh_only(victim)))) {
 	/* Held ghosts: BX X already handled the silent destroy on
 	 * IRCv3-aware peers; non-IRCv3-aware peers don't process BX X
@@ -1155,12 +1284,31 @@ int exit_client(struct Client *cptr,
 	 *
 	 * FLAG_BOUNCER_INTERNAL_DESTROY also suppresses Q here — same
 	 * effect as FLAG_KILLED for Q-suppression purposes, but without
-	 * the network-KILL session-destroy semantics (invariant #12). */
-	sendcmdto_set_s2s_cptr(victim);
+	 * the network-KILL session-destroy semantics (invariant #12).
+	 *
+	 * The QUIT carries its own msgid and time to every downlink.  A
+	 * local victim's are its exit pre-stamp above, armed per downlink
+	 * as the event's override (each send consumes it): a local
+	 * client's stash is no link's, so the tag source's inbound-link
+	 * gate would never admit it.  A remote victim's are its own QUIT
+	 * line's tags: its link is the inbound one while that line is
+	 * handled. */
+	if (MyConnect(victim)) {
+	  sendcmdto_set_s2s_tags(cli_s2s_time_ms(victim), cli_s2s_msgid(victim));
+	  quit_armed = 1;
+	} else
+	  sendcmdto_set_s2s_cptr(victim);
 	sendcmdto_one(victim, CMD_QUIT, dlp->value.cptr, ":%s", comment);
       }
     }
   }
+  /* sendcmdto_one consumes the armed msgid/time on its fast path, but
+   * not when a session-id hint sends it down the general path, and an
+   * exit from a timer (a ping-out, a hold expiry) has no per-line reset
+   * after it: clear the QUIT's arm here so it cannot stamp a later,
+   * unrelated server-bound line. */
+  if (quit_armed)
+    sendcmdto_set_s2s_tags(0, NULL);
   /* Then remove the client structures */
   if (IsServer(victim)) {
     char netsplit_batch_id[32] = "";
@@ -1232,7 +1380,7 @@ int exit_client(struct Client *cptr,
      * to us) has its users reaped here, leaving them orphaned (in-doc, not live) until
      * the next ~30s verify tick -> live unicast to them drops across the window.  Flag
      * a prompt re-materialize once victim is fully gone (below). */
-    crdt_resync_subtree = feature_bool(FEAT_CRDT_PRIMARY);
+    crdt_resync_subtree = crdt_primary_on();
   }
   exit_one_client(victim, comment);
 

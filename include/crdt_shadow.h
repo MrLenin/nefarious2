@@ -132,6 +132,19 @@ static inline int crdt_accept_beyond_horizon(int from_is_mesh_stub,
 /** Initialise the shadow CRDT document for this server and arm the periodic
  *  verify timer. Idempotent; safe to call once at startup. */
 void crdt_shadow_init(uint16_t my_numeric);
+/** CRDT_ENABLED as latched at boot: what the 'C' flag advertises. */
+int crdt_shadow_boot_enabled(void);
+/** CRDT_ENABLED's feature notify: warns that a change waits for restart. */
+void crdt_shadow_enabled_changed(void);
+/** Doc-primary mode: the shadow is on (latched at boot) and CRDT_PRIMARY was
+ *  on at boot.  Every tree path withheld from C peers keys on this, so a node
+ *  whose shadow is off never skips C peers while minting nothing. */
+int crdt_primary_on(void);
+/** CRDT_PRIMARY's feature notify: warns that a change waits for restart. */
+void crdt_shadow_primary_changed(void);
+/** A ban-class cutover (FEAT_CRDT_GLINE/SHUN/ZLINE/JUPE_CUTOVER) is in force
+ *  only under doc-primary mode. */
+#define CrdtCutoverOn(feat) (crdt_primary_on() && feature_bool(feat))
 
 /** Mirror a channel join (called from add_user_to_channel). @a flags are the
  *  membership flags so the bridge can skip bouncer aliases. */
@@ -141,6 +154,8 @@ void crdt_shadow_join(struct Channel *chptr, struct Client *who,
 /** Mirror a channel part/kick/quit-from-channel (called from
  *  remove_user_from_channel, for non-alias members). */
 void crdt_shadow_part(struct Channel *chptr, struct Client *who);
+/** Arm the part comment for the next crdt_shadow_part only (NULL = none). */
+void crdt_shadow_part_reason(const char *reason);
 
 /** Phase 3j: mark a channel's CRDT creationtime incarnation boundary (called from
  *  destruct_channel). Bumps the LOCAL ctime_del so a later recreate to a higher TS
@@ -181,6 +196,9 @@ int crdt_shadow_bsess_present(const char *account, const char *sessid);
  *  the replica-reap gate.  Absent != removed: a legacy-primaried or not-yet-synced
  *  session is absent, not tombstoned, and must be spared. */
 int crdt_shadow_bsess_removed(const char *account, const char *sessid);
+/** The bsess tombstone's writer: 1 and *@a by set when the record is removed. */
+int crdt_shadow_bsess_removed_by(const char *account, const char *sessid,
+                                 uint16_t *by);
 /** M6c-1 BX Inc-2: 1 iff a non-tombstone bconns doc record exists (alias-reap gate). */
 int crdt_shadow_bconn_present(const char *account, const char *sessid,
                              const char *connnum);
@@ -310,6 +328,10 @@ int crdt_shadow_beacon_record(unsigned int num, time_t emit_ts,
  *  server @a num because a fresh lower-numeric gateway also fronts it (double-delivery
  *  election).  @a my_yxx = our own server numeric.  0 when we are the active emitter. */
 int crdt_shadow_should_standby(unsigned int num, const char *my_yxx);
+/** MR-4d per legacy link: is @a link a legacy server whose designated fronter
+ *  is another gateway, so this node re-emits nothing to it?  For
+ *  sendcmdto_set_skip_links, ahead of a gateway re-emit to legacy. */
+int crdt_legacy_link_standby(struct Client *link);
 
 /** MR-5 event-driven beacon-burst: hand a freshly-linked CRDT @a peer the full current
  *  beacon set at link time (our self + proxy-legacy beacons, plus a replay of every fresh
@@ -431,13 +453,19 @@ void crdt_shadow_reconcile_tempshuns(void);
  *  DELETE store-walk). crdt_shadow_metadata_suspend toggles the single-writer guard so
  *  a P10-relayed apply (ms_metadata) does NOT re-mirror. Additive (P10 MD not
  *  suppressed). */
+struct md_stamp;
+/** @a st: the stamped row's own stamp (metadata_write_versioned's), carried as the
+ *  doc entry's HLC so the doc and the store order the row's writes alike; NULL = a
+ *  fresh doc event. */
 void crdt_shadow_metadata_set(const char *account, const char *key,
-                              const char *value, int permanent);
+                              const char *value, int permanent,
+                              const struct md_stamp *st);
 /** Mint a doc metadata tombstone for a pre-formed storage key (account\0key). Raw-key
  *  variant of crdt_shadow_metadata_set's delete branch, for metadata_account_clear's
  *  bulk store-delete (which bypasses the (account,key) chokepoint). Same gates; skips
  *  keys not doc-present. */
-void crdt_shadow_metadata_remove_key(const void *key, uint32_t klen);
+void crdt_shadow_metadata_remove_key(const void *key, uint32_t klen,
+                                     const struct md_stamp *st);
 void crdt_shadow_reconcile_metadata(void);
 void crdt_shadow_metadata_suspend(int on);
 /** Oper diagnostic (/CRDT key): print the raw doc metadata entry for

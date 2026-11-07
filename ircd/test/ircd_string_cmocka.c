@@ -612,6 +612,109 @@ static void test_utf8_clamp_null_safe(void **state)
   assert_int_equal(0, ircd_utf8_clamp(NULL, 5));
 }
 
+/* --- ircd_line_body_clamp --- */
+
+static void test_line_body_clamp_tagged(void **state)
+{
+  /* "@Axx " (5-byte tag region) + 600 x 'a', clamped to a 510-byte body. */
+  char line[700];
+  (void)state;
+  memcpy(line, "@Axx ", 5);
+  memset(line + 5, 'a', 600);
+  assert_int_equal(5 + 510, ircd_line_body_clamp(line, 605, 510));
+}
+
+static void test_line_body_clamp_untagged(void **state)
+{
+  /* No tag region: the whole line is the body. */
+  char line[600];
+  (void)state;
+  memset(line, 'a', 600);
+  assert_int_equal(510, ircd_line_body_clamp(line, 600, 510));
+}
+
+static void test_line_body_clamp_fits(void **state)
+{
+  /* "@A " (3-byte tag region) + a 510-byte body: already at the cap. */
+  char line[513];
+  (void)state;
+  memcpy(line, "@A ", 3);
+  memset(line + 3, 'a', 510);
+  assert_int_equal(513, ircd_line_body_clamp(line, 513, 510));
+}
+
+static void test_line_body_clamp_utf8(void **state)
+{
+  /* "@A " + 300 x (2-byte) 'e-acute': clamped to a 509-byte body backs
+   * off one byte to land on a lead byte, keeping 508 body bytes. */
+  char line[603];
+  int i;
+  (void)state;
+  memcpy(line, "@A ", 3);
+  for (i = 0; i < 300; i++) {
+    line[3 + 2 * i] = '\303';
+    line[3 + 2 * i + 1] = '\251';
+  }
+  assert_int_equal(3 + 508, ircd_line_body_clamp(line, 603, 509));
+}
+
+static void test_line_body_clamp_tag_no_space(void **state)
+{
+  /* A tag region with no trailing space has no body to measure. */
+  char line[701];
+  (void)state;
+  line[0] = '@';
+  memset(line + 1, 'a', 700);
+  assert_int_equal(701, ircd_line_body_clamp(line, 701, 510));
+}
+
+static void test_line_body_clamp_tagged_512_cap(void **state)
+{
+  /* Ruling P1: a tagged line's body cap is 512, not 510. */
+  char line[700];
+  (void)state;
+  memcpy(line, "@Axx ", 5);
+  memset(line + 5, 'a', 600);
+  assert_int_equal(5 + 512, ircd_line_body_clamp(line, 605, 512));
+}
+
+static void test_line_body_clamp_latin1_run(void **state)
+{
+  /* Not UTF-8: a Latin-1 / cp1252 run of 0x80-0xBF bytes ("\260" is the
+   * Latin-1 degree sign).  No lead byte within three bytes of the cut,
+   * so the back-off must not walk into the run: the cut stays at 510. */
+  char line[603];
+  (void)state;
+  memcpy(line, "@A ", 3);
+  memset(line + 3, '\260', 600);
+  assert_int_equal(3 + 510, ircd_line_body_clamp(line, 603, 510));
+}
+
+static void test_line_body_clamp_utf8_4byte(void **state)
+{
+  /* 150 x U+1F600 (F0 9F 98 80): a 511-byte cap lands on the third
+   * continuation byte of the 128th character, so the back-off takes all
+   * three bytes back to its lead byte and keeps 127 whole characters. */
+  char line[600];
+  int i;
+  (void)state;
+  for (i = 0; i < 150; i++)
+    memcpy(line + 4 * i, "\360\237\230\200", 4);
+  assert_int_equal(508, ircd_line_body_clamp(line, 600, 511));
+}
+
+static void test_line_body_clamp_stray_continuation(void **state)
+{
+  /* 'a' x 508, a complete U+00E9 (C3 A9), then a stray A9: the cut at 510
+   * lands on the stray byte, whose lead's sequence is already complete
+   * before the cut -- nothing is split, so the cut stays at 510. */
+  char line[514];
+  (void)state;
+  memset(line, 'a', 508);
+  memcpy(line + 508, "\303\251\251bbb", 6);
+  assert_int_equal(510, ircd_line_body_clamp(line, 514, 510));
+}
+
 /* --- string_is_valid_utf8 / string_sanitize_utf8 --- */
 
 /* A line as an IRC client actually sends it: CTCP delimiters and the mIRC
@@ -661,6 +764,7 @@ static void test_utf8_invalid_sequences(void **state)
   assert_int_equal(0, string_is_valid_utf8("\300\200"));             /* overlong NUL */
   assert_int_equal(0, string_is_valid_utf8("\301\277"));             /* overlong */
   assert_int_equal(0, string_is_valid_utf8("\340\200\200"));         /* overlong 3-byte */
+  assert_int_equal(0, string_is_valid_utf8("\360\200\200\200"));     /* overlong 4-byte */
   assert_int_equal(0, string_is_valid_utf8("\355\240\200"));         /* U+D800 surrogate */
   assert_int_equal(0, string_is_valid_utf8("\342\202"));             /* truncated 3-byte */
   assert_int_equal(0, string_is_valid_utf8("\364\220\200\200"));     /* > U+10FFFF */
@@ -756,6 +860,49 @@ static void test_utf8_sanitize_truncates_at_a_sequence_boundary(void **state)
   assert_true(n < BUFSIZE);
   assert_int_equal(n, (int)strlen(buf));
   assert_int_equal(1, string_is_valid_utf8(buf));
+}
+
+/* string_is_valid_utf8_len() checks exactly 'len' bytes, a U+0000 among
+ * them: a WebSocket TEXT payload or a Close reason is counted bytes, not
+ * a C string.  Checked as a C string, everything after the NUL went
+ * unseen (RFC 6455 §8.1 asks about the whole message). */
+static void test_utf8_valid_len_runs_past_nul(void **state)
+{
+  (void)state;
+  assert_int_equal(1, string_is_valid_utf8_len("ok\0fine", 7));
+  assert_int_equal(1, string_is_valid_utf8_len("\0", 1));
+  assert_int_equal(1, string_is_valid_utf8_len("caf\303\251\0\342\202\254", 10));
+  assert_int_equal(0, string_is_valid_utf8_len("ok\0\377", 4));         /* bad byte past the NUL */
+  assert_int_equal(0, string_is_valid_utf8_len("ok\0\303", 4));         /* truncated past the NUL */
+  assert_int_equal(0, string_is_valid_utf8_len("\0\0\355\240\200", 5)); /* surrogate past NULs */
+  assert_int_equal(0, string_is_valid_utf8_len("\0\360\200\200\200", 5)); /* overlong 4-byte past a NUL */
+}
+
+/* ...and no byte past 'len': a sequence the length cuts is invalid even
+ * when the bytes after it would complete it. */
+static void test_utf8_valid_len_stops_at_len(void **state)
+{
+  (void)state;
+  assert_int_equal(1, string_is_valid_utf8_len("", 0));
+  assert_int_equal(1, string_is_valid_utf8_len("\377", 0));               /* nothing to check */
+  assert_int_equal(1, string_is_valid_utf8_len("ab\377", 2));
+  assert_int_equal(0, string_is_valid_utf8_len("\342\202\254", 2));      /* U+20AC cut short */
+  assert_int_equal(0, string_is_valid_utf8_len("\360\237\222\251", 3)); /* U+1F4A9 cut short */
+  assert_int_equal(0, string_is_valid_utf8_len("x\303\251", 2));          /* U+00E9 cut short */
+  assert_int_equal(1, string_is_valid_utf8_len("\360\237\222\251", 4));
+
+  /* On the heap with no byte to spare, a read past the end is valgrind's */
+  {
+    static const unsigned char cut[] = { 'o', 'k', 0x00, 0xF0, 0x9F, 0x92 };
+    unsigned char *heap = malloc(sizeof(cut));
+    size_t n;
+
+    assert_non_null(heap);
+    memcpy(heap, cut, sizeof(cut));
+    for (n = 0; n <= sizeof(cut); n++)
+      assert_int_equal(n <= 3, string_is_valid_utf8_len((char *)heap, n));
+    free(heap);
+  }
 }
 
 
@@ -878,6 +1025,17 @@ int main(void)
         cmocka_unit_test(test_utf8_clamp_keeps_complete_sequence),
         cmocka_unit_test(test_utf8_clamp_null_safe),
 
+        /* ircd_line_body_clamp */
+        cmocka_unit_test(test_line_body_clamp_tagged),
+        cmocka_unit_test(test_line_body_clamp_untagged),
+        cmocka_unit_test(test_line_body_clamp_fits),
+        cmocka_unit_test(test_line_body_clamp_utf8),
+        cmocka_unit_test(test_line_body_clamp_tag_no_space),
+        cmocka_unit_test(test_line_body_clamp_tagged_512_cap),
+        cmocka_unit_test(test_line_body_clamp_latin1_run),
+        cmocka_unit_test(test_line_body_clamp_utf8_4byte),
+        cmocka_unit_test(test_line_body_clamp_stray_continuation),
+
         /* ircd_text_mentions */
         cmocka_unit_test(test_mentions_basic_and_case),
         cmocka_unit_test(test_mentions_boundaries),
@@ -899,6 +1057,8 @@ int main(void)
         cmocka_unit_test(test_utf8_sanitize_keeps_formatted_line_intact),
         cmocka_unit_test(test_utf8_sanitize_returns_minus_one_past_its_window),
         cmocka_unit_test(test_utf8_sanitize_truncates_at_a_sequence_boundary),
+        cmocka_unit_test(test_utf8_valid_len_runs_past_nul),
+        cmocka_unit_test(test_utf8_valid_len_stops_at_len),
     };
 
     return cmocka_run_group_tests(tests, NULL, NULL);

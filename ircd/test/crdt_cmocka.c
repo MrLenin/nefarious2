@@ -33,6 +33,15 @@
 #include "s2s_chunk.h"
 #include "crdt_shadow.h"    /* M12: force_lastmod (static inline, pure) */
 
+/* Stub for feature_int: crdt_hlc.c's hlc_max_forward_ms() reads
+ * FEAT_HLC_MAX_FORWARD_MS through it.  Present only so crdt_hlc.o links
+ * standalone (the crdt_hlc_bound_cmocka.c precedent). */
+int feature_int(int feat)
+{
+  (void)feat;
+  return 60000;  /* ircd_features.c's F_I(HLC_MAX_FORWARD_MS) default */
+}
+
 /* ------------------------------------------------------------------ */
 /* helpers                                                            */
 /* ------------------------------------------------------------------ */
@@ -687,6 +696,153 @@ static void test_gline_op_replicates(void **state)
   crdt_state_clear(&s2);
 }
 
+/* Stage-2 review: a stamped account row's own HLC rides the doc entry, so the doc
+ * and the store order one row's writes alike.  set_at keeps the given stamp
+ * (not a fresh local event), replicates it, moves the doc clock past it, and an
+ * older stamp loses to a newer one whichever arrives last. */
+static void test_metadata_set_at_keeps_row_stamp(void **state)
+{
+  struct CrdtNetworkState s1, s2;
+  char key[32];
+  const struct CrdtLWWValue *v;
+  uint64_t now = hlc_wall_clock_ms();
+  struct HLC newer = { now + 1000, 3, 7 };   /* inside the 60 s forward bound */
+  struct HLC older = { now - 1000, 0, 9 };
+  struct HLC far = { now + 3600000ULL, 0, 7 };  /* an hour ahead: beyond it */
+  struct HLC dts;
+  uint32_t klen;
+  (void)state;
+
+  memcpy(key, "bob", 3); key[3] = '\0'; memcpy(key + 4, "umode.invisible", 15);
+  klen = 3 + 1 + 15;
+  crdt_state_init(&s1, 1);
+  crdt_state_init(&s2, 2);
+
+  crdt_metadata_set_at(&s1, key, klen, "P:1", 3, &newer, now, 60000);
+  v = crdt_metadata_get(&s1, key, klen);
+  assert_non_null(v);
+  assert_int_equal(0, hlc_compare(&v->ts, &newer));
+  assert_true(hlc_compare(&s1.clock, &newer) >= 0);   /* the doc clock moved past it */
+
+  crdt_state_sync(&s2, &s1);
+  v = crdt_metadata_get(&s2, key, klen);
+  assert_non_null(v);
+  assert_int_equal(0, hlc_compare(&v->ts, &newer));
+
+  /* An older row arriving later (a delayed gateway import) does not win. */
+  crdt_metadata_set_at(&s2, key, klen, "P:0", 3, &older, now, 60000);
+  v = crdt_metadata_get(&s2, key, klen);
+  assert_non_null(v);
+  assert_memory_equal("P:1", v->data, 3);
+
+  /* A stamped delete keeps its stamp, readable for the store heal. */
+  crdt_metadata_del_at(&s1, key, klen, &(struct HLC){ now + 2000, 0, 7 }, now, 60000);
+  assert_int_equal(1, crdt_lwwmap_deleted_ts(&s1.metadata, key, klen, &dts));
+  assert_int_equal(now + 2000, dts.physical_ms);
+
+  /* A stamp beyond the forward bound does not drag the doc clock. */
+  crdt_metadata_set_at(&s2, key, klen, "P:2", 3, &far, now, 60000);
+  assert_true(s2.clock.physical_ms < far.physical_ms);
+
+  crdt_state_clear(&s1);
+  crdt_state_clear(&s2);
+}
+
+
+/* The tombstone (or live) entry for a key, read straight from the map:
+ * crdt_lwwmap_get hides deleted entries and the digest skips them. */
+static const struct CrdtLWWEntry *lww_entry(const struct CrdtLWWMap *m,
+                                            const char *key, uint32_t klen)
+{
+  uint32_t b;
+  const struct CrdtLWWEntry *e;
+  for (b = 0; b < m->nbuckets; b++)
+    for (e = m->buckets[b]; e; e = e->ht_next)
+      if (e->key_len == klen && 0 == memcmp(e->key, key, klen))
+        return e;
+  return NULL;
+}
+
+/* Two servers that each mint the same stamped row (each took it over its own
+ * W4 link) must end with one entry and equal digests.  The writer comes from
+ * the stamp, not the minting server, so the copies are bit-identical; with
+ * each server's own numeric there, an equal ts never replaces and the digests
+ * would differ for good (anti-entropy re-sending CR F every tick). */
+static void test_metadata_same_stamp_mints_converge(void **state)
+{
+  struct CrdtNetworkState s1, s2, s3, s4;
+  char key[32];
+  const struct CrdtLWWEntry *e;
+  unsigned char *buf = malloc(1 << 16);
+  uint64_t now = hlc_wall_clock_ms();
+  struct HLC row = { now - 500, 2, 9 };       /* stamped by server 9 */
+  struct HLC gone = { now - 100, 0, 9 };
+  uint32_t klen;
+  int n;
+  (void)state;
+
+  assert_non_null(buf);
+  memcpy(key, "bob", 3); key[3] = '\0'; memcpy(key + 4, "avatar", 6);
+  klen = 3 + 1 + 6;
+  crdt_state_init(&s1, 1);
+  crdt_state_init(&s2, 2);
+  crdt_state_init(&s3, 3);
+  crdt_state_init(&s4, 4);
+
+  /* Both mint the same stamped row, then sync both ways. */
+  crdt_metadata_set_at(&s1, key, klen, "P:x", 3, &row, now, 60000);
+  crdt_metadata_set_at(&s2, key, klen, "P:x", 3, &row, now, 60000);
+  crdt_state_sync(&s2, &s1);
+  crdt_state_sync(&s1, &s2);
+  e = lww_entry(&s1.metadata, key, klen);
+  assert_non_null(e); assert_int_equal(9, e->val.writer);
+  e = lww_entry(&s2.metadata, key, klen);
+  assert_non_null(e); assert_int_equal(9, e->val.writer);
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+
+  /* The op carries the stamp's writer too: a third server that learns the
+   * row only by delta replay records 9, not 1. */
+  crdt_state_sync(&s3, &s1);
+  e = lww_entry(&s3.metadata, key, klen);
+  assert_non_null(e); assert_int_equal(9, e->val.writer);
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s3));
+
+  /* A stamped delete minted on both: the tombstones match in ts and writer,
+   * through delta replay (twice, as duplicates arrive) and a snapshot. */
+  crdt_metadata_del_at(&s1, key, klen, &gone, now, 60000);
+  crdt_metadata_del_at(&s2, key, klen, &gone, now, 60000);
+  crdt_state_sync(&s2, &s1);
+  crdt_state_sync(&s1, &s2);
+  crdt_state_sync(&s2, &s1);
+  crdt_state_sync(&s3, &s2);
+  {
+    struct CrdtNetworkState *all[3] = { &s1, &s2, &s3 };
+    int i;
+    for (i = 0; i < 3; i++) {
+      e = lww_entry(&all[i]->metadata, key, klen);
+      assert_non_null(e);
+      assert_int_equal(1, e->deleted);
+      assert_int_equal(0, hlc_compare(&e->val.ts, &gone));
+      assert_int_equal(9, e->val.writer);
+    }
+  }
+  n = crdt_snapshot_encode(&s1, buf, 1 << 16);
+  assert_true(n > 0);
+  assert_true(crdt_snapshot_apply(&s4, buf, (size_t)n) >= 0);
+  assert_true(crdt_snapshot_apply(&s4, buf, (size_t)n) >= 0);   /* a duplicate */
+  e = lww_entry(&s4.metadata, key, klen);
+  assert_non_null(e);
+  assert_int_equal(1, e->deleted);
+  assert_int_equal(9, e->val.writer);
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+
+  free(buf);
+  crdt_state_clear(&s1);
+  crdt_state_clear(&s2);
+  crdt_state_clear(&s3);
+  crdt_state_clear(&s4);
+}
+
 /* ================================================================== */
 /* Tier C F2-b: account metadata as a plain HLC-LWW doc collection keyed by the
  * opaque account\0key composite (variable-length blob value). SET replicates via
@@ -910,9 +1066,101 @@ static void test_bsess_op_replicates(void **state)
   crdt_state_sync(&s2, &s1);
   assert_int_equal(1, crdt_bsess_is_explicitly_removed(&s2, ACC, SID));
   assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+  /* the tombstone names the holder that wrote it (the replica reap ends a
+   * record following a remote primary only on that primary's holder's) */
+  {
+    uint16_t by = 0;
+    assert_int_equal(1, crdt_bsess_removed_by(&s2, ACC, SID, &by));
+    assert_int_equal(s1.my_numeric, by);
+    assert_int_equal(0, crdt_bsess_removed_by(&s2, ACC, "nosuch", &by));
+  }
 
   crdt_state_clear(&s1);
   crdt_state_clear(&s2);
+}
+
+/* Equal-stamp tie in the doc's LWW map: a live write beats a tombstone and
+ * the larger value bytes win, whichever arrives first (md_lww_take agrees). */
+static void lww_tie_apply(struct CrdtLWWMap *m, int order)
+{
+  struct HLC ts = { 5000, 3, 7 };
+  int i;
+  for (i = 0; i < 3; i++)
+    switch ((i + order) % 3) {
+    case 0: crdt_lwwmap_set(m, "k", 1, "*:abc", 5, ts, 7); break;
+    case 1: crdt_lwwmap_set(m, "k", 1, "P:abc", 5, ts, 7); break;
+    case 2: crdt_lwwmap_delete(m, "k", 1, ts, 7); break;
+    }
+}
+
+static void test_lww_equal_stamp_tie(void **state)
+{
+  (void)state;
+  int order;
+  for (order = 0; order < 3; order++) {
+    struct CrdtLWWMap m;
+    const struct CrdtLWWValue *v;
+    crdt_lwwmap_init(&m);
+    lww_tie_apply(&m, order);
+    v = crdt_lwwmap_get(&m, "k", 1);
+    assert_non_null(v);
+    assert_int_equal(5, v->data_len);
+    assert_memory_equal(v->data, "P:abc", 5);
+    crdt_lwwmap_clear(&m);
+  }
+  {
+    struct CrdtLWWMap m;                          /* longer wins a prefix tie */
+    struct HLC ts = { 5000, 3, 7 };
+    crdt_lwwmap_init(&m);
+    crdt_lwwmap_set(&m, "k", 1, "ab", 2, ts, 7);
+    assert_int_equal(1, crdt_lwwmap_set(&m, "k", 1, "abc", 3, ts, 7));
+    assert_int_equal(0, crdt_lwwmap_set(&m, "k", 1, "ab", 2, ts, 7));
+    assert_int_equal(0, crdt_lwwmap_set(&m, "k", 1, "abc", 3, ts, 7)); /* same: no-op */
+    assert_int_equal(0, crdt_lwwmap_delete(&m, "k", 1, ts, 7));
+    assert_int_equal(3, crdt_lwwmap_get(&m, "k", 1)->data_len);
+    crdt_lwwmap_clear(&m);
+  }
+}
+
+/* The GC hold keeps a stable bsess DELETE op, and so its tombstone, only
+ * while the op still backs the tombstone: a later SET frees it. */
+static int gc_hold_all(uint8_t coll, const char *key, uint32_t key_len)
+{
+  (void)coll; (void)key; (void)key_len;
+  return 1;
+}
+
+static void test_bsess_gc_hold(void **state)
+{
+  (void)state;
+  static struct CrdtStateVector stable;
+  struct CrdtNetworkState s;
+  struct CrdtBouncerSession rec;
+  int i;
+  for (i = 0; i < CRDT_MAX_SERVERS; i++)
+    stable.seq[i] = UINT64_MAX;
+  memset(&rec, 0, sizeof rec);
+
+  crdt_state_init(&s, 4);                       /* no hold: collected */
+  crdt_bsess_set(&s, "alice", "Bxxx", &rec);
+  crdt_bsess_del(&s, "alice", "Bxxx");
+  crdt_state_gc(&s, &stable);
+  assert_int_equal(0, (int)s.oplog.count);
+  assert_false(crdt_bsess_is_explicitly_removed(&s, "alice", "Bxxx"));
+  crdt_state_clear(&s);
+
+  crdt_state_init(&s, 4);
+  s.gc_hold = gc_hold_all;
+  crdt_bsess_set(&s, "alice", "Bxxx", &rec);
+  crdt_bsess_del(&s, "alice", "Bxxx");
+  crdt_state_gc(&s, &stable);
+  assert_int_equal(1, (int)s.oplog.count);      /* the DELETE stays */
+  assert_true(crdt_bsess_is_explicitly_removed(&s, "alice", "Bxxx"));
+  crdt_bsess_set(&s, "alice", "Bxxx", &rec);    /* superseded */
+  crdt_state_gc(&s, &stable);
+  assert_int_equal(0, (int)s.oplog.count);
+  assert_non_null(crdt_bsess_get(&s, "alice", "Bxxx"));
+  crdt_state_clear(&s);
 }
 
 /* 5-5e M3: crdt_bsess_winner derives the cross-sessid election winner (strcmp-lowest
@@ -1480,6 +1728,36 @@ static void test_kick_info_replicates_and_hlc_gates(void **state)
   mv = crdt_lwwmap_get(&s2.members_status, key, klen);
   assert_true(hlc_compare(&mv->ts, &kv->ts) > 0);    /* join newer -> kick stale */
 
+  crdt_state_clear(&s1);
+  crdt_state_clear(&s2);
+}
+
+/* A rejoin's kick-record delete replicates, so a plain PART after kick+rejoin is
+ * not read back as the old kick on a peer (the members_status gate alone fails
+ * once delete-on-leave has removed the status the rejoin wrote). */
+static void test_kick_info_remove_replicates(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s1, s2;
+  struct CrdtKickInfo ki;
+  uint64_t seq;
+  crdt_state_init(&s1, 4);
+  crdt_state_init(&s2, 3);
+  memset(&ki, 0, sizeof ki);
+  strcpy(ki.kicker, "DAAAA");
+  strcpy(ki.reason, "out");
+  crdt_kick_info_set(&s1, "#c", "DAAAB", &ki);
+  assert_true(crdt_state_sync(&s2, &s1) >= 0);
+  assert_non_null(crdt_kick_info_get(&s2, "#c", "DAAAB"));
+  crdt_kick_info_remove(&s1, "#c", "DAAAB");
+  assert_null(crdt_kick_info_get(&s1, "#c", "DAAAB"));
+  seq = s1.next_seq;
+  crdt_kick_info_remove(&s1, "#c", "DAAAB");        /* no live record: no op */
+  crdt_kick_info_remove(&s1, "#c", "DAAAZ");
+  assert_int_equal(seq, s1.next_seq);
+  assert_true(crdt_state_sync(&s2, &s1) >= 0);
+  assert_null(crdt_kick_info_get(&s2, "#c", "DAAAB"));
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
   crdt_state_clear(&s1);
   crdt_state_clear(&s2);
 }
@@ -2467,6 +2745,125 @@ static void test_user_remove_reason_rides_delete(void **state)
   assert_int_equal(0, crdt_user_quit_reason_take(&s2, "DAAAC", why, sizeof why)); /* none carried */
   /* value-less tombstones on both sides: the doc digests agree */
   assert_int_equal(0, memcmp(&s1.users.entry_count, &s2.users.entry_count, sizeof s1.users.entry_count));
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+
+  crdt_state_clear(&s1);
+  crdt_state_clear(&s2);
+}
+
+/* The part comment rides the member's first REMOVE op (the OR-Set keeps no value):
+ * the receiver parks it once per leave, a reason-less PART and a KICK park none,
+ * and the digests still agree. */
+static void test_chan_part_reason_rides_remove(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s1, s2;
+  char why[CRDT_PARTREASON_LEN];
+  int i;
+  crdt_state_init(&s1, 4);
+  crdt_state_init(&s2, 3);
+
+  for (i = 0; i < 3; i++) {                  /* join churn: three add-tags for DAAAB */
+    crdt_chan_join(&s1, "#c", "DAAAB");
+    if (i < 2) crdt_chan_remove(&s1, "#c", "DAAAB", CRDT_PRIORITY_USER);
+  }
+  crdt_chan_join(&s1, "#c", "DAAAC");
+  crdt_chan_join(&s1, "#c", "DAAAD");
+  assert_true(crdt_state_sync(&s2, &s1) >= 0);
+
+  crdt_chan_remove_reason(&s1, "#c", "DAAAB", CRDT_PRIORITY_USER, "off to lunch");
+  crdt_chan_remove(&s1, "#c", "DAAAC", CRDT_PRIORITY_USER);              /* no reason */
+  crdt_chan_remove_reason(&s1, "#c", "DAAAD", CRDT_PRIORITY_CHANOP, "kicked"); /* not a part */
+  assert_int_equal(0, crdt_chan_part_reason_take(&s1, "#c", "DAAAB", why, sizeof why)); /* origin parks nothing */
+  assert_true(crdt_state_sync(&s2, &s1) >= 0);
+  why[0] = '\0';
+  assert_int_equal(1, crdt_chan_part_reason_take(&s2, "#c", "DAAAB", why, sizeof why));
+  assert_string_equal(why, "off to lunch");
+  assert_int_equal(0, crdt_chan_part_reason_take(&s2, "#c", "DAAAB", why, sizeof why)); /* once */
+  assert_int_equal(0, crdt_chan_part_reason_take(&s2, "#c", "DAAAC", why, sizeof why));
+  assert_int_equal(0, crdt_chan_part_reason_take(&s2, "#c", "DAAAD", why, sizeof why));
+  assert_int_equal(0, crdt_chan_part_reason_take(&s2, "#other", "DAAAB", why, sizeof why));
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+  assert_true(crdt_state_digest_materialized(&s1) == crdt_state_digest_materialized(&s2));
+
+  crdt_state_clear(&s1);
+  crdt_state_clear(&s2);
+}
+
+/* A part reason over the cap is cut on a UTF-8 boundary, never inside a
+ * sequence. */
+static void test_chan_part_reason_utf8_cut(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s1, s2;
+  char why[CRDT_PARTREASON_LEN], longr[CRDT_PARTREASON_LEN + 8];
+  crdt_state_init(&s1, 4);
+  crdt_state_init(&s2, 3);
+  crdt_chan_join(&s1, "#c", "DAAAB");
+  assert_true(crdt_state_sync(&s2, &s1) >= 0);
+  memset(longr, 'a', CRDT_PARTREASON_LEN - 2);
+  strcpy(longr + CRDT_PARTREASON_LEN - 2, "\xc3\xa9tail");  /* e-acute straddles the cap */
+  crdt_chan_remove_reason(&s1, "#c", "DAAAB", CRDT_PRIORITY_USER, longr);
+  assert_true(crdt_state_sync(&s2, &s1) >= 0);
+  assert_int_equal(1, crdt_chan_part_reason_take(&s2, "#c", "DAAAB", why, sizeof why));
+  assert_int_equal(CRDT_PARTREASON_LEN - 2, strlen(why));
+  crdt_state_clear(&s1);
+  crdt_state_clear(&s2);
+}
+
+/* A parked part reason never outlives the leave it describes: a rejoin in the
+ * same delta drops it, the newest reason for a member wins, CR/LF never reach
+ * the parked text, one delta can park more reasons than any fixed ring held,
+ * and the end-of-pass clear empties the store. */
+static void test_chan_part_reason_lifetime(void **state)
+{
+  (void)state;
+  struct CrdtNetworkState s1, s2;
+  char why[CRDT_PARTREASON_LEN], num[16];
+  int i;
+  crdt_state_init(&s1, 4);
+  crdt_state_init(&s2, 3);
+
+  /* PART "brb", rejoin, PART with no comment (e.g. suppressed by +m): nothing */
+  crdt_chan_join(&s1, "#c", "DAAAB");
+  crdt_chan_remove_reason(&s1, "#c", "DAAAB", CRDT_PRIORITY_USER, "brb");
+  crdt_chan_join(&s1, "#c", "DAAAB");
+  crdt_chan_remove(&s1, "#c", "DAAAB", CRDT_PRIORITY_USER);
+  /* PART "brb", rejoin, PART "bye": the second reason */
+  crdt_chan_join(&s1, "#c", "DAAAC");
+  crdt_chan_remove_reason(&s1, "#c", "DAAAC", CRDT_PRIORITY_USER, "brb");
+  crdt_chan_join(&s1, "#c", "DAAAC");
+  crdt_chan_remove_reason(&s1, "#c", "DAAAC", CRDT_PRIORITY_USER, "bye");
+  /* PART "old", rejoin: still a member, nothing parked */
+  crdt_chan_join(&s1, "#c", "DAAAD");
+  crdt_chan_remove_reason(&s1, "#c", "DAAAD", CRDT_PRIORITY_USER, "old");
+  crdt_chan_join(&s1, "#c", "DAAAD");
+  /* a reason with an embedded line break is cut at it */
+  crdt_chan_join(&s1, "#c", "DAAAE");
+  crdt_chan_remove_reason(&s1, "#c", "DAAAE", CRDT_PRIORITY_USER, "a\r\nPRIVMSG #c :x");
+  /* more leaves in one delta than the old 64-slot ring */
+  for (i = 0; i < 100; i++) {
+    snprintf(num, sizeof num, "DAB%02d", i);
+    crdt_chan_join(&s1, "#big", num);
+    crdt_chan_remove_reason(&s1, "#big", num, CRDT_PRIORITY_USER, num);
+  }
+  assert_true(crdt_state_sync(&s2, &s1) >= 0);
+
+  assert_int_equal(0, crdt_chan_part_reason_take(&s2, "#c", "DAAAB", why, sizeof why));
+  assert_int_equal(1, crdt_chan_part_reason_take(&s2, "#c", "DAAAC", why, sizeof why));
+  assert_string_equal(why, "bye");
+  assert_int_equal(0, crdt_chan_part_reason_take(&s2, "#c", "DAAAC", why, sizeof why));
+  assert_int_equal(0, crdt_chan_part_reason_take(&s2, "#c", "DAAAD", why, sizeof why));
+  assert_int_equal(1, crdt_chan_part_reason_take(&s2, "#c", "DAAAE", why, sizeof why));
+  assert_string_equal(why, "a");
+  for (i = 0; i < 100; i++) {
+    snprintf(num, sizeof num, "DAB%02d", i);
+    if (i == 50) break;                       /* leave half parked for the clear */
+    assert_int_equal(1, crdt_chan_part_reason_take(&s2, "#big", num, why, sizeof why));
+    assert_string_equal(why, num);
+  }
+  crdt_chan_part_reasons_clear(&s2);
+  assert_int_equal(0, crdt_chan_part_reason_take(&s2, "#big", "DAB60", why, sizeof why));
   assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
 
   crdt_state_clear(&s1);
@@ -4177,6 +4574,9 @@ int main(void)
     cmocka_unit_test(test_orphan_members_residue_converges),
     cmocka_unit_test(test_owner_remove_beats_snapshot_reimport),
     cmocka_unit_test(test_user_remove_reason_rides_delete),
+    cmocka_unit_test(test_chan_part_reason_rides_remove),
+    cmocka_unit_test(test_chan_part_reason_utf8_cut),
+    cmocka_unit_test(test_chan_part_reason_lifetime),
     cmocka_unit_test(test_digest_gc_invariant),
     cmocka_unit_test(test_decommission_replicates),
     cmocka_unit_test(test_decommission_reap_and_return),
@@ -4213,8 +4613,12 @@ int main(void)
     cmocka_unit_test(test_user_record_host_overrides),
     cmocka_unit_test(test_gline_doc_converges_same_lastmod),
     cmocka_unit_test(test_metadata_op_replicates),
+    cmocka_unit_test(test_metadata_set_at_keeps_row_stamp),
+    cmocka_unit_test(test_metadata_same_stamp_mints_converge),
     cmocka_unit_test(test_bsess_op_replicates),
     cmocka_unit_test(test_bsess_winner),
+    cmocka_unit_test(test_bsess_gc_hold),
+    cmocka_unit_test(test_lww_equal_stamp_tie),
     cmocka_unit_test(test_bconn_roster),
     cmocka_unit_test(test_blease_compare),
     cmocka_unit_test(test_blease_decide),
@@ -4226,6 +4630,7 @@ int main(void)
     cmocka_unit_test(test_jupe_op_replicates),
     cmocka_unit_test(test_chan_ctime_min_incarnation),
     cmocka_unit_test(test_kick_info_replicates_and_hlc_gates),
+    cmocka_unit_test(test_kick_info_remove_replicates),
     cmocka_unit_test(test_E_squit_creates_no_membership_tombstones),
     cmocka_unit_test(test_server_state_converges),
     cmocka_unit_test(test_server_state_converges_mesh),

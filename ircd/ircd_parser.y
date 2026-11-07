@@ -277,6 +277,8 @@ static void free_slist(struct SLink **link) {
 %token MAXREQUESTSIZE
 %token QUEUEMAX
 %token BATCHSIZE
+%token SIGNATUREWINDOW
+%token LEGACYSECRET
 /* and now a lot of privileges... */
 %token TPRIV_CHAN_LIMIT TPRIV_MODE_LCHAN TPRIV_DEOP_LCHAN TPRIV_WALK_LCHAN
 %token TPRIV_LOCAL_KILL TPRIV_REHASH TPRIV_RESTART TPRIV_GITSYNC TPRIV_DIE
@@ -2136,7 +2138,8 @@ webhookblock: WEBHOOK
 webhookitems: webhookitem webhookitems | webhookitem;
 webhookitem: webhookport | webhooksecret | webhookvhost | webhookpath
            | webhookmaxconn | webhookmaxreqsize
-           | webhookqueuemax | webhookbatchsize;
+           | webhookqueuemax | webhookbatchsize
+           | webhooksigwindow | webhooklegacysecret | webhookrealm;
 webhookport: PORT '=' NUMBER ';'
 {
   sasl_conf_webhook_set_port($3);
@@ -2171,6 +2174,19 @@ webhookqueuemax: QUEUEMAX '=' NUMBER ';'
 webhookbatchsize: BATCHSIZE '=' NUMBER ';'
 {
   sasl_conf_webhook_set_batch_size($3);
+};
+webhooksigwindow: SIGNATUREWINDOW '=' NUMBER ';'
+{
+  sasl_conf_webhook_set_signature_window($3);
+};
+webhooklegacysecret: LEGACYSECRET '=' yesorno ';'
+{
+  sasl_conf_webhook_set_legacy_secret($3);
+};
+webhookrealm: REALM '=' QSTRING ';'
+{
+  sasl_conf_webhook_set_realm($3);
+  MyFree($3);
 };
 
 /* ---------------------------------------------------------------- */

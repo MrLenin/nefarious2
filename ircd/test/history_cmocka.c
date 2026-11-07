@@ -1,10 +1,10 @@
 /* history_cmocka.c - CMocka unit tests for history serialization functions
  *
- * Tests the pure functions from history.c without requiring LMDB:
+ * Links the real record codec (history_record.c) -- serialize,
+ * deserialize, sentinel escaping, CH W forward encode/split -- and tests
+ * copies of the other pure helpers, without a database:
  * - build_key() - Key construction
  * - parse_key() - Key parsing
- * - serialize_message() - Message serialization
- * - deserialize_message() - Message deserialization
  * - parse_reference() - Reference string parsing (from m_chathistory.c)
  */
 
@@ -21,54 +21,17 @@
 /* Include necessary headers */
 #include "ircd_defs.h"
 #include "ircd_chattr.h"
+#include "history_stamp.h"
+
+/* The real record codec: ../history_record.o */
+#include "history.h"
+#include "history_record.h"
 
 /* Define constants from history.c */
 #define KEY_SEP '\0'
-/* HISTORY_VALUE_BUFSIZE now defined in history.h */
-
-#define HISTORY_MSGID_LEN 64
-#define HISTORY_TIMESTAMP_LEN 32
-#define HISTORY_SENDER_LEN (NICKLEN + USERLEN + HOSTLEN + 3)
-#define HISTORY_CONTENT_LEN 4096
-
-/* Message types from history.h */
-enum HistoryMessageType {
-    HISTORY_PRIVMSG = 0,
-    HISTORY_NOTICE  = 1,
-    HISTORY_JOIN    = 2,
-    HISTORY_PART    = 3,
-    HISTORY_QUIT    = 4,
-    HISTORY_KICK    = 5,
-    HISTORY_MODE    = 6,
-    HISTORY_TOPIC   = 7,
-    HISTORY_TAGMSG  = 8,
-    HISTORY_GAP     = 9,
-    HISTORY_NICK    = 10,
-    HISTORY_REDACT  = 11,
-    HISTORY_MULTILINE = 12
-};
-
-/* Reference types from history.h */
-enum HistoryRefType {
-    HISTORY_REF_TIMESTAMP = 0,
-    HISTORY_REF_MSGID     = 1,
-    HISTORY_REF_NONE      = 2
-};
-
-/* HistoryMessage structure from history.h */
-struct HistoryMessage {
-    char msgid[HISTORY_MSGID_LEN];
-    char timestamp[HISTORY_TIMESTAMP_LEN];
-    char target[CHANNELLEN + 1];
-    char sender[HISTORY_SENDER_LEN];
-    char account[ACCOUNTLEN + 1];
-    enum HistoryMessageType type;
-    char content[HISTORY_CONTENT_LEN];
-    struct HistoryMessage *next;
-};
-
-/* Stub for ircd_snprintf - use regular snprintf */
-#define ircd_snprintf(client, buf, size, fmt, ...) snprintf(buf, size, fmt, ##__VA_ARGS__)
+/* The parse_key copy's own timestamp bound: its tests use ISO timestamps,
+ * longer than history.h's HISTORY_TIMESTAMP_LEN (unix seconds.millis). */
+#define KEY_TIMESTAMP_LEN 32
 
 /* ========== Inlined functions from history.c ========== */
 
@@ -129,7 +92,7 @@ static int parse_key(const char *key, int keylen,
     sep2 = memchr(p, KEY_SEP, end - p);
     if (sep2) {
         if (timestamp) {
-            if ((size_t)(sep2 - p) >= HISTORY_TIMESTAMP_LEN) return -1;
+            if ((size_t)(sep2 - p) >= KEY_TIMESTAMP_LEN) return -1;
             memcpy(timestamp, p, sep2 - p);
             timestamp[sep2 - p] = '\0';
         }
@@ -143,7 +106,7 @@ static int parse_key(const char *key, int keylen,
     } else {
         /* No msgid in key */
         if (timestamp) {
-            if ((size_t)(end - p) >= HISTORY_TIMESTAMP_LEN) return -1;
+            if ((size_t)(end - p) >= KEY_TIMESTAMP_LEN) return -1;
             memcpy(timestamp, p, end - p);
             timestamp[end - p] = '\0';
         }
@@ -154,58 +117,21 @@ static int parse_key(const char *key, int keylen,
     return 0;
 }
 
+/* serialize/deserialize run the real codec (../history_record.o); these
+ * wrappers keep the older tests' call shape. */
 static int serialize_message(char *buf, int bufsize,
                              enum HistoryMessageType type,
                              const char *sender, const char *account,
                              const char *content)
 {
-    return ircd_snprintf(0, buf, bufsize, "%d|%s|%s|%s",
-                         (int)type,
-                         sender ? sender : "",
-                         account ? account : "",
-                         content ? content : "");
+    return history_serialize_record(buf, bufsize, type, sender, account,
+                                    content, NULL, NULL, 0);
 }
 
 static int deserialize_message(const char *data, int datalen,
                                struct HistoryMessage *msg)
 {
-    const char *p, *end;
-    char *field;
-    int type;
-
-    p = data;
-    end = data + datalen;
-
-    /* Parse type */
-    field = strchr(p, '|');
-    if (!field || field >= end) return -1;
-    type = atoi(p);
-    if (type < 0 || type > HISTORY_MULTILINE) return -1;
-    msg->type = (enum HistoryMessageType)type;
-    p = field + 1;
-
-    /* Parse sender */
-    field = strchr(p, '|');
-    if (!field || field >= end) return -1;
-    if ((size_t)(field - p) >= sizeof(msg->sender)) return -1;
-    memcpy(msg->sender, p, field - p);
-    msg->sender[field - p] = '\0';
-    p = field + 1;
-
-    /* Parse account */
-    field = strchr(p, '|');
-    if (!field || field >= end) return -1;
-    if ((size_t)(field - p) >= sizeof(msg->account)) return -1;
-    memcpy(msg->account, p, field - p);
-    msg->account[field - p] = '\0';
-    p = field + 1;
-
-    /* Parse content - rest of string */
-    if ((size_t)(end - p) >= sizeof(msg->content)) return -1;
-    memcpy(msg->content, p, end - p);
-    msg->content[end - p] = '\0';
-
-    return 0;
+    return history_deserialize_record(data, (size_t)datalen, msg);
 }
 
 /* parse_reference from m_chathistory.c */
@@ -442,76 +368,8 @@ static void test_parse_key_roundtrip(void **state)
     }
 }
 
-/* ========== #103 sentinel-escape helpers (copied verbatim from
- * ircd/history.c -- pure logic, no deps, gated here) ========== */
+/* ========== #103 sentinel-escape helpers (../history_record.o) ========== */
 #define HIST_ESC 0x04
-static int history_field_needs_escape(unsigned char c)
-{
-  return c == HIST_ESC || c == 0x05 || c == 0x06;
-}
-static char *history_escape_field(char *dst, size_t dstsize, const char *src)
-{
-  size_t o = 0;
-  const unsigned char *p;
-  if (dstsize == 0)
-    return dst;
-  for (p = (const unsigned char *)(src ? src : ""); *p; ++p) {
-    if (history_field_needs_escape(*p)) {
-      if (o + 2 >= dstsize) break;
-      dst[o++] = HIST_ESC;
-      dst[o++] = (char)(*p ^ 0x40);
-    } else {
-      if (o + 1 >= dstsize) break;
-      dst[o++] = (char)*p;
-    }
-  }
-  dst[o] = '\0';
-  return dst;
-}
-static void history_unescape_field(char *str)
-{
-  char *r = str, *w = str;
-  while (*r) {
-    if (*r == HIST_ESC && r[1]) { *w++ = (char)((unsigned char)r[1] ^ 0x40); r += 2; }
-    else { *w++ = *r++; }
-  }
-  *w = '\0';
-}
-static char *history_forward_encode(char *dst, size_t dstsize,
-                                    const char *client_tags, const char *text)
-{
-  size_t used = 0;
-  if (dstsize == 0)
-    return dst;
-  dst[0] = '\0';
-  if (client_tags && client_tags[0]) {
-    if (dstsize < 3)
-      return dst;
-    dst[used++] = '\x06';
-    history_escape_field(dst + used, dstsize - used - 1, client_tags);
-    used += strlen(dst + used);
-    dst[used++] = '\x06';
-    dst[used] = '\0';
-  }
-  history_escape_field(dst + used, dstsize - used, text ? text : "");
-  return dst;
-}
-static char *history_forward_split(char *content, char **tags_out)
-{
-  char *text = content;
-  *tags_out = NULL;
-  if (content[0] == '\x06') {
-    char *close = strchr(content + 1, '\x06');
-    if (close) {
-      *close = '\0';
-      *tags_out = content + 1;
-      history_unescape_field(*tags_out);
-      text = close + 1;
-    }
-  }
-  history_unescape_field(text);
-  return text;
-}
 
 static void test_sentinel_escape_roundtrip(void **state)
 {
@@ -556,6 +414,470 @@ static void test_sentinel_escape_of_escape_byte(void **state)
   assert_string_equal(esc, "a\004Db");
   history_unescape_field(esc);
   assert_string_equal(esc, "a\004b");
+}
+
+/* ========== '|' in the header fields (parsers fuzz F14) ========== */
+
+/* Store a full record through the real codec and read it back. */
+static void record_roundtrip(const char *sender, const char *account,
+                             const char *content, struct HistoryMessage *msg)
+{
+  char buf[HISTORY_VALUE_BUFSIZE];
+  int len;
+
+  len = history_serialize_record(buf, sizeof(buf), HISTORY_PRIVMSG, sender,
+                                 account, content, NULL, NULL, 0);
+  assert_true(len > 0 && len < (int)sizeof(buf));
+  memset(msg, 0, sizeof(*msg));
+  assert_int_equal(0, history_deserialize_record(buf, (size_t)len, msg));
+}
+
+static void test_record_pipe_nick_roundtrip(void **state)
+{
+  struct HistoryMessage msg;
+  (void)state;
+  /* '|' is a nick character ({|}~ are lowercase letters in ircd_chattr). */
+  record_roundtrip("foo|away!user@host.example", "foo", "back soon", &msg);
+  assert_string_equal(msg.sender, "foo|away!user@host.example");
+  assert_string_equal(msg.account, "foo");
+  assert_string_equal(msg.content, "back soon");
+}
+
+static void test_record_pipe_nick_account_spoof(void **state)
+{
+  struct HistoryMessage msg;
+  (void)state;
+  /* The F14 reproducer: nick "a|admin|b" logged in as "realacct".  The
+   * record must not replay as sender "a" with account=admin. */
+  record_roundtrip("a|admin|b!user@host", "realacct", "spoof?", &msg);
+  assert_string_equal(msg.sender, "a|admin|b!user@host");
+  assert_string_equal(msg.account, "realacct");
+  assert_string_equal(msg.content, "spoof?");
+}
+
+static void test_record_pipe_in_account(void **state)
+{
+  struct HistoryMessage msg;
+  (void)state;
+  record_roundtrip("nick!user@host", "a|b", "text", &msg);
+  assert_string_equal(msg.sender, "nick!user@host");
+  assert_string_equal(msg.account, "a|b");
+  assert_string_equal(msg.content, "text");
+}
+
+static void test_record_longest_pipe_sender(void **state)
+{
+  char sender[HISTORY_SENDER_LEN];
+  char *p = sender;
+  struct HistoryMessage msg;
+  (void)state;
+  /* A NICKLEN nick of all '|' plus the longest user and host: the
+   * longest legal sender, which escapes to more than HISTORY_SENDER_LEN
+   * bytes on disk and must still decode. */
+  memset(p, '|', NICKLEN); p += NICKLEN;
+  *p++ = '!';
+  memset(p, 'u', USERLEN); p += USERLEN;
+  *p++ = '@';
+  memset(p, 'h', HOSTLEN); p += HOSTLEN;
+  *p = '\0';
+  assert_int_equal(strlen(sender), HISTORY_SENDER_LEN - 1);
+  record_roundtrip(sender, "acct", "x", &msg);
+  assert_string_equal(msg.sender, sender);
+  assert_string_equal(msg.account, "acct");
+  assert_string_equal(msg.content, "x");
+}
+
+static void test_record_ordinary_bytes_unchanged(void **state)
+{
+  char buf[HISTORY_VALUE_BUFSIZE];
+  int len;
+  (void)state;
+  /* A sender without '|' serializes exactly as before, and '|' in the
+   * content (the last field) stays raw. */
+  len = history_serialize_record(buf, sizeof(buf), HISTORY_PRIVMSG,
+                                 "nick!user@host", "acct", "a|b|c",
+                                 NULL, NULL, 0);
+  assert_int_equal(len, (int)strlen("0|nick!user@host|acct|a|b|c"));
+  assert_string_equal(buf, "0|nick!user@host|acct|a|b|c");
+}
+
+static void test_unescape_header_span(void **state)
+{
+  static const char stored[] = "2|a\004<b!u@h|acct|";
+  char out[16];
+  (void)state;
+  /* The JOIN-row scan decodes the raw sender span between the first two
+   * '|' with this; the escaped '|' comes back. */
+  assert_int_equal(7, history_unescape_header(out, sizeof(out), stored + 2, 8));
+  assert_string_equal(out, "a|b!u@h");
+  /* Legacy span, no escapes: copied unchanged. */
+  assert_int_equal(5, history_unescape_header(out, sizeof(out), "n!u@h", 5));
+  assert_string_equal(out, "n!u@h");
+  /* Too long for dst after unescaping: refused, not truncated. */
+  assert_int_equal(-1, history_unescape_header(out, 5, "n!u@h", 5));
+  assert_int_equal(4, history_unescape_header(out, 5, "a\004<b!", 5));
+  assert_string_equal(out, "a|b!");
+}
+
+static void test_record_legacy_decode(void **state)
+{
+  static const char plain[] = "0|nick!user@host|acct|hello|world";
+  struct HistoryMessage msg;
+  (void)state;
+  /* Records written before '|' was escaped decode as they always did. */
+  memset(&msg, 0, sizeof(msg));
+  assert_int_equal(0, history_deserialize_record(plain, strlen(plain), &msg));
+  assert_int_equal(msg.type, HISTORY_PRIVMSG);
+  assert_string_equal(msg.sender, "nick!user@host");
+  assert_string_equal(msg.account, "acct");
+  assert_string_equal(msg.content, "hello|world");
+}
+
+/* ========== Legacy rows a '|' nick shifted (read-side repair) ========== */
+
+/* Decode a raw stored value (a row as an older binary wrote it). */
+static void legacy_decode(const char *row, struct HistoryMessage *msg)
+{
+  memset(msg, 0, sizeof(*msg));
+  assert_int_equal(0, history_deserialize_record(row, strlen(row), msg));
+}
+
+static void test_legacy_pipe_nick_no_account(void **state)
+{
+  struct HistoryMessage msg;
+  (void)state;
+  /* The F14 reproducer as an older binary stored it: nick a|admin|b, not
+   * logged in.  The naive split read sender "a", account=admin. */
+  legacy_decode("1|a|admin|b!u@host||spoof?", &msg);
+  assert_int_equal(msg.type, HISTORY_NOTICE);
+  assert_string_equal(msg.sender, "a|admin|b!u@host");
+  assert_string_equal(msg.account, "");
+  assert_string_equal(msg.content, "spoof?");
+  /* Content is never split: its own '|' (and a mask-like run) stay. */
+  legacy_decode("0|a|admin|b!u@host||x|y!z@w|v", &msg);
+  assert_string_equal(msg.sender, "a|admin|b!u@host");
+  assert_string_equal(msg.account, "");
+  assert_string_equal(msg.content, "x|y!z@w|v");
+}
+
+static void test_legacy_pipe_nick_real_account(void **state)
+{
+  struct HistoryMessage msg;
+  (void)state;
+  /* Logged in as realacct: sender and content are repaired, but a
+   * shifted row never yields an account (review ruling: the re-split
+   * cannot rule out a '|' in the host, so its account slot could be a
+   * host fragment).  Missing, never spoofed. */
+  legacy_decode("1|a|admin|b!user@host|realacct|spoof?", &msg);
+  assert_int_equal(msg.type, HISTORY_NOTICE);
+  assert_string_equal(msg.sender, "a|admin|b!user@host");
+  assert_string_equal(msg.account, "");
+  assert_string_equal(msg.content, "spoof?");
+}
+
+static void test_legacy_pipe_nick_and_pipe_host_no_account(void **state)
+{
+  struct HistoryMessage msg;
+  (void)state;
+  /* A '|' in the host too (IsHostChar takes {|}~: a resolved, WEBIRC,
+   * SETHOST or services-assigned host).  Nick a|b, host x|admin, no
+   * login: the re-split closes the host at its first '|', and the slot
+   * after it holds "admin".  No account is ever produced from it. */
+  legacy_decode("0|a|b!u@x|admin||hi", &msg);
+  assert_string_equal(msg.account, "");
+  assert_string_equal(msg.sender, "a|b!u@x");
+  assert_string_equal(msg.content, "|hi");
+  /* Same with a real account behind it. */
+  legacy_decode("0|a|b!u@x|admin|realacct|hi", &msg);
+  assert_string_equal(msg.account, "");
+  assert_string_equal(msg.sender, "a|b!u@x");
+  assert_string_equal(msg.content, "realacct|hi");
+}
+
+static void test_legacy_ordinary_pipe_nick(void **state)
+{
+  struct HistoryMessage msg;
+  (void)state;
+  /* An ordinary nick like foo|away: every row it ever wrote. */
+  legacy_decode("0|foo|away!u@h|acct|back | soon", &msg);
+  assert_int_equal(msg.type, HISTORY_PRIVMSG);
+  assert_string_equal(msg.sender, "foo|away!u@h");
+  assert_string_equal(msg.account, "");
+  assert_string_equal(msg.content, "back | soon");
+  /* A JOIN row (empty content), as the JOIN-row scan reads it. */
+  legacy_decode("2|foo|away!~u@2001:db8::1|acct|", &msg);
+  assert_int_equal(msg.type, HISTORY_JOIN);
+  assert_string_equal(msg.sender, "foo|away!~u@2001:db8::1");
+  assert_string_equal(msg.account, "");
+  assert_string_equal(msg.content, "");
+}
+
+static void test_legacy_pipe_nick_leading_and_runs(void **state)
+{
+  struct HistoryMessage msg;
+  (void)state;
+  /* A nick that starts with '|': the naive sender was empty. */
+  legacy_decode("0||lead!u@h||hi", &msg);
+  assert_string_equal(msg.sender, "|lead!u@h");
+  assert_string_equal(msg.account, "");
+  assert_string_equal(msg.content, "hi");
+  /* A nick of '|' only, logged in (the account is not returned). */
+  legacy_decode("0|||||!u@h|acct|x", &msg);
+  assert_string_equal(msg.sender, "||||!u@h");
+  assert_string_equal(msg.account, "");
+  assert_string_equal(msg.content, "x");
+}
+
+static void test_legacy_pipe_username_resplit(void **state)
+{
+  struct HistoryMessage msg;
+  (void)state;
+  /* A '|' in the USERNAME shifts the fields too (IsUserChar takes {|}~):
+   * the naive sender is "nick!x", the account "admin".  No user
+   * character is '@', so the first '@' after the '!' closes the user. */
+  legacy_decode("0|nick!x|admin|y@host||hi", &msg);
+  assert_string_equal(msg.sender, "nick!x|admin|y@host");
+  assert_string_equal(msg.account, "");
+  assert_string_equal(msg.content, "hi");
+  /* Logged in: still no account from a shifted row. */
+  legacy_decode("0|nick!~x|ad|y@host|acct|hi|there", &msg);
+  assert_string_equal(msg.sender, "nick!~x|ad|y@host");
+  assert_string_equal(msg.account, "");
+  assert_string_equal(msg.content, "hi|there");
+  /* The common real shape: a client that sends its nick as USER, so the
+   * nick and the username both carry the '|' (the bed's test clients do
+   * this: p|admin|271dc!p|admin|27@...). */
+  legacy_decode("0|p|admin|x!p|admin|x@767A62.F9398.IP||spoof?", &msg);
+  assert_string_equal(msg.sender, "p|admin|x!p|admin|x@767A62.F9398.IP");
+  assert_string_equal(msg.account, "");
+  assert_string_equal(msg.content, "spoof?");
+  /* A username that starts with '|'. */
+  legacy_decode("0|nick!|u@h||hi", &msg);
+  assert_string_equal(msg.sender, "nick!|u@h");
+  assert_string_equal(msg.account, "");
+  assert_string_equal(msg.content, "hi");
+}
+
+static void test_legacy_pipe_nick_sections(void **state)
+{
+  struct HistoryMessage msg;
+  (void)state;
+  /* The shift also hid the content's sentinel sections (PM original
+   * target, client tags, incarnation) behind the header bytes; after
+   * the repair they open the content field again. */
+  legacy_decode("0|a|b!u@h|acct|\005x|y\005\006+reply=abc\006\007123\007text|more", &msg);
+  assert_string_equal(msg.sender, "a|b!u@h");
+  assert_string_equal(msg.account, "");
+  assert_string_equal(msg.original_target, "x|y");
+  assert_string_equal(msg.client_tags, "+reply=abc");
+  assert_int_equal(msg.incarnation, 123);
+  assert_string_equal(msg.content, "text|more");
+}
+
+static void test_legacy_legit_senders_unchanged(void **state)
+{
+  struct HistoryMessage msg;
+  (void)state;
+  /* Every sender form the store paths write, as before the escape:
+   * nick!user@host (users, services, CH W forwards), a server name (a
+   * server's MODE/KICK/TOPIC/notice, CH W from a server).  None was
+   * split wrongly, so none may change -- whatever its content holds. */
+  legacy_decode("0|nick!user@host||a|b!c@d|e|f", &msg);
+  assert_string_equal(msg.sender, "nick!user@host");
+  assert_string_equal(msg.account, "");
+  assert_string_equal(msg.content, "a|b!c@d|e|f");
+  legacy_decode("0|ChanServ!X3@X3.AfterNET.Services||Welcome", &msg);
+  assert_string_equal(msg.sender, "ChanServ!X3@X3.AfterNET.Services");
+  assert_string_equal(msg.account, "");
+  assert_string_equal(msg.content, "Welcome");
+  legacy_decode("0|n!~u@2001:db8::1|acct|x|y", &msg);
+  assert_string_equal(msg.sender, "n!~u@2001:db8::1");
+  assert_string_equal(msg.account, "acct");
+  assert_string_equal(msg.content, "x|y");
+  legacy_decode("6|hub.fractalrealities.net||+o x|y", &msg);
+  assert_int_equal(msg.type, HISTORY_MODE);
+  assert_string_equal(msg.sender, "hub.fractalrealities.net");
+  assert_string_equal(msg.account, "");
+  assert_string_equal(msg.content, "+o x|y");
+  /* A server's KICK or TOPIC can carry a mask-shaped text. */
+  legacy_decode("7|hub.fractalrealities.net||a|b!c@d|e|f", &msg);
+  assert_string_equal(msg.sender, "hub.fractalrealities.net");
+  assert_string_equal(msg.account, "");
+  assert_string_equal(msg.content, "a|b!c@d|e|f");
+  /* No store path writes "*" or an empty sender; such a row reads as
+   * before when it has no account (one it has is dropped: such a
+   * sender is not a legitimate form, see the next test). */
+  legacy_decode("0|*||text", &msg);
+  assert_string_equal(msg.sender, "*");
+  assert_string_equal(msg.account, "");
+  assert_string_equal(msg.content, "text");
+  legacy_decode("0|||text", &msg);
+  assert_string_equal(msg.sender, "");
+  assert_string_equal(msg.account, "");
+  assert_string_equal(msg.content, "text");
+}
+
+static void test_legacy_ambiguous_shift_drops_account(void **state)
+{
+  struct HistoryMessage msg;
+  (void)state;
+  /* Mis-split, but the re-split is not a safe nick!user@host: the
+   * naive split stands, without its account (a fragment of the sender,
+   * never the real one), and nothing else changes.  A '|' username
+   * longer than USERLEN, or with a byte no username holds: */
+  legacy_decode("0|nick!x|admin|yyyy@host||hi", &msg);
+  assert_string_equal(msg.sender, "nick!x");
+  assert_string_equal(msg.account, "");
+  assert_string_equal(msg.content, "yyyy@host||hi");
+  legacy_decode("0|nick!x|ad+min@host||hi", &msg);
+  assert_string_equal(msg.sender, "nick!x");
+  assert_string_equal(msg.account, "");
+  assert_string_equal(msg.content, "|hi");
+  /* No '!' anywhere: nothing marks where the sender ended. */
+  legacy_decode("0|a|admin|text", &msg);
+  assert_string_equal(msg.sender, "a");
+  assert_string_equal(msg.account, "");
+  assert_string_equal(msg.content, "text");
+  /* The would-be nick is not a nick (a space; a leading digit). */
+  legacy_decode("0|a|b c!u@h|acct|x", &msg);
+  assert_string_equal(msg.sender, "a");
+  assert_string_equal(msg.account, "");
+  assert_string_equal(msg.content, "acct|x");
+  legacy_decode("0|1a|b!u@h|acct|x", &msg);
+  assert_string_equal(msg.sender, "1a");
+  assert_string_equal(msg.account, "");
+  assert_string_equal(msg.content, "acct|x");
+  /* Too long to be a nick. */
+  legacy_decode("0|aaaaaaaaaaaaaaaaaaaa|bbbbbbbbbbbbbbbbbbbb!u@h|acct|x", &msg);
+  assert_string_equal(msg.sender, "aaaaaaaaaaaaaaaaaaaa");
+  assert_string_equal(msg.account, "");
+  assert_string_equal(msg.content, "acct|x");
+  /* No account field after the would-be sender. */
+  legacy_decode("0|a|b!u@h|acct", &msg);
+  assert_string_equal(msg.sender, "a");
+  assert_string_equal(msg.account, "");
+  assert_string_equal(msg.content, "acct");
+  /* The account field is never read on the re-split path, whatever it
+   * holds: here one longer than any account, and the row still
+   * re-splits, without an account. */
+  legacy_decode("0|a|b!u@h|aaaaaaaaaaaaaaaaaaaa|x", &msg);
+  assert_string_equal(msg.sender, "a|b!u@h");
+  assert_string_equal(msg.account, "");
+  assert_string_equal(msg.content, "x");
+}
+
+static void test_escaped_rows_never_resplit(void **state)
+{
+  struct HistoryMessage msg;
+  char buf[HISTORY_VALUE_BUFSIZE];
+  int len;
+  (void)state;
+  /* A row written with the escape keeps exactly what was stored, even
+   * when its content looks like the rest of a shifted header. */
+  len = history_serialize_record(buf, sizeof(buf), HISTORY_PRIVMSG,
+                                 "a|b!u@h", "", "c!d@e|f|g", NULL, NULL, 0);
+  assert_true(len > 0);
+  memset(&msg, 0, sizeof(msg));
+  assert_int_equal(0, history_deserialize_record(buf, (size_t)len, &msg));
+  assert_string_equal(msg.sender, "a|b!u@h");
+  assert_string_equal(msg.account, "");
+  assert_string_equal(msg.content, "c!d@e|f|g");
+  /* Escaped '|' in the account only. */
+  len = history_serialize_record(buf, sizeof(buf), HISTORY_PRIVMSG,
+                                 "n!u@h", "a|b", "x!y@z|w|v", NULL, NULL, 0);
+  memset(&msg, 0, sizeof(msg));
+  assert_int_equal(0, history_deserialize_record(buf, (size_t)len, &msg));
+  assert_string_equal(msg.sender, "n!u@h");
+  assert_string_equal(msg.account, "a|b");
+  assert_string_equal(msg.content, "x!y@z|w|v");
+  /* A stored sender holding an escape is never treated as legacy, even
+   * a bare one: written by the escaping code, it is exact. */
+  legacy_decode("0|a\004<b|acct|c!d@e|f|g", &msg);
+  assert_string_equal(msg.sender, "a|b");
+  assert_string_equal(msg.account, "acct");
+  assert_string_equal(msg.content, "c!d@e|f|g");
+}
+
+static void test_split_header_resplits_legacy_join(void **state)
+{
+  static const char row[] = "2|foo|away!u@h|acct|";
+  char sender[HISTORY_SENDER_LEN];
+  char account[ACCOUNTLEN + 1];
+  int shifted = -1;
+  (void)state;
+  /* The JOIN-row scan reads the header through history_split_header,
+   * so a legacy foo|away JOIN is found under its whole nick. */
+  memset(account, 'x', sizeof(account));
+  assert_int_equal((int)strlen("foo|away!u@h|acct|"),
+                   history_split_header(row + 2, strlen(row) - 2,
+                                        sender, sizeof(sender),
+                                        account, sizeof(account), &shifted));
+  assert_string_equal(sender, "foo|away!u@h");
+  assert_string_equal(account, "");
+  assert_int_equal(shifted, 1);
+  /* A NULL out-parameter is allowed (the JOIN-row scan passes one). */
+  assert_int_equal((int)strlen("foo|away!u@h|acct|"),
+                   history_split_header(row + 2, strlen(row) - 2,
+                                        sender, sizeof(sender),
+                                        account, sizeof(account), NULL));
+  /* A legitimate header clears it. */
+  shifted = -1;
+  assert_int_equal((int)strlen("n!u@h|acct|"),
+                   history_split_header("n!u@h|acct|x", strlen("n!u@h|acct|x"),
+                                        sender, sizeof(sender),
+                                        account, sizeof(account), &shifted));
+  assert_int_equal(shifted, 0);
+  assert_string_equal(account, "acct");
+}
+
+/* Decode a raw stored value and return its header_repaired flag. */
+static int repaired_flag(const char *row)
+{
+  struct HistoryMessage msg;
+  memset(&msg, 0x5a, sizeof(msg));   /* the decode must set it either way */
+  assert_int_equal(0, history_deserialize_record(row, strlen(row), &msg));
+  return msg.header_repaired;
+}
+
+static void test_header_repaired_flag(void **state)
+{
+  char buf[HISTORY_VALUE_BUFSIZE];
+  struct HistoryMessage msg;
+  int len;
+  (void)state;
+  /* Set for every row found shifted: re-split (nick '|', username '|',
+   * both, a '|' host behind it) ... */
+  assert_int_equal(1, repaired_flag("1|a|admin|b!u@host||spoof?"));
+  assert_int_equal(1, repaired_flag("1|a|admin|b!user@host|realacct|spoof?"));
+  assert_int_equal(1, repaired_flag("0|nick!x|admin|y@host||hi"));
+  assert_int_equal(1, repaired_flag("0|p|admin|x!p|admin|x@767A62.F9398.IP||spoof?"));
+  assert_int_equal(1, repaired_flag("0|a|b!u@x|admin||hi"));
+  assert_int_equal(1, repaired_flag("0||lead!u@h||hi"));
+  /* ... and kept as read without its account (re-split refused). */
+  assert_int_equal(1, repaired_flag("0|nick!x|admin|yyyy@host||hi"));
+  assert_int_equal(1, repaired_flag("0|a|admin|text"));
+  assert_int_equal(1, repaired_flag("0|a|b c!u@h|acct|x"));
+  /* Clear for every legitimate legacy form ... */
+  assert_int_equal(0, repaired_flag("0|nick!user@host|acct|hello|world"));
+  assert_int_equal(0, repaired_flag("0|nick!user@host||a|b!c@d|e|f"));
+  assert_int_equal(0, repaired_flag("0|ChanServ!X3@X3.AfterNET.Services||Welcome"));
+  assert_int_equal(0, repaired_flag("0|n!~u@2001:db8::1|acct|x|y"));
+  assert_int_equal(0, repaired_flag("6|hub.fractalrealities.net||+o x|y"));
+  assert_int_equal(0, repaired_flag("7|hub.fractalrealities.net||a|b!c@d|e|f"));
+  /* ... and for escaped rows, '|' sender or '|' account. */
+  len = history_serialize_record(buf, sizeof(buf), HISTORY_PRIVMSG,
+                                 "a|admin|b!u@h", "realacct", "c!d@e|f|g",
+                                 NULL, NULL, 0);
+  memset(&msg, 0x5a, sizeof(msg));
+  assert_int_equal(0, history_deserialize_record(buf, (size_t)len, &msg));
+  assert_int_equal(0, msg.header_repaired);
+  assert_string_equal(msg.account, "realacct");
+  len = history_serialize_record(buf, sizeof(buf), HISTORY_PRIVMSG,
+                                 "n!u@h", "a|b", "x", NULL, NULL, 0);
+  memset(&msg, 0x5a, sizeof(msg));
+  assert_int_equal(0, history_deserialize_record(buf, (size_t)len, &msg));
+  assert_int_equal(0, msg.header_repaired);
+  assert_int_equal(0, repaired_flag("0|a\004<b|acct|c!d@e|f|g"));
 }
 
 /* Mirror of ml_content_resolve's multiline-identification predicate
@@ -953,6 +1275,32 @@ static void test_parse_reference_case_sensitive(void **state)
 
 /* ========== Main ========== */
 
+/* TARGETS index max() rule (history_stamp_newer): a row stored late with
+ * an older stamp must not move a target's latest time backwards. */
+static void test_stamp_newer_orders_by_time(void **state)
+{
+  (void)state;
+  assert_true(history_stamp_newer("1792600200.500", 14, "1792600200.499", 14));
+  assert_false(history_stamp_newer("1792600200.499", 14, "1792600200.500", 14));
+  assert_false(history_stamp_newer("1792600200.500", 14, "1792600200.500", 14));
+}
+
+static void test_stamp_newer_late_older_row_loses(void **state)
+{
+  (void)state;
+  /* the newest message is held; a multiline batch stamped a second earlier
+   * arrives afterwards over S2S */
+  assert_false(history_stamp_newer("1792600199.900", 14, "1792600200.100", 14));
+}
+
+static void test_stamp_newer_longer_seconds_wins(void **state)
+{
+  (void)state;
+  assert_true(history_stamp_newer("10000000000.000", 15, "9999999999.999", 14) ||
+              history_stamp_newer("10000000000.000", 15, "1000000000.000", 14));
+  assert_true(history_stamp_newer("1792600200.5001", 15, "1792600200.500", 14));
+}
+
 int main(void)
 {
     const struct CMUnitTest tests[] = {
@@ -990,8 +1338,30 @@ int main(void)
         cmocka_unit_test(test_sentinel_escape_roundtrip),
         cmocka_unit_test(test_sentinel_escape_neutralizes_injection),
         cmocka_unit_test(test_sentinel_escape_of_escape_byte),
+        cmocka_unit_test(test_record_pipe_nick_roundtrip),
+        cmocka_unit_test(test_record_pipe_nick_account_spoof),
+        cmocka_unit_test(test_record_pipe_in_account),
+        cmocka_unit_test(test_record_longest_pipe_sender),
+        cmocka_unit_test(test_record_ordinary_bytes_unchanged),
+        cmocka_unit_test(test_unescape_header_span),
+        cmocka_unit_test(test_record_legacy_decode),
+        cmocka_unit_test(test_legacy_pipe_nick_no_account),
+        cmocka_unit_test(test_legacy_pipe_nick_real_account),
+        cmocka_unit_test(test_legacy_pipe_nick_and_pipe_host_no_account),
+        cmocka_unit_test(test_legacy_ordinary_pipe_nick),
+        cmocka_unit_test(test_legacy_pipe_nick_leading_and_runs),
+        cmocka_unit_test(test_legacy_pipe_username_resplit),
+        cmocka_unit_test(test_legacy_pipe_nick_sections),
+        cmocka_unit_test(test_legacy_legit_senders_unchanged),
+        cmocka_unit_test(test_legacy_ambiguous_shift_drops_account),
+        cmocka_unit_test(test_escaped_rows_never_resplit),
+        cmocka_unit_test(test_split_header_resplits_legacy_join),
+        cmocka_unit_test(test_header_repaired_flag),
         cmocka_unit_test(test_forward_encode_split_roundtrip),
         cmocka_unit_test(test_forward_encode_blocks_injection),
+        cmocka_unit_test(test_stamp_newer_orders_by_time),
+        cmocka_unit_test(test_stamp_newer_late_older_row_loses),
+        cmocka_unit_test(test_stamp_newer_longer_seconds_wins),
         cmocka_unit_test(test_multiline_ref_is_type_keyed),
         cmocka_unit_test(test_reserved_vendor_tag),
         cmocka_unit_test(test_deserialize_all_message_types),

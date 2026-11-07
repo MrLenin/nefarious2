@@ -172,6 +172,9 @@ void crdt_state_clear(struct CrdtNetworkState *st)
   crdt_lwwmap_clear(&st->modes);
   crdt_lwwmap_clear(&st->members_status);
   crdt_lwwmap_clear(&st->kick_info);
+  free(st->part_reasons);
+  st->part_reasons = NULL;
+  st->part_reasons_n = st->part_reasons_cap = 0;
   crdt_lwwmap_clear(&st->chanmeta);
   crdt_lwwmap_clear(&st->glines);
   crdt_lwwmap_clear(&st->shuns);
@@ -231,6 +234,19 @@ void crdt_user_set(struct CrdtNetworkState *st, const char *numeric,
   record(st, op);
 }
 
+/* The length of @a reason cut to at most @a max bytes, never inside a UTF-8
+ * sequence. */
+static size_t reason_cut_len(const char *reason, size_t max)
+{
+  size_t rl = strlen(reason);
+  if (rl <= max)
+    return rl;
+  rl = max;
+  while (rl > 0 && ((unsigned char)reason[rl] & 0xC0) == 0x80)
+    rl--;
+  return rl;
+}
+
 void crdt_user_remove_reason(struct CrdtNetworkState *st, const char *numeric,
                              const char *reason)
 {
@@ -244,8 +260,7 @@ void crdt_user_remove_reason(struct CrdtNetworkState *st, const char *numeric,
   op->ts = ts;
   op->writer = st->my_numeric;
   if (reason && *reason) {           /* rides the op only; the tombstone keeps no value */
-    size_t rl = strlen(reason);
-    if (rl > CRDT_QUITREASON_LEN - 1) rl = CRDT_QUITREASON_LEN - 1;
+    size_t rl = reason_cut_len(reason, CRDT_QUITREASON_LEN - 1);
     op->val = memdup(reason, rl);
     op->val_len = (uint32_t)rl;
   }
@@ -264,6 +279,22 @@ void crdt_user_remove(struct CrdtNetworkState *st, const char *numeric)
   crdt_user_remove_reason(st, numeric, NULL);
 }
 
+/* Copy at most @a max-1 bytes of an op value, stopping at CR, LF or NUL: the
+ * text is relayed inside a P10/client line, so it must never split one. */
+static void reason_copy(char *dst, size_t max, const void *val, uint32_t vlen)
+{
+  const char *v = (const char *)val;
+  size_t i = 0;
+  while (i < vlen && i + 1 < max && v[i] && v[i] != '\r' && v[i] != '\n') {
+    dst[i] = v[i];
+    i++;
+  }
+  /* cut short: never end inside a UTF-8 sequence */
+  while (i > 0 && i < vlen && ((unsigned char)v[i] & 0xC0) == 0x80)
+    i--;
+  dst[i] = '\0';
+}
+
 static void quit_ring_note(struct CrdtNetworkState *st, const char *key, uint32_t klen,
                            const void *val, uint32_t vlen)
 {
@@ -271,7 +302,7 @@ static void quit_ring_note(struct CrdtNetworkState *st, const char *key, uint32_
   if (klen >= CRDT_NUMERICLEN) return;
   if (vlen > CRDT_QUITREASON_LEN - 1) vlen = CRDT_QUITREASON_LEN - 1;
   memcpy(st->quit_ring[i].num, key, klen); st->quit_ring[i].num[klen] = '\0';
-  memcpy(st->quit_ring[i].reason, val, vlen); st->quit_ring[i].reason[vlen] = '\0';
+  reason_copy(st->quit_ring[i].reason, sizeof st->quit_ring[i].reason, val, vlen);
   st->quit_ring_head = i + 1;
 }
 
@@ -337,8 +368,9 @@ void crdt_chan_join(struct CrdtNetworkState *st, const char *chan,
   record(st, op);
 }
 
-void crdt_chan_remove(struct CrdtNetworkState *st, const char *chan,
-                      const char *numeric, uint8_t priority)
+void crdt_chan_remove_reason(struct CrdtNetworkState *st, const char *chan,
+                             const char *numeric, uint8_t priority,
+                             const char *reason)
 {
   struct CrdtChannel *ch = crdt_state_channel(st, chan, 0);
   if (!ch) return;
@@ -362,9 +394,105 @@ void crdt_chan_remove(struct CrdtNetworkState *st, const char *chan,
       op->key_len = klen;
       op->tag = removed[i];
       op->priority = priority;
+      if (reason && *reason && priority == CRDT_PRIORITY_USER) {
+        /* the first op only: one parked reason per leave, never a stale spare
+         * that a later reason-less PART of the same member would pick up */
+        size_t rl = reason_cut_len(reason, CRDT_PARTREASON_LEN - 1);
+        op->val = memdup(reason, rl);
+        op->val_len = (uint32_t)rl;
+        reason = NULL;
+      }
       record(st, op);
     }
   } while (n == 64);
+}
+
+void crdt_chan_remove(struct CrdtNetworkState *st, const char *chan,
+                      const char *numeric, uint8_t priority)
+{
+  crdt_chan_remove_reason(st, chan, numeric, priority, NULL);
+}
+
+static int part_key(char *key, size_t keylen, const char *chan, uint32_t clen,
+                    const char *num, uint32_t nlen)
+{
+  if (!chan || !num || clen + 1 + nlen >= keylen) return 0;
+  memcpy(key, chan, clen); key[clen] = ' ';
+  memcpy(key + clen + 1, num, nlen); key[clen + 1 + nlen] = '\0';
+  return 1;
+}
+
+static int part_find(const struct CrdtNetworkState *st, const char *key)
+{
+  unsigned i;
+  for (i = 0; i < st->part_reasons_n; i++)
+    if (!strcmp(st->part_reasons[i].key, key))
+      return (int)i;
+  return -1;
+}
+
+static void part_drop(struct CrdtNetworkState *st, int i)
+{
+  if (i < 0) return;
+  st->part_reasons[i] = st->part_reasons[--st->part_reasons_n];  /* order-free */
+}
+
+static void part_reason_note(struct CrdtNetworkState *st, const char *chan, uint32_t clen,
+                             const char *num, uint32_t nlen, const void *val, uint32_t vlen)
+{
+  char key[CRDT_PARTKEY_LEN];
+  char why[CRDT_PARTREASON_LEN];
+  int i;
+  if (!part_key(key, sizeof key, chan, clen, num, nlen)) return;
+  reason_copy(why, sizeof why, val, vlen);
+  i = part_find(st, key);
+  if (!why[0]) { part_drop(st, i); return; }
+  if (i < 0) {
+    if (st->part_reasons_n == st->part_reasons_cap) {
+      unsigned ncap = st->part_reasons_cap ? st->part_reasons_cap * 2 : 16;
+      struct CrdtPartReason *n;
+      if (ncap > CRDT_PARTREASON_MAX) ncap = CRDT_PARTREASON_MAX;
+      if (ncap <= st->part_reasons_cap) return;   /* full: this leave goes bare */
+      n = realloc(st->part_reasons, ncap * sizeof *n);
+      if (!n) return;
+      st->part_reasons = n;
+      st->part_reasons_cap = ncap;
+    }
+    i = (int)st->part_reasons_n++;
+    strcpy(st->part_reasons[i].key, key);
+  }
+  strcpy(st->part_reasons[i].reason, why);    /* newest reason for this member wins */
+}
+
+static void part_reason_forget(struct CrdtNetworkState *st, const char *chan, uint32_t clen,
+                               const char *num, uint32_t nlen)
+{
+  char key[CRDT_PARTKEY_LEN];
+  if (st->part_reasons_n && part_key(key, sizeof key, chan, clen, num, nlen))
+    part_drop(st, part_find(st, key));
+}
+
+int crdt_chan_part_reason_take(struct CrdtNetworkState *st, const char *chan,
+                               const char *numeric, char *buf, size_t buflen)
+{
+  char key[CRDT_PARTKEY_LEN];
+  int i;
+  if (!part_key(key, sizeof key, chan, (uint32_t)strlen(chan), numeric,
+                (uint32_t)strlen(numeric)))
+    return 0;
+  if ((i = part_find(st, key)) < 0)
+    return 0;
+  if (buf && buflen) {
+    strncpy(buf, st->part_reasons[i].reason, buflen - 1);
+    buf[buflen - 1] = '\0';
+  }
+  part_drop(st, i);
+  return 1;
+}
+
+void crdt_chan_part_reasons_clear(struct CrdtNetworkState *st)
+{
+  st->part_reasons_n = 0;
 }
 
 /* Phase 3i: op-recording ban/except add/remove (mirrors crdt_chan_join/remove,
@@ -929,10 +1057,48 @@ int crdt_gline_is_explicitly_removed(const struct CrdtNetworkState *st,
 void crdt_metadata_set(struct CrdtNetworkState *st, const char *key, uint32_t klen,
                        const void *val, uint32_t vlen)
 {
-  struct HLC ts = hlc_local_event(&st->clock);
+  crdt_metadata_set_at(st, key, klen, val, vlen, NULL, 0, 0);
+}
+
+/* The metadata writes with an explicit timestamp: the stamped account row's own
+ * HLC (metadata_lww's md_stamp), so the doc's LWW and the store's LWW order one
+ * row's writes the same way and a doc->store heal keeps the row's stamp.  The doc
+ * clock moves past it (hlc_receive), as for any remote op.  @a at NULL: a fresh
+ * local event, as before. */
+static struct HLC metadata_op_ts(struct CrdtNetworkState *st, const struct HLC *at,
+                                 uint64_t now_ms, uint64_t max_forward_ms)
+{
+  if (!at)
+    return hlc_local_event(&st->clock);
+  /* Bounded, as every peer clock is (W4): a stamp too far ahead keeps its
+   * place in the entry but does not drag the doc clock, which orders every
+   * other collection's local ops too.  The callers refuse such stamps.  The
+   * wall clock and the bound come from the caller (the engine reads no
+   * features). */
+  hlc_receive_bounded(&st->clock, at, now_ms, max_forward_ms, NULL);
+  return *at;
+}
+
+/* The writer recorded for a metadata write: the stamp's own node when the
+ * row carries one.  Two servers that mint the same stamped row (each took it
+ * over a W4 link) then hold bit-identical entries, and the digest, which
+ * hashes the writer, agrees; with our numeric there, an equal ts never
+ * replaces (crdt_lwwmap_set), so each would keep its own copy for good. */
+static uint16_t metadata_op_writer(const struct CrdtNetworkState *st,
+                                   const struct HLC *at)
+{
+  return at ? at->node_id : st->my_numeric;
+}
+
+void crdt_metadata_set_at(struct CrdtNetworkState *st, const char *key, uint32_t klen,
+                          const void *val, uint32_t vlen, const struct HLC *at,
+                          uint64_t now_ms, uint64_t max_forward_ms)
+{
+  struct HLC ts = metadata_op_ts(st, at, now_ms, max_forward_ms);
+  uint16_t writer = metadata_op_writer(st, at);
   uint64_t seq;
   struct CrdtOp *op;
-  crdt_lwwmap_set(&st->metadata, key, klen, val, vlen, ts, st->my_numeric);
+  crdt_lwwmap_set(&st->metadata, key, klen, val, vlen, ts, writer);
   seq = st->next_seq++;
   op = op_new(st->my_numeric, seq, CRDT_OP_SET, CRDT_COLL_METADATA);
   op->key = memdup(key, klen);
@@ -940,22 +1106,30 @@ void crdt_metadata_set(struct CrdtNetworkState *st, const char *key, uint32_t kl
   op->val = vlen ? memdup(val, vlen) : NULL;
   op->val_len = vlen;
   op->ts = ts;
-  op->writer = st->my_numeric;
+  op->writer = writer;
   record(st, op);
 }
 
 void crdt_metadata_del(struct CrdtNetworkState *st, const char *key, uint32_t klen)
 {
-  struct HLC ts = hlc_local_event(&st->clock);
+  crdt_metadata_del_at(st, key, klen, NULL, 0, 0);
+}
+
+void crdt_metadata_del_at(struct CrdtNetworkState *st, const char *key, uint32_t klen,
+                          const struct HLC *at, uint64_t now_ms,
+                          uint64_t max_forward_ms)
+{
+  struct HLC ts = metadata_op_ts(st, at, now_ms, max_forward_ms);
+  uint16_t writer = metadata_op_writer(st, at);
   uint64_t seq;
   struct CrdtOp *op;
-  crdt_lwwmap_delete(&st->metadata, key, klen, ts, st->my_numeric);
+  crdt_lwwmap_delete(&st->metadata, key, klen, ts, writer);
   seq = st->next_seq++;
   op = op_new(st->my_numeric, seq, CRDT_OP_DELETE, CRDT_COLL_METADATA);
   op->key = memdup(key, klen);
   op->key_len = klen;
   op->ts = ts;
-  op->writer = st->my_numeric;
+  op->writer = writer;
   record(st, op);
 }
 
@@ -1259,6 +1433,22 @@ const struct CrdtBouncerSession *crdt_bsess_get(const struct CrdtNetworkState *s
     return NULL;
   v = crdt_lwwmap_get(&st->bsessions, key, klen);
   return v ? (const struct CrdtBouncerSession *)v->data : NULL;
+}
+
+/* The server that wrote a bsess tombstone (the holder that ended its copy):
+ * 1 and *@a by filled when the record's last write is a delete.  The delete's
+ * HLC carries the writer's numeric (crdt_bsess_del stamps a local event). */
+int crdt_bsess_removed_by(const struct CrdtNetworkState *st, const char *account,
+                          const char *sessid, uint16_t *by)
+{
+  char key[128];
+  struct HLC ts;
+  uint32_t klen = bsess_key(account, sessid, key, sizeof key);
+  if (!klen || !crdt_lwwmap_deleted_ts(&st->bsessions, key, klen, &ts))
+    return 0;
+  if (by)
+    *by = ts.node_id;
+  return 1;
 }
 
 int crdt_bsess_is_explicitly_removed(const struct CrdtNetworkState *st,
@@ -1777,10 +1967,16 @@ void crdt_state_apply_op(struct CrdtNetworkState *st, const struct CrdtOp *op)
 
   if (op->coll == CRDT_COLL_CHAN_MEMBERS) {
     struct CrdtChannel *ch = chan_get(st, op->chan, op->chan_len, 1);
-    if (op->type == CRDT_OP_ADD)
+    if (op->type == CRDT_OP_ADD) {
       crdt_orset_merge_add(&ch->members, op->key, op->key_len, op->tag);
-    else
+      /* a rejoin supersedes any leave reason still parked for this member */
+      part_reason_forget(st, op->chan, op->chan_len, op->key, op->key_len);
+    } else {
       crdt_orset_merge_remove(&ch->members, op->tag, op->priority);
+      if (op->val && op->val_len && op->priority == CRDT_PRIORITY_USER)
+        part_reason_note(st, op->chan, op->chan_len, op->key, op->key_len,
+                         op->val, op->val_len);   /* reason-carrying leave */
+    }
   } else if (op->coll == CRDT_COLL_CHAN_BANS ||
              op->coll == CRDT_COLL_CHAN_EXCEPTS) {   /* Phase 3i ban/except OR-Sets */
     struct CrdtChannel *ch = chan_get(st, op->chan, op->chan_len, 1);
@@ -2333,6 +2529,17 @@ void crdt_member_status_remove(struct CrdtNetworkState *st, const char *chan,
     mint_meta_delete(st, &st->members_status, CRDT_COLL_MEMBER_STATUS, key, klen);
 }
 
+/* Delete the kick record for @a numeric on @a chan, if one is live (a rejoin
+ * supersedes it, so a later plain PART is never read as that kick). */
+void crdt_kick_info_remove(struct CrdtNetworkState *st, const char *chan,
+                           const char *numeric)
+{
+  char key[512];
+  uint32_t klen = chan_num_key(chan, numeric, key, sizeof key);
+  if (klen && crdt_lwwmap_get(&st->kick_info, key, klen))
+    mint_meta_delete(st, &st->kick_info, CRDT_COLL_KICK_INFO, key, klen);
+}
+
 /* M10 anchor test: a channel is FULLY gone iff its members OR-Set is empty AND
  * causally stable (no live member-removes: tomb_count==0) AND its ctime incarnation
  * is dead. tomb_count==0 (NOT ctime-dead alone) is the causal-stability signal:
@@ -2769,6 +2976,18 @@ int crdt_state_reclaim_orphan_tempshuns(struct CrdtNetworkState *st)
   return total;
 }
 
+/* Is @a op the DELETE behind its key's current tombstone?  A later write
+ * supersedes it, and then nothing needs it held. */
+static int delete_backs_tombstone(const struct CrdtNetworkState *st,
+                                  const struct CrdtOp *op)
+{
+  const struct CrdtLWWMap *m = lww_for((struct CrdtNetworkState *)st, op->coll);
+  struct HLC t;
+
+  return m && crdt_lwwmap_deleted_ts(m, op->key, op->key_len, &t)
+         && hlc_compare(&t, &op->ts) == 0;
+}
+
 int crdt_state_gc(struct CrdtNetworkState *st,
                   const struct CrdtStateVector *stable)
 {
@@ -2779,7 +2998,10 @@ int crdt_state_gc(struct CrdtNetworkState *st,
   uint32_t cnt = 0;
   while (cur) {
     struct CrdtOp *nx = cur->next;
-    if (stable->seq[cur->origin] >= cur->seq) {
+    if (stable->seq[cur->origin] >= cur->seq
+        && !(cur->type == CRDT_OP_DELETE && st->gc_hold
+             && delete_backs_tombstone(st, cur)
+             && st->gc_hold((uint8_t)cur->coll, cur->key, cur->key_len))) {
       /* This op is causally stable (every peer has it). If it's an LWW delete, its
        * tombstone is now reclaimable too — free it (unless a newer write superseded
        * it). Fixes unbounded growth of delete-tombstones (e.g. quit users / 3m). */

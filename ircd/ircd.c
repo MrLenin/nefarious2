@@ -425,6 +425,56 @@ int is_client_tag_denied(const char *tag, size_t tag_len)
 }
 
 /*----------------------------------------------------------------------------
+ * Shutdown: everything that owns a descriptor lets go before
+ * close_connections() closes them by number.
+ *--------------------------------------------------------------------------*/
+/** Close every store.
+ *
+ * close_connections() closes 3..MAXCONNECTIONS without asking who owns a
+ * number.  A RocksDB env still open there keeps its WAL, MANIFEST, info LOG,
+ * LOCK and SST descriptors in its own records, and its background threads
+ * (flush, compaction, the stats dump) keep using them: a flush or
+ * compaction running past the close loop writes to a number that is free,
+ * or -- after any open() in the process -- someone else's file, the
+ * corruption class of the TLS close_notify (4b658482).  The history and
+ * webpush stores were never closed here (history_shutdown() had no caller):
+ * the close loop took their descriptors, and their threads lived on until
+ * exit() or execv().
+ *
+ * rocksdb_close() cancels its env's background work and waits for what is
+ * running -- a compaction stops at its next key, a running flush finishes,
+ * bounded by the write buffer -- and closes its own files.  The shared
+ * pool threads then sit idle until exit or exec and hold no descriptor.
+ */
+static void shutdown_stores(void)
+{
+  stop_listeners();          /* refuse new connections before the slow part */
+  bounce_db_shutdown();      /* persist bouncer sessions (metadata env) */
+  history_shutdown();        /* history, multiline content, presence state:
+                              * the presence CF lives on the metadata env,
+                              * so this goes first */
+  webpush_store_shutdown();
+  metadata_shutdown();       /* metadata, read markers, bouncer sessions,
+                              * presence records */
+}
+
+/** Stop the threads that write to log and pipe descriptors, then close the
+ * logs for good.  Producers before the consumer: the crypt workers (which
+ * log, and signal the main loop through a pipe) are joined first, then the
+ * async log writer drains its queue and exits -- a worker logging after
+ * the writer stopped would lock its destroyed mutex.  log_shutdown() keeps
+ * the logs shut through close_connections() and whatever the dying event
+ * batch still runs after server_die() returns: a log line there would
+ * reopen its file on a number just closed (0, 1, 2, or one a client still
+ * holds). */
+static void shutdown_writers(void)
+{
+  thread_pool_shutdown();
+  log_async_shutdown();
+  log_shutdown();
+}
+
+/*----------------------------------------------------------------------------
  * API: server_die
  *--------------------------------------------------------------------------*/
 /** Terminate the server with a message.
@@ -434,10 +484,9 @@ void server_die(const char *message)
 {
   /* log_write will send out message to both log file and as server notice */
   log_write(LS_SYSTEM, L_CRIT, 0, "Server terminating: %s", message);
-  stop_listeners();      /* refuse new connections before the slow part */
-  bounce_db_shutdown();  /* Persist bouncer sessions before closing connections */
-  metadata_shutdown();   /* close the metadata/readmarkers RocksDB env */
+  shutdown_stores();
   flush_connections(0);
+  shutdown_writers();
   close_connections(1);
   running = 0;
 }
@@ -454,8 +503,15 @@ void server_panic(const char *message)
   log_write(LS_SYSTEM, L_CRIT, LOG_NOSNOTICE, "Server panic: %s", message);
   flush_connections(0);
   log_close();
-  close_connections(1);
-  exit(1);
+  /* No close_connections() and no exit(): the stores cannot be closed here
+   * (a store close allocates, and we are out of memory), and closing their
+   * descriptors by number under their live background threads -- or
+   * running exit()'s static destructors, which tear RocksDB down -- would
+   * hand a WAL or SST number to the next open.  _exit() leaves every
+   * descriptor to the kernel, which closes them only once the last thread
+   * is gone: nothing can reuse a number.  Every committed write is already
+   * in the WAL. */
+  _exit(1);
 }
 
 /*----------------------------------------------------------------------------
@@ -476,14 +532,9 @@ void server_restart(const char *message)
 
   sendto_opmask_butone(0, SNO_OLDSNO, "Restarting server: %s", message);
   Debug((DEBUG_NOTICE, "Restarting server..."));
-  stop_listeners();      /* refuse new connections before the slow part */
-  bounce_db_shutdown();  /* Persist bouncer sessions before closing connections */
-  metadata_shutdown();   /* close the metadata/readmarkers RocksDB env */
+  shutdown_stores();
   flush_connections(0);
-
-  log_async_shutdown();  /* Flush pending log entries before shutdown */
-  thread_pool_shutdown();
-  log_close();
+  shutdown_writers();
 
   close_connections(!(thisServer.bootopt & (BOOT_TTY | BOOT_DEBUG | BOOT_CHKCONF)));
 
@@ -491,8 +542,14 @@ void server_restart(const char *message)
 
   execv(SPATH, thisServer.argv);
 
-  /* Have to reopen since it has been closed above */
-  log_reopen();
+  /* Have to reopen since it has been closed above (keeping execv's errno
+   * for the %m below) */
+  {
+    int err = errno;
+
+    log_resume();
+    errno = err;
+  }
 
   log_write(LS_SYSTEM, L_CRIT, 0, "execv(%s,%s) failed: %m", SPATH,
 	    *thisServer.argv);
@@ -679,7 +736,7 @@ static void check_pings(struct Event* ev) {
 
     /* Remove dead clients. */
     if (IsDead(cptr) && !IsMeshStub(cptr)) {
-      exit_client(cptr, cptr, &me, cli_info(cptr));
+      exit_dead_client(cptr, "Dead socket");   /* or holds it */
       continue;
     }
     /* Tier2 T2-a: a mesh-server stub is intentionally a dead send-sink
@@ -791,48 +848,16 @@ static void check_pings(struct Event* ev) {
                              "No response from %s, closing link",
                              cli_name(cptr));
 
-      /* Try alias promotion first — if aliases exist, promote one.
-       * On successful promote the user is now represented by the
-       * promoted alias's numeric; this exit is bouncer-internal
-       * cleanup, not a real disconnect.  SetBouncerInternalDestroy
-       * gates s_misc.c's per-channel and per-server QUIT broadcasts
-       * so peers / channel members don't see "user has quit (Session
-       * transferred)" for what is, end-to-end, an in-place numeric
-       * swap (BX P handles the wire-level swap on bouncer-aware peers
-       * — including the production upstream).
-       *
-       * MUST gate on cptr being the actual primary (bsess->hs_client
-       * == cptr).  bounce_get_session() returns the same session for
-       * the primary AND any of its aliases (alias→primary follow), so
-       * without this guard a timing-out ALIAS would trigger
-       * bounce_promote_alias on the session, which picks the oldest
-       * alias and overwrites hs_client with it.  The original primary
-       * (still alive) is then silently displaced — no exit, no
-       * detach — leaving it session-disjoint while alive: the
-       * "ibutsu / ibutsu_ orphan" symptom.  When cptr is an alias,
-       * fall through to normal exit_client which handles alias
-       * untrack + remove without touching hs_client. */
-      if (IsUser(cptr) && bounce_enabled_for(cptr) && IsAccount(cptr)
-          && !IsBouncerAlias(cptr)) {
-        struct BouncerSession *bsess = bounce_get_session(cptr);
-        if (bsess && bsess->hs_client == cptr
-            && bsess->hs_alias_count > 0) {
-          if (bounce_promote_alias(bsess, 0) == 0) {
-            SetBouncerInternalDestroy(cptr);
-            exit_client_msg(cptr, cptr, &me, "Session transferred");
-            continue;
-          }
-        }
-      }
-
-      /* Check if client should enter bouncer HOLD mode instead of exiting */
-      if (IsUser(cptr) && bounce_should_hold(cptr)) {
-        if (bounce_hold_client(cptr, "Ping timeout") == 0) {
-          /* Successfully entered hold - don't exit_client */
-          continue;
-        }
-        /* If hold failed, fall through to normal exit */
-      }
+      /* A session primary that pinged out goes through the disconnect
+       * rule a QUIT and a dead socket do (bounce_promote_or_hold): a live
+       * device of its own copy takes over (one here at once, one on
+       * another server at the next tick), else the session holds or,
+       * with hold off, ends.  An alias exits plainly.  After a promote
+       * here the old primary's channels are already left, so the exit
+       * below shows no QUIT in them. */
+      if (IsUser(cptr) && !IsBouncerAlias(cptr)
+          && bounce_promote_or_hold(cptr, "Ping timeout") == 0)
+        continue; /* held */
 
       exit_client_msg(cptr, cptr, &me, "Ping timeout");
       continue;
@@ -867,16 +892,17 @@ static void check_pings(struct Event* ev) {
   timer_add(&ping_timer, check_pings, 0, TT_ABSOLUTE, next_check);
 }
 
-/** Periodic callback to purge old history messages.
- * Runs every hour to enforce CHATHISTORY_RETENTION policy.
- * @param[in] ev Timer event (ignored).
+/** The chathistory maintenance tick (CHATHISTORY_MAINTENANCE_INTERVAL,
+ * floor 60 s): starts a trim pass -- retention age-out runs from there in
+ * budgeted slices on the trimmer's own 1 s timer (history_trim_tick) --
+ * and prunes expired presence intervals.
+ * @param[in] ev Timer event: only its expiry runs a tick (the ET_DESTROY
+ * of a timer_del, e.g. history_purge_restart_timer's, is not a tick).
  */
 static void history_purge_callback(struct Event* ev)
 {
-  int retention_days;
-  unsigned long max_age_seconds;
-
-  (void)ev; /* unused */
+  if (ev_type(ev) != ET_EXPIRE)
+    return;
 
   /* Only run if chathistory storage is enabled */
   if (!feature_bool(FEAT_CHATHISTORY_STORE))
@@ -885,21 +911,18 @@ static void history_purge_callback(struct Event* ev)
   if (!history_is_available())
     return;
 
-  /* Run storage management maintenance (eviction if needed)
-   * This has its own internal interval check. */
-  history_maintenance_tick();
+  /* A trim pass starts on every maintenance tick, retention or not:
+   * age-out simply has no work at retention 0 (the slice timer carries
+   * any backlog on at 1 s). */
+  history_trim_tick(1);
 
-  retention_days = feature_int(FEAT_CHATHISTORY_RETENTION);
-  if (retention_days <= 0)
+  if (feature_int(FEAT_CHATHISTORY_RETENTION) <= 0)
     return; /* Retention disabled */
-
-  max_age_seconds = (unsigned long)retention_days * 24 * 60 * 60;
-  history_purge_old(max_age_seconds);
 
   /* Strict-presence chathistory: prune intervals fully older than the
    * retention horizon.  Cheap (in-memory walk + a single CF scan of a
-   * small CF) and bounded — happens once per retention pass alongside
-   * the existing chathistory purge. */
+   * small CF) and bounded — happens once per maintenance tick, as the
+   * trim pass starts. */
   presence_retention_sweep();
 }
 
@@ -1361,7 +1384,11 @@ int main(int argc, char **argv) {
    * flag will set FLAG_IRCV3AWARE on us and gate fork-only emissions
    * accordingly. Legacy peers ignore the unknown flag char. */
   SetIRCv3Aware(&me);
-  SetCrdtAware(&me);   /* this binary speaks the CR (CRDT sync) token */
+  /* 'C' means this server's shadow writes the doc, not just that the binary
+   * speaks CR: peers skip the tree path for C peers.  Latched at boot with
+   * the shadow (crdt_shadow_boot_enabled). */
+  if (crdt_shadow_boot_enabled())
+    SetCrdtAware(&me);
   /* Deliberately do NOT SetRenameCapable(&me): 'r' (FLAG_RENAME_CAPABLE)
    * exists so this fork can recognize and propagate rename-capable
    * non-v3 peers (X3, which advertises 'r'), not to advertise it on our
@@ -1397,11 +1424,11 @@ int main(int argc, char **argv) {
     struct db_init_arg web_arg  = { NULL, 0 };
     pthread_t hist_th, meta_th, web_th;
     int hist_started = 0, meta_started = 0, web_started = 0;
+    uint64_t newest_row_ms = 0;   /* 0 = no history store */
 
     if (feature_bool(FEAT_CHATHISTORY_STORE)) {
-      /* Map size and zstd compression must be configured before
-       * history_init() runs. */
-      history_set_map_size((size_t)feature_int(FEAT_HISTORY_MAP_SIZE_MB));
+      /* zstd compression must be configured before history_init() runs
+       * (HISTORY_MAP_SIZE_MB is the trimmer's logical cap, read live). */
 #ifdef USE_ZSTD
       compress_init((size_t)feature_int(FEAT_COMPRESS_THRESHOLD),
                     feature_int(FEAT_COMPRESS_LEVEL));
@@ -1437,8 +1464,13 @@ int main(int argc, char **argv) {
       if (hist_arg.rc != 0)
         log_write(LS_SYSTEM, L_WARNING, 0,
                   "Failed to initialize chathistory database, feature disabled");
-      else
+      else {
         chathistory_init_callbacks();
+        /* One walk of the targets CF serves the trimmer's start (its
+         * index-gap check) and the presence boot-close below (the newest
+         * stored row). */
+        newest_row_ms = history_trim_start();
+      }
     }
     if (feature_bool(FEAT_CAP_draft_metadata_2) && meta_arg.rc != 0)
       log_write(LS_SYSTEM, L_WARNING, 0,
@@ -1452,7 +1484,7 @@ int main(int argc, char **argv) {
      * completes.  Also runs the boot-close sweep for stale open
      * intervals.  Non-fatal: without the env, session-anchored
      * presence remains usable in-memory. */
-    presence_set_boot_alive_hint(history_newest_activity_ms());
+    presence_set_boot_alive_hint(newest_row_ms);
     if (presence_init() != 0 && feature_bool(FEAT_CHATHISTORY_STRICT_PRESENCE)) {
       /* Strict presence with no account store hides every authenticated
        * user's history behind a zero record.  Fail loud and fail open. */
