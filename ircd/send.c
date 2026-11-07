@@ -147,6 +147,16 @@ void sendcmdto_set_skip_crdt_servers(void)
   skip_crdt_servers_once = 1;
 }
 
+/** One-shot, like skip_crdt_servers_once: the next sendcmdto_serv_butone or
+ *  sendcmdto_serv_butone_v3 skips every directly linked server for which
+ *  @a skip returns nonzero (the MR-4d standby gateways' legacy links). */
+static int (*skip_links_once)(struct Client *link);
+
+void sendcmdto_set_skip_links(int (*skip)(struct Client *link))
+{
+  skip_links_once = skip;
+}
+
 /* M6: the next sendcmdto_match_butone delivers to LOCAL matching users only
  * (the CR M receiver of a masked message; the mesh copy already reached
  * every peer, the origin's or the gateway's tree copy reaches legacy). */
@@ -479,6 +489,7 @@ void sendcmdto_reset_s2s_overrides(void)
   /* The crdt-mesh one-shots too: one left armed would make the next
    * unrelated broadcast skip the CRDT peers or the local members. */
   skip_crdt_servers_once = 0;
+  skip_links_once = NULL;
   skip_local_members_once = 0;
   match_local_only_once = 0;
 }
@@ -2293,7 +2304,9 @@ void sendcmdto_serv_butone(struct Client *from, const char *cmd,
   struct Client *primary_dir = NULL;
   int skip_crdt = skip_crdt_servers_once;  /* F1/R6a: one-shot — skip CRDT-aware relay
                                             * (the doc / CR plane already covers them) */
+  int (*skip_link)(struct Client *) = skip_links_once;
   skip_crdt_servers_once = 0;
+  skip_links_once = NULL;
 
   /* Split S2S delivery for aliases: two modes.
    * 1) Explicit: caller set s2s_alias_source (JOIN/PART via joinbuf)
@@ -2428,6 +2441,8 @@ void sendcmdto_serv_butone(struct Client *from, const char *cmd,
 
       if (skip_crdt && IsCrdtAware(lp->value.cptr))
         continue;  /* F1/R6a: the doc / CR plane covers this CRDT peer */
+      if (skip_link && skip_link(lp->value.cptr))
+        continue;
 
       /* Pick tagged or legacy variant per-peer. */
       if (mb_legacy && !IsIRCv3Aware(lp->value.cptr)) {
@@ -2494,8 +2509,10 @@ void sendcmdto_serv_butone_v3(struct Client *from, const char *cmd,
   struct Client *alias_from = NULL;
   struct Client *primary_dir = NULL;
   int skip_crdt = skip_crdt_servers_once;   /* R6a: one-shot CRDT-server relay skip (TAGMSG demote/bridge) */
+  int (*skip_link)(struct Client *) = skip_links_once;
 
   skip_crdt_servers_once = 0;
+  skip_links_once = NULL;
 
   if (s2s_alias_source) {
     alias_from = s2s_alias_source;
@@ -2604,6 +2621,8 @@ void sendcmdto_serv_butone_v3(struct Client *from, const char *cmd,
     if (!IsIRCv3Aware(lp->value.cptr))
       continue;
     if (skip_crdt && IsCrdtAware(lp->value.cptr))   /* R6a: the CR-M flood covers this CRDT peer */
+      continue;
+    if (skip_link && skip_link(lp->value.cptr))
       continue;
     if (IsBurstGated(lp->value.cptr))
       continue;

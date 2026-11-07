@@ -810,7 +810,10 @@ int ms_gitsync(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
        * links only.  The mesh is single-gateway by design; the window below
        * still stops two gateways on one legacy island from bouncing the
        * same broadcast between them (each gateway mints the other's tree
-       * copy back into the mesh with a fresh msgid). */
+       * copy back into the mesh with a fresh msgid).  With no tree presence
+       * every gateway passes this gate alike, so only the MR-4d designated
+       * fronter of each legacy link re-emits; on a tree path (via_crdt)
+       * only the gateway on that path passes, and it must not stand down. */
       struct Client *osrv = IsUser(sptr) ? cli_user(sptr)->server
                             : (IsMe(sptr) ? NULL : sptr);
       int via_crdt = osrv && cli_from(osrv) && IsCrdtAware(cli_from(osrv));
@@ -823,6 +826,8 @@ int ms_gitsync(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
                                  && (!IsMeshStub(osrv) || IsPresented(osrv))) ? sptr
                               : &me;
         sendcmdto_set_skip_crdt_servers();
+        if (!via_crdt || IsMeshStub(osrv))  /* an anchor is its own CRDT-aware cli_from */
+          sendcmdto_set_skip_links(crdt_legacy_link_standby);
         if (subarg)
           sendcmdto_serv_butone_v3(lsrc, CMD_GITSYNC, NULL, "* %s %s", action, subarg);
         else

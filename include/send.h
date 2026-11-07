@@ -78,6 +78,9 @@ extern void sendcmdto_set_skip_local_members(void);
  * set by the channel relay when the CR-M flood will carry this msg to those CRDT peers, so
  * the tree no longer double-carries it.  One-shot; consumed (reset) at call entry. */
 extern void sendcmdto_set_skip_crdt_servers(void);
+/* One-shot: the next sendcmdto_serv_butone[_v3] skips each directly linked
+ * server for which @a skip returns nonzero. */
+extern void sendcmdto_set_skip_links(int (*skip)(struct Client *link));
 extern void sendcmdto_set_match_local_only(void);   /* M6 */
 /* Opt-in S2S tags for the next sendcmdto_serv_butone() call */
 extern void sendcmdto_want_s2s_tags(int want);

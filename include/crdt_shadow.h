@@ -328,6 +328,10 @@ int crdt_shadow_beacon_record(unsigned int num, time_t emit_ts,
  *  server @a num because a fresh lower-numeric gateway also fronts it (double-delivery
  *  election).  @a my_yxx = our own server numeric.  0 when we are the active emitter. */
 int crdt_shadow_should_standby(unsigned int num, const char *my_yxx);
+/** MR-4d per legacy link: is @a link a legacy server whose designated fronter
+ *  is another gateway, so this node re-emits nothing to it?  For
+ *  sendcmdto_set_skip_links, ahead of a gateway re-emit to legacy. */
+int crdt_legacy_link_standby(struct Client *link);
 
 /** MR-5 event-driven beacon-burst: hand a freshly-linked CRDT @a peer the full current
  *  beacon set at link time (our self + proxy-legacy beacons, plus a replay of every fresh

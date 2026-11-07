@@ -234,6 +234,13 @@ int crdt_shadow_should_standby(unsigned int num, const char *my_yxx)
   return crdt_gateway_should_standby((int)base64toint(my_yxx), fronter_num, fresh);
 }
 
+int crdt_legacy_link_standby(struct Client *link)
+{
+  return link && IsServer(link) && !IsCrdtAware(link)
+         && crdt_shadow_should_standby((unsigned int)base64toint(cli_yxx(link)),
+                                       cli_yxx(&me));
+}
+
 /* MR-5 event-driven beacon-burst: when a CRDT peer links, hand it the full current
  * beacon set at once, instead of making it wait up to a CRDT_BEACON_STALE window for the
  * periodic 30s flood + eager relay to reach it.  Closes the cold-link "blind leaf" gap
