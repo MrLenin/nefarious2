@@ -37,6 +37,7 @@
 #include "crdt_shadow.h"   /* crdt_shadow_active: mesh copy of a redaction */
 #include "hash.h"
 #include "history.h"
+#include "history_trim_codec.h"
 #include "ircd.h"
 #include "ircd_features.h"
 #include "ircd_log.h"
@@ -230,10 +231,15 @@ int m_redact(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
                  && ircd_strcmp(msg->account, cli_user(sptr)->account) == 0) {
         /* Authenticated owner: account match, no time window */
         can_redact = 1;
-      } else if (!msg->account[0] && !cli_user(sptr)->account[0]) {
+      } else if (!msg->account[0] && !cli_user(sptr)->account[0]
+                 && !msg->header_repaired) {
         /* Unauthenticated sender mask fallback: both message and user must
          * be unauthenticated, and nick!user@host must match exactly.
-         * This only works within the same session (nick changes break it). */
+         * This only works within the same session (nick changes break it).
+         * Not for a row whose '|'-shifted header was repaired on read: its
+         * account is empty because none could be trusted, not because the
+         * sender was unauthenticated, so the mask proves nothing; it takes
+         * the window and chanop path below like anyone else's row. */
         char current_mask[HISTORY_SENDER_LEN];
         ircd_snprintf(0, current_mask, sizeof(current_mask), "%s!%s@%s",
                       cli_name(sptr), cli_user(sptr)->username,
@@ -317,6 +323,7 @@ int m_redact(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
       char timestamp[32];
       char sender[HISTORY_SENDER_LEN];
       char redact_content[512];
+      char owner[HTC_OWNER_MAX];
 
       history_format_ms(timestamp, sizeof(timestamp), time_ms);
       ircd_snprintf(0, sender, sizeof(sender), "%s!%s@%s",
@@ -332,7 +339,8 @@ int m_redact(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
 
       history_store_message(redact_msgid, timestamp, target, NULL, sender,
                             cli_user(sptr)->account[0] ? cli_user(sptr)->account : "",
-                            HISTORY_REDACT, redact_content, NULL);
+                            HISTORY_REDACT, redact_content, NULL,
+                            history_owner_of(owner, sizeof(owner), sptr));
 
       /* Write-forward to STORE servers if we're non-STORE.  The reason
        * is client-supplied: sentinel-escape it for the CH W payload. */
@@ -385,12 +393,14 @@ int m_redact(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
  * @param[in] parv Argument vector.
  * @return CPTR_KILLED if client was squit, else 0.
  */
-/* Apply a channel redaction that reached us from elsewhere (P10 REDACT or the
- * CR M 'R' mesh copy): placeholder the row, store ONE REDACT context row
- * under the origin's redact_msgid/time (one-time-per-message), fan out to
- * local members with the capability.  Idempotent: a repeat (two servers or
- * two users redacting the same message, or the catch-up query replaying one
- * we already applied) is still shown locally but stores no second row. */
+/* Apply a channel redaction that reached us from elsewhere (P10 REDACT, or
+ * the redaction catch-up replay): placeholder the row, store ONE REDACT
+ * context row under the origin's redact_msgid/time (one-time-per-message),
+ * fan out to local members with the capability.  Idempotent: a repeat (two
+ * servers or two users redacting the same message, or the catch-up query
+ * replaying one we already applied) is still shown locally but stores no
+ * second row.  @a sender_str / @a account_str name the stored redacter
+ * explicitly (catch-up); NULL derives them from @a src. */
 void redact_apply_row(struct Client *src, const char *target,
                       const char *msgid, const char *redact_msgid,
                       uint64_t time_ms, const char *reason,
@@ -411,6 +421,7 @@ void redact_apply_row(struct Client *src, const char *target,
     char timestamp[32];
     char sender[HISTORY_SENDER_LEN];
     char redact_content[512];
+    char owner[HTC_OWNER_MAX];
 
     ircd_snprintf(0, timestamp, sizeof(timestamp), "%llu.%03llu",
                   (unsigned long long)(time_ms / 1000),
@@ -432,11 +443,20 @@ void redact_apply_row(struct Client *src, const char *target,
       ircd_snprintf(0, redact_content, sizeof(redact_content),
                     "%s", msgid);
 
+    /* The row's trim owner: the redacter.  A catch-up row names it only
+     * off the wire (@a account_str, its sender's server unknown here):
+     * its account, else "-"; otherwise @a src, whose account it carries. */
+    if (account_str) {
+      if (htc_owner_key(owner, sizeof(owner), account_str, NULL, NULL) < 0)
+        ircd_strncpy(owner, HTC_OWNER_NONE, sizeof(owner));
+    } else
+      history_owner_of(owner, sizeof(owner), src);
+
     history_store_message(redact_msgid, timestamp, target, NULL, sender,
                           account_str ? account_str
                           : ((cli_user(src) && cli_user(src)->account[0])
                              ? cli_user(src)->account : ""),
-                          HISTORY_REDACT, redact_content, NULL);
+                          HISTORY_REDACT, redact_content, NULL, owner);
   }
 
   /* Set msgid for live channel broadcast */

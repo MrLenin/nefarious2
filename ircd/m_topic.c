@@ -40,6 +40,7 @@
 #include "numnicks.h"
 #include "send.h"
 #include "history.h"
+#include "history_trim_codec.h"
 
 /* #include <assert.h> -- Now using assert in ircd_log.h */
 #include <stdlib.h> /* for atoi() */
@@ -60,6 +61,7 @@ static void store_topic_event(struct Client *sptr, struct Channel *chptr,
   char fallback_msgid[64];
   const char *msgid;
   char sender[HISTORY_SENDER_LEN];
+  char owner[HTC_OWNER_MAX];
   const char *account;
 
   if (!history_is_available())
@@ -104,10 +106,12 @@ static void store_topic_event(struct Client *sptr, struct Channel *chptr,
   /* Get account name if logged in */
   account = (cli_user(sptr) && cli_user(sptr)->account[0])
             ? cli_user(sptr)->account : NULL;
+  /* The row's trim owner: the client whose account it carries. */
+  history_owner_of(owner, sizeof(owner), sptr);
 
   /* Store in database */
   history_store_message(msgid, timestamp, chptr->chname, NULL, sender,
-                        account, HISTORY_TOPIC, topic ? topic : "", NULL);
+                        account, HISTORY_TOPIC, topic ? topic : "", NULL, owner);
 }
 #endif /* USE_ROCKSDB */
 
@@ -146,7 +150,8 @@ static void do_settopic(struct Client *sptr, struct Client *cptr,
        ircd_strncpy((char *)&nick, nicktok, NICKLEN + 1);
    } else {
      memset(chptr->topic_nick, 0, NICKLEN + USERLEN + HOSTLEN + 3);
-     if (feature_bool(FEAT_HOST_IN_TOPIC)) {
+     /* A server (or &his) has no user@host to show. */
+     if (feature_bool(FEAT_HOST_IN_TOPIC) && cli_user(from)) {
        ircd_snprintf(0, chptr->topic_nick, NICKLEN + USERLEN + HOSTLEN + 3, "%s!%s@%s",
                      cli_name(from), cli_user(from)->username, cli_user(from)->host);
      } else {

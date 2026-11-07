@@ -27,6 +27,10 @@
 #ifndef INCLUDED_metadata_h
 #define INCLUDED_metadata_h
 
+#ifndef INCLUDED_metadata_lww_h
+#include "metadata_lww.h"
+#endif
+
 struct Client;
 struct Channel;
 
@@ -143,6 +147,18 @@ extern int metadata_readmarker_get(const char *account, const char *target, char
  * @return 0 on success (updated), 1 if not updated (older timestamp), -1 on error.
  */
 extern int metadata_readmarker_set(const char *account, const char *target, const char *timestamp);
+
+/** Visit every read marker stored for an account: its target name and
+ * timestamp string, in key (target-name) order -- it does not sort or
+ * bound by timestamp itself; a caller wanting the newest N decides that.
+ * @param[in] account Account name.
+ * @param[in] cb Called once per marker; a nonzero return stops the walk.
+ * @param[in] arg Opaque pointer passed through to @a cb.
+ * @return the number of markers visited, or -1 on error.
+ */
+extern int metadata_readmarker_foreach(const char *account,
+                       int (*cb)(const char *target, const char *ts, void *arg),
+                       void *arg);
 
 /** Clear all metadata for an account in LMDB.
  * @param[in] account Account name.
@@ -497,6 +513,130 @@ extern void metadata_send_join_notifications(struct Client *joiner, struct Chann
  */
 extern void metadata_notify_subscribers(const char *target, const char *key,
                                         const char *value, int visibility);
+
+/** Change one key of @a cptr's in-memory metadata and its mode-sync flag
+ * (metadata_mode_sync[]) only: no store row, no notification, nothing
+ * sent.  For a server that learns a user's mode-synced key from another
+ * fork server's M line: that user's own server is the one writer of the
+ * account's row (set_user_mode), and the stamped row it sends is what
+ * this server stores.
+ * @param[in] cptr Client whose memory changes.
+ * @param[in] key Key name.
+ * @param[in] value Value to set, or NULL to delete.
+ * @param[in] visibility METADATA_VIS_PUBLIC or METADATA_VIS_PRIVATE.
+ */
+/** Give one of our connections the account's stored modes (push-2 final
+ * fix wave, I-1): for each mode-synced key (metadata_mode_sync[]:
+ * umode.*, chathistory.*, draft/persistence/hold) the account has a row
+ * for, the flag follows the row -- a live row by its value, a tombstone
+ * as off; a key with no row leaves the flag as it is.  The +p rule
+ * (PRIV_HIDE_CHANNELS / DERESTRICT_HIDECHANS) applies.  Not for a device
+ * (bouncer alias) or a remote copy.
+ * @param[in] cptr Our connection, a user with an account.
+ * @param[in] live 0 at registration, before the N (flags and list set
+ *            silently: the N carries them); 1 for a login after
+ *            registration (each change through umode_sync_apply: echo,
+ *            counts, M line, session mirror).
+ */
+extern void metadata_mode_sync_restore(struct Client *cptr, int live);
+
+extern void metadata_client_memory_set(struct Client *cptr, const char *key,
+                                       const char *value, int visibility);
+
+/* ========== W4: stamped account store (cross-fork-server sync) ========== */
+
+/** Mint a fresh HLC stamp for a local account-store write.
+ * Thin wrapper over hlc_global_event() (crdt_hlc.h) in the struct
+ * md_stamp shape the metadata_lww.h codec and store use.
+ */
+extern struct md_stamp metadata_stamp_now(void);
+
+/** Write (or tombstone) one stamped account-metadata row: the value row
+ * and its clock row (metadata_clock column family) in one write batch.
+ * metadata_account_set_ts (the backing of metadata_account_set /
+ * metadata_account_set_permanent) is stamp-now plus this writer, so
+ * every existing writer is stamped and every delete leaves a tombstone.
+ * @param[in] account Account name.
+ * @param[in] key Metadata key.
+ * @param[in] value Value to set, or NULL to tombstone (delete the value
+ *             row; the clock row is still written, with tombstone=1).
+ * @param[in] vis METADATA_VIS_PUBLIC or METADATA_VIS_PRIVATE (meaningless
+ *             for a tombstone, but still recorded).
+ * @param[in] st Stamp to record in the clock row.
+ * @return 0 on success, -1 on error.
+ */
+extern int metadata_account_put_versioned(const char *account, const char *key,
+                                          const char *value, int vis,
+                                          const struct md_stamp *st);
+
+/** Read one account-metadata row's current version: the clock row plus
+ * (for a live row) the decoded value.  A live row with no clock entry
+ * (written before this feature existed) reads with stamp 0.0.0.
+ * @param[in] account Account name.
+ * @param[in] key Metadata key.
+ * @param[out] out Version info (stamp/tombstone/vis/value/vlen); on a
+ *             live row, @a out->value points into @a valbuf.
+ * @param[out] valbuf Buffer the live value is decoded into.
+ * @param[in] vlen Size of @a valbuf.
+ * @return 0 (found — live row or tombstone), 1 (absent), -1 (error).
+ */
+extern int metadata_account_get_version(const char *account, const char *key,
+                                        struct md_version *out,
+                                        char *valbuf, size_t vlen);
+
+/** Merge an incoming stamped version against the stored one by the pure
+ * LWW rule (metadata_lww.h's md_lww_take).  On take: folds the incoming
+ * stamp into this server's global HLC (hlc_global_receive, so our clock
+ * never reads behind a peer's) and persists the incoming row under its
+ * OWN stamp (metadata_account_put_versioned) — never a freshly minted
+ * one, so every peer that merges the same row agrees on its stamp.
+ * @param[in] account Account name.
+ * @param[in] key Metadata key.
+ * @param[in] in Incoming version to merge.
+ * @return 1 (taken), 0 (kept the local version), -1 (error).
+ */
+/** The doc mirror of an account row written without a store
+ * (metadata_account_write with storage unconfigured): what
+ * metadata_write_versioned mirrors after a store write, under the row's
+ * stamp @a st. */
+extern void metadata_doc_mirror_account(const char *account, const char *key,
+                                        const char *value, int visibility,
+                                        const struct md_stamp *st);
+extern int metadata_account_merge(const char *account, const char *key,
+                                  const struct md_version *in);
+
+/** Visit every live row and every tombstone stored for @a account.
+ * Unlike metadata_account_list, a key of any length is visited — a
+ * 64+ byte draft/persistence/... key is never skipped or truncated.
+ * @param[in] account Account name.
+ * @param[in] cb Called once per row; a nonzero return stops the walk.
+ * @param[in] arg Opaque pointer passed through to @a cb.
+ * @return the number of rows visited, or -1 on error.
+ */
+extern int metadata_account_foreach_version(const char *account,
+                       int (*cb)(const char *key, const struct md_version *v, void *arg),
+                       void *arg);
+
+/** Apply an account-store change to every IsUser client logged into
+ * @a account, local or remote: updates the in-memory MetadataEntry list
+ * (metadata_apply_client_memory's per-client half) and the mode-sync
+ * flag table (metadata_mode_sync[]) for each.  A mode-synced key touches
+ * only this server's own connections: each non-device connection whose
+ * mode differs is changed as a self MODE (umode_sync_apply: echo, counts,
+ * M line, session mirror); remote copies change by their servers' M
+ * lines.  No store write.  Keys of METADATA_KEY_LEN or longer are skipped (they
+ * cannot fit the in-memory key buffer).  Notifies local
+ * draft/metadata-2 subscribers once for a PRIVATE key (any one session
+ * of the account resolves every session, per metadata_notify_subscribers'
+ * own account-wide PRIVATE scoping), or once per distinct non-alias nick
+ * for a PUBLIC one.
+ * @param[in] account Account name.
+ * @param[in] key Metadata key.
+ * @param[in] value New value, or NULL for an unset.
+ * @param[in] vis METADATA_VIS_PUBLIC or METADATA_VIS_PRIVATE.
+ */
+extern void metadata_account_apply_memory(const char *account, const char *key,
+                                          const char *value, int vis);
 
 /* X3 dependency removed - Nefarious is now authoritative for metadata */
 

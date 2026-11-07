@@ -40,6 +40,27 @@ struct HLC hlc_local_event(struct HLC *local);
  */
 struct HLC hlc_receive(struct HLC *local, const struct HLC *remote);
 
+/** @brief Advance HLC on receiving a remote timestamp, with a bound on
+ *  how far ahead of our wall clock the remote is allowed to read.
+ *
+ *  If @a max_forward_ms is nonzero and the remote's physical_ms reads
+ *  more than @a max_forward_ms ahead of @a now_ms, the remote reading
+ *  is refused: *rejected is set to 1 and *local is advanced exactly as
+ *  a local event at @a now_ms (today's hlc_local_event rule, but using
+ *  the caller-supplied "now" instead of re-reading the wall clock).
+ *  The remote's own stamp is left untouched by this refusal — the
+ *  event keeps its origin time; only the receiving clock declines to
+ *  move toward it.
+ *
+ *  Otherwise *rejected is set to 0 and today's receive algorithm runs
+ *  using @a now_ms in place of a fresh wall-clock read.
+ *
+ *  @a rejected may be NULL when the caller does not need the outcome.
+ */
+struct HLC hlc_receive_bounded(struct HLC *local, const struct HLC *remote,
+                                uint64_t now_ms, uint64_t max_forward_ms,
+                                int *rejected);
+
 /** @brief Compare two HLC timestamps.
  *  Returns <0, 0, >0 (lexicographic on physical_ms, logical, node_id).
  */
@@ -58,8 +79,16 @@ const struct HLC *hlc_global(void);
 /** @brief Advance the global HLC for a local event. */
 struct HLC hlc_global_event(void);
 
-/** @brief Update the global HLC from a received remote timestamp. */
-void hlc_global_receive(const struct HLC *remote);
+/** @brief Update the global HLC from a received remote timestamp, refusing
+ *  it when the remote reads more than @a max_forward_ms ahead of our wall
+ *  clock (0 = unbounded, matching hlc_receive's unbounded behaviour).
+ *  Returns 1 when refused (the global clock was NOT advanced toward the
+ *  remote; it still took a local-event step), 0 when adopted normally.
+ *  On refusal, *ahead_ms is set to how far ahead the remote read; it may
+ *  be NULL when the caller does not need that value.
+ */
+int hlc_global_receive(const struct HLC *remote, uint64_t max_forward_ms,
+                        uint64_t *ahead_ms);
 
 #ifdef DEBUGMODE
 #include <time.h>   /* time_t */
@@ -69,5 +98,14 @@ void hlc_global_receive(const struct HLC *remote);
  *  to translation units that include config.h before this header.) */
 extern time_t ircd_fake_clock_offset;
 #endif
+/** @brief Read FEAT_HLC_MAX_FORWARD_MS, normalised for hlc_global_receive /
+ *  md_stamp_ahead: a negative configured value has no sane bounded
+ *  meaning and is treated as 0 (unbounded) rather than sign-extended
+ *  into a huge uint64_t.  The one place this normalisation happens;
+ *  every caller that needs the forward-skew slack (parse.c's inbound
+ *  HLC tag receive, metadata_sync.c's stamped-row receive) reads it
+ *  from here instead of re-deriving it.
+ */
+uint64_t hlc_max_forward_ms(void);
 
 #endif /* INCLUDED_crdt_hlc_h */

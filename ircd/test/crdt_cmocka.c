@@ -33,6 +33,15 @@
 #include "s2s_chunk.h"
 #include "crdt_shadow.h"    /* M12: force_lastmod (static inline, pure) */
 
+/* Stub for feature_int: crdt_hlc.c's hlc_max_forward_ms() reads
+ * FEAT_HLC_MAX_FORWARD_MS through it.  Present only so crdt_hlc.o links
+ * standalone (the crdt_hlc_bound_cmocka.c precedent). */
+int feature_int(int feat)
+{
+  (void)feat;
+  return 60000;  /* ircd_features.c's F_I(HLC_MAX_FORWARD_MS) default */
+}
+
 /* ------------------------------------------------------------------ */
 /* helpers                                                            */
 /* ------------------------------------------------------------------ */
@@ -685,6 +694,153 @@ static void test_gline_op_replicates(void **state)
 
   crdt_state_clear(&s1);
   crdt_state_clear(&s2);
+}
+
+/* Stage-2 review: a stamped account row's own HLC rides the doc entry, so the doc
+ * and the store order one row's writes alike.  set_at keeps the given stamp
+ * (not a fresh local event), replicates it, moves the doc clock past it, and an
+ * older stamp loses to a newer one whichever arrives last. */
+static void test_metadata_set_at_keeps_row_stamp(void **state)
+{
+  struct CrdtNetworkState s1, s2;
+  char key[32];
+  const struct CrdtLWWValue *v;
+  uint64_t now = hlc_wall_clock_ms();
+  struct HLC newer = { now + 1000, 3, 7 };   /* inside the 60 s forward bound */
+  struct HLC older = { now - 1000, 0, 9 };
+  struct HLC far = { now + 3600000ULL, 0, 7 };  /* an hour ahead: beyond it */
+  struct HLC dts;
+  uint32_t klen;
+  (void)state;
+
+  memcpy(key, "bob", 3); key[3] = '\0'; memcpy(key + 4, "umode.invisible", 15);
+  klen = 3 + 1 + 15;
+  crdt_state_init(&s1, 1);
+  crdt_state_init(&s2, 2);
+
+  crdt_metadata_set_at(&s1, key, klen, "P:1", 3, &newer, now, 60000);
+  v = crdt_metadata_get(&s1, key, klen);
+  assert_non_null(v);
+  assert_int_equal(0, hlc_compare(&v->ts, &newer));
+  assert_true(hlc_compare(&s1.clock, &newer) >= 0);   /* the doc clock moved past it */
+
+  crdt_state_sync(&s2, &s1);
+  v = crdt_metadata_get(&s2, key, klen);
+  assert_non_null(v);
+  assert_int_equal(0, hlc_compare(&v->ts, &newer));
+
+  /* An older row arriving later (a delayed gateway import) does not win. */
+  crdt_metadata_set_at(&s2, key, klen, "P:0", 3, &older, now, 60000);
+  v = crdt_metadata_get(&s2, key, klen);
+  assert_non_null(v);
+  assert_memory_equal("P:1", v->data, 3);
+
+  /* A stamped delete keeps its stamp, readable for the store heal. */
+  crdt_metadata_del_at(&s1, key, klen, &(struct HLC){ now + 2000, 0, 7 }, now, 60000);
+  assert_int_equal(1, crdt_lwwmap_deleted_ts(&s1.metadata, key, klen, &dts));
+  assert_int_equal(now + 2000, dts.physical_ms);
+
+  /* A stamp beyond the forward bound does not drag the doc clock. */
+  crdt_metadata_set_at(&s2, key, klen, "P:2", 3, &far, now, 60000);
+  assert_true(s2.clock.physical_ms < far.physical_ms);
+
+  crdt_state_clear(&s1);
+  crdt_state_clear(&s2);
+}
+
+
+/* The tombstone (or live) entry for a key, read straight from the map:
+ * crdt_lwwmap_get hides deleted entries and the digest skips them. */
+static const struct CrdtLWWEntry *lww_entry(const struct CrdtLWWMap *m,
+                                            const char *key, uint32_t klen)
+{
+  uint32_t b;
+  const struct CrdtLWWEntry *e;
+  for (b = 0; b < m->nbuckets; b++)
+    for (e = m->buckets[b]; e; e = e->ht_next)
+      if (e->key_len == klen && 0 == memcmp(e->key, key, klen))
+        return e;
+  return NULL;
+}
+
+/* Two servers that each mint the same stamped row (each took it over its own
+ * W4 link) must end with one entry and equal digests.  The writer comes from
+ * the stamp, not the minting server, so the copies are bit-identical; with
+ * each server's own numeric there, an equal ts never replaces and the digests
+ * would differ for good (anti-entropy re-sending CR F every tick). */
+static void test_metadata_same_stamp_mints_converge(void **state)
+{
+  struct CrdtNetworkState s1, s2, s3, s4;
+  char key[32];
+  const struct CrdtLWWEntry *e;
+  unsigned char *buf = malloc(1 << 16);
+  uint64_t now = hlc_wall_clock_ms();
+  struct HLC row = { now - 500, 2, 9 };       /* stamped by server 9 */
+  struct HLC gone = { now - 100, 0, 9 };
+  uint32_t klen;
+  int n;
+  (void)state;
+
+  assert_non_null(buf);
+  memcpy(key, "bob", 3); key[3] = '\0'; memcpy(key + 4, "avatar", 6);
+  klen = 3 + 1 + 6;
+  crdt_state_init(&s1, 1);
+  crdt_state_init(&s2, 2);
+  crdt_state_init(&s3, 3);
+  crdt_state_init(&s4, 4);
+
+  /* Both mint the same stamped row, then sync both ways. */
+  crdt_metadata_set_at(&s1, key, klen, "P:x", 3, &row, now, 60000);
+  crdt_metadata_set_at(&s2, key, klen, "P:x", 3, &row, now, 60000);
+  crdt_state_sync(&s2, &s1);
+  crdt_state_sync(&s1, &s2);
+  e = lww_entry(&s1.metadata, key, klen);
+  assert_non_null(e); assert_int_equal(9, e->val.writer);
+  e = lww_entry(&s2.metadata, key, klen);
+  assert_non_null(e); assert_int_equal(9, e->val.writer);
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+
+  /* The op carries the stamp's writer too: a third server that learns the
+   * row only by delta replay records 9, not 1. */
+  crdt_state_sync(&s3, &s1);
+  e = lww_entry(&s3.metadata, key, klen);
+  assert_non_null(e); assert_int_equal(9, e->val.writer);
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s3));
+
+  /* A stamped delete minted on both: the tombstones match in ts and writer,
+   * through delta replay (twice, as duplicates arrive) and a snapshot. */
+  crdt_metadata_del_at(&s1, key, klen, &gone, now, 60000);
+  crdt_metadata_del_at(&s2, key, klen, &gone, now, 60000);
+  crdt_state_sync(&s2, &s1);
+  crdt_state_sync(&s1, &s2);
+  crdt_state_sync(&s2, &s1);
+  crdt_state_sync(&s3, &s2);
+  {
+    struct CrdtNetworkState *all[3] = { &s1, &s2, &s3 };
+    int i;
+    for (i = 0; i < 3; i++) {
+      e = lww_entry(&all[i]->metadata, key, klen);
+      assert_non_null(e);
+      assert_int_equal(1, e->deleted);
+      assert_int_equal(0, hlc_compare(&e->val.ts, &gone));
+      assert_int_equal(9, e->val.writer);
+    }
+  }
+  n = crdt_snapshot_encode(&s1, buf, 1 << 16);
+  assert_true(n > 0);
+  assert_true(crdt_snapshot_apply(&s4, buf, (size_t)n) >= 0);
+  assert_true(crdt_snapshot_apply(&s4, buf, (size_t)n) >= 0);   /* a duplicate */
+  e = lww_entry(&s4.metadata, key, klen);
+  assert_non_null(e);
+  assert_int_equal(1, e->deleted);
+  assert_int_equal(9, e->val.writer);
+  assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+
+  free(buf);
+  crdt_state_clear(&s1);
+  crdt_state_clear(&s2);
+  crdt_state_clear(&s3);
+  crdt_state_clear(&s4);
 }
 
 /* ================================================================== */
@@ -4213,6 +4369,8 @@ int main(void)
     cmocka_unit_test(test_user_record_host_overrides),
     cmocka_unit_test(test_gline_doc_converges_same_lastmod),
     cmocka_unit_test(test_metadata_op_replicates),
+    cmocka_unit_test(test_metadata_set_at_keeps_row_stamp),
+    cmocka_unit_test(test_metadata_same_stamp_mints_converge),
     cmocka_unit_test(test_bsess_op_replicates),
     cmocka_unit_test(test_bsess_winner),
     cmocka_unit_test(test_bconn_roster),

@@ -58,6 +58,43 @@ extern struct db_iter *db_iter_open(struct db_env *env,
                                     struct db_cf *cf,
                                     struct db_snapshot *snap);
 
+/** Open a new iterator on @a cf, restricted to the half-open range
+ * [@a lower, @a upper).  @a lower is inclusive, @a upper is exclusive;
+ * either may be NULL (with its length 0) for an unbounded end on that
+ * side.  The iterator keeps its own copies of both bounds -- the
+ * caller's buffers only need to live for the duration of this call
+ * (RocksDB's C readoptions otherwise keep only a pointer, which would
+ * dangle once a stack-built bound goes out of scope).
+ *
+ * db_iter_seek_first positions at @a lower (or the smallest key in
+ * the CF when @a lower is NULL).  A db_iter_seek() to a key below
+ * @a lower lands on the first key >= @a lower, same as seeking to
+ * @a lower itself; a seek at or past @a upper is DB_NOTFOUND, same as
+ * stepping off the bounded range.
+ *
+ * @a snap behaves as in db_iter_open.  Returns NULL on failure
+ * (allocation, bad CF, etc.). */
+extern struct db_iter *db_iter_open_bounded(struct db_env *env,
+                                            struct db_cf *cf,
+                                            struct db_snapshot *snap,
+                                            const void *lower, size_t llen,
+                                            const void *upper, size_t ulen);
+
+/** db_iter_open_bounded, plus a cap on the deleted (or otherwise hidden)
+ * entries one positioning call -- seek, seek_first, seek_last, next, prev
+ * -- may step over: past @a max_skip, that call returns DB_INCOMPLETE and
+ * leaves the iterator unpositioned, so a check over a range that holds a
+ * long run of tombstones costs at most @a max_skip steps instead of the
+ * whole run.  0 = no cap (db_iter_open_bounded).  RocksDB:
+ * ReadOptions::max_skippable_internal_keys (its count includes the
+ * hidden versions a tombstone shadows). */
+extern struct db_iter *db_iter_open_bounded_limited(struct db_env *env,
+                                                    struct db_cf *cf,
+                                                    struct db_snapshot *snap,
+                                                    const void *lower, size_t llen,
+                                                    const void *upper, size_t ulen,
+                                                    unsigned long long max_skip);
+
 /** Close an iterator and release its resources.  Safe on NULL. */
 extern void db_iter_close(struct db_iter *it);
 

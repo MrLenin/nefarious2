@@ -150,6 +150,13 @@ struct HistoryMessage {
    * A channel recreated on the losing side of a split is a different
    * incarnation and its rows are not the surviving channel's history. */
   time_t incarnation;
+  /** Non-zero when the stored header was found shifted by a '|' an older
+   * binary left raw in the nick or username (history_split_header):
+   * the sender was re-split, or kept as read, and the account is empty
+   * because none could be trusted.  An empty account here is NOT proof
+   * the sender was unauthenticated, so nothing may stand the sender
+   * mask in for it (m_redact's mask fallback skips such rows). */
+  int header_repaired;
 };
 
 /** Target info for CHATHISTORY TARGETS query. */
@@ -165,14 +172,6 @@ enum HistoryDirection {
   HISTORY_DIR_AFTER  = 1,  /**< Messages after reference */
   HISTORY_DIR_AROUND = 2,  /**< Messages around reference */
   HISTORY_DIR_LATEST = 3   /**< Most recent messages */
-};
-
-/** Storage state for graceful degradation. */
-enum HistoryStorageState {
-  HISTORY_STORAGE_NORMAL   = 0, /**< Normal operation (<HIGH_WATERMARK) */
-  HISTORY_STORAGE_WARNING  = 1, /**< Eviction active (HIGH-95%) */
-  HISTORY_STORAGE_CRITICAL = 2, /**< Aggressive eviction (95-99%) */
-  HISTORY_STORAGE_SUSPENDED= 3  /**< No new writes (>99%) */
 };
 
 /** Reference type for history queries. */
@@ -204,13 +203,18 @@ extern void history_shutdown(void);
  * @param[in] account Sender's account name (may be NULL).
  * @param[in] type Message type.
  * @param[in] content Message content (may be NULL for some types).
- * @return 0 on success, -1 on error.
+ * @param[in] client_tags Client-only tags to keep with the row (may be NULL).
+ * @param[in] owner The row's trim owner key (history_owner_of, or
+ *   htc_owner_key for a sender known only off the wire); NULL = "-".
+ * @return 0 on success, -1 on error (including a row the trim index
+ *   cannot hold).
  */
 extern int history_store_message(const char *msgid, const char *timestamp,
                                   const char *target, const char *original_target,
                                   const char *sender, const char *account,
                                   enum HistoryMessageType type,
-                                  const char *content, const char *client_tags);
+                                  const char *content, const char *client_tags,
+                                  const char *owner);
 
 /** Store a multiline message with content in the unified content store.
  * Content is stored separately in ml_content, and the history entry stores
@@ -223,13 +227,67 @@ extern int history_store_message(const char *msgid, const char *timestamp,
  * @param[in] content      Multiline content (\x1F-separated lines).
  * @param[in] content_len  Length of content.
  * @param[in] paste_secret Paste secret for URL access (NULL to skip).
+ * @param[in] owner The row's trim owner key (as history_store_message).
  * @return 0 on success, -1 on error.
  */
 extern int history_store_multiline(const char *msgid, const char *timestamp,
                                    const char *target, const char *original_target,
                                    const char *sender, const char *account,
                                    const char *content,
-                                   size_t content_len, const char *paste_secret);
+                                   size_t content_len, const char *paste_secret,
+                                   const char *owner);
+
+/** The trim owner key of a row @a sptr sends: "-" for NULL; a server
+ * (or this server) -> "s:<server name>"; a user -> htc_owner_key(its
+ * account, its IP, its server's name): "a:<account>", else "i:<IP
+ * bucket>", else "s:<its server>".  Never a nick or a session id.
+ * @return @a buf (always NUL-terminated; "-" if the key does not fit). */
+extern const char *history_owner_of(char *buf, size_t size, struct Client *sptr);
+
+/** Start the trimmer (main thread, after history_init, before the event
+ * loop): the index-gap check (htrim_check_index_gap, with rows stamped up
+ * to two maintenance intervals ahead counted), then the slice timer.
+ * @return the newest last-activity stamp across every stored target, in
+ * epoch ms (0 when the store is empty or unavailable) -- proof of life
+ * for the presence boot-close: the server was alive when it stored that
+ * row.  The gap check's walk of the targets CF reads it. */
+extern uint64_t history_trim_start(void);
+
+/** One trim slice under the live features; re-arms the 1 s slice timer
+ * while work remains (and after a failed slice, up to 5 in a row).
+ * @a pass_start marks the start of a pass: age-out opens a pass where its
+ * walk stopped, or back at the oldest row indexed behind that point since
+ * (htrim_pass_start).  A slice that finished the backfill with the logical
+ * total over the cap's high watermark also warns the operators
+ * (SNO_OLDSNO): eviction inside retention starts next. */
+extern void history_trim_tick(int pass_start);
+
+/** Make the next 1 s tick a pass start (a retention change: age-out
+ * walks on under the new cutoff). */
+extern void history_trim_kick(void);
+
+/** CHATHISTORY_TRIM_SLICE_MS changed: the longest slice so far was
+ * measured under the old budget (STATS max goes back to 0). */
+extern void history_trim_slice_budget_changed(void);
+
+/** The retention this store really covers, in days -- what CH A S / CH A
+ * R tell peers: CHATHISTORY_RETENTION, but never further back than the
+ * coverage floor oldest-overall eviction left inside it (rows older than
+ * the floor may be gone), and then at least 1
+ * (htc_effective_days(CHATHISTORY_RETENTION, htrim_coverage_floor_ms(),
+ * now)).  Without a floor it is the configured value itself (0 =
+ * unlimited, as peers read it).  Client ISUPPORT keeps the configured
+ * value. */
+extern int history_coverage_days(void);
+
+/** Called on the main thread, outside any store, when
+ * history_coverage_days() may have changed: a trim slice moved or cleared
+ * the coverage floor, and every trim pass start (the floor ages a day).
+ * It may send to peers. */
+typedef void (*history_coverage_cb)(void);
+
+/** Register the coverage callback (NULL = none). */
+extern void history_set_coverage_callback(history_coverage_cb cb);
 
 #ifdef USE_ROCKSDB
 struct db_env;
@@ -353,11 +411,6 @@ extern int history_query_between(const char *target,
  * @param[out] result Pointer to result list head (caller must free).
  * @return Number of targets returned, or -1 on error.
  */
-/** The newest last-activity stamp across every stored target, in epoch
- * milliseconds; 0 when the store is empty or unavailable.  Proof of life
- * for crash recovery: the server was alive when it stored that row. */
-extern uint64_t history_newest_activity_ms(void);
-
 /** Per-target keep/skip hook for history_query_targets: 1 keeps the
  * target (it counts toward the limit), 0 skips it.  The walk is in key
  * order, not recency, so any filtering the caller would do afterwards
@@ -397,13 +450,6 @@ extern void history_free_messages(struct HistoryMessage *list);
  */
 extern void history_free_targets(struct HistoryTarget *list);
 
-/** Purge old messages from the database.
- * Called periodically to enforce retention policy.
- * @param[in] max_age_seconds Maximum age of messages to keep.
- * @return Number of messages deleted, or -1 on error.
- */
-extern int history_purge_old(unsigned long max_age_seconds);
-
 /** Get timestamp for a given message ID.
  * Useful for converting msgid references to timestamps.
  * @param[in] msgid Message ID to look up.
@@ -439,7 +485,7 @@ extern int history_deserialize_record(const void *data, size_t datalen,
                                       struct HistoryMessage *msg);
 
 /** Redact a message: strip content/tags but keep the entry in the database.
- * Used instead of history_delete_message() to support REDACT-as-context.
+ * A redaction keeps the row (REDACT-as-context) rather than deleting it.
  * The original message remains with empty content so it can serve as the
  * parent for a REDACT context message during chathistory replay.
  * @param[in] target Channel or nick where message was sent.
@@ -534,14 +580,6 @@ extern int history_iso_to_unix(const char *iso_ts, char *unix_buf, size_t unix_b
 
 /* Read Marker API moved to metadata.h (metadata_readmarker_get/set) */
 
-/** Delete a message from the history database.
- * Used by message-redaction to remove redacted messages.
- * @param[in] target Channel or nick where message was sent.
- * @param[in] msgid Message ID to delete.
- * @return 0 on success, -1 on error, 1 if not found.
- */
-extern int history_delete_message(const char *target, const char *msgid);
-
 /** Lookup a message by ID and verify sender.
  * Used by message-redaction to validate authorization.
  * @param[in] target Channel or nick where message was sent.
@@ -551,45 +589,6 @@ extern int history_delete_message(const char *target, const char *msgid);
  */
 extern int history_lookup_message(const char *target, const char *msgid,
                                    struct HistoryMessage **msg);
-
-/** Set history database map size.
- * Must be called before history_init().
- * @param[in] size_mb Size in megabytes.
- */
-extern void history_set_map_size(size_t size_mb);
-
-/** Get history database map size.
- * @return Current map size in bytes.
- */
-extern size_t history_get_map_size(void);
-
-/** Get current database utilization.
- * @return Utilization as percentage (0-100), or -1 on error.
- */
-extern int history_db_utilization(void);
-
-/** Get current storage state.
- * @return Current storage state enum value.
- */
-extern enum HistoryStorageState history_storage_state(void);
-
-/** Evict messages until target utilization is reached.
- * @param[in] target_percent Target utilization percentage (e.g., 75).
- * @return Number of messages evicted, or -1 on error.
- */
-extern int history_evict_to_target(int target_percent);
-
-/** Periodic maintenance function.
- * Checks utilization and evicts if necessary.
- * Should be called from the main event loop.
- */
-extern void history_maintenance_tick(void);
-
-/** Get last eviction statistics.
- * @param[out] count Number of messages evicted in last run.
- * @param[out] timestamp Unix timestamp of last eviction.
- */
-extern void history_last_eviction(int *count, time_t *timestamp);
 
 /** Callback type for channel enumeration.
  * @param[in] channel Channel name.
@@ -626,13 +625,6 @@ extern int history_enumerate_channels(history_channel_callback callback, void *d
  */
 extern int history_has_channel(const char *target);
 
-/** Check if a channel has any actual messages in history_dbi.
- * More accurate than history_has_channel() after eviction/purge.
- * @param[in] target Channel name.
- * @return 1 if channel has messages, 0 if empty, -1 on error.
- */
-extern int history_channel_has_messages(const char *target);
-
 struct StatDesc;
 
 /** Report CHATHISTORY statistics for /STATS.
@@ -667,29 +659,6 @@ extern void history_report_gc(struct Client *to);
  * @param[in] to Client to send results to.
  */
 extern void history_report_store_info(struct Client *to);
-
-/*
- * Per-User Quota API (anti-flood protection)
- *
- * Tracks message counts per user per channel to prevent a single user
- * from dominating channel history. When a user exceeds their quota
- * percentage, warnings are logged.
- */
-
-/** Get the current message count for a user in a channel.
- * @param[in] channel Channel name.
- * @param[in] account Account name.
- * @return Message count, or 0 if not found.
- */
-extern int history_quota_get_count(const char *channel, const char *account);
-
-/** Check if a user is over their quota for a channel.
- * @param[in] channel Channel name.
- * @param[in] account Account name.
- * @param[in] channel_limit Total messages allowed in channel.
- * @return 1 if over quota, 0 if not.
- */
-extern int history_quota_check(const char *channel, const char *account, int channel_limit);
 
 /*
  * Auto-replay API (for bouncer resume)

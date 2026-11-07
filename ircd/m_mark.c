@@ -119,6 +119,9 @@ int ms_mark(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
   if (!IsServer(sptr) && !IsMeshStub(sptr) && !IsMe(sptr))
     return protocol_violation(sptr, "MARK from non-server %s", cli_name(sptr));
 
+  if (parc < 3)
+    return protocol_violation(sptr, "MARK received too few parameters (%u)", parc);
+
   if (!strcmp(parv[2], MARK_WEBIRC)) {
     if(parc < 4)
       return protocol_violation(sptr, "MARK webirc received too few parameters (%u)", parc);
@@ -162,7 +165,10 @@ int ms_mark(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
 
     if ((acptr = FindUser(parv[1]))) {
        cli_sslcliexp(acptr) = strtoul(parv[3], NULL, 10);
-       sendcmdto_serv_butone(sptr, CMD_MARK, cptr, "%s %s :%s", cli_name(acptr), MARK_SSLCLIEXP, parv[3]);
+       /* Fork-only MARK type: legacy peers don't know SSLCLIEXP and
+        * just drop it as noise, but the wire-hygiene rule is that a
+        * legacy peer never receives what it does not understand. */
+       sendcmdto_serv_butone_v3(sptr, CMD_MARK, cptr, "%s %s :%s", cli_name(acptr), MARK_SSLCLIEXP, parv[3]);
     }
   } else if (!strcmp(parv[2], MARK_KILL)) {
     if(parc < 4)
@@ -183,7 +189,8 @@ int ms_mark(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
        * client.  A non-empty cli_wsorigin is itself the "is WS" signal
        * the WHOIS render gates on. */
       ircd_strncpy(cli_wsorigin(acptr), parv[3], sizeof(cli_wsorigin(acptr)));
-      sendcmdto_serv_butone(sptr, CMD_MARK, cptr, "%s %s :%s", cli_name(acptr), MARK_WEBSOCKET, parv[3]);
+      /* Fork-only MARK type: see the SSLCLIEXP comment above. */
+      sendcmdto_serv_butone_v3(sptr, CMD_MARK, cptr, "%s %s :%s", cli_name(acptr), MARK_WEBSOCKET, parv[3]);
     }
   } else if (!strcmp(parv[2], MARK_MARK) || !strcmp(parv[2], MARK_DNSBL_DATA)) {
     if(parc < 4)

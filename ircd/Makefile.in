@@ -87,7 +87,8 @@ UMKPASSWD_SRC = ${CRYPTO_SRC} \
 	memdebug.c \
 	umkpasswd.c
 
-# The KC_SRC list below is the vendored ircd/kc/*.c sources.  configure
+# The KC_SRC list below is the vendored ircd/kc/*.c sources plus
+# webhook_subject.c (its header includes kc/kc_webhook.h, so jansson).  configure
 # substitutes them only under --enable-keycloak, and nothing otherwise:
 # unlike every other optional consumer (sasl_auth.c, ircd_kc_adapter.c,
 # ...) the kc/ sources are verbatim from evilnet/libkc and carry no
@@ -120,6 +121,10 @@ IRCD_SRC = \
 	gitsync.c \
 	hash.c \
 	history.c \
+	history_trim_codec.c \
+	history_trim.c \
+	history_record.c \
+	ipcheck_refund.c \
 	redact_index.c \
 	chathistory_ephemeral.c \
 	chathistory_presence.c \
@@ -147,6 +152,7 @@ IRCD_SRC = \
 	lex.yy.c \
 	list.c \
 	listener.c \
+	sessid_index.c \
 	m_account.c \
 	m_admin.c \
 	m_asll.c \
@@ -225,10 +231,21 @@ IRCD_SRC = \
 	webpush_mute.c \
 	webpush_expiry.c \
 	webpush_keyring.c \
+	account_id.c \
+	webhook_eventlog.c \
 	webpush_attention.c \
 	bouncer_converge.c \
+	bouncer_wire.c \
+	bouncer_count.c \
+	bouncer_rebind_auth.c \
+	exit_reason.c \
+	bouncer_deauth.c \
+	bouncer_transplant.c \
+	bouncer_record.c \
 	webpush_line.c \
 	metadata.c \
+	metadata_lww.c \
+	metadata_sync.c \
 	m_rehash.c \
 	m_remove.c \
 	m_reset.c \
@@ -552,7 +569,10 @@ IPcheck.o: IPcheck.c ../config.h ../include/IPcheck.h ../include/client.h \
   ../include/ircd.h ../include/match.h ../include/msg.h \
   ../include/ircd_alloc.h ../include/ircd_events.h \
   ../include/ircd_features.h ../include/ircd_log.h ../include/ircd_string.h \
-  ../include/s_debug.h ../include/s_user.h ../include/send.h
+  ../include/s_debug.h ../include/s_user.h ../include/send.h \
+  ../include/ipcheck_refund.h
+ipcheck_refund.o: ipcheck_refund.c ../config.h ../include/ipcheck_refund.h \
+  ../include/ircd_defs.h
 channel.o: channel.c ../config.h ../include/channel.h ../include/class.h \
   ../include/client.h ../include/destruct_event.h ../include/hash.h \
   ../include/ircd.h ../include/ircd_alloc.h ../include/ircd_chattr.h \
@@ -627,6 +647,13 @@ hash.o: hash.c ../config.h ../include/hash.h ../include/client.h \
 history.o: history.c ../config.h ../include/history.h ../include/ircd_alloc.h \
   ../include/ircd_log.h ../include/ircd_snprintf.h ../include/ircd_string.h \
   ../include/s_debug.h
+history_trim_codec.o: history_trim_codec.c ../config.h \
+  ../include/history_trim_codec.h ../include/db_casefold.h ../include/res.h
+history_trim.o: history_trim.c ../config.h ../include/history_trim.h \
+  ../include/history_trim_codec.h ../include/history_stamp.h \
+  ../include/redact_index.h ../include/db_cursor.h ../include/db_env.h \
+  ../include/db_txn.h ../include/db_types.h ../include/ircd_alloc.h \
+  ../include/ircd_log.h
 ircd.o: ircd.c ../config.h ../include/ircd.h ../include/IPcheck.h \
   ../include/class.h ../include/client.h ../include/crule.h \
   ../include/destruct_event.h ../include/hash.h ../include/ircd_alloc.h \
@@ -845,10 +872,10 @@ m_die.o: m_die.c ../config.h ../include/client.h ../include/ircd.h \
   ../include/numeric.h ../include/numnicks.h ../include/s_bsd.h \
   ../include/send.h
 m_endburst.o: m_endburst.c ../config.h ../include/channel.h \
-  ../include/client.h ../include/hash.h ../include/ircd.h \
-  ../include/ircd_log.h ../include/ircd_reply.h ../include/ircd_string.h \
-  ../include/msg.h ../include/numeric.h ../include/numnicks.h \
-  ../include/send.h
+  ../include/client.h ../include/hash.h ../include/history.h \
+  ../include/ircd.h ../include/ircd_log.h ../include/ircd_reply.h \
+  ../include/ircd_string.h ../include/msg.h ../include/numeric.h \
+  ../include/numnicks.h ../include/send.h
 m_error.o: m_error.c ../config.h ../include/client.h ../include/hash.h \
   ../include/ircd.h ../include/ircd_alloc.h ../include/ircd_log.h \
   ../include/ircd_reply.h ../include/ircd_string.h ../include/numeric.h \

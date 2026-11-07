@@ -38,7 +38,8 @@
 #include "client.h"
 #include "hash.h"
 #include "history.h"
-#include "redact_index.h"   /* design B: redaction catch-up query */
+#include "history_trim_codec.h"
+#include "redact_index.h"   /* redaction catch-up query (design B) */
 #include "ircd.h"
 #include "ircd_alloc.h"
 #include "ircd_compress.h"
@@ -708,9 +709,11 @@ static struct HistoryRowFilter *query_row_filter(struct Client *sptr,
 }
 
 /** Copy @a in to @a out without the server's own PM-history markers
- * (`+evilnet.github.io/sid=` and the legacy `+afternet.org/sid=`).  They
- * exist for the ephemeral participant check in check_history_access and
- * carry a session id that is nobody else's business.
+ * (`+evilnet.github.io/sid=` and the legacy `+afternet.org/sid=`, and the
+ * sender's and recipient's `ssid=` / `rsid=`).  They exist for the
+ * ephemeral participant check in check_history_access and for naming a
+ * conversation after the right session (replay.c), and carry session ids
+ * that are nobody else's business.
  * @return @a out (empty when nothing else was there). */
 static const char *strip_internal_tags(const char *in, char *out, size_t outsz)
 {
@@ -723,6 +726,8 @@ static const char *strip_internal_tags(const char *in, char *out, size_t outsz)
     const char *end = strchr(in, ';');
     size_t len = end ? (size_t)(end - in) : strlen(in);
     int internal = (len >= 22 && memcmp(in, "+evilnet.github.io/sid", 22) == 0)
+                   || (len >= 23 && memcmp(in, "+evilnet.github.io/ssid", 23) == 0)
+                   || (len >= 23 && memcmp(in, "+evilnet.github.io/rsid", 23) == 0)
                    || (len >= 17 && memcmp(in, "+afternet.org/sid", 17) == 0);
     if (!internal && len > 0 && pos + len + 2 <= outsz) {
       if (pos)
@@ -2997,8 +3002,12 @@ static void complete_targets_fed(struct FedRequest *req)
   filter_targets_window(&merged, ctx->ts1, ctx->ts2);
 
   /* Send to client with access filtering and limit enforcement */
+  /* Complete only if nothing was cut: a storage server that timed out
+   * or capped its rows (fed_truncated) leaves targets unlisted, and the
+   * end tag would tell the client it may skip them. */
   send_targets_batch(client, merged, req->limit, req->label,
-                     ctx->local_count + ctx->fed_count < req->limit);
+                     ctx->local_count + ctx->fed_count < req->limit
+                     && !req->fed_truncated);
 
   history_free_targets(merged);
 }
@@ -3083,11 +3092,18 @@ static int chathistory_targets(struct Client *sptr, const char *ref1_str,
   {
     struct HistoryTarget *sorted = merge_targets(targets, NULL);
     int fetch_limit = limit * 3;
+    /* Complete only when the network was exhausted.  If the local walk
+     * filled the page, federation was skipped, but other storage servers
+     * may hold targets that belong on it: say nothing, and let the client
+     * page on.  Without federation (or nobody to ask) local is all. */
+    int fed_skipped = feature_bool(FEAT_CHATHISTORY_FEDERATION)
+                      && count >= limit
+                      && count_storage_servers(NULL, 0) > 0;
     if (fetch_limit > 500)
       fetch_limit = 500;
     filter_targets_window(&sorted, ts1, ts2);
     send_targets_batch(sptr, sorted, limit, cli_label(sptr),
-                       count < fetch_limit && !slot_miss);
+                       count < fetch_limit && !slot_miss && !fed_skipped);
     history_free_targets(sorted);
   }
   history_free_targets(targets);
@@ -3377,16 +3393,18 @@ static void append_write_chunk_data(struct WriteChunkEntry *chunk, const char *b
  * @param[in] account Sender's account or "*".
  * @param[in] type_char Type character (P, N, T).
  * @param[in] content Message content.
+ * @param[in] origin Name of the server that sent the CH W / CH WB.
  */
 static void process_write_forward(const char *target, const char *msgid,
                                   const char *timestamp, const char *sender,
                                   const char *account, char type_char,
-                                  char *content)
+                                  char *content, const char *origin)
 {
   struct Channel *chptr;
   enum HistoryMessageType type;
   int has_local_users;
   char *client_tags = NULL;
+  char owner[HTC_OWNER_MAX];
 
   /* Only process channels */
   if (!IsChannelName(target))
@@ -3491,13 +3509,21 @@ static void process_write_forward(const char *target, const char *msgid,
   /* Check if this is a new channel for Layer 1 advertisement */
   int is_new_channel = (history_has_channel(target) == 0);
 
+  /* The row's trim owner: the account the forwarder named, else the
+   * forwarding server (the sender's own IP and server are not on the
+   * wire).  An account too long for an owner key falls back the same
+   * way. */
+  if (htc_owner_key(owner, sizeof(owner), account, NULL, origin) < 0
+      && htc_owner_key(owner, sizeof(owner), NULL, NULL, origin) < 0)
+    ircd_strncpy(owner, HTC_OWNER_NONE, sizeof(owner));
+
   /* Store the message.  original_target is NULL on the federation
    * write-forward path — the federated source doesn't (yet) carry that
    * field, so replay's direction-reconstruction fallback handles PMs
    * stored via this path. */
   if (history_store_message(msgid, timestamp, target, NULL, sender,
                             (account[0] == '*') ? NULL : account,
-                            type, content, client_tags) == 0) {
+                            type, content, client_tags, owner) == 0) {
     /* Layer 1: Broadcast CH A + if this is the first message in the channel */
     if (is_new_channel) {
       broadcast_channel_advertisement(target);
@@ -4210,11 +4236,13 @@ void chathistory_report_ads(struct Client *to, const struct StatDesc *sd, char *
              "A :Summary: %d storage server(s) of %d advertised",
              storage_count, total_count);
 
-  /* Show our own status */
+  /* Show our own status: the configured retention, and the coverage
+   * CH A S / R advertise (less once oldest-overall eviction left a
+   * floor inside retention). */
   if (feature_bool(FEAT_CHATHISTORY_STORE)) {
     send_reply(to, SND_EXPLICIT | RPL_STATSDEBUG,
-               "A :Local: STORE enabled, retention=%d days",
-               feature_int(FEAT_CHATHISTORY_RETENTION));
+               "A :Local: STORE enabled, retention=%d days, advertising %d days",
+               feature_int(FEAT_CHATHISTORY_RETENTION), history_coverage_days());
   } else {
     send_reply(to, SND_EXPLICIT | RPL_STATSDEBUG,
                "A :Local: STORE disabled (relay only)");
@@ -4378,14 +4406,50 @@ static void broadcast_channel_removal(const char **channels, int count)
   }
 }
 
+/** The coverage (days) last told to peers by CH A R, or seeded at start
+ * with what every link's CH A S will carry; -1 = not known yet. */
+static int coverage_advertised = -1;
+
+/** history_coverage_days() may have changed (the trim engine moved or
+ * cleared the coverage floor, a trim pass started, CHATHISTORY_RETENTION
+ * changed): tell every IRCv3 peer the new value with CH A R -- only when
+ * it differs from the last one told.  The engine calls this after every
+ * committed oldest-overall slice, about once a second during a drain, and
+ * at every pass start; the value changes far more rarely.  Links that
+ * come up later hear the value of the moment in their CH A S
+ * (ms_end_of_burst).  Main thread, never inside a store: it sends. */
+void chathistory_coverage_changed(void)
+{
+  int now;
+
+  if (!feature_bool(FEAT_CHATHISTORY_STORE))
+    return;                                     /* we advertise no storage */
+  now = history_coverage_days();
+  if (now == coverage_advertised)
+    return;
+  coverage_advertised = now;
+  if (!cli_serv(&me))
+    return;                                     /* before make_server: no links */
+  sendcmdto_serv_butone_v3(&me, CMD_CHATHISTORY, NULL, "A R %d", now);
+  log_write(LS_SYSTEM, L_INFO, 0,
+            "chathistory: advertising %d days of coverage (retention %d)",
+            now, feature_int(FEAT_CHATHISTORY_RETENTION));
+  /* Mesh peers read it from the doc's CH-storage record (change-gated). */
+  crdt_shadow_ch_storage_publish();
+}
+
 /** Initialize chathistory callbacks.
- * Registers the channel removal callback with the history subsystem.
- * Called after history_init() succeeds.
+ * Registers the channel removal and coverage callbacks with the history
+ * subsystem.  Called after history_init() succeeds (main thread).
  */
 void chathistory_init_callbacks(void)
 {
   history_set_channel_removed_callback(broadcast_channel_removal);
-  Debug((DEBUG_DEBUG, "chathistory: registered channel removal callback"));
+  /* The coverage peers will hear at their link's CH A S: a change from
+   * it is what CH A R reports.  (history_init has read the floor.) */
+  coverage_advertised = history_coverage_days();
+  history_set_coverage_callback(chathistory_coverage_changed);
+  Debug((DEBUG_DEBUG, "chathistory: registered channel removal and coverage callbacks"));
 }
 
 /** Check if a server's retention window covers a given timestamp.
@@ -5736,6 +5800,11 @@ static void complete_redact_fed(struct FedRequest *req)
     sendcmdto_want_s2s_tags(1);
     sendcmdto_serv_butone_v3(sptr, CMD_REDACT, sptr, "%s %s :%s",
                           req->target, ctx->msgid, reason ? reason : "");
+
+    /* Disarm: this runs from a federation callback, outside any
+     * per-line reset, so a left-armed msgid tags the next unrelated
+     * client send with this REDACT's id (as m_redact.c does). */
+    sendcmdto_set_client_msgid(NULL);
   }
 }
 
@@ -7374,7 +7443,12 @@ int ms_chathistory(struct Client *cptr, struct Client *sptr, int parc, char *par
     int has_more = 0;
     int is_continuation = 0;
 
-    if (parc < 4)
+    /* The shortest form is the final continuation, "B <reqid> <msgid>
+     * :<b64>" (parc 5).  A 4-param line has no data: the continuation
+     * branch below would take the NULL parv[4] as its base64 and
+     * strlen() it.  Drop it here, before the forward, so it never
+     * reaches the request's origin either. */
+    if (parc < 5)
       return 0;
 
     reqid = parv[2];
@@ -7553,6 +7627,7 @@ int ms_chathistory(struct Client *cptr, struct Client *sptr, int parc, char *par
       ad->retention_days = retention;
       ad->last_update = CurrentTime;
       absence_close(server_ad_index(sptr));   /* back: close its absence */
+      redact_catchup_kick((unsigned int)server_ad_index(sptr));   /* what did we miss while it was away? */
 
       Debug((DEBUG_DEBUG, "CH A S: Server %s advertises storage with %d day retention",
              cli_name(sptr), retention));
@@ -7709,7 +7784,7 @@ int ms_chathistory(struct Client *cptr, struct Client *sptr, int parc, char *par
            target, msgid, cli_name(sptr)));
 
     process_write_forward(target, msgid, timestamp, sender, account,
-                          type_str[0], content);
+                          type_str[0], content, cli_name(sptr));
   }
   else if (strcmp(subcmd, "WB") == 0) {
     /* Write Forward (base64): WB <target> <msgid> <ts> <sender> <account> <type> [+] :<b64>
@@ -7723,7 +7798,11 @@ int ms_chathistory(struct Client *cptr, struct Client *sptr, int parc, char *par
     int has_more = 0;
     int is_continuation = 0;
 
-    if (parc < 4)
+    /* The shortest form is the final continuation, "WB <target> <msgid>
+     * :<b64>" (parc 5).  A 4-param line has no data: the continuation
+     * branch below would take the NULL parv[4] as its base64 and
+     * strlen() it. */
+    if (parc < 5)
       return 0;
 
     target = parv[2];
@@ -7823,7 +7902,8 @@ int ms_chathistory(struct Client *cptr, struct Client *sptr, int parc, char *par
       if (ch_base64_decode(chunk->b64_data, chunk->b64_len, &decoded, &decoded_len)) {
         Debug((DEBUG_DEBUG, "CH WB: Decoded %zu bytes for %s", decoded_len, target));
         process_write_forward(chunk->target, chunk->msgid, chunk->timestamp,
-                              chunk->sender, chunk->account, type_char, decoded);
+                              chunk->sender, chunk->account, type_char, decoded,
+                              cli_name(sptr));
         MyFree(decoded);
       } else {
         Debug((DEBUG_DEBUG, "CH WB: Base64 decode failed for %s", target));

@@ -85,6 +85,7 @@
 #include "crdt_shadow.h"
 #include "hash.h"
 #include "history.h"
+#include "history_trim_codec.h"
 #include "ircd.h"
 #include "ircd_features.h"
 #include "ircd_log.h"
@@ -140,6 +141,7 @@ static void store_tagmsg_history(struct Client *sptr, struct Channel *chptr,
   char fallback_msgid[64];
   const char *msgid;
   char sender[HISTORY_SENDER_LEN];
+  char owner[HTC_OWNER_MAX];
   const char *account;
 
   if (!history_is_available())
@@ -185,11 +187,13 @@ static void store_tagmsg_history(struct Client *sptr, struct Channel *chptr,
   /* Get account name if logged in */
   account = (cli_user(sptr) && cli_user(sptr)->account[0])
             ? cli_user(sptr)->account : NULL;
+  /* The row's trim owner: the client whose account it carries. */
+  history_owner_of(owner, sizeof(owner), sptr);
 
   /* Store locally or forward to STORE server */
   if (feature_bool(FEAT_CHATHISTORY_STORE)) {
     history_store_message(msgid, timestamp, chptr->chname, NULL, sender,
-                          account, HISTORY_TAGMSG, "", client_tags);
+                          account, HISTORY_TAGMSG, "", client_tags, owner);
   } else if (feature_bool(FEAT_CHATHISTORY_WRITE_FORWARD)) {
     /* Bracket + sentinel-escape the tags for transparent forwarding
      * (split back out in process_write_forward). */
@@ -291,28 +295,51 @@ int m_tagmsg(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
       /* Store for chathistory event-playback — same msgid as broadcast */
       store_tagmsg_history(sptr, chptr, client_tags, tagmsg_msgid, tagmsg_ms);
 
-      /* Propagate to other servers (S2S with tags in P10 message).
-       * Use the same msgid and time we generated for local delivery. */
+      /* Propagate to other servers (S2S). Use the same msgid and time
+       * we generated for local delivery; client tags ride the ,C
+       * compact-tag segment instead of the body (audit 0.1) -- a
+       * large client tag used to push the body past a peer's 512-byte
+       * cap and drop the whole link.
+       *
+       * sendcmdto_serv_butone_v3() reaches only IRCv3-aware peers, and
+       * toward those it builds the tag region exactly when
+       * P10_MESSAGE_TAGS is on (send_s2s_tags_on()).  With the feature
+       * off there is no ,C to carry the tags, so keep the body form
+       * "@<tags> #chan" that every receiver still reads (ms_tagmsg's
+       * parv[1][0] == '@' branch) -- a bare "TM #chan" would be
+       * dropped -- but only when the whole line fits: the line is cut
+       * at 510 bytes, and a cut ending inside the channel name lands
+       * the tags in another channel (send_s2s_untagged_fits). */
       if (!IsLocalChannel(chptr->chname)) {
-        sendcmdto_set_s2s_tags(tagmsg_ms, tagmsg_msgid);
-        sendcmdto_want_s2s_tags(1);
         /* R6a (tree demote): suppress the TAGMSG tree relay to CRDT-aware peers when the
-         * CR-M flood below will carry it there (same member scan as the flood).  Set before
-         * the v3 call, which consumes the one-shot flag at entry. */
+         * CR-M flood below will carry it there (same member scan as the flood).  Set right
+         * before the v3 call, which consumes the one-shot flag at entry. */
+        int crdt_skip = 0;
         if (feature_bool(FEAT_CRDT_PRIMARY)) {
-          int sk = crdt_have_mesh_stub();   /* R6c: partitioned -> CR-M is the carrier */
           struct Membership *cmemb;
-          for (cmemb = chptr->members; !sk && cmemb; cmemb = cmemb->next_member) {
+          crdt_skip = crdt_have_mesh_stub();   /* R6c: partitioned -> CR-M is the carrier */
+          for (cmemb = chptr->members; !crdt_skip && cmemb; cmemb = cmemb->next_member) {
             struct Client *csrv = cli_user(cmemb->user) ? cli_user(cmemb->user)->server : NULL;
             if (csrv && csrv != &me &&
                 (IsMeshStub(csrv) || (IsServer(csrv) && IsCrdtAware(csrv))))
-              sk = 1;
+              crdt_skip = 1;
           }
-          if (sk)
-            sendcmdto_set_skip_crdt_servers();
         }
-        sendcmdto_serv_butone_v3(sptr, CMD_TAGMSG, cptr, "@%s %s",
-                              client_tags, chptr->chname);
+        if (feature_bool(FEAT_P10_MESSAGE_TAGS)) {
+          sendcmdto_set_s2s_tags(tagmsg_ms, tagmsg_msgid);
+          sendcmdto_want_s2s_tags(1);
+          sendcmdto_set_s2s_client_tags(client_tags);
+          if (crdt_skip)
+            sendcmdto_set_skip_crdt_servers();
+          sendcmdto_serv_butone_v3(sptr, CMD_TAGMSG, cptr, "%s",
+                                chptr->chname);
+        } else if (send_s2s_untagged_fits(sptr, TOK_TAGMSG, "@%s %s",
+                                          client_tags, chptr->chname)) {
+          if (crdt_skip)
+            sendcmdto_set_skip_crdt_servers();
+          sendcmdto_serv_butone_v3(sptr, CMD_TAGMSG, cptr, "@%s %s",
+                                client_tags, chptr->chname);
+        }
       }
 
       /* R4a (channel-over-mesh): flood TAGMSG (cmd 'T', client tags as payload) to any
@@ -368,15 +395,32 @@ int m_tagmsg(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
         }
       }
       else {
-        /* Remote user - forward to their server with tags.
-         * Tier2 T2-b / MR-1: route over the CRDT mesh (cmd 'T', client tags as
-         * payload) instead of the P10 tree when the target is on a mesh stub
-         * (dead-sink -> always) or, under FEAT_CRDT_ROUTE_UNICAST, a live CRDT-aware
-         * server; 1 -> handled over CR. */
-        if (!crdt_route_unicast_try(sptr, 'T', acptr, dm_msgid, client_tags)) {
-          sendcmdto_set_s2s_tags(dm_ms, dm_msgid);
-          sendcmdto_one(sptr, CMD_TAGMSG, acptr, "@%s %C",
-                        client_tags, acptr);
+        /* Remote user.  Tier2 T2-b / MR-1: route over the CRDT mesh (cmd 'T',
+         * client tags as payload) instead of the P10 tree when the target is
+         * on a mesh stub (dead-sink -> always) or, under
+         * FEAT_CRDT_ROUTE_UNICAST, a live CRDT-aware server; 1 -> handled
+         * over CR.
+         *
+         * Otherwise only toward an IRCv3-aware next hop (audit
+         * 0.1) -- a legacy next hop has no TAGMSG handler at all, so
+         * it gets nothing rather than a bare/body-tagged command.
+         * Client tags ride ,C via sendcmdto_one_tags_with_client when
+         * that link gets the tag region; otherwise (P10_MESSAGE_TAGS
+         * off) the body form "@<tags> <numeric>", as ml_send_line()
+         * does for multiline -- a bare "TM <numeric>" would be dropped
+         * -- when the whole line fits (send_s2s_untagged_fits): a cut
+         * one ends inside the target numeric, which the receiver also
+         * tries as a nick. */
+        if (!crdt_route_unicast_try(sptr, 'T', acptr, dm_msgid, client_tags)
+            && IsIRCv3Aware(cli_from(acptr))) {
+          if (send_s2s_tags_on(acptr)) {
+            sendcmdto_set_s2s_tags(dm_ms, dm_msgid);
+            sendcmdto_one_tags_with_client(sptr, CMD_TAGMSG, acptr, dm_msgid,
+                                           client_tags, "%C", acptr);
+          } else if (send_s2s_untagged_fits(sptr, TOK_TAGMSG, "@%s %C",
+                                            client_tags, acptr))
+            sendcmdto_one(sptr, CMD_TAGMSG, acptr, "@%s %C",
+                          client_tags, acptr);
         }
 
         /* Echo TAGMSG back to sender if they have echo-message */
@@ -483,7 +527,7 @@ int ms_tagmsg(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
      * the old code delivered no msgid while the store minted one
      * nobody ever saw. */
     if (feature_bool(FEAT_MSGID) && !cli_s2s_msgid(cptr)[0])
-      generate_msgid(cli_s2s_msgid(cptr), S2S_MSGID_BUFSIZE);
+      s2s_mint_link_event(cptr);
     if (cli_s2s_msgid(cptr)[0])
       sendcmdto_set_client_event(cli_s2s_msgid(cptr), history_event_time_ms(cptr));
 
@@ -501,20 +545,38 @@ int ms_tagmsg(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
 
     /* R6a (tree demote, see m_tagmsg): only a legacy-origin TAGMSG (!IsCrdtAware(cptr)) floods
      * here; suppress the redundant tree relay to CRDT-aware peers when we flood. */
+    int crdt_skip = 0;
     if (feature_bool(FEAT_CRDT_PRIMARY) && (!cptr || !IsCrdtAware(cptr))) {
       struct Membership *cmemb;
       for (cmemb = chptr->members; cmemb; cmemb = cmemb->next_member) {
         struct Client *csrv = cli_user(cmemb->user) ? cli_user(cmemb->user)->server : NULL;
         if (csrv && csrv != &me &&
             (IsMeshStub(csrv) || (IsServer(csrv) && IsCrdtAware(csrv)))) {
-          sendcmdto_set_skip_crdt_servers();
+          crdt_skip = 1;
           break;
         }
       }
     }
-    /* Propagate to other servers */
-    sendcmdto_serv_butone_v3(sptr, CMD_TAGMSG, cptr, "@%s %s",
-                          client_tags, target);
+    /* Propagate to other servers: client tags ride ,C instead of the
+     * body (audit 0.1), and the origin's msgid/time are restated via
+     * cptr rather than left for a fresh mint -- this relay used to go
+     * out untagged, losing the msgid.  With P10_MESSAGE_TAGS off no
+     * peer gets a tag region, so the body form, as in m_tagmsg(), when
+     * the whole line fits. */
+    if (feature_bool(FEAT_P10_MESSAGE_TAGS)) {
+      sendcmdto_set_s2s_cptr(cptr);
+      sendcmdto_want_s2s_tags(1);
+      sendcmdto_set_s2s_client_tags(client_tags);
+      if (crdt_skip)
+        sendcmdto_set_skip_crdt_servers();
+      sendcmdto_serv_butone_v3(sptr, CMD_TAGMSG, cptr, "%s", target);
+    } else if (send_s2s_untagged_fits(sptr, TOK_TAGMSG, "@%s %s",
+                                      client_tags, target)) {
+      if (crdt_skip)
+        sendcmdto_set_skip_crdt_servers();
+      sendcmdto_serv_butone_v3(sptr, CMD_TAGMSG, cptr, "@%s %s",
+                               client_tags, target);
+    }
 
     /* Store in history (or write-forward to STORE server).
      * Use S2S msgid if available so clients can deduplicate. */
@@ -549,7 +611,7 @@ int ms_tagmsg(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
     /* Unified msgid (see the channel arm above): reuse or mint into
      * the link buffer so delivery and storage share one id. */
     if (feature_bool(FEAT_MSGID) && !cli_s2s_msgid(cptr)[0])
-      generate_msgid(cli_s2s_msgid(cptr), S2S_MSGID_BUFSIZE);
+      s2s_mint_link_event(cptr);
     if (cli_s2s_msgid(cptr)[0])
       sendcmdto_set_client_event(cli_s2s_msgid(cptr), history_event_time_ms(cptr));
 
@@ -562,15 +624,30 @@ int ms_tagmsg(struct Client* cptr, struct Client* sptr, int parc, char* parv[])
       /* Note: If client doesn't support message-tags, TAGMSG is silently dropped */
     }
     else {
-      /* Remote user - forward to their server with tags.
-       * Tier2 P2 / MR-1: route over the CRDT mesh (cmd 'T', client tags) instead of
-       * the P10 tree when the target is on a mesh stub (dead-sink -> always) or,
-       * under FEAT_CRDT_ROUTE_UNICAST, a live CRDT-aware server. */
+      /* Remote user.  Tier2 P2 / MR-1: route over the CRDT mesh (cmd 'T',
+       * client tags) instead of the P10 tree when the target is on a mesh
+       * stub (dead-sink -> always) or, under FEAT_CRDT_ROUTE_UNICAST, a live
+       * CRDT-aware server.
+       *
+       * Otherwise only toward an IRCv3-aware next hop (audit 0.1)
+       * -- a legacy next hop has no TAGMSG and gets nothing. Client
+       * tags ride ,C; restate the origin's msgid/time via cptr.  With
+       * no tag region toward that link, the body form, as in
+       * m_tagmsg(), when the whole line fits. */
       if (!crdt_route_unicast_try(sptr, 'T', acptr,
                                   cli_s2s_msgid(cptr)[0] ? cli_s2s_msgid(cptr) : "*",
-                                  client_tags))
-        sendcmdto_one(sptr, CMD_TAGMSG, acptr, "@%s %C",
-                      client_tags, acptr);
+                                  client_tags)
+          && IsIRCv3Aware(cli_from(acptr))) {
+        if (send_s2s_tags_on(acptr)) {
+          sendcmdto_set_s2s_cptr(cptr);
+          sendcmdto_one_tags_with_client(sptr, CMD_TAGMSG, acptr,
+                                         cli_s2s_msgid(cptr), client_tags,
+                                         "%C", acptr);
+        } else if (send_s2s_untagged_fits(sptr, TOK_TAGMSG, "@%s %C",
+                                          client_tags, acptr))
+          sendcmdto_one(sptr, CMD_TAGMSG, acptr, "@%s %C",
+                        client_tags, acptr);
+      }
     }
 
     /* Store DM TAGMSG for event-playback -- mirrors the local-client

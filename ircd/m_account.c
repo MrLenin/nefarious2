@@ -80,6 +80,7 @@
  */
 #include "config.h"
 
+#include "account_id.h"
 #include "bouncer_session.h"
 #include "client.h"
 #include "handlers.h"           /* B0/MR-3d (LOC reverse): crdt_route_services_reply_try */
@@ -92,6 +93,7 @@
 #include "ircd_string.h"
 #include "msg.h"
 #include "numnicks.h"
+#include "s_misc.h"
 #include "s_auth.h"
 #include "s_bsd.h"
 #include "s_debug.h"
@@ -210,6 +212,7 @@ int ms_account(struct Client* cptr, struct Client* sptr, int parc,
 {
   struct Client *acptr;
   char type;
+  int exit_ghost = 0;
 
   if (parc < 3)
     return need_more_params(sptr, "ACCOUNT");
@@ -245,40 +248,7 @@ int ms_account(struct Client* cptr, struct Client* sptr, int parc,
                                     "(ACCOUNT Removal)", cli_name(acptr));
         assert(0 != cli_user(acptr)->account[0]);
 
-        /* Destroy all bouncer sessions for this account before clearing it.
-         * Re-lookup each iteration because bounce_destroy() may free the
-         * AccountSessions struct when the last session is removed. */
-        {
-          struct BouncerSession *sess;
-          while ((sess = bounce_find_any_session(cli_user(acptr)->account)) != NULL)
-            bounce_destroy(sess);
-        }
-
-        /* Clear all persisted metadata for this account from LMDB and
-         * free in-memory metadata entries.  Must happen while the account
-         * string is still set so the LMDB lookup key is valid. */
-        metadata_clear_client(acptr);
-
-        /* Decrement authusers for all channels this user is in.
-         * channel_account_adjust skips CHFL_ALIAS memberships, so an
-         * AC U addressed at an alias numeric cannot steal counts the
-         * alias never added. */
-        channel_account_adjust(acptr, -1);
-
-        /* Strict-presence anchor transfer: account -> session, closing
-         * the account-anchored open interval (deauth previously left
-         * it open forever -- unbounded forward visibility). */
-        presence_anchor_transfer(acptr, cli_user(acptr)->account, 0,
-                                 cli_session_id(acptr), 1);
-
-        /* Emit the alias account-clear BEFORE ClearAccount:
-         * bounce_emit_alias_update bails on !IsAccount(primary), so
-         * the old order (clear first) silently stranded every alias
-         * with a stale FLAG_ACCOUNT after deauth. */
-        bounce_emit_alias_update(acptr, "account", "");
-
-        ClearAccount(acptr);
-        ircd_strncpy(cli_user(acptr)->account, "", ACCOUNTLEN + 1);
+        exit_ghost = bounce_account_deauth_apply(acptr);
 
         {
           char ac_msgid[64] = "";
@@ -308,6 +278,16 @@ int ms_account(struct Client* cptr, struct Client* sptr, int parc,
 
         sendcmdto_serv_butone(sptr, CMD_ACCOUNT, cptr, "%C U", acptr);
         crdt_account_tunnel_owner(cptr, acptr, "U", NULL, NULL);
+
+        /* A local held ghost has nothing left to revive into once its
+         * account is gone; it leaves now that the clear has been relayed
+         * (exit first and the relay would name a client that no longer
+         * exists). */
+        if (exit_ghost) {
+          ClearBouncerHold(acptr);
+          exit_client(acptr, acptr, &me, "Account deauthorized");
+          return 0;
+        }
       } else if (type == 'R' || type == 'M') {
         if (parc < 4)
           return need_more_params(sptr, "ACCOUNT");
@@ -340,15 +320,13 @@ int ms_account(struct Client* cptr, struct Client* sptr, int parc,
         metadata_load_account(acptr, parv[3]);
 
         {
-          int was_account = IsAccount(acptr);
+          int was_account = IsAccount(acptr) ? 1 : 0;   /* flag beyond bit 31: never store the mask in an int */
           char presence_old_acct[ACCOUNTLEN + 1];
           ircd_strncpy(presence_old_acct, cli_user(acptr)->account,
                        sizeof(presence_old_acct));
 
           ircd_strncpy(cli_user(acptr)->account, parv[3], ACCOUNTLEN + 1);
           SetAccount(acptr);
-
-          bounce_emit_alias_update(acptr, "account", cli_user(acptr)->account);
 
           /* Count this member's channels only on a false->true account
            * transition.  An account CHANGE ('M') arrives with the user
@@ -372,7 +350,29 @@ int ms_account(struct Client* cptr, struct Client* sptr, int parc,
           cli_user(acptr)->acc_create = atoi(parv[4]);
           Debug((DEBUG_DEBUG, "Received timestamped account: account \"%s\", "
                  "timestamp %Tu", parv[3], cli_user(acptr)->acc_create));
-        }
+        } else
+          cli_user(acptr)->acc_create = 0;
+
+        /* Fifth parameter: the Keycloak user id, compact.  Anything else
+         * in that slot -- RENAME's marker, a value an older hop cut
+         * short -- is not an id and leaves it unknown. */
+        if (parc > 5 && account_id_valid(parv[5])) {
+          ircd_strncpy(cli_user(acptr)->kc_id, parv[5], sizeof(cli_user(acptr)->kc_id));
+          Debug((DEBUG_DEBUG, "Received account id %s for account \"%s\"",
+                 cli_user(acptr)->kc_id, parv[3]));
+        } else
+          cli_user(acptr)->kc_id[0] = '\0';
+
+        /* The aliases follow, once the primary carries the account's ts
+         * and id (they take both with the name).  The primary's own server
+         * tells the network (BX U account=); elsewhere that update may
+         * have come first and left the aliases with the primary's previous
+         * ts and id, so they catch up from it here -- either order ends
+         * the same, and only one server broadcasts. */
+        if (MyConnect(acptr))
+          bounce_emit_alias_update(acptr, "account", cli_user(acptr)->account);
+        else
+          bounce_sync_alias_identity(acptr);
 
         {
           char ac_msgid[64] = "";
@@ -399,13 +399,16 @@ int ms_account(struct Client* cptr, struct Client* sptr, int parc,
           }
         }
 
-        if (parc > 4) {
+        if (cli_user(acptr)->kc_id[0])
+          sendcmdto_serv_butone(sptr, CMD_ACCOUNT, cptr, "%C %c %s %Tu %s",
+                                acptr, type, parv[3], cli_user(acptr)->acc_create,
+                                cli_user(acptr)->kc_id);
+        else if (parc > 4)
           sendcmdto_serv_butone(sptr, CMD_ACCOUNT, cptr, "%C %c %s %s",
                                 acptr, type, parv[3], parv[4]);
-        } else {
+        else
           sendcmdto_serv_butone(sptr, CMD_ACCOUNT, cptr, "%C %c %s",
                                 acptr, type, parv[3]);
-        }
         {
           char tbuf[2];
           tbuf[0] = type; tbuf[1] = '\0';
@@ -418,6 +421,11 @@ int ms_account(struct Client* cptr, struct Client* sptr, int parc,
            (feature_int(FEAT_HOST_HIDING_STYLE) == 3)) &&
           IsHiddenHost(acptr))
         hide_hostmask(acptr);
+      /* A login of our connection (services' AUTH, after registration):
+       * it takes the account's modes, each change echoed with its M
+       * line, after the AC above (push-2 final fix wave, I-1).  A no-op
+       * for a remote user and after a logout (no account). */
+      metadata_mode_sync_restore(acptr, 1);
 
       /* 3l account-prop: the doc user record's account only updated at
        * register/nick/umode refresh, so a post-registration U/R/M never
@@ -518,9 +526,10 @@ int ms_account(struct Client* cptr, struct Client* sptr, int parc,
         ircd_strncpy(cli_user(acptr)->account, cli_loc(acptr)->account,
                         ACCOUNTLEN + 1);
 
-        if (parc > 4) {
-          cli_user(acptr)->acc_create = atoi(parv[4]);
-        }
+        /* No timestamp in the reply: none, not whatever an earlier login
+         * of this connection left (as the R/M path above does). */
+        cli_user(acptr)->acc_create = (parc > 4) ? atoi(parv[4]) : 0;
+        cli_user(acptr)->kc_id[0] = '\0';   /* the reply from services carries no id */
 
         if ((feature_int(FEAT_HOST_HIDING_STYLE) == 1) ||
             (feature_int(FEAT_HOST_HIDING_STYLE) == 3)) {
@@ -625,6 +634,9 @@ int ms_account(struct Client* cptr, struct Client* sptr, int parc,
                           cli_user(acptr)->acc_create ? "%C %s %Tu" : "%C %s",
                           acptr, cli_user(acptr)->account,
                           cli_user(acptr)->acc_create);
+    /* Our connection's login: the account's modes (push-2 final fix
+     * wave, I-1), as the extended form above. */
+    metadata_mode_sync_restore(acptr, 1);
 
     /* 3l account-prop: same re-mint as the extended U/R/M tail above. */
     crdt_shadow_user_add(acptr);

@@ -97,6 +97,7 @@
 #include "ircd_features.h"
 #include "history.h"
 #include "crdt_shadow.h"
+#include "history_trim_codec.h"
 #include "chathistory_presence.h"
 
 /* #include <assert.h> -- Now using assert in ircd_log.h */
@@ -120,6 +121,7 @@ static void store_kick_event(struct Client *sptr, struct Channel *chptr,
   const char *msgid;
   char sender[HISTORY_SENDER_LEN];
   char kick_text[512];
+  char owner[HTC_OWNER_MAX];
   const char *account;
 
   if (!history_is_available())
@@ -163,6 +165,8 @@ static void store_kick_event(struct Client *sptr, struct Channel *chptr,
   /* Get account name if logged in */
   account = (cli_user(sptr) && cli_user(sptr)->account[0])
             ? cli_user(sptr)->account : NULL;
+  /* The row's trim owner: the client whose account it carries. */
+  history_owner_of(owner, sizeof(owner), sptr);
 
   /* Build kick text: "kicked_nick :reason" */
   ircd_snprintf(0, kick_text, sizeof(kick_text), "%s :%s",
@@ -170,7 +174,7 @@ static void store_kick_event(struct Client *sptr, struct Channel *chptr,
 
   /* Store in database */
   history_store_message(msgid, timestamp, chptr->chname, NULL, sender,
-                        account, HISTORY_KICK, kick_text, NULL);
+                        account, HISTORY_KICK, kick_text, NULL, owner);
 }
 #endif /* USE_ROCKSDB */
 

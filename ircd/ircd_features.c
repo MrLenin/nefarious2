@@ -751,12 +751,16 @@ feature_notify_chathistory_retention(void)
   if (!cli_serv(&me))
     return;
 
-  /* Send CH A R <retention> to all peer servers */
-  sendcmdto_serv_butone_v3(&me, CMD_CHATHISTORY, NULL, "A R %d", retention);
+  /* Age-out under the new cutoff: a pass at the next trim tick (a
+   * shorter retention drains in slices, never in one go). */
+  history_trim_kick();
 
   log_write(LS_SYSTEM, L_INFO, 0,
-            "chathistory: retention changed to %d days, notified peers",
-            retention);
+            "chathistory: retention changed to %d days", retention);
+
+  /* Peers hear the coverage this retention gives (CH A R), when it
+   * changed: a coverage floor inside retention bounds it either way. */
+  chathistory_coverage_changed();
 
   /* Also notify clients via cap-notify */
   feature_notify_chathistory_caps();
@@ -850,6 +854,15 @@ static void
 feature_notify_chathistory_maintenance_interval(void)
 {
   history_purge_restart_timer();
+}
+
+/** Handle FEAT_CHATHISTORY_TRIM_SLICE_MS change — the longest trim slice
+ * so far (STATS chathistory "max") was measured under the old budget.
+ */
+static void
+feature_notify_chathistory_trim_slice_ms(void)
+{
+  history_trim_slice_budget_changed();
 }
 
 /** Handle FEAT_BOUNCER_PERSIST_INTERVAL change — re-arm the dirty-persist
@@ -1030,6 +1043,9 @@ static struct FeatureDesc {
   F_I(IPCHECK_CLONE_LIMIT, 0, 4, 0),
   F_I(IPCHECK_CLONE_PERIOD, 0, 40, 0),
   F_I(IPCHECK_CLONE_DELAY, 0, 600, 0),
+  F_B(IPCHECK_COUNT_REFUSALS, 0, 1, 0),
+  F_I(IPCHECK_SASL_REFUND, 0, 0, 0),
+  F_I(IPCHECK_SASL_REFUND_PERIOD, 0, 600, 0),
   F_I(CHANNELLEN, 0, 200, set_isupport_channellen),
 
   /* Some misc. default paths */
@@ -1186,7 +1202,13 @@ static struct FeatureDesc {
   F_I(WEBHOOK_PORT, 0, 0, 0),
   F_S(WEBHOOK_SECRET, FEAT_NODISP, "", 0),
   F_B(WEBHOOK_KILL_ON_DISABLE, 0, 0, 0),
-  F_B(WEBHOOK_KILL_ON_DELETE, 0, 1, 0),
+  F_I(WEBHOOK_EVENTLOG_SIZE, 0, 1024, 0),      /* applied-events log entries (webhook plan 4) */
+  F_I(WEBHOOK_EVENTLOG_WINDOW, 0, 86400, 0),   /* seconds of it a newly linked peer is caught up on */
+  /* Default OFF: deauth (AC U) propagates correctly network-wide, a
+   * local-only kill does not.  Forced network-wide disconnect needs its
+   * own design -- see the open design item in
+   * .claude/para/projects/2026-09-22-bouncer-deauth-correctness.md */
+  F_B(WEBHOOK_KILL_ON_DELETE, 0, 0, 0),
   F_I(SNOMASK_DEFAULT, 0, SNO_DEFAULT, 0),
   F_I(SNOMASK_OPERDEFAULT, 0, SNO_OPERDEFAULT, 0),
   F_S(TPATH, FEAT_CASE | FEAT_MYOPER, "ircd.tune", 0),
@@ -1394,6 +1416,7 @@ static struct FeatureDesc {
   F_B(CHATHISTORY_OPS_OVERRIDE, 0, 0, 0), /* :full bypass for channel ops -- default OFF (was on by oversight; grant deliberately per network) */
   F_B(CHATHISTORY_USER_QUOTA, 0, 1, 0),      /* Enable per-user quotas */
   F_I(CHATHISTORY_USER_QUOTA_PCT, 0, 10, 0), /* Max % of channel history per user */
+  F_I(CHATHISTORY_TRIM_SLICE_MS, 0, 15, feature_notify_chathistory_trim_slice_ms),  /* Main-loop ms one trim slice may take (clamped 1..1000) */
   F_B(CHATHISTORY_REQUIRE_AUTH, 0, 0, 0),   /* Require auth for channel history (non-+H) — default off so unauthed/ephemeral clients can use CHATHISTORY out of the box; Afternet sets this to 1 in ircd.conf */
   F_B(CHATHISTORY_STRICT_PRESENCE, 0, 0, feature_notify_strict_presence), /* Filter chathistory to caller's presence windows (strict mode) */
   F_I(CHATHISTORY_PRESENCE_MAX_INTERVALS, 0, 64, 0), /* Per-(anchor,channel) cap on retained presence intervals; oldest evicted FIFO when exceeded */
@@ -1426,6 +1449,7 @@ static struct FeatureDesc {
   F_B(MSGID, 0, 1, 0),
   F_B(P10_MESSAGE_TAGS, 0, 0, 0),
   F_S(AWAY_STAR_MSG, FEAT_NULL, "Away", 0),
+  F_I(HLC_MAX_FORWARD_MS, 0, 60000, 0),
   F_I(AWAY_THROTTLE, 0, 0, 0),
   F_B(METADATA_BURST, 0, 1, 0),
   F_S(METADATA_DB, 0, "metadata", 0),
@@ -1433,6 +1457,7 @@ static struct FeatureDesc {
   F_B(METADATA_DB_NORDAHEAD, 0, 1, 0),
   F_I(METADATA_CACHE_TTL, 0, 14400, 0),
   F_I(METADATA_PURGE_FREQUENCY, 0, 3600, feature_notify_metadata_purge_frequency),
+  F_I(METADATA_TOMBSTONE_TTL, 0, 2592000, 0), /* 30 days; a D clock row older than this is purged */
 #ifdef USE_ZSTD
   F_I(COMPRESS_THRESHOLD, 0, 256, feature_notify_compress_threshold),
   F_I(COMPRESS_LEVEL, 0, 3, feature_notify_compress_level),

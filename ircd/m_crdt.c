@@ -1429,6 +1429,8 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
         if (!*q || *q == ':') break;
         ev[ec++] = q;
         while (*q && *q != ' ') q++;
+        if (*q)                /* end the token here: the third one is */
+          *q++ = '\0';         /* not followed by another pass of the loop */
       }
       while (*q == ' ') q++;
       if (ec == 3 && ((ev[2][0] == 'P' || ev[2][0] == '*') && !ev[2][1])) {
@@ -1443,7 +1445,7 @@ int ms_crdt(struct Client *cptr, struct Client *sptr, int parc, char *parv[])
         struct Client *msrc = srcu ? srcu : (srcsrv ? srcsrv : &me);
         struct Client *osrv = srcu ? cli_user(srcu)->server : srcsrv;
         Debug((DEBUG_DEBUG, "CRDT MD: mesh %s %s from %s", ev[0], ev[1], srcyxx));
-        if (metadata_apply_relayed(msrc, ev[0], ev[1], evis, evalue)
+        if (metadata_apply_relayed(NULL, msrc, ev[0], ev[1], evis, evalue)
             && (!osrv || IsMeshStub(osrv))) {
           sendcmdto_set_skip_crdt_servers();
           if (evalue)
