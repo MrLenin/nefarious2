@@ -801,6 +801,15 @@ int crdt_shadow_bsess_removed(const char *account, const char *sessid)
   return crdt_bsess_is_explicitly_removed(&g_crdt, account, sessid);
 }
 
+/** As crdt_shadow_bsess_removed, and names the tombstone's writer in @a by. */
+int crdt_shadow_bsess_removed_by(const char *account, const char *sessid,
+                                 uint16_t *by)
+{
+  if (!shadow_on())
+    return 0;
+  return crdt_bsess_removed_by(&g_crdt, account, sessid, by);
+}
+
 /* M6c-1 BX Inc-2 (fix): is this connection's bconn doc record still LIVE (not
  * tombstoned/absent)?  The alias-reap oracle, mirror of crdt_shadow_bsess_present
  * for the replica-session reap.  crdt_bconn_get returns NULL for a tombstone. */
@@ -6720,11 +6729,37 @@ static void crdt_shadow_verify_cb(struct Event *ev)
   }
 }
 
+/* GC hold (crdt_state_gc): a bsessions tombstone stays while a record of
+ * that session that the replica reap may still end exists here, so the
+ * reap, which may wait on it (bounce_crdt_replica_reap), still finds it when
+ * it acts.  The engine asks only for a DELETE op that still backs its key's
+ * tombstone. */
+static int shadow_gc_hold(uint8_t coll, const char *key, uint32_t key_len)
+{
+  char account[ACCOUNTLEN + 1], sessid[BOUNCER_SESSID_LEN];
+  const char *z;
+  uint32_t alen, slen;
+
+  if (coll != CRDT_COLL_BSESSIONS || !key)
+    return 0;
+  z = memchr(key, '\0', key_len);
+  if (!z)
+    return 0;
+  alen = (uint32_t)(z - key);
+  slen = key_len - alen - 1;
+  if (alen > ACCOUNTLEN || slen == 0 || slen >= sizeof sessid)
+    return 0;
+  memcpy(account, key, alen); account[alen] = '\0';
+  memcpy(sessid, z + 1, slen); sessid[slen] = '\0';
+  return bounce_record_awaits_reap(account, sessid);
+}
+
 void crdt_shadow_init(uint16_t my_numeric)
 {
   if (g_inited)
     return;
   crdt_state_init(&g_crdt, my_numeric);
+  g_crdt.gc_hold = shadow_gc_hold;
   g_boot_enabled = feature_bool(FEAT_CRDT_ENABLED) ? 1 : 0;
   /* Restart-epoch defense: seed next_seq from the wall clock (ms) so a restarted
    * server's freshly-reset op sequence never reuses seqs from a previous

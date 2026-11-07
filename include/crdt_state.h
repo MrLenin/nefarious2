@@ -453,6 +453,12 @@ struct CrdtNetworkState {
     char reason[CRDT_QUITREASON_LEN];
   } quit_ring[CRDT_QUIT_RING];
   unsigned                quit_ring_head;
+  /** Optional GC hold: when set and it returns nonzero for a DELETE op's
+   *  collection and key, crdt_state_gc keeps the op (and so its tombstone)
+   *  past causal stability.  Asked only while the op still backs the key's
+   *  tombstone.  The bouncer reap needs a tombstone it has not
+   *  acted on yet (a record of that key still exists here). */
+  int                   (*gc_hold)(uint8_t coll, const char *key, uint32_t key_len);
 };
 
 /* ---- lifecycle ---- */
@@ -641,6 +647,9 @@ const struct CrdtBouncerSession *crdt_bsess_get(const struct CrdtNetworkState *s
 /** 1 iff (account,sessid) has an explicit delete-tombstone (gate for doc->live removal). */
 int crdt_bsess_is_explicitly_removed(const struct CrdtNetworkState *st,
                                      const char *account, const char *sessid);
+/** Was the bsess record's last write a delete, and by which server (*@a by)? */
+int crdt_bsess_removed_by(const struct CrdtNetworkState *st, const char *account,
+                          const char *sessid, uint16_t *by);
 /** 5-5e M3: the cross-sessid election winner = strcmp-lowest sessid among @a account's
  *  LIVE bsessions records (matches bouncer_session.c's strcmp election). Writes the
  *  NUL-terminated winner to @a out; returns out, or NULL if no live session in the doc. */

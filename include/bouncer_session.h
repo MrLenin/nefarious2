@@ -2284,6 +2284,9 @@ extern int bounce_session_assert_invariant(
  * sync responsibility?" decisions.
  */
 extern int session_has_local_holder(struct BouncerSession *session);
+/** Is there a record of @a account's session @a sessid here that the replica
+ * reap may still end (one we do not hold)? */
+int bounce_record_awaits_reap(const char *account, const char *sessid);
 
 /** The server the session's primary (hs_client, live or a held ghost) is
  * a client of; NULL when the session has none.  This, not `hs_origin`,

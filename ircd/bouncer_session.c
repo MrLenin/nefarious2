@@ -711,8 +711,11 @@ static void session_roster_add(struct BouncerSession *session,
                                const char *alias_profile);
 static void bounce_retract_crossed_face(struct BouncerSession *s,
                                         const char *reason);
+static void crossed_primary_leaves(struct BouncerSession *s, struct Client *link,
+                                   struct Client *killer, const char *reason);
 static void bounce_bsx_end_devices(struct BouncerSession *s,
                                    struct Client *sender, const char *sessid);
+static void member_end_resolve(struct BouncerSession *s);
 static void bounce_note_registration_wait(struct BouncerSession *s);
 static time_t session_wait_until(struct BouncerSession *s);
 static int session_still_waits(struct BouncerSession *s);
@@ -1395,6 +1398,21 @@ void bounce_session_adopt_kc_id(struct BouncerSession *session, const char *id)
  * bounds a BS A that never comes (W3 12c-2b fix round 3, I-1). */
 #define BOUNCE_ANNOUNCED_WAIT 5
 
+/** Does a tombstone written by server @a by end this replica's copy?  A
+ * replica following a remote primary ends only on that primary's server's
+ * tombstone: after a split two holders can keep copies under one id, and
+ * one ending its copy must not end the other's.  A replica with no primary
+ * cannot say which copy it was, so any tombstone counts. */
+static int tombstone_ends_copy(const struct BouncerSession *s, uint16_t by)
+{
+  struct Client *ps;
+
+  if (!s->hs_client)
+    return 1;
+  ps = cli_user(s->hs_client) ? cli_user(s->hs_client)->server : NULL;
+  return ps && (uint16_t)base64toint(cli_yxx(ps)) == by;
+}
+
 /** Read every session of @a account as the chooser reads it
  * (bounce_choose(), bouncer_wire.h) for a login of @a cptr, in the
  * account's list order.  The primary of a session whose slot is not ours
@@ -1421,6 +1439,7 @@ static int bounce_choose_read(struct Client *cptr, const char *account,
 {
   struct AccountSessions *as = bounce_find_by_account(account);
   struct BouncerSession *s;
+  uint16_t by = 0;
   int n = 0;
 
   for (s = as ? as->as_sessions : NULL; s; s = s->hs_anext) {
@@ -1436,6 +1455,13 @@ static int bounce_choose_read(struct Client *cptr, const char *account,
     if (!s->hs_client || !MyConnect(s->hs_client))
       bounce_resolve_hs_client_from_ghost(s, site);
     p = s->hs_client;
+    /* A replica whose copy is tombstoned is one the reap has yet to end (it
+     * may wait on devices here): never a session to join.  The reap's rule
+     * decides whose copy a tombstone ended. */
+    if (!(p && MyConnect(p))
+        && crdt_shadow_bsess_removed_by(s->hs_account, s->hs_sessid, &by)
+        && tombstone_ends_copy(s, by))
+      continue;
     unused = may_end && s->hs_state == BOUNCE_HOLDING && s->hs_alias_count == 0
              && p && MyConnect(p) && IsBouncerHold(p) && cli_saslkcidlive(cptr);
     r = &rows[n];
@@ -3694,6 +3720,37 @@ int session_has_local_holder(struct BouncerSession *session)
   return 0;
 }
 
+int bounce_record_awaits_reap(const char *account, const char *sessid)
+{
+  struct BouncerSession *s;
+
+  if (!account || !sessid || !(s = bounce_find_by_token_sessid(account, sessid)))
+    return 0;
+  return !(s->hs_client && MyConnect(s->hs_client));   /* we hold it: never reaped */
+}
+
+/** Does a live device of @a session connect here?  The stored roster can
+ * keep an entry for a device that moved to another record
+ * (bounce_alias_untrack() clears the first record naming it), so each
+ * entry counts only while it names a live local alias of this session. */
+static int session_has_live_local_device(struct BouncerSession *session)
+{
+  const char *me_yxx = cli_yxx(&me);
+  int i;
+
+  for (i = 0; i < session->hs_alias_count; i++) {
+    struct Client *a;
+
+    if (0 != strcmp(session->hs_aliases[i].ba_server, me_yxx))
+      continue;
+    a = findNUser(session->hs_aliases[i].ba_numeric);
+    if (a && MyConnect(a) && IsBouncerAlias(a) && !HasFlag(a, FLAG_CLOSING)
+        && 0 == strcmp(cli_session_id(a), session->hs_sessid))
+      return 1;
+  }
+  return 0;
+}
+
 /* 5-5e M6a (doc-native bouncer cutover): create a REPLICA BouncerSession from converged
  * doc state on a node that is NOT the holder.  Byte-for-byte mirrors the BS-C "active"/
  * "holding" replica path (bounce_handle_bs :4163-4211): hs_client=NULL, BOUNCE_ACTIVE/
@@ -4080,6 +4137,7 @@ void bounce_crdt_replica_reap(void)
   enum { REAP_BATCH = 32 };
   struct BouncerSession *doomed[REAP_BATCH];
   int i, nd = 0;
+  uint16_t by = 0;
 
   if (!feature_bool(FEAT_CRDT_BOUNCER_DOC) || !feature_bool(FEAT_CRDT_PRIMARY))
     return;
@@ -4091,12 +4149,44 @@ void bounce_crdt_replica_reap(void)
       for (s = as->as_sessions; s && nd < REAP_BATCH; s = s->hs_anext) {
         if (s->hs_state == BOUNCE_DESTROYING)
           continue;
-        if (s->hs_client != NULL)                       /* local primary -> not a replica */
+        /* Spared only while we hold it (our primary, live or a held
+         * ghost): the holder writes the tombstone, so ours is never one we
+         * did not decide.  A replica naming a REMOTE primary is reaped too:
+         * after the holder ends a session whose primary carries on (a
+         * member end, bounce_end_here), its devices here must not stay
+         * aliases of a dead session, nor new logins alias into it. */
+        if (s->hs_client && MyConnect(s->hs_client))
           continue;
-        if (!crdt_shadow_bsess_removed(s->hs_account, s->hs_sessid))
-          continue;              /* INVARIANT 11: reap ONLY on an EXPLICIT doc tombstone.
-                                  * Absent (legacy-primaried -> never written; or not yet
-                                  * synced) != removed -> spared, not reaped. */
+        /* INVARIANT 11: reap ONLY on an EXPLICIT doc tombstone.  Absent
+         * (legacy-primaried -> never written; or not yet synced) != removed
+         * -> spared, not reaped.  The tombstone stays while this record
+         * does (the GC hold, crdt_shadow.c shadow_gc_hold), so a record
+         * left waiting below still finds it. */
+        if (!crdt_shadow_bsess_removed_by(s->hs_account, s->hs_sessid, &by))
+          continue;
+        /* A record following a remote primary ends only on its OWN holder's
+         * tombstone: after a split two holders can keep copies under one id,
+         * and one ending its copy must not end the devices here that follow
+         * the other's live primary (BS X spares a live copy the same way). */
+        /* A record with no primary may only not have resolved it yet
+         * (member_end_resolve()): resolve it first, so the check below
+         * reads the holder it follows. */
+        if (!s->hs_client)
+          member_end_resolve(s);
+        if (s->hs_client && MyConnect(s->hs_client))
+          continue;
+        if (s->hs_client) {
+          if (!tombstone_ends_copy(s, by))
+            continue;
+        } else if (session_has_live_local_device(s)) {
+          /* Still none, and devices of it are here: nothing says which
+           * copy they follow, so which copy this tombstone ended is
+           * unknown and it waits (for the primary to resolve, or for its
+           * devices to leave).  Without a copy key on the record and its
+           * delete this is the most the reap can tell.  With no device
+           * here nothing but the record goes. */
+          continue;
+        }
         doomed[nd++] = s;        /* explicitly tombstoned + no local primary -> stale replica */
       }
     }
@@ -4116,9 +4206,36 @@ void bounce_crdt_replica_reap(void)
      * a node WITH a legacy downlink (the gateway) actually emits to .2; a leaf
      * reaping the same replica reaches no legacy peer => exactly-once toward .2
      * (single-gateway; multi-gateway = MR-4d election, out of scope). BS X is
-     * account/sessid-keyed (no server-relative numeric) so &me source is correct. */
-    bounce_broadcast(doomed[i], 'X', NULL);
-    bounce_destroy(doomed[i]);
+     * account/sessid-keyed, sourced from the holder's server (below). */
+    {
+      struct BouncerSession *d = doomed[i];
+      struct Client *p = d->hs_client;
+      struct Client *holder = (p && cli_user(p) && cli_user(p)->server)
+                              ? cli_user(p)->server : &me;
+      char account[ACCOUNTLEN + 1], sessid[BOUNCER_SESSID_LEN];
+
+      ircd_strncpy(account, d->hs_account, sizeof(account));
+      ircd_strncpy(sessid, d->hs_sessid, sizeof(sessid));
+      /* From the holder's server, as crdt_m6c1_synth_bs_ad sources BS A/D:
+       * a receiver ends only the devices that follow the BS X's sender
+       * (bounce_bsx_end_devices), so one from us would leave a legacy
+       * server's devices aliases of the primary.  From us only when no
+       * primary names the holder. */
+      sendcmdto_set_skip_crdt_servers();
+      sendcmdto_serv_butone_v3(holder, CMD_BOUNCER_SESSION, NULL, "X %s %s",
+                               account, sessid);
+      /* Everything a BS X from the holder tears down (the X case of
+       * ms_bounce_session): the session's devices here, a primary kept for
+       * a crossed promote, then the record, then the id on any client that
+       * still carries it.  The holder is the primary's server when the
+       * record names one, else it is gone and decides nothing more. */
+      bounce_bsx_end_devices(d, holder, sessid);
+      if (d->hs_crossed_face[0])
+        crossed_primary_leaves(d, p ? cli_from(p) : &me, &me,
+                               "Bouncer session ended");
+      bounce_destroy(d);
+      bounce_forget_ended_id(account, sessid);
+    }
   }
 }
 

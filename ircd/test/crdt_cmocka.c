@@ -1066,9 +1066,58 @@ static void test_bsess_op_replicates(void **state)
   crdt_state_sync(&s2, &s1);
   assert_int_equal(1, crdt_bsess_is_explicitly_removed(&s2, ACC, SID));
   assert_true(crdt_state_digest(&s1) == crdt_state_digest(&s2));
+  /* the tombstone names the holder that wrote it (the replica reap ends a
+   * record following a remote primary only on that primary's holder's) */
+  {
+    uint16_t by = 0;
+    assert_int_equal(1, crdt_bsess_removed_by(&s2, ACC, SID, &by));
+    assert_int_equal(s1.my_numeric, by);
+    assert_int_equal(0, crdt_bsess_removed_by(&s2, ACC, "nosuch", &by));
+  }
 
   crdt_state_clear(&s1);
   crdt_state_clear(&s2);
+}
+
+/* The GC hold keeps a stable bsess DELETE op, and so its tombstone, only
+ * while the op still backs the tombstone: a later SET frees it. */
+static int gc_hold_all(uint8_t coll, const char *key, uint32_t key_len)
+{
+  (void)coll; (void)key; (void)key_len;
+  return 1;
+}
+
+static void test_bsess_gc_hold(void **state)
+{
+  (void)state;
+  static struct CrdtStateVector stable;
+  struct CrdtNetworkState s;
+  struct CrdtBouncerSession rec;
+  int i;
+  for (i = 0; i < CRDT_MAX_SERVERS; i++)
+    stable.seq[i] = UINT64_MAX;
+  memset(&rec, 0, sizeof rec);
+
+  crdt_state_init(&s, 4);                       /* no hold: collected */
+  crdt_bsess_set(&s, "alice", "Bxxx", &rec);
+  crdt_bsess_del(&s, "alice", "Bxxx");
+  crdt_state_gc(&s, &stable);
+  assert_int_equal(0, (int)s.oplog.count);
+  assert_false(crdt_bsess_is_explicitly_removed(&s, "alice", "Bxxx"));
+  crdt_state_clear(&s);
+
+  crdt_state_init(&s, 4);
+  s.gc_hold = gc_hold_all;
+  crdt_bsess_set(&s, "alice", "Bxxx", &rec);
+  crdt_bsess_del(&s, "alice", "Bxxx");
+  crdt_state_gc(&s, &stable);
+  assert_int_equal(1, (int)s.oplog.count);      /* the DELETE stays */
+  assert_true(crdt_bsess_is_explicitly_removed(&s, "alice", "Bxxx"));
+  crdt_bsess_set(&s, "alice", "Bxxx", &rec);    /* superseded */
+  crdt_state_gc(&s, &stable);
+  assert_int_equal(0, (int)s.oplog.count);
+  assert_non_null(crdt_bsess_get(&s, "alice", "Bxxx"));
+  crdt_state_clear(&s);
 }
 
 /* 5-5e M3: crdt_bsess_winner derives the cross-sessid election winner (strcmp-lowest
@@ -4373,6 +4422,7 @@ int main(void)
     cmocka_unit_test(test_metadata_same_stamp_mints_converge),
     cmocka_unit_test(test_bsess_op_replicates),
     cmocka_unit_test(test_bsess_winner),
+    cmocka_unit_test(test_bsess_gc_hold),
     cmocka_unit_test(test_bconn_roster),
     cmocka_unit_test(test_blease_compare),
     cmocka_unit_test(test_blease_decide),

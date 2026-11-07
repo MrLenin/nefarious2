@@ -185,6 +185,9 @@ int crdt_shadow_bsess_present(const char *account, const char *sessid);
  *  the replica-reap gate.  Absent != removed: a legacy-primaried or not-yet-synced
  *  session is absent, not tombstoned, and must be spared. */
 int crdt_shadow_bsess_removed(const char *account, const char *sessid);
+/** The bsess tombstone's writer: 1 and *@a by set when the record is removed. */
+int crdt_shadow_bsess_removed_by(const char *account, const char *sessid,
+                                 uint16_t *by);
 /** M6c-1 BX Inc-2: 1 iff a non-tombstone bconns doc record exists (alias-reap gate). */
 int crdt_shadow_bconn_present(const char *account, const char *sessid,
                              const char *connnum);

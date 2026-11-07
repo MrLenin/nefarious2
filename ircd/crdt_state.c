@@ -1307,6 +1307,22 @@ const struct CrdtBouncerSession *crdt_bsess_get(const struct CrdtNetworkState *s
   return v ? (const struct CrdtBouncerSession *)v->data : NULL;
 }
 
+/* The server that wrote a bsess tombstone (the holder that ended its copy):
+ * 1 and *@a by filled when the record's last write is a delete.  The delete's
+ * HLC carries the writer's numeric (crdt_bsess_del stamps a local event). */
+int crdt_bsess_removed_by(const struct CrdtNetworkState *st, const char *account,
+                          const char *sessid, uint16_t *by)
+{
+  char key[128];
+  struct HLC ts;
+  uint32_t klen = bsess_key(account, sessid, key, sizeof key);
+  if (!klen || !crdt_lwwmap_deleted_ts(&st->bsessions, key, klen, &ts))
+    return 0;
+  if (by)
+    *by = ts.node_id;
+  return 1;
+}
+
 int crdt_bsess_is_explicitly_removed(const struct CrdtNetworkState *st,
                                      const char *account, const char *sessid)
 {
@@ -2815,6 +2831,18 @@ int crdt_state_reclaim_orphan_tempshuns(struct CrdtNetworkState *st)
   return total;
 }
 
+/* Is @a op the DELETE behind its key's current tombstone?  A later write
+ * supersedes it, and then nothing needs it held. */
+static int delete_backs_tombstone(const struct CrdtNetworkState *st,
+                                  const struct CrdtOp *op)
+{
+  const struct CrdtLWWMap *m = lww_for((struct CrdtNetworkState *)st, op->coll);
+  struct HLC t;
+
+  return m && crdt_lwwmap_deleted_ts(m, op->key, op->key_len, &t)
+         && hlc_compare(&t, &op->ts) == 0;
+}
+
 int crdt_state_gc(struct CrdtNetworkState *st,
                   const struct CrdtStateVector *stable)
 {
@@ -2825,7 +2853,10 @@ int crdt_state_gc(struct CrdtNetworkState *st,
   uint32_t cnt = 0;
   while (cur) {
     struct CrdtOp *nx = cur->next;
-    if (stable->seq[cur->origin] >= cur->seq) {
+    if (stable->seq[cur->origin] >= cur->seq
+        && !(cur->type == CRDT_OP_DELETE && st->gc_hold
+             && delete_backs_tombstone(st, cur)
+             && st->gc_hold((uint8_t)cur->coll, cur->key, cur->key_len))) {
       /* This op is causally stable (every peer has it). If it's an LWW delete, its
        * tombstone is now reclaimable too — free it (unless a newer write superseded
        * it). Fixes unbounded growth of delete-tombstones (e.g. quit users / 3m). */
